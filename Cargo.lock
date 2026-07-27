@@ -2820,6 +2820,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "ciborium",
  "clap",
  "ed25519-dalek",
  "flate2",

@@ -62,6 +62,7 @@ pub mod secrets;
 pub mod traffic;
 pub mod trust_root;
 pub mod updates;
+pub mod webchat_ui;
 // pub mod bundles;
 // pub mod revisions;
 // pub mod traffic;
