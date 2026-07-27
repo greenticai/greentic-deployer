@@ -327,6 +327,34 @@ fn stage_into(
         )));
     }
 
+    // A bundle whose packs serve webchat but ship no page gets the standard SPA
+    // pinned alongside them. Done here, before the lock is built, so the added
+    // pack is digest-pinned exactly like the bundle's own — the lock still
+    // describes precisely what the runtime will load.
+    //
+    // Skipped, not failed, when env init resolved no platform pack: a browser
+    // tier is an improvement, and refusing to deploy for want of one would make
+    // an offline env undeployable.
+    if crate::cli::webchat_ui::needs_webchat_ui(&gtpacks) {
+        match crate::cli::webchat_ui::cached_ui_pack(env_dir) {
+            Some(cached) => {
+                let staged = crate::cli::webchat_ui::stage_ui_pack(&cached, &packs_dir)?;
+                eprintln!(
+                    "bundle `{}` serves webchat with no UI pack; pinning {} for its browser tier",
+                    bundle_path.display(),
+                    crate::cli::webchat_ui::WEBCHAT_UI_PACK_FILE
+                );
+                gtpacks.push(staged);
+            }
+            None => eprintln!(
+                "bundle `{}` serves webchat with no UI pack, and no platform \
+                 {} is cached for this env; deploying without a browser tier",
+                bundle_path.display(),
+                crate::cli::webchat_ui::WEBCHAT_UI_PACK_FILE
+            ),
+        }
+    }
+
     reject_duplicate_pack_ids(&gtpacks)?;
 
     let mut packs = Vec::with_capacity(gtpacks.len());
