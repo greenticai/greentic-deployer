@@ -101,43 +101,34 @@ fn facts_from_manifest(value: &ciborium::Value) -> WebchatFacts {
     facts
 }
 
+/// Whether any element of `ext.inline.<array_key>[].<field>` starts with
+/// `prefix`. Both the provider and the static-route checks share this shape.
+fn inline_array_has(ext: &ciborium::Value, array_key: &str, field: &str, prefix: &str) -> bool {
+    let items = lookup(ext, "inline")
+        .and_then(|inline| lookup(inline, array_key))
+        .and_then(ciborium::Value::as_array);
+    let Some(items) = items else { return false };
+    items.iter().any(|item| {
+        lookup(item, field)
+            .and_then(ciborium::Value::as_text)
+            .is_some_and(|t| t.starts_with(prefix))
+    })
+}
+
 /// Whether a `greentic.provider-extension.v1` extension declares a webchat
 /// provider. `messaging.provider_ingress.v1` is shared by every messaging
 /// provider (Telegram, Teams, webchat, ...), so checking it alone would inject
 /// the SPA into non-webchat bundles. The `provider_type` inside
 /// `greentic.provider-extension.v1` is the typed identity.
 fn declares_webchat_provider(ext: &ciborium::Value) -> bool {
-    let Some(inline) = lookup(ext, "inline") else {
-        return false;
-    };
-    let Some(providers) = lookup(inline, "providers") else {
-        return false;
-    };
-    let Some(providers) = providers.as_array() else {
-        return false;
-    };
-    providers.iter().any(|provider| {
-        lookup(provider, "provider_type")
-            .and_then(ciborium::Value::as_text)
-            .is_some_and(|pt| pt.starts_with("messaging.webchat"))
-    })
+    inline_array_has(ext, "providers", "provider_type", "messaging.webchat")
 }
 
 /// Whether a `greentic.static-routes.v1` extension declares a route under the
 /// webchat prefix. A pack can declare static routes for something else
 /// entirely, so the prefix — not the extension's presence — is the test.
 fn declares_webchat_route(ext: &ciborium::Value) -> bool {
-    let Some(routes) = lookup(ext, "inline").and_then(|inline| lookup(inline, "routes")) else {
-        return false;
-    };
-    let Some(routes) = routes.as_array() else {
-        return false;
-    };
-    routes.iter().any(|route| {
-        lookup(route, "public_path")
-            .and_then(ciborium::Value::as_text)
-            .is_some_and(|path| path.starts_with(WEBCHAT_ROUTE_PREFIX))
-    })
+    inline_array_has(ext, "routes", "public_path", WEBCHAT_ROUTE_PREFIX)
 }
 
 fn lookup<'a>(value: &'a ciborium::Value, key: &str) -> Option<&'a ciborium::Value> {
@@ -192,35 +183,34 @@ mod tests {
         Value::Text(s.to_string())
     }
 
-    fn static_routes_ext(public_path: &str) -> (Value, Value) {
+    fn inline_ext(ext_name: &str, array_key: &str, field: &str, value: &str) -> (Value, Value) {
         (
-            text("greentic.static-routes.v1"),
+            text(ext_name),
             Value::Map(vec![(
                 text("inline"),
                 Value::Map(vec![(
-                    text("routes"),
-                    Value::Array(vec![Value::Map(vec![(
-                        text("public_path"),
-                        text(public_path),
-                    )])]),
+                    text(array_key),
+                    Value::Array(vec![Value::Map(vec![(text(field), text(value))])]),
                 )]),
             )]),
         )
     }
 
+    fn static_routes_ext(public_path: &str) -> (Value, Value) {
+        inline_ext(
+            "greentic.static-routes.v1",
+            "routes",
+            "public_path",
+            public_path,
+        )
+    }
+
     fn provider_ext(provider_type: &str) -> (Value, Value) {
-        (
-            text("greentic.provider-extension.v1"),
-            Value::Map(vec![(
-                text("inline"),
-                Value::Map(vec![(
-                    text("providers"),
-                    Value::Array(vec![Value::Map(vec![(
-                        text("provider_type"),
-                        text(provider_type),
-                    )])]),
-                )]),
-            )]),
+        inline_ext(
+            "greentic.provider-extension.v1",
+            "providers",
+            "provider_type",
+            provider_type,
         )
     }
 

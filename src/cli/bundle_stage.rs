@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use crate::environment::LocalFsStore;
 use crate::environment::atomic_write::atomic_write_json;
 
-use super::OpError;
+use super::{OpError, webchat_ui};
 
 /// Refs produced by staging a local bundle, threaded onto the new [`Revision`].
 ///
@@ -335,14 +335,14 @@ fn stage_into(
     // Skipped, not failed, when env init resolved no platform pack: a browser
     // tier is an improvement, and refusing to deploy for want of one would make
     // an offline env undeployable.
-    if crate::cli::webchat_ui::needs_webchat_ui(&gtpacks) {
-        match crate::cli::webchat_ui::cached_ui_pack(env_dir) {
+    if webchat_ui::needs_webchat_ui(&gtpacks) {
+        match webchat_ui::cached_ui_pack(env_dir) {
             Some(cached) => {
-                let staged = crate::cli::webchat_ui::stage_ui_pack(&cached, &packs_dir)?;
+                let staged = webchat_ui::stage_ui_pack(&cached, &packs_dir)?;
                 eprintln!(
                     "bundle `{}` serves webchat with no UI pack; pinning {} for its browser tier",
                     bundle_path.display(),
-                    crate::cli::webchat_ui::WEBCHAT_UI_PACK_FILE
+                    webchat_ui::WEBCHAT_UI_PACK_FILE
                 );
                 gtpacks.push(staged);
             }
@@ -350,7 +350,7 @@ fn stage_into(
                 "bundle `{}` serves webchat with no UI pack, and no platform \
                  {} is cached for this env; deploying without a browser tier",
                 bundle_path.display(),
-                crate::cli::webchat_ui::WEBCHAT_UI_PACK_FILE
+                webchat_ui::WEBCHAT_UI_PACK_FILE
             ),
         }
     }
