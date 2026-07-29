@@ -3070,6 +3070,11 @@ fn export_impl(
         )));
     }
 
+    // Load the env trust root once — used both for receipt verification
+    // (delta exports) and for the signing-identity preflight (all exports).
+    let env_dir = store.env_dir(&env_id)?;
+    let trust = crate::environment::trust_root::load(&env_dir)?;
+
     // Delta: if --base-receipt is given, verify and load its held digests.
     let held_digests: std::collections::HashSet<String> = if let Some(receipt_path) =
         &payload.base_receipt
@@ -3088,8 +3093,6 @@ fn export_impl(
             source,
         })?;
         // Verify receipt signature against the env trust root.
-        let env_dir = store.env_dir(&env_id)?;
-        let trust = crate::environment::trust_root::load(&env_dir)?;
         let receipt = greentic_update::envelope::verify_import_receipt(
             &receipt_bytes,
             &receipt_sig_bytes,
@@ -3098,6 +3101,14 @@ fn export_impl(
         .map_err(|e| {
             OpError::Conflict(format!("base receipt signature verification failed: {e}"))
         })?;
+        // Bind the receipt to this environment — a receipt covering a different
+        // env must never drive a delta export.
+        if receipt.env_id != env_id.as_str() {
+            return Err(OpError::InvalidArgument(format!(
+                "base receipt covers env `{}`, not `{env_id}`",
+                receipt.env_id
+            )));
+        }
         receipt.held_digests.into_iter().collect()
     } else {
         std::collections::HashSet::new()
@@ -3148,6 +3159,30 @@ fn export_impl(
     };
     // --key-id overrides the key's canonical id when explicitly given.
     let key_id = payload.key_id.unwrap_or(key_id);
+
+    // Fail-closed preflight: an envelope signed by an untrusted key or a
+    // mislabeled key id must fail at export time, not after the physical
+    // airgap transfer.  We round-trip sign+verify through the same public API
+    // the importer uses so any trust-root mismatch surfaces here.
+    let (probe_bytes, probe_sig) = greentic_update::envelope::build_import_receipt(
+        env_id.as_str(),
+        Vec::new(),
+        &priv_pem,
+        &key_id,
+    )
+    .map_err(|e| {
+        OpError::Conflict(format!(
+            "signing-identity preflight: build probe failed: {e}"
+        ))
+    })?;
+    greentic_update::envelope::verify_import_receipt(&probe_bytes, &probe_sig, &trust).map_err(
+        |e| {
+            OpError::InvalidArgument(format!(
+                "signing identity `{key_id}` is not trusted by env `{env_id}`'s trust root \
+                 — the receiver would reject this envelope: {e}"
+            ))
+        },
+    )?;
 
     // Build the envelope into a temporary file in the same directory, then
     // atomically persist it to the final path.  This avoids truncating an
@@ -7411,6 +7446,136 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(
             matches!(&err, OpError::InvalidArgument(m) if m.contains("--key-id requires --signing-key")),
             "expected key-id-without-signing-key rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_receipt_for_other_env() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Build a VALID signed receipt whose env_id is a different environment.
+        let held = vec![digest_of(art_data)];
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "other-env",
+            held,
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("other-receipt.json");
+        let receipt_sig_path = out_dir.path().join("other-receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        let out_path = out_dir.path().join("bad.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("other-env") && m.contains("local")),
+            "expected env mismatch rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_untrusted_signing_key() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, _tk, _key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Generate a fresh key NOT registered in the env trust root.
+        let (untrusted_priv, untrusted_tk) = key_pair(99);
+        let untrusted_key_path = store_dir.path().join("untrusted-key.pem");
+        std::fs::write(&untrusted_key_path, &untrusted_priv).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&untrusted_key_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let out_path = out_dir.path().join("untrusted.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            untrusted_key_path,
+            &untrusted_tk.key_id,
+        );
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not trusted")),
+            "expected untrusted-key rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_mislabeled_key_id() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, _tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Use the trusted signing key but with a wrong key id.
+        let out_path = out_dir.path().join("mislabeled.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            "not-the-registered-id",
+        );
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not trusted")),
+            "expected mislabeled-key-id rejection, got: {err:?}"
         );
         assert!(!out_path.exists());
     }
