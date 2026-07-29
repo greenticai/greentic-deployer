@@ -294,6 +294,7 @@ fn route_remote(
             // Signs with the local operator key against the local env trust
             // root; the remote store holds neither.
             UpdatesVerb::Publish(_) => Err(not_supported("updates publish")),
+            UpdatesVerb::Export(_) => Err(not_supported("updates export")),
         },
     }
 }

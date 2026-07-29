@@ -727,6 +727,11 @@ pub enum UpdatesVerb {
     /// server's current one plus one, and the endpoint defaults to the env's
     /// configured `plan_endpoint`. The signing key never leaves this machine.
     Publish(UpdatesPublishArgs),
+    /// Export a staged update plan and its blobs into a `.gtupdate` envelope
+    /// for airgap transfer. Supports delta export via `--base-receipt` (skips
+    /// blobs the receiver already holds) and `--targets` filtering (includes
+    /// only binary blobs for the listed targets).
+    Export(UpdatesExportArgs),
 }
 
 #[derive(Args, Debug)]
@@ -931,6 +936,39 @@ pub struct UpdatesGetArgs {
     /// DSSE envelope sidecar for `--plan-file`.
     #[arg(long = "plan-sig-file", requires = "plan_file")]
     pub plan_sig_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesExportArgs {
+    /// Target environment id.
+    pub env_id: Option<String>,
+    /// Plan id of the staged plan to export (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
+    /// Output path for the `.gtupdate` envelope.
+    #[arg(long = "out")]
+    pub out: Option<PathBuf>,
+    /// Path to a signed import receipt from a prior import on the receiving
+    /// side. Blobs whose digests appear in the receipt's held-digest inventory
+    /// are skipped (delta export). Requires `--base-receipt-sig`.
+    #[arg(long = "base-receipt", requires = "base_receipt_sig")]
+    pub base_receipt: Option<PathBuf>,
+    /// DSSE signature sidecar for `--base-receipt`.
+    #[arg(long = "base-receipt-sig", requires = "base_receipt")]
+    pub base_receipt_sig: Option<PathBuf>,
+    /// Comma-separated target triples. When set, only binary blobs whose
+    /// target matches are included; artifact/content blobs are always included.
+    #[arg(long = "targets", value_delimiter = ',')]
+    pub targets: Vec<String>,
+    /// PKCS#8 Ed25519 private key PEM for signing the envelope manifest.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id to sign under, overriding the key's canonical id — for when the
+    /// receiver's trust root registers this key under a different id. The id
+    /// must still resolve in the env trust root (the export preflight enforces
+    /// this).
+    #[arg(long = "key-id", requires = "signing_key")]
+    pub key_id: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1346,6 +1384,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::ConfigShow { .. } => "config-show",
                 UpdatesVerb::PlanBuild(_) => "plan-build",
                 UpdatesVerb::Publish(_) => "publish",
+                UpdatesVerb::Export(_) => "export",
             },
         ),
     }
@@ -1695,6 +1734,7 @@ fn dispatch_updates(
         }
         UpdatesVerb::PlanBuild(args) => super::updates::plan_build(store, flags, args)?,
         UpdatesVerb::Publish(args) => super::updates::publish(store, flags, args)?,
+        UpdatesVerb::Export(args) => super::updates::export(store, flags, args)?,
     };
     print_outcome(&outcome)
 }

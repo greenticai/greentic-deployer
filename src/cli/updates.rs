@@ -157,6 +157,35 @@ pub struct UpdateConfigShowFilter {
     pub environment_id: String,
 }
 
+/// Payload for `op updates export` — export a staged plan into a `.gtupdate`
+/// envelope for airgap transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesExportPayload {
+    pub environment_id: String,
+    /// Plan id of the staged plan to export (from a prior `op updates get`).
+    pub plan_id: String,
+    /// Output path for the `.gtupdate` envelope.
+    pub out: PathBuf,
+    /// Path to a signed import receipt from a prior import on the receiving
+    /// side. Blobs whose digests appear in the receipt's held-digest inventory
+    /// are skipped (delta export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_receipt: Option<PathBuf>,
+    /// DSSE signature sidecar for `base_receipt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_receipt_sig: Option<PathBuf>,
+    /// Target triples. When non-empty, only binary blobs whose target matches
+    /// are included; artifact/content blobs are always included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// PKCS#8 Ed25519 private key PEM path for signing the envelope manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id for the signing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
 /// The dev-store/Vault secret path for one TLS artifact: `<tenant>/_/tls/<name>`
 /// (`<tenant>/<team>/<pack>/<name>` with the default team `_`).
 fn tls_rel_path(tenant: &str, name: &str) -> String {
@@ -2348,6 +2377,26 @@ fn load_trust_root_from_file(
 /// `op updates apply` is upsert-only, so the default minimal target is a no-op,
 /// and there is no binary for the runtime to swap. Refuse to sign it rather than
 /// mint a plan that reports `applied` without changing anything.
+/// Resolve the signing key for plan/envelope signing: an explicit
+/// `--signing-key` path, or the global operator key. Shared by `plan-build`
+/// (via [`build_and_sign_plan`]) and `export`.
+fn resolve_signing_key(
+    signing_key: Option<&Path>,
+) -> Result<(zeroize::Zeroizing<String>, String), OpError> {
+    match signing_key {
+        Some(key_path) => Ok(crate::operator_key::read_signing_key_at(key_path)?),
+        None => {
+            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "no --signing-key provided and the global operator key is unavailable: {e}. \
+                     Create or bootstrap the operator key first, or pass --signing-key <path>."
+                ))
+            })?;
+            Ok((op_key.private_pem, op_key.key_id))
+        }
+    }
+}
+
 fn build_and_sign_plan(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -2378,18 +2427,7 @@ fn build_and_sign_plan(
     }
 
     // Resolve the signing key: explicit --signing-key or the global operator key.
-    let (priv_pem, key_id) = match content.signing_key {
-        Some(key_path) => crate::operator_key::read_signing_key_at(key_path)?,
-        None => {
-            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
-                OpError::InvalidArgument(format!(
-                    "no --signing-key provided and the global operator key is unavailable: {e}. \
-                     Create or bootstrap the operator key first, or pass --signing-key <path>."
-                ))
-            })?;
-            (op_key.private_pem, op_key.key_id)
-        }
-    };
+    let (priv_pem, key_id) = resolve_signing_key(content.signing_key)?;
 
     // Load the env trust root so build_update_plan can verify the key is trusted.
     let trust = match content.trust_root {
@@ -2906,6 +2944,316 @@ fn publish_schema() -> Value {
             "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."},
             "all_envs": {"type": "boolean", "description": "Publish to ALL environments registered on the plan server. Requires plan_server_url."},
             "plan_server_url": {"type": ["string", "null"], "description": "Base URL of the plan server. Used with all_envs to enumerate environments."}
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// export: package a staged plan + blobs into a .gtupdate envelope
+// ---------------------------------------------------------------------------
+
+/// `op updates export <env> --plan-id <id> --out <path>` — export a staged plan
+/// and its content-addressed blobs into a `.gtupdate` envelope for airgap
+/// transfer. Supports delta export via `--base-receipt` (skips blobs the
+/// receiver already holds) and `--targets` filtering (includes only binary blobs
+/// for the listed targets; artifact/content blobs are always included).
+pub fn export(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesExportArgs,
+) -> Result<OpOutcome, OpError> {
+    export_impl(store, flags, args, None)
+}
+
+/// Body of [`export`], with an optional staging-root override so tests can point
+/// the FSM at a tempdir instead of `~/.greentic/updates`.
+fn export_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesExportArgs,
+    updates_root_override: Option<&std::path::Path>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "export", export_schema()));
+    }
+
+    // Build payload from CLI args or --answers.
+    let payload = {
+        let from_args = match (args.env_id, args.plan_id, args.out) {
+            (Some(environment_id), Some(plan_id), Some(out)) => Some(UpdatesExportPayload {
+                environment_id,
+                plan_id,
+                out,
+                base_receipt: args.base_receipt,
+                base_receipt_sig: args.base_receipt_sig,
+                targets: args.targets,
+                signing_key: args.signing_key,
+                key_id: args.key_id,
+            }),
+            _ => None,
+        };
+        resolve_payload::<UpdatesExportPayload>(flags, from_args)?
+    };
+
+    let env_id = parse_env_id(&payload.environment_id)?;
+
+    // Load the staged plan.
+    let root = open_updates_root(&env_id, updates_root_override)?;
+    let staged = root
+        .load(&payload.plan_id)
+        .map_err(|e| OpError::Conflict(format!("load staged update plan: {e}")))?
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "no staged plan `{}` under env `{env_id}`; nothing to export",
+                payload.plan_id
+            ))
+        })?;
+
+    // Stage gate: reject plans still in Downloading (incomplete artifacts).
+    let stage = staged
+        .stage()
+        .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+    if stage == greentic_update::staging::UpdateStage::Downloading {
+        return Err(OpError::InvalidArgument(format!(
+            "plan `{}` is `downloading` (artifacts incomplete); wait for `op updates get` to \
+             finish staging before exporting",
+            payload.plan_id
+        )));
+    }
+
+    // Read plan + sig bytes.
+    let plan_bytes = staged
+        .plan_bytes()
+        .map_err(|e| OpError::Conflict(format!("read plan bytes: {e}")))?;
+    let sig_bytes = staged
+        .envelope_bytes()
+        .map_err(|e| OpError::Conflict(format!("read plan signature bytes: {e}")))?;
+
+    let plan = staged.plan();
+
+    // Collect all referenced blobs and verify they exist on disk. Artifact
+    // (content) blobs carry no target; binary blobs carry their target triple.
+    let mut blob_entries: Vec<BlobEntry> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut collect = |digest: &String, path: PathBuf, target: Option<String>| {
+        if path.exists() {
+            blob_entries.push(BlobEntry {
+                digest: digest.clone(),
+                path,
+                target,
+            });
+        } else {
+            missing.push(digest.clone());
+        }
+    };
+
+    for art in &plan.artifacts {
+        let path = staged.artifact_blob_path(art).map_err(|e| {
+            OpError::Conflict(format!("artifact blob path for `{}`: {e}", art.name))
+        })?;
+        collect(&art.digest, path, None);
+    }
+    for bin in &plan.binaries {
+        let path = staged
+            .binary_blob_path(bin)
+            .map_err(|e| OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name)))?;
+        collect(&bin.digest, path, Some(bin.target.clone()));
+    }
+
+    if !missing.is_empty() {
+        return Err(OpError::Conflict(format!(
+            "export aborted: {} blob(s) missing on disk: {}",
+            missing.len(),
+            missing.join(", ")
+        )));
+    }
+
+    // Load the env trust root once — used both for receipt verification
+    // (delta exports) and for the signing-identity preflight (all exports).
+    let env_dir = store.env_dir(&env_id)?;
+    let trust = crate::environment::trust_root::load(&env_dir)?;
+
+    // Delta: if --base-receipt is given, verify and load its held digests.
+    let held_digests: std::collections::HashSet<String> = if let Some(receipt_path) =
+        &payload.base_receipt
+    {
+        let receipt_sig_path = payload.base_receipt_sig.as_ref().ok_or_else(|| {
+            OpError::InvalidArgument(
+                "--base-receipt-sig is required when --base-receipt is given".to_string(),
+            )
+        })?;
+        let receipt_bytes = std::fs::read(receipt_path).map_err(|source| OpError::Io {
+            path: receipt_path.clone(),
+            source,
+        })?;
+        let receipt_sig_bytes = std::fs::read(receipt_sig_path).map_err(|source| OpError::Io {
+            path: receipt_sig_path.clone(),
+            source,
+        })?;
+        // Verify receipt signature against the env trust root.
+        let receipt = greentic_update::envelope::verify_import_receipt(
+            &receipt_bytes,
+            &receipt_sig_bytes,
+            &trust,
+        )
+        .map_err(|e| {
+            OpError::Conflict(format!("base receipt signature verification failed: {e}"))
+        })?;
+        // Bind the receipt to this environment — a receipt covering a different
+        // env must never drive a delta export.
+        if receipt.env_id != env_id.as_str() {
+            return Err(OpError::InvalidArgument(format!(
+                "base receipt covers env `{}`, not `{env_id}`",
+                receipt.env_id
+            )));
+        }
+        receipt.held_digests.into_iter().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // Target filter set.
+    let target_filter: std::collections::HashSet<&str> =
+        payload.targets.iter().map(|s| s.as_str()).collect();
+
+    // Partition blobs into included vs skipped.
+    let mut included: Vec<&BlobEntry> = Vec::new();
+    let mut skipped_count: usize = 0;
+    for entry in &blob_entries {
+        // Delta: skip blobs held by the receiver.
+        if held_digests.contains(&entry.digest) {
+            skipped_count += 1;
+            continue;
+        }
+        // Target filtering: applies only to binary blobs (those with a target).
+        if !target_filter.is_empty()
+            && let Some(ref t) = entry.target
+            && !target_filter.contains(t.as_str())
+        {
+            skipped_count += 1;
+            continue;
+        }
+        included.push(entry);
+    }
+
+    // Resolve signing key.
+    if payload.key_id.is_some() && payload.signing_key.is_none() {
+        return Err(OpError::InvalidArgument(
+            "--key-id requires --signing-key".to_string(),
+        ));
+    }
+    let (priv_pem, key_id) = resolve_signing_key(payload.signing_key.as_deref())?;
+    // --key-id overrides the key's canonical id when explicitly given; the
+    // preflight below still requires that id to be registered in the trust root.
+    let key_id = payload.key_id.unwrap_or(key_id);
+
+    // Fail-closed preflight: an envelope signed by an untrusted key or a
+    // mislabeled key id must fail at export time, not after the physical
+    // airgap transfer.  We round-trip sign+verify through the same public API
+    // the importer uses so any trust-root mismatch surfaces here.
+    let (probe_bytes, probe_sig) = greentic_update::envelope::build_import_receipt(
+        env_id.as_str(),
+        Vec::new(),
+        &priv_pem,
+        &key_id,
+    )
+    .map_err(|e| {
+        OpError::Conflict(format!(
+            "signing-identity preflight: build probe failed: {e}"
+        ))
+    })?;
+    greentic_update::envelope::verify_import_receipt(&probe_bytes, &probe_sig, &trust).map_err(
+        |e| {
+            OpError::InvalidArgument(format!(
+                "signing identity `{key_id}` is not trusted by env `{env_id}`'s trust root \
+                 — the receiver would reject this envelope: {e}"
+            ))
+        },
+    )?;
+
+    // Build the envelope into a temporary file in the same directory, then
+    // atomically persist it to the final path.  This avoids truncating an
+    // existing envelope before the new one is fully written: if any step fails,
+    // the temp file is cleaned up on drop and the original is preserved.
+    let out_parent = payload.out.parent().unwrap_or(std::path::Path::new("."));
+    let tmp_file = tempfile::NamedTempFile::new_in(out_parent).map_err(|source| OpError::Io {
+        path: out_parent.to_path_buf(),
+        source,
+    })?;
+    let mut builder =
+        greentic_update::envelope::EnvelopeBuilder::new(tmp_file.as_file(), &priv_pem, &key_id)
+            .map_err(|e| OpError::Conflict(format!("create envelope builder: {e}")))?;
+
+    builder
+        .add_plan(&plan_bytes, &sig_bytes)
+        .map_err(|e| OpError::Conflict(format!("add plan to envelope: {e}")))?;
+
+    let mut byte_total: u64 = 0;
+    for entry in &included {
+        let bytes = std::fs::read(&entry.path).map_err(|source| OpError::Io {
+            path: entry.path.clone(),
+            source,
+        })?;
+        byte_total += bytes.len() as u64;
+        builder
+            .add_blob(
+                &entry.digest,
+                &bytes,
+                "application/octet-stream",
+                entry.target.as_deref(),
+            )
+            .map_err(|e| {
+                OpError::Conflict(format!("add blob {} to envelope: {e}", entry.digest))
+            })?;
+    }
+
+    builder
+        .finish()
+        .map_err(|e| OpError::Conflict(format!("finish envelope: {e}")))?;
+
+    tmp_file.persist(&payload.out).map_err(|e| OpError::Io {
+        path: payload.out.clone(),
+        source: e.error,
+    })?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "export",
+        serde_json::json!({
+            "environment_id": env_id.as_str(),
+            "plan_id": payload.plan_id,
+            "out": payload.out.display().to_string(),
+            "blobs_included": included.len(),
+            "blobs_skipped": skipped_count,
+            "byte_total": byte_total,
+        }),
+    ))
+}
+
+/// Internal blob entry for the export pipeline. `target` is `Some(<triple>)`
+/// for binary blobs and `None` for artifact (content) blobs.
+struct BlobEntry {
+    digest: String,
+    path: PathBuf,
+    target: Option<String>,
+}
+
+fn export_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdatesExportPayload",
+        "type": "object",
+        "required": ["environment_id", "plan_id", "out"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "plan_id": {"type": "string", "description": "Plan id of the staged plan to export (from `op updates get`)."},
+            "out": {"type": "string", "description": "Output path for the `.gtupdate` envelope."},
+            "base_receipt": {"type": ["string", "null"], "description": "Path to a signed import receipt for delta export. Requires base_receipt_sig."},
+            "base_receipt_sig": {"type": ["string", "null"], "description": "DSSE signature sidecar for base_receipt."},
+            "targets": {"type": "array", "items": {"type": "string"}, "description": "Target triples for binary blob filtering. Empty = all."},
+            "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
+            "key_id": {"type": ["string", "null"], "description": "Key id for the signing key."}
         }
     })
 }
@@ -6585,5 +6933,664 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         let (owner2, repo2) = parse_owner_repo("greentic-start");
         assert_eq!(owner2, "greenticai");
         assert_eq!(repo2, "greentic-start");
+    }
+
+    // ---- Phase A2: op updates export --------------------------------------
+
+    /// Build, sign, and stage a plan with artifacts + binaries, returning the
+    /// key pair for further signing. Stages everything to `Staged`.
+    fn stage_plan_with_blobs(
+        updates_dir: &std::path::Path,
+        store_dir: &std::path::Path,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)], // (name, bytes, target)
+    ) -> (String, TrustedKey, PathBuf) {
+        use greentic_update::staging::UpdatesRoot;
+
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(store_dir);
+        env_trusting(&store, &tk);
+        let build_trust = TrustRoot::new(vec![tk.clone()]);
+
+        let artifacts: Vec<Value> = art_payloads
+            .iter()
+            .map(|(name, bytes)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+        let binaries: Vec<Value> = bin_payloads
+            .iter()
+            .map(|(name, bytes, target)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "target": target,
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-export",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": "nonce-export",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": artifacts,
+            "binaries": binaries,
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv_pem, &tk.key_id, &build_trust)
+                .unwrap();
+        let verified = verify_with(&built.plan_bytes, &built.envelope_bytes, &tk);
+        let root = UpdatesRoot::open_in(updates_dir, "local").unwrap();
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+
+        // Put artifact blobs.
+        for (name, bytes) in art_payloads {
+            let art = staged
+                .plan()
+                .artifacts
+                .iter()
+                .find(|a| a.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_artifact(&art, bytes).unwrap();
+        }
+        // Put binary blobs.
+        for (name, bytes, _target) in bin_payloads {
+            let bin = staged
+                .plan()
+                .binaries
+                .iter()
+                .find(|b| b.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_binary_blob(&bin, bytes).unwrap();
+        }
+
+        advance_to_staged(&staged).unwrap();
+
+        // Write the signing key to a temp file for the export verb.
+        // Mode 0o600 — the operator_key loader rejects world-readable keys.
+        let key_path = store_dir.join("signing-key.pem");
+        std::fs::write(&key_path, &priv_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        (priv_pem, tk, key_path)
+    }
+
+    fn export_args(
+        env_id: &str,
+        plan_id: &str,
+        out: PathBuf,
+        signing_key: PathBuf,
+        key_id: &str,
+    ) -> crate::cli::dispatch::UpdatesExportArgs {
+        crate::cli::dispatch::UpdatesExportArgs {
+            env_id: Some(env_id.into()),
+            plan_id: Some(plan_id.into()),
+            out: Some(out),
+            base_receipt: None,
+            base_receipt_sig: None,
+            targets: vec![],
+            signing_key: Some(signing_key),
+            key_id: Some(key_id.into()),
+        }
+    }
+
+    /// Scan an exported envelope back with `tk` as the sole trusted key.
+    /// Returns the scan result plus the quarantine dir guard that owns the
+    /// extracted files (dropping it deletes them).
+    fn scan_exported(
+        path: &std::path::Path,
+        tk: &TrustedKey,
+    ) -> (
+        greentic_update::envelope::ScannedEnvelopeRef,
+        tempfile::TempDir,
+    ) {
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let quarantine = tempdir().unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        let scanned = greentic_update::envelope::scan_envelope_to_dir(
+            file,
+            &trust,
+            &greentic_update::envelope::ScanLimits::default(),
+            quarantine.path(),
+        )
+        .unwrap();
+        (scanned, quarantine)
+    }
+
+    #[test]
+    fn export_full_round_trip() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content-alpha";
+        let bin_data = b"binary-executable-bytes";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        let out_path = out_dir.path().join("export.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.op, "export");
+        assert_eq!(out.noun, NOUN);
+        assert_eq!(out.result["plan_id"], "plan-export");
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 0);
+        assert!(out.result["byte_total"].as_u64().unwrap() > 0);
+        assert!(out_path.exists());
+
+        // Scan the envelope back and verify its contents.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+
+        assert_eq!(scanned.manifest.plan_id, "plan-export");
+        assert_eq!(scanned.manifest.env_id, "local");
+
+        // Plan bytes round-trip.
+        let scanned_plan_bytes = std::fs::read(&scanned.plan_path).unwrap();
+        let scanned_plan: greentic_update::plan::UpdatePlan =
+            serde_json::from_slice(&scanned_plan_bytes).unwrap();
+        assert_eq!(scanned_plan.plan_id, "plan-export");
+
+        // Blob fidelity.
+        let art_digest = digest_of(art_data);
+        let bin_digest = digest_of(bin_data);
+        assert!(scanned.blob_paths.contains_key(&art_digest));
+        assert!(scanned.blob_paths.contains_key(&bin_digest));
+        assert_eq!(
+            std::fs::read(scanned.blob_paths.get(&art_digest).unwrap()).unwrap(),
+            art_data
+        );
+        assert_eq!(
+            std::fs::read(scanned.blob_paths.get(&bin_digest).unwrap()).unwrap(),
+            bin_data
+        );
+    }
+
+    #[test]
+    fn export_delta_skips_held_blobs() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-alpha";
+        let bin_data = b"binary-beta";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Build a receipt that claims the artifact digest is already held.
+        let held = vec![digest_of(art_data)];
+        let (receipt_bytes, receipt_sig_bytes) =
+            greentic_update::envelope::build_import_receipt("local", held, &priv_pem, &tk.key_id)
+                .unwrap();
+        let receipt_path = out_dir.path().join("receipt.json");
+        let receipt_sig_path = out_dir.path().join("receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        let out_path = out_dir.path().join("delta.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.result["blobs_included"], 1, "only the binary");
+        assert_eq!(out.result["blobs_skipped"], 1, "the artifact was held");
+
+        // Scan and verify only the binary blob is present.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+
+        let art_digest = digest_of(art_data);
+        let bin_digest = digest_of(bin_data);
+        assert!(
+            !scanned.blob_paths.contains_key(&art_digest),
+            "held artifact should be absent"
+        );
+        assert!(
+            scanned.blob_paths.contains_key(&bin_digest),
+            "binary should be present"
+        );
+    }
+
+    #[test]
+    fn export_filters_binary_targets() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"content-artifact";
+        let bin_linux = b"linux-binary";
+        let bin_macos = b"macos-binary";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[
+                ("gtc", bin_linux, "x86_64-unknown-linux-gnu"),
+                ("gtc-mac", bin_macos, "aarch64-apple-darwin"),
+            ],
+        );
+
+        let out_path = out_dir.path().join("filtered.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        // Only include Linux binaries.
+        args.targets = vec!["x86_64-unknown-linux-gnu".into()];
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // Artifact + linux binary included, macos binary skipped.
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 1);
+
+        // Verify the envelope contents.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+
+        let art_digest = digest_of(art_data);
+        let linux_digest = digest_of(bin_linux);
+        let macos_digest = digest_of(bin_macos);
+        assert!(
+            scanned.blob_paths.contains_key(&art_digest),
+            "artifact always included"
+        );
+        assert!(
+            scanned.blob_paths.contains_key(&linux_digest),
+            "linux binary included"
+        );
+        assert!(
+            !scanned.blob_paths.contains_key(&macos_digest),
+            "macos binary filtered out"
+        );
+    }
+
+    #[test]
+    fn export_rejects_downloading_plan() {
+        use greentic_update::staging::UpdatesRoot;
+
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // Stage a plan that is still in Downloading (don't advance).
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (plan_b, sig_b) = signed_plan(
+            "local",
+            "plan-dl",
+            1,
+            json!([
+                {"name": "a1", "version": "1.0.0", "digest": digest_of(b"x"), "source": "file:///a1"},
+            ]),
+            json!({}),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let verified = verify_with(&plan_b, &sig_b, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.begin(&verified, &plan_b, &sig_b).unwrap();
+
+        let key_path = store_dir.path().join("key.pem");
+        std::fs::write(&key_path, &priv7).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let args = export_args(
+            "local",
+            "plan-dl",
+            out_dir.path().join("out.gtupdate"),
+            key_path,
+            &tk7.key_id,
+        );
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("downloading")),
+            "expected downloading rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_rejects_bad_receipt_sig() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Build a receipt signed by a DIFFERENT key (untrusted).
+        let (priv_other, tk_other) = key_pair(9);
+        let held = vec![digest_of(art_data)];
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "local",
+            held,
+            &priv_other,
+            &tk_other.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("bad-receipt.json");
+        let receipt_sig_path = out_dir.path().join("bad-receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        let out_path = out_dir.path().join("bad.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("receipt")),
+            "expected receipt verification error, got: {err:?}"
+        );
+        // Fail-closed: no envelope file written.
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_base_receipt_without_sig() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let out_path = out_dir.path().join("out.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        // Set base_receipt but omit base_receipt_sig — bypasses clap's
+        // `requires` guard, exercising the code-level validation.
+        args.base_receipt = Some(out_dir.path().join("receipt.json"));
+        args.base_receipt_sig = None;
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("base-receipt-sig")),
+            "expected base-receipt-sig rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_key_id_without_signing_key() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, _key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let out_path = out_dir.path().join("out.gtupdate");
+        // Build args manually — signing_key: None, key_id: Some.
+        let args = crate::cli::dispatch::UpdatesExportArgs {
+            env_id: Some("local".into()),
+            plan_id: Some("plan-export".into()),
+            out: Some(out_path.clone()),
+            base_receipt: None,
+            base_receipt_sig: None,
+            targets: vec![],
+            signing_key: None,
+            key_id: Some(tk.key_id.clone()),
+        };
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("--key-id requires --signing-key")),
+            "expected key-id-without-signing-key rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_receipt_for_other_env() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Build a VALID signed receipt whose env_id is a different environment.
+        let held = vec![digest_of(art_data)];
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "other-env",
+            held,
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("other-receipt.json");
+        let receipt_sig_path = out_dir.path().join("other-receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        let out_path = out_dir.path().join("bad.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("other-env") && m.contains("local")),
+            "expected env mismatch rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_untrusted_signing_key() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, _tk, _key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Generate a fresh key NOT registered in the env trust root.
+        let (untrusted_priv, untrusted_tk) = key_pair(99);
+        let untrusted_key_path = store_dir.path().join("untrusted-key.pem");
+        std::fs::write(&untrusted_key_path, &untrusted_priv).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&untrusted_key_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let out_path = out_dir.path().join("untrusted.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            untrusted_key_path,
+            &untrusted_tk.key_id,
+        );
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not trusted")),
+            "expected untrusted-key rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_mislabeled_key_id() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, _tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Use the trusted signing key but with a wrong key id.
+        let out_path = out_dir.path().join("mislabeled.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            "not-the-registered-id",
+        );
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not trusted")),
+            "expected mislabeled-key-id rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_schema_fn() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let args = crate::cli::dispatch::UpdatesExportArgs {
+            env_id: None,
+            plan_id: None,
+            out: None,
+            base_receipt: None,
+            base_receipt_sig: None,
+            targets: vec![],
+            signing_key: None,
+            key_id: None,
+        };
+        let out = export_impl(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            args,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.op, "export");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["plan_id"].is_object());
+        assert!(out.result["properties"]["out"].is_object());
+        assert!(out.result["properties"]["base_receipt"].is_object());
+        assert!(out.result["properties"]["targets"].is_object());
     }
 }
