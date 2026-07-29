@@ -3149,13 +3149,18 @@ fn export_impl(
     // --key-id overrides the key's canonical id when explicitly given.
     let key_id = payload.key_id.unwrap_or(key_id);
 
-    // Build the envelope.
-    let out_file = std::fs::File::create(&payload.out).map_err(|source| OpError::Io {
-        path: payload.out.clone(),
+    // Build the envelope into a temporary file in the same directory, then
+    // atomically persist it to the final path.  This avoids truncating an
+    // existing envelope before the new one is fully written: if any step fails,
+    // the temp file is cleaned up on drop and the original is preserved.
+    let out_parent = payload.out.parent().unwrap_or(std::path::Path::new("."));
+    let tmp_file = tempfile::NamedTempFile::new_in(out_parent).map_err(|source| OpError::Io {
+        path: out_parent.to_path_buf(),
         source,
     })?;
-    let mut builder = greentic_update::envelope::EnvelopeBuilder::new(out_file, &priv_pem, &key_id)
-        .map_err(|e| OpError::Conflict(format!("create envelope builder: {e}")))?;
+    let mut builder =
+        greentic_update::envelope::EnvelopeBuilder::new(tmp_file.as_file(), &priv_pem, &key_id)
+            .map_err(|e| OpError::Conflict(format!("create envelope builder: {e}")))?;
 
     builder
         .add_plan(&plan_bytes, &sig_bytes)
@@ -3183,6 +3188,11 @@ fn export_impl(
     builder
         .finish()
         .map_err(|e| OpError::Conflict(format!("finish envelope: {e}")))?;
+
+    tmp_file.persist(&payload.out).map_err(|e| OpError::Io {
+        path: payload.out.clone(),
+        source: e.error,
+    })?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -7326,6 +7336,82 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             "expected receipt verification error, got: {err:?}"
         );
         // Fail-closed: no envelope file written.
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_base_receipt_without_sig() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let out_path = out_dir.path().join("out.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        // Set base_receipt but omit base_receipt_sig — bypasses clap's
+        // `requires` guard, exercising the code-level validation.
+        args.base_receipt = Some(out_dir.path().join("receipt.json"));
+        args.base_receipt_sig = None;
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("base-receipt-sig")),
+            "expected base-receipt-sig rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_key_id_without_signing_key() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, _key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let out_path = out_dir.path().join("out.gtupdate");
+        // Build args manually — signing_key: None, key_id: Some.
+        let args = crate::cli::dispatch::UpdatesExportArgs {
+            env_id: Some("local".into()),
+            plan_id: Some("plan-export".into()),
+            out: Some(out_path.clone()),
+            base_receipt: None,
+            base_receipt_sig: None,
+            targets: vec![],
+            signing_key: None,
+            key_id: Some(tk.key_id.clone()),
+        };
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("--key-id requires --signing-key")),
+            "expected key-id-without-signing-key rejection, got: {err:?}"
+        );
         assert!(!out_path.exists());
     }
 

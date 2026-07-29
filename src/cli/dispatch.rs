@@ -964,7 +964,7 @@ pub struct UpdatesExportArgs {
     #[arg(long = "signing-key")]
     pub signing_key: Option<PathBuf>,
     /// Key id for the signing key.
-    #[arg(long = "key-id")]
+    #[arg(long = "key-id", requires = "signing_key")]
     pub key_id: Option<String>,
 }
 
