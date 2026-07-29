@@ -3206,44 +3206,9 @@ fn export_impl(
         }
     }
 
-    // Collect all referenced blobs and verify they exist on disk. Artifact
-    // (content) blobs carry no target; binary blobs carry their target triple.
-    let mut blob_entries: Vec<BlobEntry> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
-    let mut collect = |digest: &String, path: PathBuf, target: Option<String>| {
-        if path.exists() {
-            blob_entries.push(BlobEntry {
-                digest: digest.clone(),
-                path,
-                target,
-            });
-        } else {
-            missing.push(digest.clone());
-        }
-    };
-
-    for art in &plan.artifacts {
-        let path = staged.artifact_blob_path(art).map_err(|e| {
-            OpError::Conflict(format!("artifact blob path for `{}`: {e}", art.name))
-        })?;
-        collect(&art.digest, path, None);
-    }
-    for bin in &plan.binaries {
-        let path = staged
-            .binary_blob_path(bin)
-            .map_err(|e| OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name)))?;
-        collect(&bin.digest, path, Some(bin.target.clone()));
-    }
-
-    if !missing.is_empty() {
-        return Err(OpError::Conflict(format!(
-            "export aborted: {} blob(s) missing on disk: {}",
-            missing.len(),
-            missing.join(", ")
-        )));
-    }
-
     // Delta: if --base-receipt is given, verify and load its held digests.
+    // Resolved BEFORE blob collection so that held/filtered blobs are not
+    // required on disk.
     let held_digests: std::collections::HashSet<String> = if let Some(receipt_path) =
         &payload.base_receipt
     {
@@ -3286,24 +3251,63 @@ fn export_impl(
     let target_filter: std::collections::HashSet<&str> =
         payload.targets.iter().map(|s| s.as_str()).collect();
 
-    // Partition blobs into included vs skipped.
-    let mut included: Vec<&BlobEntry> = Vec::new();
+    // Collect all referenced blobs and verify that INCLUDED blobs exist on
+    // disk.  Blobs that will be skipped (held by the receiver via delta
+    // receipt, or excluded by target filter) are NOT required on disk.
+    let mut included: Vec<BlobEntry> = Vec::new();
     let mut skipped_count: usize = 0;
-    for entry in &blob_entries {
+    let mut missing: Vec<String> = Vec::new();
+
+    for art in &plan.artifacts {
+        // Artifacts carry no target and are never target-filtered.
+        if held_digests.contains(&art.digest) {
+            skipped_count += 1;
+            continue;
+        }
+        let path = staged.artifact_blob_path(art).map_err(|e| {
+            OpError::Conflict(format!("artifact blob path for `{}`: {e}", art.name))
+        })?;
+        if path.exists() {
+            included.push(BlobEntry {
+                digest: art.digest.clone(),
+                path,
+                target: None,
+            });
+        } else {
+            missing.push(art.digest.clone());
+        }
+    }
+    for bin in &plan.binaries {
         // Delta: skip blobs held by the receiver.
-        if held_digests.contains(&entry.digest) {
+        if held_digests.contains(&bin.digest) {
             skipped_count += 1;
             continue;
         }
-        // Target filtering: applies only to binary blobs (those with a target).
-        if !target_filter.is_empty()
-            && let Some(ref t) = entry.target
-            && !target_filter.contains(t.as_str())
-        {
+        // Target filtering: applies only to binary blobs.
+        if !target_filter.is_empty() && !target_filter.contains(bin.target.as_str()) {
             skipped_count += 1;
             continue;
         }
-        included.push(entry);
+        let path = staged
+            .binary_blob_path(bin)
+            .map_err(|e| OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name)))?;
+        if path.exists() {
+            included.push(BlobEntry {
+                digest: bin.digest.clone(),
+                path,
+                target: Some(bin.target.clone()),
+            });
+        } else {
+            missing.push(bin.digest.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(OpError::Conflict(format!(
+            "export aborted: {} blob(s) missing on disk: {}",
+            missing.len(),
+            missing.join(", ")
+        )));
     }
 
     // Build the envelope into a temporary file in the same directory, then
@@ -9904,6 +9908,152 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(scanned.blob_paths.contains_key(&digest_of(art_data)));
         assert!(scanned.blob_paths.contains_key(&digest_of(bin_linux)));
         assert!(!scanned.blob_paths.contains_key(&digest_of(bin_macos)));
+    }
+
+    #[test]
+    fn export_targets_filter_tolerates_absent_nontarget_blob() {
+        // Plan with two binaries (different targets). Only the selected
+        // target's file is supplied via --binary-blob; the non-target binary
+        // blob is absent from disk. Export with --targets selecting only
+        // one target must SUCCEED because the absent binary is excluded by
+        // the filter and therefore not required on disk.
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-target-tolerate";
+        let bin_linux = b"linux-binary-tolerate";
+        let bin_macos = b"macos-binary-tolerate";
+
+        // Stage plan with both binaries, then remove the macos blob from disk.
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[
+                ("gtc-linux", bin_linux, "x86_64-unknown-linux-gnu"),
+                ("gtc-macos", bin_macos, "aarch64-apple-darwin"),
+            ],
+        );
+
+        // Only supply the linux binary via --binary-blob.
+        let linux_file = out_dir.path().join("gtc-linux");
+        std::fs::write(&linux_file, bin_linux).unwrap();
+
+        let out_path = out_dir.path().join("target-tolerate.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.binary_blobs = vec![linux_file];
+        args.targets = vec!["x86_64-unknown-linux-gnu".to_string()];
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // 1 artifact + 1 linux binary included; 1 macos binary skipped.
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 1);
+
+        // Verify the envelope contains only the artifact and the linux binary.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+        assert!(
+            scanned.blob_paths.contains_key(&digest_of(art_data)),
+            "artifact always included"
+        );
+        assert!(
+            scanned.blob_paths.contains_key(&digest_of(bin_linux)),
+            "linux binary included"
+        );
+        assert!(
+            !scanned.blob_paths.contains_key(&digest_of(bin_macos)),
+            "macos binary filtered out"
+        );
+    }
+
+    #[test]
+    fn export_delta_tolerates_absent_receipt_held_blob() {
+        // A plan whose binary blob is absent locally but whose digest
+        // appears in a trusted import receipt. Delta export must SUCCEED
+        // with that blob skipped. Without the receipt the same export must
+        // fail closed naming the missing digest.
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-delta-tolerate";
+        let bin_data = b"bin-delta-tolerate";
+
+        // Stage plan, then remove the binary blob from disk.
+        let (priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Build a receipt claiming the binary digest is already held.
+        let held = vec![digest_of(bin_data)];
+        let (receipt_bytes, receipt_sig_bytes) =
+            greentic_update::envelope::build_import_receipt("local", held, &priv_pem, &tk.key_id)
+                .unwrap();
+        let receipt_path = out_dir.path().join("receipt.json");
+        let receipt_sig_path = out_dir.path().join("receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        // Delta export with the receipt — binary blob is absent but held,
+        // so the export must succeed.
+        let out_path = out_dir.path().join("delta-tolerate.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // Artifact included (on disk), binary skipped (held by receipt).
+        assert_eq!(out.result["blobs_included"], 1, "only the artifact");
+        assert_eq!(out.result["blobs_skipped"], 1, "binary held by receipt");
+        assert!(out_path.exists());
+
+        // Without the receipt, the same export must fail on the missing binary.
+        let fail_path = out_dir.path().join("should-not-exist.gtupdate");
+        let args_no_receipt = export_args(
+            "local",
+            "plan-export",
+            fail_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        let err = export_impl(
+            &store,
+            &OpFlags::default(),
+            args_no_receipt,
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("missing on disk")),
+            "expected missing-blob error, got: {err:?}"
+        );
+        if let OpError::Conflict(m) = &err {
+            assert!(
+                m.contains(&digest_of(bin_data)),
+                "error should name the missing digest"
+            );
+        }
+        assert!(!fail_path.exists(), "no envelope on error");
     }
 
     #[test]
