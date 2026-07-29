@@ -3341,6 +3341,38 @@ fn import_impl(
         }
     };
 
+    // Resolve signing key + preflight BEFORE any durable side effects
+    // (CAS, staging FSM). Matches the export convention: fail on untrusted
+    // identity before mutations, not after.
+    if payload.key_id.is_some() && payload.signing_key.is_none() {
+        return Err(OpError::InvalidArgument(
+            "--key-id requires --signing-key".to_string(),
+        ));
+    }
+    let (priv_pem, key_id) = resolve_signing_key(payload.signing_key.as_deref())?;
+    let key_id = payload.key_id.unwrap_or(key_id);
+
+    // Signing-identity preflight (shared pattern with export).
+    let (probe_bytes, probe_sig) = greentic_update::envelope::build_import_receipt(
+        env_id.as_str(),
+        Vec::new(),
+        &priv_pem,
+        &key_id,
+    )
+    .map_err(|e| {
+        OpError::Conflict(format!(
+            "signing-identity preflight: build probe failed: {e}"
+        ))
+    })?;
+    greentic_update::envelope::verify_import_receipt(&probe_bytes, &probe_sig, &trust).map_err(
+        |e| {
+            OpError::InvalidArgument(format!(
+                "signing identity `{key_id}` is not trusted by env `{env_id}`'s trust root \
+                 — the receipt would be unverifiable: {e}"
+            ))
+        },
+    )?;
+
     let root = open_updates_root(&env_id, updates_root_override)?;
 
     // Create the quarantine directory under the env's updates root (same
@@ -3521,37 +3553,7 @@ fn import_impl(
         }
     };
 
-    // 11. Sign + write the import receipt.
-    if payload.key_id.is_some() && payload.signing_key.is_none() {
-        return Err(OpError::InvalidArgument(
-            "--key-id requires --signing-key".to_string(),
-        ));
-    }
-    let (priv_pem, key_id) = resolve_signing_key(payload.signing_key.as_deref())?;
-    let key_id = payload.key_id.unwrap_or(key_id);
-
-    // Signing-identity preflight (shared pattern with export).
-    let (probe_bytes, probe_sig) = greentic_update::envelope::build_import_receipt(
-        env_id.as_str(),
-        Vec::new(),
-        &priv_pem,
-        &key_id,
-    )
-    .map_err(|e| {
-        OpError::Conflict(format!(
-            "signing-identity preflight: build probe failed: {e}"
-        ))
-    })?;
-    greentic_update::envelope::verify_import_receipt(&probe_bytes, &probe_sig, &trust).map_err(
-        |e| {
-            OpError::InvalidArgument(format!(
-                "signing identity `{key_id}` is not trusted by env `{env_id}`'s trust root \
-                 — the receipt would be unverifiable: {e}"
-            ))
-        },
-    )?;
-
-    // Build receipt from CURRENT full CAS inventory after import.
+    // Sign + write the import receipt from CURRENT full CAS inventory.
     let cas_inventory = root
         .cas_list()
         .map_err(|e| OpError::Conflict(format!("cas_list: {e}")))?;
@@ -3663,6 +3665,45 @@ fn cas_gc_impl(
     let env_id = parse_env_id(&payload.environment_id)?;
     let root = open_updates_root(&env_id, updates_root_override)?;
 
+    // Resolve signing key + preflight BEFORE any durable side effects
+    // (CAS eviction). Matches the export convention: fail on untrusted
+    // identity before mutations, not after.
+    let trust = match &payload.trust_root {
+        Some(path) => load_trust_root_from_file(path)?,
+        None => {
+            let env_dir = store.env_dir(&env_id)?;
+            store_trust_root::load(&env_dir)?
+        }
+    };
+
+    if payload.key_id.is_some() && payload.signing_key.is_none() {
+        return Err(OpError::InvalidArgument(
+            "--key-id requires --signing-key".to_string(),
+        ));
+    }
+    let (priv_pem, key_id) = resolve_signing_key(payload.signing_key.as_deref())?;
+    let key_id = payload.key_id.unwrap_or(key_id);
+
+    // Signing-identity preflight.
+    let (probe_bytes, probe_sig) = greentic_update::envelope::build_import_receipt(
+        env_id.as_str(),
+        Vec::new(),
+        &priv_pem,
+        &key_id,
+    )
+    .map_err(|e| {
+        OpError::Conflict(format!(
+            "signing-identity preflight: build probe failed: {e}"
+        ))
+    })?;
+    greentic_update::envelope::verify_import_receipt(&probe_bytes, &probe_sig, &trust).map_err(
+        |e| {
+            OpError::InvalidArgument(format!(
+                "signing identity `{key_id}` is not trusted by env `{env_id}`'s trust root: {e}"
+            ))
+        },
+    )?;
+
     // Collect all digests referenced by any non-evicted staged plan.
     let plans = root
         .list()
@@ -3702,42 +3743,6 @@ fn cas_gc_impl(
     }
 
     // Re-sign + write the import receipt reflecting post-eviction inventory.
-    let trust = match &payload.trust_root {
-        Some(path) => load_trust_root_from_file(path)?,
-        None => {
-            let env_dir = store.env_dir(&env_id)?;
-            store_trust_root::load(&env_dir)?
-        }
-    };
-
-    if payload.key_id.is_some() && payload.signing_key.is_none() {
-        return Err(OpError::InvalidArgument(
-            "--key-id requires --signing-key".to_string(),
-        ));
-    }
-    let (priv_pem, key_id) = resolve_signing_key(payload.signing_key.as_deref())?;
-    let key_id = payload.key_id.unwrap_or(key_id);
-
-    // Signing-identity preflight.
-    let (probe_bytes, probe_sig) = greentic_update::envelope::build_import_receipt(
-        env_id.as_str(),
-        Vec::new(),
-        &priv_pem,
-        &key_id,
-    )
-    .map_err(|e| {
-        OpError::Conflict(format!(
-            "signing-identity preflight: build probe failed: {e}"
-        ))
-    })?;
-    greentic_update::envelope::verify_import_receipt(&probe_bytes, &probe_sig, &trust).map_err(
-        |e| {
-            OpError::InvalidArgument(format!(
-                "signing identity `{key_id}` is not trusted by env `{env_id}`'s trust root: {e}"
-            ))
-        },
-    )?;
-
     let post_gc_inventory = root
         .cas_list()
         .map_err(|e| OpError::Conflict(format!("cas_list post-gc: {e}")))?;
@@ -9052,5 +9057,107 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         .unwrap();
 
         assert_eq!(out.result["plan_id"], "plan-export");
+    }
+
+    #[test]
+    fn import_rejects_untrusted_signing_key_before_side_effects() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"untrusted-key-art";
+        let envelope_path = out_dir.path().join("untrusted.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Set up the import env with the SAME trust root (envelope is trusted).
+        let import_s = LocalFsStore::new(import_store.path());
+        env_trusting(&import_s, &tk);
+
+        // Use a DIFFERENT key for receipt signing — not in the trust root.
+        let (untrusted_pem, untrusted_tk) = key_pair(42);
+        let key_path = import_store.path().join("untrusted-signing-key.pem");
+        std::fs::write(&key_path, &untrusted_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let args = import_args("local", envelope_path, key_path, &untrusted_tk.key_id);
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must reject with InvalidArgument mentioning signing identity.
+        match &err {
+            OpError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("signing identity"),
+                    "expected signing identity error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got: {other:?}"),
+        }
+
+        // CAS must be empty — preflight ran before any durable side effects.
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        let cas = root.cas_list().unwrap();
+        assert!(
+            cas.is_empty(),
+            "CAS should be empty after preflight rejection, found: {cas:?}"
+        );
+    }
+
+    #[test]
+    fn cas_gc_evicts_terminal_plan_blobs() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"terminal-plan-art";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // The plan is at Staged. Transition it to Rejected (terminal).
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let loaded = root.load("plan-export").unwrap().unwrap();
+        loaded
+            .transition(greentic_update::staging::UpdateStage::Rejected)
+            .unwrap();
+
+        // Seed CAS with the plan's artifact digest.
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let out = cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // Terminal plan's blobs should be evicted.
+        assert_eq!(
+            out.result["evicted"], 1,
+            "terminal plan blob should be evicted"
+        );
+        assert_eq!(out.result["kept"], 0);
+        assert!(
+            !root.cas_contains(&digest_of(art_data)).unwrap(),
+            "blob referenced only by terminal plan should be gone"
+        );
     }
 }
