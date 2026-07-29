@@ -3572,6 +3572,8 @@ fn import_impl(
     let mut result = serde_json::json!({
         "environment_id": env_id.as_str(),
         "plan_id": verified.plan.plan_id,
+        "plan_sha256": verified.plan_sha256,
+        "verified_key_ids": verified.verified_key_ids,
         "stage": final_stage.as_str(),
         "blobs_imported": blobs_imported,
         "blobs_already_held": blobs_already_held,
@@ -9057,6 +9059,72 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         .unwrap();
 
         assert_eq!(out.result["plan_id"], "plan-export");
+    }
+
+    /// The import outcome must carry `plan_sha256` and `verified_key_ids`
+    /// from the deploy-side `verify_update_plan` call (defense-in-depth: the
+    /// scanner already verified, but the deploy code re-verifies from the
+    /// quarantine bytes). Removing that re-verification zeros
+    /// `verified_key_ids` and may alter `plan_sha256`.
+    #[test]
+    fn import_outcome_carries_plan_verification_fields() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"verify-fields-art";
+        let envelope_path = out_dir.path().join("verify-fields.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let import_s = LocalFsStore::new(import_store.path());
+        env_trusting(&import_s, &tk);
+        let key_path = import_store.path().join("signing-key.pem");
+        let (priv_pem, _) = key_pair(7);
+        std::fs::write(&key_path, &priv_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        // plan_sha256 must be present and be bare hex (no scheme prefix).
+        let sha = out.result["plan_sha256"].as_str().unwrap();
+        assert!(
+            !sha.contains(':'),
+            "plan_sha256 must be bare hex from verify_update_plan, got: {sha}"
+        );
+        assert_eq!(sha.len(), 64, "SHA-256 hex must be 64 chars");
+
+        // verified_key_ids must be non-empty: the plan was signed by a
+        // trusted key that verify_update_plan must resolve.
+        let key_ids = out.result["verified_key_ids"].as_array().unwrap();
+        assert!(
+            !key_ids.is_empty(),
+            "verified_key_ids must be populated by verify_update_plan"
+        );
+        assert!(
+            key_ids.iter().any(|k| k.as_str() == Some(&tk.key_id)),
+            "expected signing key `{}` in verified_key_ids, got: {:?}",
+            tk.key_id,
+            key_ids
+        );
     }
 
     #[test]
