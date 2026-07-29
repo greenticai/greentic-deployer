@@ -3105,6 +3105,18 @@ fn export_impl(
 
     let plan = staged.plan();
 
+    // Resolve trust root and preflight the signing identity BEFORE any staging-
+    // tree mutations (--binary-blob writes below). This restores the invariant
+    // that export has zero side effects when the signing key is invalid.
+    let trust = resolve_trust_root(store, &env_id, payload.trust_root.as_deref())?;
+    let (priv_pem, key_id) = preflight_signing_identity(
+        &env_id,
+        payload.signing_key.as_deref(),
+        payload.key_id,
+        &trust,
+        "the receiver would reject this envelope",
+    )?;
+
     // --binary-blob: inject user-supplied binary files into the staging tree
     // BEFORE the missing-blob check so the existing fail-closed gate picks them
     // up. Each supplied file must match exactly one plan binary by SHA-256;
@@ -3156,6 +3168,17 @@ fn export_impl(
             let dest = staged.binary_blob_path(bin).map_err(|e| {
                 OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name))
             })?;
+            // Guard against symlink-based path traversal out of the staging
+            // tree, matching the invariant enforced by put_binary_blob in the
+            // staging library (which calls its own assert_no_symlink_ancestors).
+            crate::path_safety::assert_no_symlink_ancestors(root.env_dir(), &dest).map_err(
+                |e| {
+                    OpError::Conflict(format!(
+                        "binary blob path for `{}` escapes staging tree: {e}",
+                        bin.name
+                    ))
+                },
+            )?;
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
                     path: parent.to_path_buf(),
@@ -3202,8 +3225,6 @@ fn export_impl(
             missing.join(", ")
         )));
     }
-
-    let trust = resolve_trust_root(store, &env_id, payload.trust_root.as_deref())?;
 
     // Delta: if --base-receipt is given, verify and load its held digests.
     let held_digests: std::collections::HashSet<String> = if let Some(receipt_path) =
@@ -3267,14 +3288,6 @@ fn export_impl(
         }
         included.push(entry);
     }
-
-    let (priv_pem, key_id) = preflight_signing_identity(
-        &env_id,
-        payload.signing_key.as_deref(),
-        payload.key_id,
-        &trust,
-        "the receiver would reject this envelope",
-    )?;
 
     // Build the envelope into a temporary file in the same directory, then
     // atomically persist it to the final path.  This avoids truncating an
@@ -9677,6 +9690,14 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             matches!(&err, OpError::InvalidArgument(m) if m.contains("matches no binary")),
             "expected no-match error naming digest, got: {err:?}"
         );
+        // The error must name the computed digest of the supplied file.
+        if let OpError::InvalidArgument(m) = &err {
+            let expected_digest = digest_of(b"unrelated-content-no-match");
+            assert!(
+                m.contains(&expected_digest),
+                "error should name the computed digest `{expected_digest}`, got: {m}"
+            );
+        }
         assert!(!out_path.exists(), "no envelope should be written on error");
     }
 
@@ -9760,6 +9781,14 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             matches!(&err, OpError::InvalidArgument(m) if m.contains("matches no binary")),
             "expected no-match error for tampered file, got: {err:?}"
         );
+        // The error must name the computed digest of the tampered content.
+        if let OpError::InvalidArgument(m) = &err {
+            let expected_digest = digest_of(b"tampered-binary-different-content");
+            assert!(
+                m.contains(&expected_digest),
+                "error should name the computed digest `{expected_digest}`, got: {m}"
+            );
+        }
     }
 
     #[test]
@@ -9803,6 +9832,61 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
                 "error should name the missing digest"
             );
         }
+    }
+
+    #[test]
+    fn export_binary_blob_with_targets_filters_correctly() {
+        // Two plan binaries for different targets, both supplied via
+        // --binary-blob. When --targets selects only one platform, the envelope
+        // must include 1 artifact + 1 matching binary (blobs_included = 2) and
+        // skip 1 non-matching binary (blobs_skipped = 1).
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-targets-filter";
+        let bin_linux = b"bin-linux-content";
+        let bin_macos = b"bin-macos-content";
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[
+                ("gtc-linux", bin_linux, "x86_64-unknown-linux-gnu"),
+                ("gtc-macos", bin_macos, "aarch64-apple-darwin"),
+            ],
+        );
+
+        // Write both binary files.
+        let linux_file = out_dir.path().join("gtc-linux");
+        let macos_file = out_dir.path().join("gtc-macos");
+        std::fs::write(&linux_file, bin_linux).unwrap();
+        std::fs::write(&macos_file, bin_macos).unwrap();
+
+        let out_path = out_dir.path().join("targets-filter.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.binary_blobs = vec![linux_file, macos_file];
+        args.targets = vec!["x86_64-unknown-linux-gnu".to_string()];
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // 1 artifact + 1 matching binary included; 1 non-matching binary skipped.
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 1);
+
+        // Verify the envelope contains the artifact and the linux binary, but
+        // not the macos binary.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+        assert!(scanned.blob_paths.contains_key(&digest_of(art_data)));
+        assert!(scanned.blob_paths.contains_key(&digest_of(bin_linux)));
+        assert!(!scanned.blob_paths.contains_key(&digest_of(bin_macos)));
     }
 
     #[test]
