@@ -3177,9 +3177,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "1.2.0-dev.30251506034"
+version = "1.2.0-dev.30347759036"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c878fc7f294cd60c39e7753e2a97d392f4ca30f8682e2f7e6c61054196159437"
+checksum = "4586be5b2c773a429005c7e4b66253318ac3dfe89e488f26dde2a9ba9e5601eb"
 dependencies = [
  "chrono",
  "flate2",
@@ -3198,6 +3198,7 @@ dependencies = [
  "thiserror 2.0.19",
  "x509-parser",
  "zip 2.4.2",
+ "zstd",
 ]
 
 [[package]]
