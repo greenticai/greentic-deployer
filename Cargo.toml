@@ -177,7 +177,7 @@ features = [
 # `>=1.2.0-dev` excludes stable 1.1.x and a stable range excludes every
 # `1.2.0-dev.*` — there is no union. The `<1.3.0-0` upper bound caps the
 # range below the next minor without matching any real semver pre-release.
-version = ">=1.2.0-dev.30347759036, <1.3.0-0"
+version = ">=1.2.0-dev.30432113510, <1.3.0-0"
 features = [
     "binswap",
     "enroll",

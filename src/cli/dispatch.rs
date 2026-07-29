@@ -732,6 +732,20 @@ pub enum UpdatesVerb {
     /// blobs the receiver already holds) and `--targets` filtering (includes
     /// only binary blobs for the listed targets).
     Export(UpdatesExportArgs),
+    /// Import a `.gtupdate` envelope into the local staging tree (airgap
+    /// import). Scans, verifies, populates the durable import CAS, admits the
+    /// plan through the staging FSM, and optionally promotes to `Staged`.
+    Import(UpdatesImportArgs),
+    /// Garbage-collect orphaned CAS blobs that are no longer referenced by any
+    /// non-evicted staged plan, then rewrite the import receipt.
+    ///
+    /// **Concurrency caveat:** `cas-gc` must not run concurrently with
+    /// `op updates import` on the same environment. GC's reference snapshot
+    /// and the import's CAS-populate/admission are not mutually serialized;
+    /// a concurrent GC can evict blobs of a plan admitted after the snapshot.
+    /// Recovery: re-run the import with the full envelope. A lock-held GC
+    /// inside `greentic-update` is a tracked follow-up.
+    CasGc(UpdatesCasGcArgs),
 }
 
 #[derive(Args, Debug)]
@@ -969,6 +983,55 @@ pub struct UpdatesExportArgs {
     /// this).
     #[arg(long = "key-id", requires = "signing_key")]
     pub key_id: Option<String>,
+    /// Path to a trust-root.json file for envelope signing verification.
+    /// Bypasses the env-store trust root lookup, enabling CI runners
+    /// with no local env dir.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesImportArgs {
+    /// Target environment id.
+    pub env_id: Option<String>,
+    /// Path to the `.gtupdate` envelope to import.
+    #[arg(long = "envelope")]
+    pub envelope: Option<PathBuf>,
+    /// Promote the imported plan from `Inbox` to `Staged` after import.
+    #[arg(long)]
+    pub stage: bool,
+    /// PKCS#8 Ed25519 private key PEM for signing the import receipt.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id to sign under, overriding the key's canonical id. Requires
+    /// `--signing-key`.
+    #[arg(long = "key-id", requires = "signing_key")]
+    pub key_id: Option<String>,
+    /// Advisory staleness threshold in days. Plans older than this many days
+    /// produce a warning but are still imported. Default: 30.
+    #[arg(long = "staleness-days", default_value = "30")]
+    pub staleness_days: u64,
+    /// Path to a trust-root.json file for signature verification.
+    /// Bypasses the env-store trust root lookup.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesCasGcArgs {
+    /// Target environment id.
+    pub env_id: Option<String>,
+    /// PKCS#8 Ed25519 private key PEM for re-signing the import receipt.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id to sign under, overriding the key's canonical id. Requires
+    /// `--signing-key`.
+    #[arg(long = "key-id", requires = "signing_key")]
+    pub key_id: Option<String>,
+    /// Path to a trust-root.json file for the signing-identity preflight.
+    /// Bypasses the env-store trust root lookup.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1385,6 +1448,8 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::PlanBuild(_) => "plan-build",
                 UpdatesVerb::Publish(_) => "publish",
                 UpdatesVerb::Export(_) => "export",
+                UpdatesVerb::Import(_) => "import",
+                UpdatesVerb::CasGc(_) => "cas-gc",
             },
         ),
     }
@@ -1735,6 +1800,8 @@ fn dispatch_updates(
         UpdatesVerb::PlanBuild(args) => super::updates::plan_build(store, flags, args)?,
         UpdatesVerb::Publish(args) => super::updates::publish(store, flags, args)?,
         UpdatesVerb::Export(args) => super::updates::export(store, flags, args)?,
+        UpdatesVerb::Import(args) => super::updates::import(store, flags, args)?,
+        UpdatesVerb::CasGc(args) => super::updates::cas_gc(store, flags, args)?,
     };
     print_outcome(&outcome)
 }

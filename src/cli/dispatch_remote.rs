@@ -295,6 +295,8 @@ fn route_remote(
             // root; the remote store holds neither.
             UpdatesVerb::Publish(_) => Err(not_supported("updates publish")),
             UpdatesVerb::Export(_) => Err(not_supported("updates export")),
+            UpdatesVerb::Import(_) => Err(not_supported("updates import")),
+            UpdatesVerb::CasGc(_) => Err(not_supported("updates cas-gc")),
         },
     }
 }
