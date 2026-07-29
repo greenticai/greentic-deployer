@@ -738,6 +738,13 @@ pub enum UpdatesVerb {
     Import(UpdatesImportArgs),
     /// Garbage-collect orphaned CAS blobs that are no longer referenced by any
     /// non-evicted staged plan, then rewrite the import receipt.
+    ///
+    /// **Concurrency caveat:** `cas-gc` must not run concurrently with
+    /// `op updates import` on the same environment. GC's reference snapshot
+    /// and the import's CAS-populate/admission are not mutually serialized;
+    /// a concurrent GC can evict blobs of a plan admitted after the snapshot.
+    /// Recovery: re-run the import with the full envelope. A lock-held GC
+    /// inside `greentic-update` is a tracked follow-up.
     CasGc(UpdatesCasGcArgs),
 }
 

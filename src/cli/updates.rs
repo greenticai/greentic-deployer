@@ -3463,19 +3463,53 @@ fn import_impl(
     )
     .map_err(|e| OpError::Conflict(format!("import preflight failed: {e}")))?;
 
-    // 6. Populate CAS with every envelope blob (cas_put re-verifies digests).
+    // 5b. Verify CAS integrity for digests NOT carried in the envelope.
+    //     `preflight_digests` uses the existence-only `cas_contains` check;
+    //     `cas_get` re-reads and re-hashes, catching on-disk corruption.
+    //     Placed before any CAS write / admission so a corrupt-CAS delta
+    //     import leaves zero new state. Reads each CAS-held blob once —
+    //     correctness over speed; these are the same blobs staging would read.
+    {
+        let mut corrupted: Vec<String> = Vec::new();
+        let all_required = verified
+            .plan
+            .artifacts
+            .iter()
+            .map(|a| &a.digest)
+            .chain(verified.plan.binaries.iter().map(|b| &b.digest));
+        for digest in all_required {
+            if !envelope_digests.contains(digest) && root.cas_get(digest).is_err() {
+                corrupted.push(digest.clone());
+            }
+        }
+        if !corrupted.is_empty() {
+            return Err(OpError::Conflict(format!(
+                "CAS integrity check failed — {} digest(s) are corrupt or unreadable: {}. \
+                 Re-import with a full (non-delta) envelope to repair.",
+                corrupted.len(),
+                corrupted.join(", "),
+            )));
+        }
+    }
+
+    // 6. Populate CAS with every envelope blob unconditionally. `cas_put`
+    //    re-verifies the digest and atomically overwrites the on-disk blob,
+    //    which repairs a corrupted CAS entry (bit-rot, partial write from a
+    //    prior crash). The `blobs_already_held` counter is still tracked for
+    //    reporting, checked before the put.
     let mut blobs_imported: usize = 0;
     let mut blobs_already_held: usize = 0;
     for (digest, blob_path) in &scanned.blob_paths {
-        if root.cas_contains(digest).unwrap_or(false) {
+        let already_held = root.cas_contains(digest).unwrap_or(false);
+        let blob_bytes = std::fs::read(blob_path).map_err(|source| OpError::Io {
+            path: blob_path.clone(),
+            source,
+        })?;
+        root.cas_put(digest, &blob_bytes)
+            .map_err(|e| OpError::Conflict(format!("cas_put `{digest}`: {e}")))?;
+        if already_held {
             blobs_already_held += 1;
         } else {
-            let blob_bytes = std::fs::read(blob_path).map_err(|source| OpError::Io {
-                path: blob_path.clone(),
-                source,
-            })?;
-            root.cas_put(digest, &blob_bytes)
-                .map_err(|e| OpError::Conflict(format!("cas_put `{digest}`: {e}")))?;
             blobs_imported += 1;
         }
     }
@@ -3644,6 +3678,14 @@ pub fn cas_gc(
     cas_gc_impl(store, flags, args, None)
 }
 
+/// Body of [`cas_gc`], with an optional updates-root override for testing.
+///
+/// **Concurrency caveat:** `cas-gc` must not run concurrently with
+/// `op updates import` on the same environment. GC's reference snapshot and
+/// the import's CAS-populate/admission are not mutually serialized; a
+/// concurrent GC can evict blobs of a plan admitted after the snapshot.
+/// Recovery: re-run the import with the full envelope. A lock-held GC inside
+/// `greentic-update` is a tracked follow-up.
 fn cas_gc_impl(
     store: &LocalFsStore,
     flags: &OpFlags,
@@ -3728,23 +3770,47 @@ fn cas_gc_impl(
         }
     }
 
-    // List all CAS blobs and remove unreferenced ones.
+    // List all CAS blobs and compute the eviction set.
     let all_blobs = root
         .cas_list()
         .map_err(|e| OpError::Conflict(format!("cas_list: {e}")))?;
-    let mut evicted: usize = 0;
+    let mut to_evict: Vec<String> = Vec::new();
     let mut kept: usize = 0;
     for digest in &all_blobs {
         if referenced.contains(digest) {
             kept += 1;
         } else {
-            root.cas_remove(digest)
-                .map_err(|e| OpError::Conflict(format!("cas_remove `{digest}`: {e}")))?;
-            evicted += 1;
+            to_evict.push(digest.clone());
         }
     }
 
-    // Re-sign + write the import receipt reflecting post-eviction inventory.
+    // Crash-consistency invariant: at every crash point the receipt on disk
+    // must under-claim (never over-claim) what the CAS holds, so a delta
+    // export against it over-sends — always correct, never silently incomplete.
+    //
+    // When evicting, first write an EMPTY receipt (under-claims everything),
+    // then remove CAS blobs, then write the true post-eviction receipt.
+    // A crash between eviction and the final receipt leaves the empty receipt,
+    // which forces a full (non-delta) export — safe, just redundant.
+    if !to_evict.is_empty() {
+        let (empty_bytes, empty_sig) = greentic_update::envelope::build_import_receipt(
+            env_id.as_str(),
+            Vec::new(),
+            &priv_pem,
+            &key_id,
+        )
+        .map_err(|e| OpError::Conflict(format!("build empty receipt: {e}")))?;
+        root.write_import_receipt(&empty_bytes, &empty_sig)
+            .map_err(|e| OpError::Conflict(format!("write empty receipt: {e}")))?;
+    }
+
+    for digest in &to_evict {
+        root.cas_remove(digest)
+            .map_err(|e| OpError::Conflict(format!("cas_remove `{digest}`: {e}")))?;
+    }
+    let evicted = to_evict.len();
+
+    // Write the true post-eviction receipt from a fresh CAS inventory.
     let post_gc_inventory = root
         .cas_list()
         .map_err(|e| OpError::Conflict(format!("cas_list post-gc: {e}")))?;
@@ -9226,6 +9292,248 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(
             !root.cas_contains(&digest_of(art_data)).unwrap(),
             "blob referenced only by terminal plan should be gone"
+        );
+    }
+
+    #[test]
+    fn cas_gc_crash_between_evict_and_receipt_underclaims() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"gc-crash-art";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        // Add an orphan whose CAS path is replaced with a non-empty directory
+        // so that `cas_remove` will error (simulating a crash in the eviction
+        // window).
+        let orphan = b"orphan-crash-blob";
+        let orphan_digest = digest_of(orphan);
+        root.cas_put(&orphan_digest, orphan).unwrap();
+
+        // Replace the orphan's CAS file with a non-empty directory.
+        let hex = orphan_digest.strip_prefix("sha256:").unwrap();
+        let orphan_path = root.env_dir().join("cas").join(format!("sha256-{hex}"));
+        std::fs::remove_file(&orphan_path).unwrap();
+        std::fs::create_dir(&orphan_path).unwrap();
+        std::fs::write(orphan_path.join("sentinel"), b"block removal").unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let err =
+            cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        // cas_gc must fail because cas_remove hit the directory.
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("cas_remove")),
+            "expected cas_remove failure, got: {err:?}"
+        );
+
+        // The receipt on disk must be the EMPTY one written before eviction
+        // started — under-claiming, not the stale pre-GC inventory.
+        let (receipt_bytes, receipt_sig_bytes) = root.read_import_receipt().unwrap().unwrap();
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let receipt = greentic_update::envelope::verify_import_receipt(
+            &receipt_bytes,
+            &receipt_sig_bytes,
+            &trust,
+        )
+        .unwrap();
+        assert!(
+            receipt.held_digests.is_empty(),
+            "after eviction failure the receipt must under-claim (empty), got: {:?}",
+            receipt.held_digests
+        );
+
+        // Clean up the sentinel directory so tempdir drop succeeds.
+        let _ = std::fs::remove_dir_all(&orphan_path);
+    }
+
+    #[test]
+    fn import_repairs_corrupted_cas_blob() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"repair-artifact";
+        let envelope_path = out_dir.path().join("repair.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Pre-seed the import CAS with a CORRUPTED blob (wrong bytes, same digest key).
+        let import_root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        let digest = digest_of(art_data);
+        // Write the correct blob first so the file exists at the right path...
+        import_root.cas_put(&digest, art_data).unwrap();
+        // ...then overwrite the file directly with garbage.
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        let blob_path = import_root
+            .env_dir()
+            .join("cas")
+            .join(format!("sha256-{hex}"));
+        std::fs::write(&blob_path, b"corrupted-bytes-not-matching-digest").unwrap();
+        // Sanity: cas_get should now fail (hash mismatch).
+        assert!(
+            import_root.cas_get(&digest).is_err(),
+            "corrupted blob should fail cas_get"
+        );
+
+        let import_s = LocalFsStore::new(import_store.path());
+        env_trusting(&import_s, &tk);
+        let key_path = import_store.path().join("signing-key.pem");
+        let (priv_pem, _) = key_pair(7);
+        std::fs::write(&key_path, &priv_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Import the full envelope — it carries the correct blob.
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.result["plan_id"], "plan-export");
+        // The blob was already held (corrupted), so reported as already_held.
+        // But the unconditional cas_put repaired it.
+        assert_eq!(out.result["blobs_already_held"], 1);
+
+        // Verify the repair: cas_get now succeeds and returns correct bytes.
+        let repaired = import_root.cas_get(&digest).unwrap();
+        assert_eq!(
+            repaired, art_data,
+            "cas_put during import must repair the corrupted blob"
+        );
+    }
+
+    #[test]
+    fn import_delta_rejects_corrupted_cas_blob() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"delta-corrupt-artifact";
+        let bin_data = b"delta-corrupt-binary";
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(export_store.path());
+        env_trusting(&store, &tk);
+
+        let (_export_priv, _tk2, key_path) = stage_plan_with_blobs(
+            export_updates.path(),
+            export_store.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Build a receipt claiming the artifact is already held so the delta
+        // export will skip it.
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "local",
+            vec![digest_of(art_data)],
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("receipt.json");
+        let receipt_sig_path = out_dir.path().join("receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        // Delta export: skip the held artifact.
+        let envelope_path = out_dir.path().join("delta-corrupt.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            envelope_path.clone(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+        export_impl(
+            &store,
+            &OpFlags::default(),
+            args,
+            Some(export_updates.path()),
+        )
+        .unwrap();
+
+        // Set up import env with the artifact in CAS, then CORRUPT it.
+        let import_s = LocalFsStore::new(import_store.path());
+        env_trusting(&import_s, &tk);
+        let import_root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        import_root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        let art_hex = digest_of(art_data)
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_string();
+        let blob_path = import_root
+            .env_dir()
+            .join("cas")
+            .join(format!("sha256-{art_hex}"));
+        std::fs::write(&blob_path, b"corrupted-delta").unwrap();
+
+        let import_key_path = import_store.path().join("signing-key.pem");
+        std::fs::write(&import_key_path, &priv_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&import_key_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let import_a = import_args("local", envelope_path, import_key_path, &tk.key_id);
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            import_a,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must fail closed naming the corrupted digest.
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("CAS integrity")),
+            "expected CAS integrity failure, got: {err:?}"
+        );
+
+        // No new plan should have been admitted.
+        let plans = import_root.list().unwrap();
+        assert!(
+            plans.is_empty(),
+            "no plan should be admitted after integrity failure"
+        );
+
+        // No new receipt should exist.
+        assert!(
+            import_root.read_import_receipt().unwrap().is_none(),
+            "no receipt should be written after integrity failure"
         );
     }
 }
