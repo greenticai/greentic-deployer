@@ -988,6 +988,14 @@ pub struct UpdatesExportArgs {
     /// with no local env dir.
     #[arg(long = "trust-root")]
     pub trust_root: Option<PathBuf>,
+    /// Path to a local binary file to include in the export. The file's
+    /// SHA-256 must match a `binaries[].digest` in the staged plan. Repeat
+    /// for each binary (e.g. `--binary-blob gtc-linux --binary-blob
+    /// gtc-macos`). When the plan carries binaries and they are not already
+    /// staged, omitting this flag causes the export to fail closed (missing
+    /// blobs).
+    #[arg(long = "binary-blob")]
+    pub binary_blobs: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]
