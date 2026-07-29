@@ -5,7 +5,6 @@
 //! import -> delta-export. Every step runs inside tempdirs with HOME overridden,
 //! no network access, and no real user state.
 
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,10 +32,13 @@ fn run_deployer(
     (stdout, stderr, output.status)
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+/// Parse the first JSON line from CLI stdout, panicking with `label` on failure.
+fn parse_json(stdout: &str, label: &str) -> serde_json::Value {
+    stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .next()
+        .unwrap_or_else(|| panic!("no JSON in {label} stdout: {stdout}"))
 }
 
 #[test]
@@ -73,11 +75,7 @@ fn airgap_cli_round_trip() {
         "env init failed: stdout={stdout}\nstderr={stderr}"
     );
     // Parse env id from stdout JSON.
-    let init_out: serde_json::Value = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .next()
-        .unwrap_or_else(|| panic!("no JSON in env init stdout: {stdout}"));
+    let init_out = parse_json(&stdout, "env init");
     let env_id = init_out["result"]["environment_id"]
         .as_str()
         .unwrap_or("local");
@@ -86,7 +84,7 @@ fn airgap_cli_round_trip() {
     let bin_payload = b"fake-greentic-start-binary-for-e2e-test";
     let bin_file = out_dir.join("fake-binary");
     std::fs::write(&bin_file, bin_payload).unwrap();
-    let bin_digest_hex = sha256_hex(bin_payload);
+    let bin_digest_hex = greentic_update::plan::sha256_hex(bin_payload);
     let bin_digest = format!("sha256:{bin_digest_hex}");
 
     // 3. plan-build: build a signed plan with one binary artifact.
@@ -146,11 +144,7 @@ fn airgap_cli_round_trip() {
     );
 
     // Parse plan_id from get output.
-    let get_out: serde_json::Value = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .next()
-        .unwrap_or_else(|| panic!("no JSON in updates get stdout: {stdout}"));
+    let get_out = parse_json(&stdout, "updates get");
     let plan_id = get_out["result"]["plan_id"]
         .as_str()
         .unwrap_or_else(|| panic!("no plan_id in get output: {get_out}"));
@@ -182,11 +176,7 @@ fn airgap_cli_round_trip() {
     assert!(envelope_path.exists(), "envelope file must exist");
 
     // Parse and verify export output fields.
-    let export_out: serde_json::Value = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .next()
-        .unwrap_or_else(|| panic!("no JSON in export stdout: {stdout}"));
+    let export_out = parse_json(&stdout, "export");
     assert!(
         export_out["result"]["blobs_included"].as_u64().unwrap() > 0,
         "export must include at least one blob"
@@ -294,11 +284,7 @@ fn airgap_cli_round_trip() {
     );
 
     // Parse import output.
-    let import_out: serde_json::Value = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .next()
-        .unwrap_or_else(|| panic!("no JSON in import stdout: {stdout}"));
+    let import_out = parse_json(&stdout, "import");
     assert_eq!(
         import_out["result"]["stage"].as_str().unwrap_or(""),
         "staged",
@@ -309,9 +295,12 @@ fn airgap_cli_round_trip() {
         "import must import at least one blob"
     );
 
-    // Verify receipt files exist.
-    let receipt_path = upd_imp.join(env_id).join("import-receipt.json");
-    let receipt_sig_path = upd_imp.join(env_id).join("import-receipt.json.sig");
+    // Derive receipt paths from import output.
+    let receipt_path_str = import_out["result"]["receipt_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no receipt_path in import output: {import_out}"));
+    let receipt_path = PathBuf::from(receipt_path_str);
+    let receipt_sig_path = PathBuf::from(format!("{receipt_path_str}.sig"));
     assert!(
         receipt_path.exists(),
         "import-receipt.json must exist at {}",
@@ -354,11 +343,7 @@ fn airgap_cli_round_trip() {
     assert!(delta_envelope.exists(), "delta envelope must exist");
 
     // Parse delta export output.
-    let delta_out: serde_json::Value = stdout
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .next()
-        .unwrap_or_else(|| panic!("no JSON in delta export stdout: {stdout}"));
+    let delta_out = parse_json(&stdout, "delta export");
     assert!(
         delta_out["result"]["blobs_skipped"].as_u64().unwrap() > 0,
         "delta export must skip at least one blob"

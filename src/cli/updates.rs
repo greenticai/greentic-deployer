@@ -3046,6 +3046,8 @@ fn export_impl(
     args: crate::cli::dispatch::UpdatesExportArgs,
     updates_root_override: Option<&std::path::Path>,
 ) -> Result<OpOutcome, OpError> {
+    use std::collections::{HashMap, HashSet};
+
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, "export", export_schema()));
     }
@@ -3123,16 +3125,13 @@ fn export_impl(
     // unmatched or duplicate-digest files are hard errors.
     if !args.binary_blobs.is_empty() {
         // Build a digest->BinaryArtifact lookup from the plan's binaries.
-        let plan_bin_by_digest: std::collections::HashMap<
-            &str,
-            &greentic_update::plan::BinaryArtifact,
-        > = plan
+        let plan_bin_by_digest: HashMap<&str, &greentic_update::plan::BinaryArtifact> = plan
             .binaries
             .iter()
             .map(|b| (b.digest.as_str(), b))
             .collect();
 
-        let mut seen_digests: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_digests: HashSet<String> = HashSet::new();
 
         for blob_path in &args.binary_blobs {
             let bytes = std::fs::read(blob_path).map_err(|source| OpError::Io {
@@ -3168,50 +3167,14 @@ fn export_impl(
             let dest = staged.binary_blob_path(bin).map_err(|e| {
                 OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name))
             })?;
-            // Guard against symlink-based path traversal out of the staging
-            // tree, matching the invariant enforced by put_binary_blob in the
-            // staging library (which calls its own assert_no_symlink_ancestors).
-            crate::path_safety::assert_no_symlink_ancestors(root.env_dir(), &dest).map_err(
-                |e| {
-                    OpError::Conflict(format!(
-                        "binary blob path for `{}` escapes staging tree: {e}",
-                        bin.name
-                    ))
-                },
-            )?;
-            let parent = dest.parent().ok_or_else(|| {
-                OpError::Conflict(format!("no parent dir for `{}`", dest.display()))
-            })?;
-            std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-            // Write via temp-file + persist so a crash mid-write never leaves a
-            // torn blob at the content-addressed path (matching the atomic
-            // write `put_binary_blob` does via the library).
-            use std::io::Write as _;
-            let mut tmp =
-                tempfile::NamedTempFile::new_in(parent).map_err(|source| OpError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            tmp.write_all(&bytes).map_err(|source| OpError::Io {
-                path: tmp.path().to_path_buf(),
-                source,
-            })?;
-            tmp.persist(&dest).map_err(|e| OpError::Io {
-                path: dest,
-                source: e.error,
-            })?;
+            stage_blob_bytes(root.env_dir(), &dest, &bytes)?;
         }
     }
 
     // Delta: if --base-receipt is given, verify and load its held digests.
     // Resolved BEFORE blob collection so that held/filtered blobs are not
     // required on disk.
-    let held_digests: std::collections::HashSet<String> = if let Some(receipt_path) =
-        &payload.base_receipt
-    {
+    let held_digests: HashSet<String> = if let Some(receipt_path) = &payload.base_receipt {
         let receipt_sig_path = payload.base_receipt_sig.as_ref().ok_or_else(|| {
             OpError::InvalidArgument(
                 "--base-receipt-sig is required when --base-receipt is given".to_string(),
@@ -3244,12 +3207,11 @@ fn export_impl(
         }
         receipt.held_digests.into_iter().collect()
     } else {
-        std::collections::HashSet::new()
+        HashSet::new()
     };
 
     // Target filter set.
-    let target_filter: std::collections::HashSet<&str> =
-        payload.targets.iter().map(|s| s.as_str()).collect();
+    let target_filter: HashSet<&str> = payload.targets.iter().map(|s| s.as_str()).collect();
 
     // Collect all referenced blobs and verify that INCLUDED blobs exist on
     // disk.  Blobs that will be skipped (held by the receiver via delta
@@ -3257,6 +3219,18 @@ fn export_impl(
     let mut included: Vec<BlobEntry> = Vec::new();
     let mut skipped_count: usize = 0;
     let mut missing: Vec<String> = Vec::new();
+
+    let mut collect = |digest: &String, path: PathBuf, target: Option<String>| {
+        if path.exists() {
+            included.push(BlobEntry {
+                digest: digest.clone(),
+                path,
+                target,
+            });
+        } else {
+            missing.push(digest.clone());
+        }
+    };
 
     for art in &plan.artifacts {
         // Artifacts carry no target and are never target-filtered.
@@ -3267,15 +3241,7 @@ fn export_impl(
         let path = staged.artifact_blob_path(art).map_err(|e| {
             OpError::Conflict(format!("artifact blob path for `{}`: {e}", art.name))
         })?;
-        if path.exists() {
-            included.push(BlobEntry {
-                digest: art.digest.clone(),
-                path,
-                target: None,
-            });
-        } else {
-            missing.push(art.digest.clone());
-        }
+        collect(&art.digest, path, None);
     }
     for bin in &plan.binaries {
         // Delta: skip blobs held by the receiver.
@@ -3291,15 +3257,7 @@ fn export_impl(
         let path = staged
             .binary_blob_path(bin)
             .map_err(|e| OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name)))?;
-        if path.exists() {
-            included.push(BlobEntry {
-                digest: bin.digest.clone(),
-                path,
-                target: Some(bin.target.clone()),
-            });
-        } else {
-            missing.push(bin.digest.clone());
-        }
+        collect(&bin.digest, path, Some(bin.target.clone()));
     }
 
     if !missing.is_empty() {
@@ -3375,6 +3333,34 @@ struct BlobEntry {
     digest: String,
     path: PathBuf,
     target: Option<String>,
+}
+
+/// Write `bytes` atomically to `dest` inside the staging tree rooted at
+/// `env_dir`, with symlink-ancestor guard and fsync.
+fn stage_blob_bytes(env_dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), OpError> {
+    crate::path_safety::assert_no_symlink_ancestors(env_dir, dest).map_err(|e| {
+        OpError::Conflict(format!(
+            "blob path `{}` escapes staging tree: {e}",
+            dest.display()
+        ))
+    })?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    crate::environment::atomic_write_bytes(dest, bytes).map_err(|e| match e {
+        crate::environment::AtomicWriteError::Io { path, source } => OpError::Io { path, source },
+        crate::environment::AtomicWriteError::Persist { target, source } => OpError::Io {
+            path: target,
+            source: source.error,
+        },
+        other => OpError::Io {
+            path: dest.to_path_buf(),
+            source: std::io::Error::other(other.to_string()),
+        },
+    })
 }
 
 fn export_schema() -> Value {
@@ -9504,127 +9490,29 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
 
     // ---- Phase B4: --binary-blob flag + E2E ---------------------------------
 
-    /// Like [`stage_plan_with_blobs`] but stages ONLY artifacts, leaving binary
-    /// blobs unstaged. Returns the same key tuple for further signing. The plan
-    /// still declares binaries (via `bin_payloads`), they just aren't on disk —
-    /// so a bare `export` without `--binary-blob` will fail-closed (missing
-    /// blobs), exercising the new flag.
+    /// Like [`stage_plan_with_blobs`] but removes binary blobs after staging.
+    /// The FSM transition does not verify blob existence, so blobs are staged
+    /// then removed; export's missing-blob gate fires unless `--binary-blob`
+    /// re-injects them.
     fn stage_plan_without_binary_blobs(
         updates_dir: &std::path::Path,
         store_dir: &std::path::Path,
         art_payloads: &[(&str, &[u8])],
         bin_payloads: &[(&str, &[u8], &str)],
     ) -> (String, TrustedKey, PathBuf) {
-        use greentic_update::staging::UpdatesRoot;
+        let result = stage_plan_with_blobs(updates_dir, store_dir, art_payloads, bin_payloads);
 
-        let (priv_pem, tk) = key_pair(7);
-        let store = LocalFsStore::new(store_dir);
-        env_trusting(&store, &tk);
-        let build_trust = TrustRoot::new(vec![tk.clone()]);
-
-        let artifacts: Vec<Value> = art_payloads
-            .iter()
-            .map(|(name, bytes)| {
-                json!({
-                    "name": name,
-                    "version": "1.0.0",
-                    "digest": digest_of(bytes),
-                })
-            })
-            .collect();
-        let binaries: Vec<Value> = bin_payloads
-            .iter()
-            .map(|(name, bytes, target)| {
-                json!({
-                    "name": name,
-                    "version": "1.0.0",
-                    "target": target,
-                    "digest": digest_of(bytes),
-                })
-            })
-            .collect();
-
-        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
-            "schema": "greentic.update-plan.v1",
-            "plan_id": "plan-export",
-            "env_id": "local",
-            "sequence": 1,
-            "created_at": "2026-07-02T00:00:00Z",
-            "nonce": "nonce-export",
-            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
-            "artifacts": artifacts,
-            "binaries": binaries,
-            "compat": {},
-            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
-        }))
-        .unwrap();
-        let built =
-            greentic_update::plan::build_update_plan(&plan, &priv_pem, &tk.key_id, &build_trust)
-                .unwrap();
-        let verified = verify_with(&built.plan_bytes, &built.envelope_bytes, &tk);
-        let root = UpdatesRoot::open_in(updates_dir, "local").unwrap();
-        let staged = root
-            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
-            .unwrap();
-
-        // Stage artifact blobs only — binary blobs are deliberately omitted.
-        for (name, bytes) in art_payloads {
-            let art = staged
-                .plan()
-                .artifacts
-                .iter()
-                .find(|a| a.name == *name)
-                .unwrap()
-                .clone();
-            staged.put_artifact(&art, bytes).unwrap();
-        }
-        // Binary blobs left on-disk for the Downloading->Inbox transition need
-        // to be staged for the transition to succeed — but put_binary_blob
-        // requires Downloading, and the FSM checks that all declared binaries
-        // have their blob file before promoting past Inbox.  We put the binary
-        // blobs here so the FSM can advance, but the important thing for the
-        // test is that the EXPORT path picks them up via --binary-blob.
-        // Actually, the FSM's `transition` to Inbox does NOT check binary blob
-        // existence — it only checks `stage` progression validity.  Let's check
-        // whether advance_to_staged works without binary blobs.  Looking at the
-        // staging code: `transition` just validates
-        // `is_valid_transition(from, to)` and rewrites state.json — it does NOT
-        // verify blobs.  So we can advance without putting binary blobs.
-        //
-        // However, the export_impl's existing missing-blob check WILL see them
-        // missing (that's the point).  The test must supply them via
-        // --binary-blob.
-        for (name, bytes, _target) in bin_payloads {
-            let bin = staged
-                .plan()
-                .binaries
-                .iter()
-                .find(|b| b.name == *name)
-                .unwrap()
-                .clone();
-            staged.put_binary_blob(&bin, bytes).unwrap();
-        }
-
-        advance_to_staged(&staged).unwrap();
-
-        // Now REMOVE the binary blobs from the staging tree so export must
-        // re-inject them via --binary-blob.
-        for (name, _bytes, _target) in bin_payloads {
-            let bin = staged
-                .plan()
-                .binaries
-                .iter()
-                .find(|b| b.name == *name)
-                .unwrap()
-                .clone();
-            let blob_path = staged.binary_blob_path(&bin).unwrap();
+        // Remove binary blobs so export must re-inject them via --binary-blob.
+        let root = greentic_update::staging::UpdatesRoot::open_in(updates_dir, "local").unwrap();
+        let staged = root.load("plan-export").unwrap().unwrap();
+        for bin in &staged.plan().binaries {
+            let blob_path = staged.binary_blob_path(bin).unwrap();
             if blob_path.exists() {
                 std::fs::remove_file(&blob_path).unwrap();
             }
         }
 
-        let key_path = write_test_key(store_dir, &priv_pem);
-        (priv_pem, tk, key_path)
+        result
     }
 
     #[test]
@@ -9761,55 +9649,6 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             matches!(&err, OpError::InvalidArgument(m) if m.contains("same digest")),
             "expected duplicate-digest error, got: {err:?}"
         );
-    }
-
-    #[test]
-    fn export_binary_blob_tampered_file_fails_closed() {
-        let store_dir = tempdir().unwrap();
-        let updates_dir = tempdir().unwrap();
-        let out_dir = tempdir().unwrap();
-        let store = LocalFsStore::new(store_dir.path());
-
-        let art_data = b"art-tamper";
-        let bin_data = b"original-binary-content";
-        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
-            updates_dir.path(),
-            store_dir.path(),
-            &[("pack-a", art_data)],
-            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
-        );
-
-        // Write a tampered file (different bytes, so different digest).
-        let tampered = out_dir.path().join("tampered-binary");
-        std::fs::write(&tampered, b"tampered-binary-different-content").unwrap();
-
-        let out_path = out_dir.path().join("should-not-exist.gtupdate");
-        let mut args = export_args(
-            "local",
-            "plan-export",
-            out_path.clone(),
-            key_path,
-            &tk.key_id,
-        );
-        args.binary_blobs = vec![tampered];
-
-        let err =
-            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
-
-        // Same error path as the no-match test: the tampered file's digest
-        // doesn't match any plan binary.
-        assert!(
-            matches!(&err, OpError::InvalidArgument(m) if m.contains("matches no binary")),
-            "expected no-match error for tampered file, got: {err:?}"
-        );
-        // The error must name the computed digest of the tampered content.
-        if let OpError::InvalidArgument(m) = &err {
-            let expected_digest = digest_of(b"tampered-binary-different-content");
-            assert!(
-                m.contains(&expected_digest),
-                "error should name the computed digest `{expected_digest}`, got: {m}"
-            );
-        }
     }
 
     #[test]
