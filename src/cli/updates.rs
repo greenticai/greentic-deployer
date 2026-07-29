@@ -3179,13 +3179,30 @@ fn export_impl(
                     ))
                 },
             )?;
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+            let parent = dest.parent().ok_or_else(|| {
+                OpError::Conflict(format!("no parent dir for `{}`", dest.display()))
+            })?;
+            std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+            // Write via temp-file + persist so a crash mid-write never leaves a
+            // torn blob at the content-addressed path (matching the atomic
+            // write `put_binary_blob` does via the library).
+            use std::io::Write as _;
+            let mut tmp =
+                tempfile::NamedTempFile::new_in(parent).map_err(|source| OpError::Io {
                     path: parent.to_path_buf(),
                     source,
                 })?;
-            }
-            std::fs::write(&dest, &bytes).map_err(|source| OpError::Io { path: dest, source })?;
+            tmp.write_all(&bytes).map_err(|source| OpError::Io {
+                path: tmp.path().to_path_buf(),
+                source,
+            })?;
+            tmp.persist(&dest).map_err(|e| OpError::Io {
+                path: dest,
+                source: e.error,
+            })?;
         }
     }
 
