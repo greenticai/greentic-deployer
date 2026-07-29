@@ -2377,6 +2377,26 @@ fn load_trust_root_from_file(
 /// `op updates apply` is upsert-only, so the default minimal target is a no-op,
 /// and there is no binary for the runtime to swap. Refuse to sign it rather than
 /// mint a plan that reports `applied` without changing anything.
+/// Resolve the signing key for plan/envelope signing: an explicit
+/// `--signing-key` path, or the global operator key. Shared by `plan-build`
+/// (via [`build_and_sign_plan`]) and `export`.
+fn resolve_signing_key(
+    signing_key: Option<&Path>,
+) -> Result<(zeroize::Zeroizing<String>, String), OpError> {
+    match signing_key {
+        Some(key_path) => Ok(crate::operator_key::read_signing_key_at(key_path)?),
+        None => {
+            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "no --signing-key provided and the global operator key is unavailable: {e}. \
+                     Create or bootstrap the operator key first, or pass --signing-key <path>."
+                ))
+            })?;
+            Ok((op_key.private_pem, op_key.key_id))
+        }
+    }
+}
+
 fn build_and_sign_plan(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -2407,18 +2427,7 @@ fn build_and_sign_plan(
     }
 
     // Resolve the signing key: explicit --signing-key or the global operator key.
-    let (priv_pem, key_id) = match content.signing_key {
-        Some(key_path) => crate::operator_key::read_signing_key_at(key_path)?,
-        None => {
-            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
-                OpError::InvalidArgument(format!(
-                    "no --signing-key provided and the global operator key is unavailable: {e}. \
-                     Create or bootstrap the operator key first, or pass --signing-key <path>."
-                ))
-            })?;
-            (op_key.private_pem, op_key.key_id)
-        }
-    };
+    let (priv_pem, key_id) = resolve_signing_key(content.signing_key)?;
 
     // Load the env trust root so build_update_plan can verify the key is trusted.
     let trust = match content.trust_root {
@@ -3022,44 +3031,33 @@ fn export_impl(
 
     let plan = staged.plan();
 
-    // Collect all referenced blobs and verify they exist on disk.
-    // Artifact blobs (content):
+    // Collect all referenced blobs and verify they exist on disk. Artifact
+    // (content) blobs carry no target; binary blobs carry their target triple.
     let mut blob_entries: Vec<BlobEntry> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    let mut collect = |digest: &String, path: PathBuf, target: Option<String>| {
+        if path.exists() {
+            blob_entries.push(BlobEntry {
+                digest: digest.clone(),
+                path,
+                target,
+            });
+        } else {
+            missing.push(digest.clone());
+        }
+    };
 
     for art in &plan.artifacts {
         let path = staged.artifact_blob_path(art).map_err(|e| {
             OpError::Conflict(format!("artifact blob path for `{}`: {e}", art.name))
         })?;
-        if path.exists() {
-            blob_entries.push(BlobEntry {
-                digest: art.digest.clone(),
-                path,
-                media_type: "application/octet-stream".to_string(),
-                target: None,
-                is_binary: false,
-            });
-        } else {
-            missing.push(art.digest.clone());
-        }
+        collect(&art.digest, path, None);
     }
-
-    // Binary blobs:
     for bin in &plan.binaries {
         let path = staged
             .binary_blob_path(bin)
             .map_err(|e| OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name)))?;
-        if path.exists() {
-            blob_entries.push(BlobEntry {
-                digest: bin.digest.clone(),
-                path,
-                media_type: "application/octet-stream".to_string(),
-                target: Some(bin.target.clone()),
-                is_binary: true,
-            });
-        } else {
-            missing.push(bin.digest.clone());
-        }
+        collect(&bin.digest, path, Some(bin.target.clone()));
     }
 
     if !missing.is_empty() {
@@ -3127,9 +3125,8 @@ fn export_impl(
             skipped_count += 1;
             continue;
         }
-        // Target filtering: applies only to binary blobs.
-        if entry.is_binary
-            && !target_filter.is_empty()
+        // Target filtering: applies only to binary blobs (those with a target).
+        if !target_filter.is_empty()
             && let Some(ref t) = entry.target
             && !target_filter.contains(t.as_str())
         {
@@ -3140,24 +3137,14 @@ fn export_impl(
     }
 
     // Resolve signing key.
-    let (priv_pem, key_id) = match payload.signing_key {
-        Some(ref key_path) => crate::operator_key::read_signing_key_at(key_path)?,
-        None => {
-            if payload.key_id.is_some() {
-                return Err(OpError::InvalidArgument(
-                    "--key-id requires --signing-key".to_string(),
-                ));
-            }
-            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
-                OpError::InvalidArgument(format!(
-                    "no --signing-key provided and the global operator key is unavailable: {e}. \
-                     Pass --signing-key <path>."
-                ))
-            })?;
-            (op_key.private_pem, op_key.key_id)
-        }
-    };
-    // --key-id overrides the key's canonical id when explicitly given.
+    if payload.key_id.is_some() && payload.signing_key.is_none() {
+        return Err(OpError::InvalidArgument(
+            "--key-id requires --signing-key".to_string(),
+        ));
+    }
+    let (priv_pem, key_id) = resolve_signing_key(payload.signing_key.as_deref())?;
+    // --key-id overrides the key's canonical id when explicitly given; the
+    // preflight below still requires that id to be registered in the trust root.
     let key_id = payload.key_id.unwrap_or(key_id);
 
     // Fail-closed preflight: an envelope signed by an untrusted key or a
@@ -3212,7 +3199,7 @@ fn export_impl(
             .add_blob(
                 &entry.digest,
                 &bytes,
-                &entry.media_type,
+                "application/octet-stream",
                 entry.target.as_deref(),
             )
             .map_err(|e| {
@@ -3243,13 +3230,12 @@ fn export_impl(
     ))
 }
 
-/// Internal blob entry for the export pipeline.
+/// Internal blob entry for the export pipeline. `target` is `Some(<triple>)`
+/// for binary blobs and `None` for artifact (content) blobs.
 struct BlobEntry {
     digest: String,
     path: PathBuf,
-    media_type: String,
     target: Option<String>,
-    is_binary: bool,
 }
 
 fn export_schema() -> Value {
@@ -7068,6 +7054,29 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         }
     }
 
+    /// Scan an exported envelope back with `tk` as the sole trusted key.
+    /// Returns the scan result plus the quarantine dir guard that owns the
+    /// extracted files (dropping it deletes them).
+    fn scan_exported(
+        path: &std::path::Path,
+        tk: &TrustedKey,
+    ) -> (
+        greentic_update::envelope::ScannedEnvelopeRef,
+        tempfile::TempDir,
+    ) {
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let quarantine = tempdir().unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        let scanned = greentic_update::envelope::scan_envelope_to_dir(
+            file,
+            &trust,
+            &greentic_update::envelope::ScanLimits::default(),
+            quarantine.path(),
+        )
+        .unwrap();
+        (scanned, quarantine)
+    }
+
     #[test]
     fn export_full_round_trip() {
         let store_dir = tempdir().unwrap();
@@ -7103,16 +7112,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(out_path.exists());
 
         // Scan the envelope back and verify its contents.
-        let trust = TrustRoot::new(vec![tk.clone()]);
-        let quarantine = tempdir().unwrap();
-        let file = std::fs::File::open(&out_path).unwrap();
-        let scanned = greentic_update::envelope::scan_envelope_to_dir(
-            file,
-            &trust,
-            &greentic_update::envelope::ScanLimits::default(),
-            quarantine.path(),
-        )
-        .unwrap();
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
 
         assert_eq!(scanned.manifest.plan_id, "plan-export");
         assert_eq!(scanned.manifest.env_id, "local");
@@ -7181,16 +7181,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(out.result["blobs_skipped"], 1, "the artifact was held");
 
         // Scan and verify only the binary blob is present.
-        let trust = TrustRoot::new(vec![tk]);
-        let quarantine = tempdir().unwrap();
-        let file = std::fs::File::open(&out_path).unwrap();
-        let scanned = greentic_update::envelope::scan_envelope_to_dir(
-            file,
-            &trust,
-            &greentic_update::envelope::ScanLimits::default(),
-            quarantine.path(),
-        )
-        .unwrap();
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
 
         let art_digest = digest_of(art_data);
         let bin_digest = digest_of(bin_data);
@@ -7242,16 +7233,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(out.result["blobs_skipped"], 1);
 
         // Verify the envelope contents.
-        let trust = TrustRoot::new(vec![tk]);
-        let quarantine = tempdir().unwrap();
-        let file = std::fs::File::open(&out_path).unwrap();
-        let scanned = greentic_update::envelope::scan_envelope_to_dir(
-            file,
-            &trust,
-            &greentic_update::envelope::ScanLimits::default(),
-            quarantine.path(),
-        )
-        .unwrap();
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
 
         let art_digest = digest_of(art_data);
         let linux_digest = digest_of(bin_linux);

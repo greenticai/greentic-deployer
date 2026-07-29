@@ -963,7 +963,10 @@ pub struct UpdatesExportArgs {
     /// PKCS#8 Ed25519 private key PEM for signing the envelope manifest.
     #[arg(long = "signing-key")]
     pub signing_key: Option<PathBuf>,
-    /// Key id for the signing key.
+    /// Key id to sign under, overriding the key's canonical id — for when the
+    /// receiver's trust root registers this key under a different id. The id
+    /// must still resolve in the env trust root (the export preflight enforces
+    /// this).
     #[arg(long = "key-id", requires = "signing_key")]
     pub key_id: Option<String>,
 }
