@@ -3177,9 +3177,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "1.2.0-dev.30347759036"
+version = "1.2.0-dev.30432113510"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4586be5b2c773a429005c7e4b66253318ac3dfe89e488f26dde2a9ba9e5601eb"
+checksum = "7ac1fb8dcf2d96786ada8993bc9472d2df6fe4ae46956ecda04e423d65bdd103"
 dependencies = [
  "chrono",
  "flate2",

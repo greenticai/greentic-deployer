@@ -3749,9 +3749,16 @@ fn cas_gc_impl(
     )?;
 
     // Collect all digests referenced by any non-evicted staged plan.
-    let plans = root
-        .list()
-        .map_err(|e| OpError::Conflict(format!("list staged plans: {e}")))?;
+    // `list_strict` fails closed on a corrupt plan marker (present but
+    // unreadable state.json) rather than silently skipping it — a skipped
+    // plan would make its blobs look orphaned, causing data loss.
+    let plans = root.list_strict().map_err(|e| {
+        OpError::Conflict(format!(
+            "cannot safely gc: plan scan found a corrupt marker — \
+             its blobs would look orphaned. Repair or remove the \
+             corrupt plan directory before retrying: {e}"
+        ))
+    })?;
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for state in &plans {
         if state.stage.is_terminal() {
@@ -9534,6 +9541,71 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(
             import_root.read_import_receipt().unwrap().is_none(),
             "no receipt should be written after integrity failure"
+        );
+    }
+
+    #[test]
+    fn cas_gc_refuses_corrupt_plan_marker() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"gc-corrupt-marker-art";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        // Write an existing receipt so we can verify it is NOT replaced.
+        let (rb, rs) = greentic_update::envelope::build_import_receipt(
+            "local",
+            vec![digest_of(art_data)],
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        root.write_import_receipt(&rb, &rs).unwrap();
+        let original_receipt = root.read_import_receipt().unwrap().unwrap();
+
+        // Corrupt the plan's state.json with invalid JSON.
+        let state_path = updates_dir
+            .path()
+            .join("local")
+            .join("plan-export")
+            .join("state.json");
+        std::fs::write(&state_path, b"{ not valid json").unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let err =
+            cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        // Must fail mentioning the corrupt marker.
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("corrupt")),
+            "expected corrupt marker failure, got: {err:?}"
+        );
+
+        // CAS blobs must still exist (nothing evicted).
+        assert!(
+            root.cas_contains(&digest_of(art_data)).unwrap(),
+            "referenced blob must survive failed gc"
+        );
+
+        // Receipt must be unchanged (no empty receipt was written).
+        let current_receipt = root.read_import_receipt().unwrap().unwrap();
+        assert_eq!(
+            original_receipt.0, current_receipt.0,
+            "receipt bytes must be unchanged after failed gc"
+        );
+        assert_eq!(
+            original_receipt.1, current_receipt.1,
+            "receipt sig must be unchanged after failed gc"
         );
     }
 }
