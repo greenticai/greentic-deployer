@@ -3882,6 +3882,8 @@ struct PushToResult {
 /// Equal sequence proceeds (idempotent rewrite). A missing meta file means a
 /// fresh directory. An unreadable or corrupt meta file is a hard error — the
 /// operator must inspect or remove the directory.
+/// Serializes writers to the same push-to directory so the monotonic+digest
+/// guard is race-free. Readers are not affected (they never take the lock).
 fn write_static_serving_dir(
     push_to: &std::path::Path,
     plan_bytes: &[u8],
@@ -3889,10 +3891,49 @@ fn write_static_serving_dir(
     verified: &greentic_update::plan::VerifiedUpdatePlan,
     root: &greentic_update::staging::UpdatesRoot,
 ) -> Result<PushToResult, OpError> {
+    use fs4::fs_std::FileExt;
+
+    // --- destination lock (Fix 2) ------------------------------------------
+    // Create the push-to root first so the lock file's parent exists.
+    std::fs::create_dir_all(push_to).map_err(|source| OpError::Io {
+        path: push_to.to_path_buf(),
+        source,
+    })?;
+    let lock_path = push_to.join(".push-lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| OpError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    match lock_file.try_lock_exclusive() {
+        Ok(true) => {} // acquired
+        Ok(false) => {
+            return Err(OpError::Conflict(format!(
+                "another --push-to write to `{}` is in progress; \
+                 retry when it completes",
+                push_to.display(),
+            )));
+        }
+        Err(source) => {
+            return Err(OpError::Io {
+                path: lock_path,
+                source,
+            });
+        }
+    }
+    // Hold `_lock_file` (and the flock) for the remainder of this function;
+    // drop releases the OS-level lock.
+    let _lock_guard = lock_file;
+
     let plan_dir = push_to.join("plan");
     let blobs_dir = push_to.join("blobs");
 
-    // --- monotonic guard ---------------------------------------------------
+    // --- monotonic + digest identity guard ---------------------------------
     let meta_path = plan_dir.join("meta");
     match std::fs::read(&meta_path) {
         Ok(existing_bytes) => {
@@ -3912,6 +3953,13 @@ fn write_static_serving_dir(
                     meta_path.display(),
                 ))
             })?;
+            let existing_sha = existing["plan_sha256"].as_str().ok_or_else(|| {
+                OpError::Conflict(format!(
+                    "push-to meta `{}` is corrupt (missing or non-string `plan_sha256`); \
+                     inspect or remove the directory before retrying",
+                    meta_path.display(),
+                ))
+            })?;
             if existing_seq > verified.plan.sequence {
                 return Err(OpError::Conflict(format!(
                     "push-to directory already serves sequence {existing_seq}, \
@@ -3919,7 +3967,20 @@ fn write_static_serving_dir(
                     verified.plan.sequence,
                 )));
             }
-            // equal or lower existing → proceed (idempotent rewrite or upgrade)
+            // Same sequence but different plan digest would silently replace
+            // the served plan, splitting the fleet (consumers that already
+            // consumed seq N ignore the replacement).
+            if existing_seq == verified.plan.sequence && existing_sha != verified.plan_sha256 {
+                return Err(OpError::Conflict(format!(
+                    "push-to directory already serves sequence {} with plan digest \
+                     {existing_sha}, but the incoming plan has digest {}; \
+                     same sequence with a different plan — bump the sequence \
+                     to publish a new plan",
+                    verified.plan.sequence, verified.plan_sha256,
+                )));
+            }
+            // equal sequence AND equal digest → idempotent rewrite
+            // lower existing sequence → upgrade
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Fresh directory — proceed.
@@ -3963,10 +4024,37 @@ fn write_static_serving_dir(
         // Pre-existing blob files are trusted by filename alone: CAS content
         // is immutable by digest, and every consumer digest-verifies what it
         // fetches — a corrupted pre-existing file is caught by readers, not
-        // by this writer.
-        if blob_path.exists() {
-            blobs_skipped += 1;
-            continue;
+        // by this writer. Non-regular entries (dirs, symlinks, fifos) are
+        // rejected — they indicate tampering or misconfiguration.
+        match std::fs::symlink_metadata(&blob_path) {
+            Ok(m) if m.file_type().is_file() => {
+                blobs_skipped += 1;
+                continue;
+            }
+            Ok(m) => {
+                let kind = m.file_type();
+                let kind_str = if kind.is_dir() {
+                    "directory"
+                } else if kind.is_symlink() {
+                    "symlink"
+                } else {
+                    "non-regular file"
+                };
+                return Err(OpError::Conflict(format!(
+                    "push-to blob path `{}` exists but is a {kind_str}; \
+                     inspect and remove it before retrying",
+                    blob_path.display(),
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Not present — write below.
+            }
+            Err(source) => {
+                return Err(OpError::Io {
+                    path: blob_path,
+                    source,
+                });
+            }
         }
 
         let blob_bytes = root.cas_get(digest).map_err(|e| {
@@ -11570,5 +11658,248 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             &sha.to_ascii_lowercase(),
             "plan_sha256 must be lowercase"
         );
+    }
+
+    #[test]
+    fn push_to_same_seq_different_plan_is_conflict() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"same-seq-diff-plan-art";
+
+        // First import: plan_id "plan-A", sequence 1.
+        let (_out1, _is, _iu) = import_with_push_to_seq(
+            push_to_dir.path(),
+            "plan-A",
+            1,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Snapshot plan.json so we can verify it is untouched after rejection.
+        let plan_before = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+
+        // Second import: plan_id "plan-B", same sequence 1, different content
+        // → different plan_sha256.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("diff-plan.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import_seq(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            "plan-B",
+            1,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must be Conflict mentioning both digests or "different plan".
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("different plan") || msg.contains("bump the sequence"),
+                    "error must mention digest mismatch, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for same-seq different-plan, got: {other:?}"),
+        }
+
+        // Dir still serves the first plan — plan.json bytes unchanged.
+        let plan_after = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+        assert_eq!(
+            plan_before, plan_after,
+            "plan.json must be untouched after same-seq digest mismatch"
+        );
+    }
+
+    #[test]
+    fn push_to_lock_contention_is_conflict() {
+        use fs4::fs_std::FileExt;
+
+        let push_to_dir = tempdir().unwrap();
+        std::fs::create_dir_all(push_to_dir.path()).unwrap();
+
+        // Pre-acquire the exclusive flock that write_static_serving_dir uses.
+        let lock_path = push_to_dir.path().join(".push-lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            lock_file.try_lock_exclusive().unwrap(),
+            "must acquire lock in test setup"
+        );
+
+        // Attempt an import-with-push-to — must fail with Conflict.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"lock-contention-art";
+        let envelope_path = out_dir.path().join("lock-test.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("in progress"),
+                    "error must mention in-progress write, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for lock contention, got: {other:?}"),
+        }
+
+        // Release the lock and verify a fresh import succeeds.
+        drop(lock_file);
+        let (_out, _is, _iu) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+        assert!(
+            _out.result["push_to"].is_object(),
+            "import must succeed after lock release"
+        );
+    }
+
+    #[test]
+    fn push_to_non_regular_blob_dir_is_conflict() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"non-regular-blob-art";
+
+        // Pre-create the blob path as a DIRECTORY.
+        let art_digest = digest_of(art_data);
+        let blob_name = art_digest.replacen(':', "-", 1);
+        let blobs_dir = push_to_dir.path().join("blobs");
+        std::fs::create_dir_all(blobs_dir.join(&blob_name)).unwrap();
+
+        // Attempt import — must fail with Conflict naming the path.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("non-regular.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("directory"),
+                    "error must name the file kind, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&blob_name),
+                    "error must name the blob path, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for directory blob, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_to_non_regular_blob_symlink_is_conflict() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"symlink-blob-art";
+
+        // Pre-create the blob path as a symlink.
+        let art_digest = digest_of(art_data);
+        let blob_name = art_digest.replacen(':', "-", 1);
+        let blobs_dir = push_to_dir.path().join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/null", blobs_dir.join(&blob_name)).unwrap();
+
+        // Attempt import — must fail with Conflict naming symlink.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("symlink.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("symlink"),
+                    "error must name the file kind, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for symlink blob, got: {other:?}"),
+        }
     }
 }
