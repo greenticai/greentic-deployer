@@ -264,6 +264,29 @@ pub(crate) fn control_url_is_acceptable(raw: &str) -> bool {
     control_url_is_acceptable_with_insecure(raw, false)
 }
 
+/// The stored-state-independent half of config-set URL validation: trim,
+/// reject blank (with a field-specific hint), reject unparseable URLs and
+/// non-http(s) schemes. Host-level policy (loopback vs `insecure_http`) is
+/// deliberately NOT checked here — that needs the effective merged config,
+/// which only exists post-merge under the transact lock.
+fn early_check_url(field: &str, raw: &str, blank_hint: &str) -> Result<String, OpError> {
+    let ep = raw.trim();
+    if ep.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "{field} must not be blank ({blank_hint})"
+        )));
+    }
+    let parsed = url::Url::parse(ep)
+        .map_err(|_| OpError::InvalidArgument(format!("{field} {ep:?} is not a valid URL")))?;
+    match parsed.scheme() {
+        "https" | "http" => Ok(ep.to_string()),
+        other => Err(OpError::InvalidArgument(format!(
+            "{field} scheme {other:?} is not acceptable \
+             (only https and http are allowed)"
+        ))),
+    }
+}
+
 /// The enrolled certificate's identity is the env's owning tenant, so an owner
 /// is required. Mirrors `vault_seed_put`'s fail-closed tenant guard (a
 /// Vault-backed env is single-tenant at the runtime) so the two write surfaces
@@ -1321,92 +1344,34 @@ pub fn config_set(
     // clear error immediately. Host-level policy (loopback vs insecure_http)
     // is decided *post-merge* under the lock against the effective merged
     // config — the early check cannot know the stored insecure_http value.
+    // Blank values are rejected fail-closed rather than silently no-op'd: an
+    // operator who passes a blank value is trying to change something.
     let validated_plan_endpoint = payload
         .plan_endpoint
         .as_deref()
         .map(|raw| {
-            let ep = raw.trim();
-            if ep.is_empty() {
-                // Reject fail-closed rather than silently no-op: an operator who
-                // passes a blank value is trying to change something. To stop
-                // polling, disable the channel; to repoint, pass a new URL.
-                return Err(OpError::InvalidArgument(
-                    "plan_endpoint must not be blank (to stop polling, disable \
-                     the channel; to repoint, pass a new URL)"
-                        .to_string(),
-                ));
-            }
-            let parsed = url::Url::parse(ep).map_err(|_| {
-                OpError::InvalidArgument(format!("plan_endpoint {ep:?} is not a valid URL"))
-            })?;
-            match parsed.scheme() {
-                "https" | "http" => {}
-                other => {
-                    return Err(OpError::InvalidArgument(format!(
-                        "plan_endpoint scheme {other:?} is not acceptable \
-                         (only https and http are allowed)"
-                    )));
-                }
-            }
-            Ok(ep.to_string())
+            early_check_url(
+                "plan_endpoint",
+                raw,
+                "to stop polling, disable the channel; to repoint, pass a new URL",
+            )
         })
         .transpose()?;
     let validated_stream_endpoint = payload
         .stream_endpoint
         .as_deref()
         .map(|raw| {
-            let ep = raw.trim();
-            if ep.is_empty() {
-                return Err(OpError::InvalidArgument(
-                    "stream_endpoint must not be blank (omit the flag to leave \
-                     unchanged; unset derives from plan_endpoint)"
-                        .to_string(),
-                ));
-            }
-            let parsed = url::Url::parse(ep).map_err(|_| {
-                OpError::InvalidArgument(format!("stream_endpoint {ep:?} is not a valid URL"))
-            })?;
-            match parsed.scheme() {
-                "https" | "http" => {}
-                other => {
-                    return Err(OpError::InvalidArgument(format!(
-                        "stream_endpoint scheme {other:?} is not acceptable \
-                         (only https and http are allowed)"
-                    )));
-                }
-            }
-            Ok(ep.to_string())
+            early_check_url(
+                "stream_endpoint",
+                raw,
+                "omit the flag to leave unchanged; unset derives from plan_endpoint",
+            )
         })
         .transpose()?;
     let validated_blob_base_url = payload
         .blob_base_url
         .as_deref()
-        .map(|raw| {
-            let ep = raw.trim();
-            if ep.is_empty() {
-                return Err(OpError::InvalidArgument(
-                    "blob_base_url must not be blank (omit the flag to leave \
-                     unchanged)"
-                        .to_string(),
-                ));
-            }
-            // Reject outright-invalid URLs (unparseable or scheme not http/https)
-            // early so the operator gets a clear error before we reach the
-            // transact lock. The full insecure-aware check runs post-merge.
-            let parsed = url::Url::parse(ep).map_err(|_| {
-                OpError::InvalidArgument(format!("blob_base_url {ep:?} is not a valid URL"))
-            })?;
-            match parsed.scheme() {
-                "https" | "http" => {}
-                other => {
-                    return Err(OpError::InvalidArgument(format!(
-                        "blob_base_url scheme {other:?} is not acceptable \
-                         (only https and http are allowed)"
-                    )));
-                }
-            }
-            Ok(ep.to_string())
-        })
+        .map(|raw| early_check_url("blob_base_url", raw, "omit the flag to leave unchanged"))
         .transpose()?;
     if payload.clear_blob_base_url == Some(true) && validated_blob_base_url.is_some() {
         return Err(OpError::InvalidArgument(
@@ -1515,35 +1480,21 @@ pub fn config_set(
             // this gate runs against the effective merged config so it sees
             // the stored insecure_http even when the current command omits it.
             let effective_insecure = cfg.resolved_insecure_http();
-            if let Some(ref ep) = cfg.plan_endpoint
-                && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
-            {
-                return Err(OpError::InvalidArgument(format!(
-                    "plan_endpoint {ep:?} is not acceptable under \
-                     insecure_http={effective_insecure}: https is required, \
-                     and plain http is allowed only to loopback unless \
-                     insecure_http=true"
-                )));
-            }
-            if let Some(ref ep) = cfg.stream_endpoint
-                && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
-            {
-                return Err(OpError::InvalidArgument(format!(
-                    "stream_endpoint {ep:?} is not acceptable under \
-                     insecure_http={effective_insecure}: https is required, \
-                     and plain http is allowed only to loopback unless \
-                     insecure_http=true"
-                )));
-            }
-            if let Some(ref ep) = cfg.blob_base_url
-                && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
-            {
-                return Err(OpError::InvalidArgument(format!(
-                    "blob_base_url {ep:?} is not acceptable under \
-                     insecure_http={effective_insecure}: https is required, \
-                     and plain http is allowed only to loopback unless \
-                     insecure_http=true"
-                )));
+            for (field, value) in [
+                ("plan_endpoint", &cfg.plan_endpoint),
+                ("stream_endpoint", &cfg.stream_endpoint),
+                ("blob_base_url", &cfg.blob_base_url),
+            ] {
+                if let Some(ep) = value
+                    && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
+                {
+                    return Err(OpError::InvalidArgument(format!(
+                        "{field} {ep:?} is not acceptable under \
+                         insecure_http={effective_insecure}: https is required, \
+                         and plain http is allowed only to loopback unless \
+                         insecure_http=true"
+                    )));
+                }
             }
 
             locked.save_update_channel(&cfg)?;
