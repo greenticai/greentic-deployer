@@ -11321,6 +11321,15 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             !sha.contains(':'),
             "plan_sha256 must be bare hex, got: {sha}"
         );
+        // The served plan.json must be the EXACT bytes the DSSE signature (and
+        // meta.plan_sha256) cover — the poll loop digest-checks the download
+        // against meta, so a re-serialized plan (even a semantically identical
+        // one) would fail every fleet fetch.
+        assert_eq!(
+            greentic_update::plan::sha256_hex(&plan_json),
+            sha,
+            "served plan.json bytes must hash to meta.plan_sha256"
+        );
 
         // Every plan-referenced digest must be present under blobs/.
         let art_digest = digest_of(art_data);
