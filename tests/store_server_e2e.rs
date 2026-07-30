@@ -118,14 +118,7 @@ fn runtime_for(id: &EnvId) -> EnvironmentRuntime {
 }
 
 fn host_config(raw: &str) -> EnvironmentHostConfig {
-    EnvironmentHostConfig {
-        env_id: env_id(raw),
-        region: Some("eu-west-1".to_string()),
-        tenant_org_id: None,
-        listen_addr: None,
-        public_base_url: None,
-        gui_enabled: None,
-    }
+    EnvironmentHostConfig::new(env_id(raw)).with_region("eu-west-1".to_string())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -188,6 +181,7 @@ async fn remote_env_lifecycle_end_to_end() {
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");
@@ -838,6 +832,7 @@ async fn backup_restore_end_to_end() {
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .expect("update environment");
@@ -1158,6 +1153,7 @@ async fn remote_reconcile_authorization_end_to_end() {
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::Keep,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .expect("advance the env out-of-band");

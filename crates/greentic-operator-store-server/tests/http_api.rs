@@ -494,14 +494,9 @@ async fn get_corrupt_stored_env_is_500_internal() {
     let env = greentic_deploy_spec::engine::fresh_environment(
         &greentic_deploy_spec::EnvId::try_from("other").unwrap(),
         "other".to_string(),
-        greentic_deploy_spec::EnvironmentHostConfig {
-            env_id: greentic_deploy_spec::EnvId::try_from("other").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-        },
+        greentic_deploy_spec::EnvironmentHostConfig::new(
+            greentic_deploy_spec::EnvId::try_from("other").unwrap(),
+        ),
         greentic_deploy_spec::RevocationConfig::default(),
         greentic_deploy_spec::RetentionPolicy::default(),
         greentic_deploy_spec::HealthStatus::default(),
@@ -578,14 +573,7 @@ async fn seed_env_with_deployment(store: &SqliteEnvironmentStore, env_id: &str) 
     let mut env = greentic_deploy_spec::engine::fresh_environment(
         &eid,
         env_id.to_string(),
-        EnvironmentHostConfig {
-            env_id: eid.clone(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-        },
+        EnvironmentHostConfig::new(eid.clone()),
         Default::default(),
         Default::default(),
         Default::default(),

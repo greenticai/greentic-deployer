@@ -438,8 +438,21 @@ pub enum TrustRootVerb {
     /// Add a `(key_id, public_pem)` pair. PEM source: `--public-key-pem` (inline)
     /// or `--public-key-file <PATH>`.
     Add(TrustRootAddArgs),
+    /// Resolve a `did:web` document and trust every key it authorizes, deriving
+    /// each `key_id` rather than taking one. Add-only: never removes a key, so
+    /// a hijacked document cannot revoke the local operator key.
+    #[command(name = "add-did")]
+    AddDid(TrustRootAddDidArgs),
     /// Remove a key by `key_id` (case-insensitive). No-op if absent.
     Remove(TrustRootRemoveArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TrustRootAddDidArgs {
+    pub env_id: Option<String>,
+    /// e.g. `did:web:trust.greentic.cloud`.
+    #[arg(long = "did")]
+    pub did: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -878,6 +891,24 @@ pub struct UpdatesPublishArgs {
     /// partial releases silently producing fewer artifacts than expected.
     #[arg(long = "expected-target-count", requires = "release")]
     pub expected_target_count: Option<usize>,
+    /// JSON file containing an array of release specs. Each entry describes
+    /// one GitHub release to derive binary artifacts from:
+    /// `[{"name":"greentic-start","version":"1.1.28","repo":"greenticai/greentic-start",
+    ///    "tag":"v1.1.28","archive_prefix":null,"checksums_asset":null,
+    ///    "targets":null,"expected_target_count":null}, ...]`.
+    /// Mutually exclusive with the single-release flags.
+    #[arg(
+        long = "release-specs-file",
+        conflicts_with_all = [
+            "release",
+            "binaries",
+            "release_repo",
+            "release_binary_name",
+            "targets",
+            "expected_target_count",
+        ]
+    )]
+    pub release_specs_file: Option<PathBuf>,
     /// Path to a trust-root.json file for plan signing verification.
     /// Bypasses the env-store trust root lookup, enabling CI runners
     /// with no local env dir.
@@ -945,6 +976,24 @@ pub struct UpdatesPlanBuildArgs {
     /// release contains a different number of archives.
     #[arg(long = "expected-target-count", requires = "release")]
     pub expected_target_count: Option<usize>,
+    /// JSON file containing an array of release specs. Each entry describes
+    /// one GitHub release to derive binary artifacts from:
+    /// `[{"name":"greentic-start","version":"1.1.28","repo":"greenticai/greentic-start",
+    ///    "tag":"v1.1.28","archive_prefix":null,"checksums_asset":null,
+    ///    "targets":null,"expected_target_count":null}, ...]`.
+    /// Mutually exclusive with the single-release flags.
+    #[arg(
+        long = "release-specs-file",
+        conflicts_with_all = [
+            "release",
+            "binaries",
+            "release_repo",
+            "release_binary_name",
+            "targets",
+            "expected_target_count",
+        ]
+    )]
+    pub release_specs_file: Option<PathBuf>,
     /// Path to a trust-root.json file for plan signing verification.
     /// Bypasses the env-store trust root lookup, enabling CI runners
     /// with no local env dir.
@@ -1436,6 +1485,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 TrustRootVerb::Bootstrap { .. } => "bootstrap",
                 TrustRootVerb::List { .. } => "list",
                 TrustRootVerb::Add(_) => "add",
+                TrustRootVerb::AddDid(_) => "add-did",
                 TrustRootVerb::Remove(_) => "remove",
             },
         ),
@@ -1730,6 +1780,18 @@ fn dispatch_trust_root(
                 _ => None, // fall through to --answers / --schema
             };
             super::trust_root::add(store, flags, payload)?
+        }
+        TrustRootVerb::AddDid(args) => {
+            let payload = match (args.env_id, args.did) {
+                (Some(environment_id), Some(did)) => {
+                    Some(super::trust_root::TrustRootAddDidPayload {
+                        environment_id,
+                        did,
+                    })
+                }
+                _ => None, // fall through to --answers / --schema
+            };
+            super::trust_root::add_did(store, flags, payload)?
         }
         TrustRootVerb::Remove(args) => {
             let payload = match (args.env_id, args.key_id) {

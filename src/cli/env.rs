@@ -122,18 +122,14 @@ pub fn create(
     };
     audit_and_record(store, ctx, |_committed| {
         let env = store
-            .create_environment(
-                &env_id,
-                payload.name,
-                EnvironmentHostConfig {
-                    env_id: env_id.clone(),
-                    region: payload.region,
-                    tenant_org_id: payload.tenant_org_id,
-                    listen_addr: parsed_listen_addr,
-                    public_base_url: parsed_public_base_url,
-                    gui_enabled: None,
-                },
-            )
+            .create_environment(&env_id, payload.name, {
+                let mut hc = EnvironmentHostConfig::new(env_id.clone());
+                hc.region = payload.region;
+                hc.tenant_org_id = payload.tenant_org_id;
+                hc.listen_addr = parsed_listen_addr;
+                hc.public_base_url = parsed_public_base_url;
+                hc
+            })
             .map_err(map_store_err_preserving_noun)?;
         let outcome = OpOutcome::new(
             NOUN,
@@ -190,6 +186,7 @@ pub fn update(
                     listen_addr: FieldUpdate::Keep,
                     public_base_url: FieldUpdate::from_option(parsed_public_base_url),
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .map_err(map_store_err_preserving_noun)?;
@@ -3300,6 +3297,7 @@ mod tests {
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -3345,6 +3343,7 @@ mod tests {
                     listen_addr: FieldUpdate::Clear, // clear
                     public_base_url: FieldUpdate::Set("https://new.example.com".to_string()),
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .unwrap();
@@ -3393,6 +3392,7 @@ mod tests {
                     listen_addr: FieldUpdate::Clear,
                     public_base_url: FieldUpdate::Clear,
                     gui_enabled: FieldUpdate::Keep,
+                    default_bundle: FieldUpdate::Keep,
                 },
             )
             .unwrap();

@@ -821,14 +821,8 @@ mod tests {
         use greentic_deploy_spec::{EnvId, EnvironmentHostConfig};
         use std::path::Path;
         let env_id: &'static EnvId = Box::leak(Box::new(EnvId::try_from("local").unwrap()));
-        let host: &'static EnvironmentHostConfig = Box::leak(Box::new(EnvironmentHostConfig {
-            env_id: env_id.clone(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled: None,
-        }));
+        let host: &'static EnvironmentHostConfig =
+            Box::leak(Box::new(EnvironmentHostConfig::new(env_id.clone())));
         ValidationContext {
             env_id,
             env_root: Path::new("/tmp/gcp-cloudrun-validate-test"),

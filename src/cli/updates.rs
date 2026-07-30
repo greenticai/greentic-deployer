@@ -18,10 +18,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
-    EnvId, Environment, MIN_POLL_INTERVAL_SECS, UpdateAction, UpdateChannelConfig,
+    DEFAULT_PLAN_ENDPOINT, EnvId, Environment, MIN_POLL_INTERVAL_SECS, UpdateAction,
+    UpdateChannelConfig,
 };
 use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use greentic_secrets_lib::core::rt;
+use greentic_update::plan::{BROADCAST_ENV_ID, plan_targets_env};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -30,7 +32,7 @@ use crate::environment::{
     trust_root as store_trust_root,
 };
 
-use super::env_manifest::{ENV_MANIFEST_SCHEMA_V1, EnvManifest};
+use super::env_manifest::{ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestEnvironment};
 use super::secrets::{get_env_secret, put_env_secret, require_secrets_pack};
 use super::{AuditCtx, OpError, OpFlags, OpOutcome, audit_and_record};
 
@@ -544,30 +546,15 @@ fn get_impl(
     let verified = greentic_update::plan::verify_update_plan(&plan_bytes, &envelope_bytes, &trust)
         .map_err(|e| OpError::Conflict(format!("update plan failed verification: {e}")))?;
 
-    // 3. The plan must target THIS environment. Two identities must agree — the
-    //    plan header (`plan.env_id`) AND the signed desired-state manifest it
+    // 3. The plan must be addressed to THIS environment — an exact `env_id`
+    //    match, or the fleet broadcast channel (`_`). Two identities must agree —
+    //    the plan header (`plan.env_id`) AND the signed desired-state manifest it
     //    carries (`target.environment.id`). Both are under the DSSE signature, so
     //    a divergence means a buggy/compromised signer produced a plan whose
     //    header names this env while its manifest reconciles another; fail closed
     //    on either mismatch before touching the staging tree.
-    if verified.plan.env_id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "plan targets env `{}`, not `{env_id}`",
-            verified.plan.env_id
-        )));
-    }
-    let manifest: EnvManifest =
-        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
-            ))
-        })?;
-    if manifest.environment.id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "plan target manifest names env `{}`, not `{env_id}`",
-            manifest.environment.id
-        )));
-    }
+    check_plan_addresses_env(&verified.plan.env_id, &env_id, "plan")?;
+    deserialize_plan_manifest(&verified.plan.target, &verified.plan.env_id)?;
 
     // 4. Admit to staging under a single lock hold — or RESUME an
     //    already-admitted identical plan. The downgrade guard (monotonic
@@ -708,7 +695,10 @@ fn admit_or_resume(
                 // Stranded mid-flight: re-gate against the CURRENT applied set
                 // before resuming, so a newer applied plan invalidates it.
                 UpdateStage::Downloading | UpdateStage::Inbox => {
-                    admit_plan(verified, &current_admission_facts(root)?)?;
+                    admit_plan(
+                        verified,
+                        &current_admission_facts(root, &verified.plan.env_id)?,
+                    )?;
                     Ok(existing)
                 }
                 // Already admitted AND promoted — its gates ran at begin.
@@ -730,8 +720,15 @@ fn admit_or_resume(
 
 /// Snapshot the applied-plan set for a resume-time re-gate (best-effort — not
 /// under the staging lock; the atomic gate is `begin_checked`).
+///
+/// `channel` is the resuming plan's target env (`_` for broadcast, the env name
+/// for per-env). The downgrade watermark is scoped to it — matching the
+/// authoritative `begin_checked` gate (greentic-update >= 1.1.2) — so a plan
+/// resuming after its env migrated channels is not wedged by the other channel's
+/// higher applied sequence. `StageState.channel` is backfilled by `list()`.
 fn current_admission_facts(
     root: &greentic_update::staging::UpdatesRoot,
+    channel: &str,
 ) -> Result<greentic_update::staging::AdmissionFacts, OpError> {
     let applied: Vec<_> = root
         .list()
@@ -740,7 +737,13 @@ fn current_admission_facts(
         .filter(|s| s.stage == greentic_update::staging::UpdateStage::Applied)
         .collect();
     Ok(greentic_update::staging::AdmissionFacts {
-        latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
+        // Per-channel downgrade watermark (see the doc note above).
+        latest_applied_sequence: applied
+            .iter()
+            .filter(|s| s.channel.as_deref() == Some(channel))
+            .map(|s| s.sequence)
+            .max(),
+        // `requires` is environment-wide — keep every applied id across channels.
         applied_plan_ids: applied.into_iter().map(|s| s.plan_id).collect(),
     })
 }
@@ -930,6 +933,12 @@ fn apply_updates_impl(
     // artifacts at the already-verified staged blobs so the apply runs from
     // local disk instead of re-fetching them from the network.
     let target = materialize_bundles(&verified.plan.target, &staged_blobs);
+    // Resolve the broadcast address to this environment's identity. `env_apply`
+    // reconciles the environment the manifest NAMES, and it does not create
+    // one — so a `_` target would send it looking for an environment called `_`
+    // and fail the whole apply ("environment `_` not found"). `_` was only ever
+    // an address; the environment being converged is this one.
+    let target = localize_broadcast_target(target, &env_id);
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
@@ -1386,6 +1395,13 @@ pub fn config_set(
         )));
     }
 
+    // Enabling without an explicit endpoint triggers the fleet-default write:
+    // the operator is subscribing to the channel and hasn't said where to poll,
+    // so we persist `DEFAULT_PLAN_ENDPOINT` (write-time, not read-time — see the
+    // deploy-spec test `enabled_config_with_no_endpoint_resolves_plan_to_none`).
+    let enabling_without_endpoint =
+        payload.enabled == Some(true) && validated_plan_endpoint.is_none();
+
     let mut fields = Vec::new();
     if payload.enabled.is_some() {
         fields.push("enabled");
@@ -1399,7 +1415,16 @@ pub fn config_set(
     if payload.poll_interval_secs.is_some() {
         fields.push("poll_interval_secs");
     }
-    if validated_plan_endpoint.is_some() {
+    // Deliberately over-reports: `enabling_without_endpoint` only says a default
+    // *may* be written — whether it actually is depends on `cfg.plan_endpoint`,
+    // which is read under the lock below, after this audit target is already
+    // sealed. Re-enabling a channel that already has a stored endpoint therefore
+    // lists `plan_endpoint` without changing it. That direction is the safe one:
+    // the alternative leaves a real write — one that points a runtime at a
+    // Greentic-operated URL — with no audit record at all. Do not "tighten" this
+    // to `validated_plan_endpoint.is_some()` without first giving the closure a
+    // way to amend `AuditCtx::target`.
+    if validated_plan_endpoint.is_some() || enabling_without_endpoint {
         fields.push("plan_endpoint");
     }
     if payload.push_enabled.is_some() {
@@ -1441,66 +1466,86 @@ pub fn config_set(
         // disjoint concurrent `config-set`s can't drop each other's fields, and
         // a corrupt/spoofed env directory (which `exists` alone would admit) is
         // rejected fail-closed before anything is written.
-        let cfg = store.transact(&env_id, |locked| -> Result<UpdateChannelConfig, OpError> {
-            // Validated Environment load under the lock (schema + env-id binding).
-            locked.load()?;
-            let mut cfg = locked
-                .load_update_channel()?
-                .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
-            if let Some(enabled) = payload.enabled {
-                cfg.enabled = Some(enabled);
-            }
-            if let Some(action) = parsed_action {
-                cfg.set_action(action);
-            }
-            if let Some(secs) = payload.poll_interval_secs {
-                cfg.poll_interval_secs = Some(secs);
-            }
-            if let Some(ep) = validated_plan_endpoint {
-                cfg.plan_endpoint = Some(ep);
-            }
-            if let Some(pe) = payload.push_enabled {
-                cfg.push_enabled = Some(pe);
-            }
-            if let Some(ep) = validated_stream_endpoint {
-                cfg.stream_endpoint = Some(ep);
-            }
-            if payload.clear_blob_base_url == Some(true) {
-                cfg.blob_base_url = None;
-            } else if let Some(ep) = validated_blob_base_url {
-                cfg.blob_base_url = Some(ep);
-            }
-            if let Some(ih) = payload.insecure_http {
-                cfg.insecure_http = Some(ih);
-            }
-
-            // Post-merge host-policy gate: the authoritative check that
-            // decides whether a plain-HTTP non-loopback URL is acceptable.
-            // Early checks above only validate scheme sanity (http/https);
-            // this gate runs against the effective merged config so it sees
-            // the stored insecure_http even when the current command omits it.
-            let effective_insecure = cfg.resolved_insecure_http();
-            for (field, value) in [
-                ("plan_endpoint", &cfg.plan_endpoint),
-                ("stream_endpoint", &cfg.stream_endpoint),
-                ("blob_base_url", &cfg.blob_base_url),
-            ] {
-                if let Some(ep) = value
-                    && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
-                {
-                    return Err(OpError::InvalidArgument(format!(
-                        "{field} {ep:?} is not acceptable under \
-                         insecure_http={effective_insecure}: https is required, \
-                         and plain http is allowed only to loopback unless \
-                         insecure_http=true"
-                    )));
+        let (cfg, defaulted_endpoint) = store.transact(
+            &env_id,
+            |locked| -> Result<(UpdateChannelConfig, bool), OpError> {
+                // Validated Environment load under the lock (schema + env-id binding).
+                locked.load()?;
+                let mut cfg = locked
+                    .load_update_channel()?
+                    .unwrap_or_else(|| UpdateChannelConfig::disabled(env_id.clone()));
+                if let Some(enabled) = payload.enabled {
+                    cfg.enabled = Some(enabled);
                 }
-            }
+                if let Some(action) = parsed_action {
+                    cfg.set_action(action);
+                }
+                if let Some(secs) = payload.poll_interval_secs {
+                    cfg.poll_interval_secs = Some(secs);
+                }
+                let mut defaulted = false;
+                if let Some(ep) = validated_plan_endpoint {
+                    cfg.plan_endpoint = Some(ep);
+                } else if enabling_without_endpoint && cfg.plan_endpoint.is_none() {
+                    // No endpoint supplied, none stored, and the operator is
+                    // enabling — persist the fleet default so the runtime has
+                    // somewhere to poll. Write-time, not read-time.
+                    cfg.plan_endpoint = Some(DEFAULT_PLAN_ENDPOINT.to_owned());
+                    defaulted = true;
+                }
+                if let Some(pe) = payload.push_enabled {
+                    cfg.push_enabled = Some(pe);
+                }
+                if let Some(ep) = validated_stream_endpoint {
+                    cfg.stream_endpoint = Some(ep);
+                }
+                if payload.clear_blob_base_url == Some(true) {
+                    cfg.blob_base_url = None;
+                } else if let Some(ep) = validated_blob_base_url {
+                    cfg.blob_base_url = Some(ep);
+                }
+                if let Some(ih) = payload.insecure_http {
+                    cfg.insecure_http = Some(ih);
+                }
 
-            locked.save_update_channel(&cfg)?;
-            Ok(cfg)
-        })?;
-        let outcome = OpOutcome::new(NOUN, "config-set", config_view(&cfg));
+                // Post-merge host-policy gate: the authoritative check that
+                // decides whether a plain-HTTP non-loopback URL is acceptable.
+                // Early checks above only validate scheme sanity (http/https);
+                // this gate runs against the effective merged config so it sees
+                // the stored insecure_http even when the current command omits it.
+                let effective_insecure = cfg.resolved_insecure_http();
+                for (field, value) in [
+                    ("plan_endpoint", &cfg.plan_endpoint),
+                    ("stream_endpoint", &cfg.stream_endpoint),
+                    ("blob_base_url", &cfg.blob_base_url),
+                ] {
+                    if let Some(ep) = value
+                        && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
+                    {
+                        return Err(OpError::InvalidArgument(format!(
+                            "{field} {ep:?} is not acceptable under \
+                             insecure_http={effective_insecure}: https is required, \
+                             and plain http is allowed only to loopback unless \
+                             insecure_http=true"
+                        )));
+                    }
+                }
+
+                locked.save_update_channel(&cfg)?;
+                Ok((cfg, defaulted))
+            },
+        )?;
+        let mut view = config_view(&cfg);
+        if defaulted_endpoint {
+            // Make the defaulting visible: silently pointing a runtime at a
+            // Greentic-operated URL is exactly the kind of thing that must
+            // surface in the operator's output.
+            view["defaulted_plan_endpoint"] = json!(DEFAULT_PLAN_ENDPOINT);
+            view["note"] = json!(format!(
+                "no plan_endpoint supplied; using fleet default: {DEFAULT_PLAN_ENDPOINT}"
+            ));
+        }
+        let outcome = OpOutcome::new(NOUN, "config-set", view);
         Ok((outcome, super::AuditGens::NONE))
     })
 }
@@ -1589,26 +1634,14 @@ fn reverify_staged(
             verified.plan.plan_id
         )));
     }
-    // Target-env identity: the plan header AND the signed desired-state manifest
-    // must both name this env (both are under the DSSE signature).
-    if verified.plan.env_id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "staged plan targets env `{}`, not `{env_id}`",
-            verified.plan.env_id
-        )));
-    }
-    let manifest: EnvManifest =
-        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
-            OpError::InvalidArgument(format!(
-                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
-            ))
-        })?;
-    if manifest.environment.id != env_id.as_str() {
-        return Err(OpError::InvalidArgument(format!(
-            "plan target manifest names env `{}`, not `{env_id}`",
-            manifest.environment.id
-        )));
-    }
+    // Target-env addressing: the plan header AND the signed desired-state
+    // manifest must agree, and the plan must be addressed to this env or to the
+    // broadcast channel (both are under the DSSE signature). Re-checked here and
+    // not just at `get` time because the staging tree is on-disk state a plan can
+    // outlive: nothing stops a `_`-addressed plan being staged, the env being
+    // renamed, and this running against a different identity.
+    check_plan_addresses_env(&verified.plan.env_id, env_id, "staged plan")?;
+    let manifest = deserialize_plan_manifest(&verified.plan.target, &verified.plan.env_id)?;
     // Fail closed on manifest content this increment cannot apply *safely*. The
     // dev-store-secret guard needs the env's `Secrets` binding, the env dir (to
     // check the dev-store files aren't symlinked off the tree), and whether the
@@ -1618,6 +1651,166 @@ fn reverify_staged(
         std::env::var_os(super::secrets::DEV_SECRETS_PATH_ENV).is_some();
     check_applyable_manifest(&env, &env_dir, &manifest, dev_secrets_path_override)?;
     Ok(verified)
+}
+
+/// Reject a plan not addressed to this environment. `what` names the subject in
+/// the error (`"plan"` / `"staged plan"`).
+///
+/// Addressing is [`plan_targets_env`]: an exact match, or the fleet broadcast
+/// channel. It is the *third* of three independent gates, which is why widening
+/// it grants no new authority — a plan still has to arrive from the
+/// `plan_endpoint` the operator configured, and still has to verify against this
+/// env's own trust root, before it gets here.
+fn check_plan_addresses_env(plan_env: &str, env_id: &EnvId, what: &str) -> Result<(), OpError> {
+    if !plan_targets_env(plan_env, env_id.as_str()) {
+        return Err(OpError::InvalidArgument(format!(
+            "{what} targets env `{plan_env}`, not `{env_id}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Require the signed target manifest to name the same environment as the plan
+/// header.
+///
+/// Compared against the **plan header**, not the local env id. Checking each
+/// against the local id separately used to imply this agreement for free; once
+/// `_` is accepted that implication breaks, and a plan header of `_` paired with
+/// a manifest naming a real env (or vice versa) would slip through two
+/// independently-passing checks. A broadcast plan must be `_` on both sides.
+fn check_manifest_matches_plan_env(manifest: &EnvManifest, plan_env: &str) -> Result<(), OpError> {
+    if manifest.environment.id != plan_env {
+        return Err(OpError::InvalidArgument(format!(
+            "plan target manifest names env `{}`, but the plan header targets `{plan_env}`",
+            manifest.environment.id
+        )));
+    }
+    Ok(())
+}
+
+/// Deserialize the plan's target as an [`EnvManifest`] and verify that the
+/// manifest's `environment.id` matches the plan header, in one call. Used by
+/// both [`get_impl`] and [`reverify_staged`] — the two consumer-side sites
+/// that need the same deser + agreement check before further admission gates.
+fn deserialize_plan_manifest(
+    target: &serde_json::Value,
+    plan_env: &str,
+) -> Result<EnvManifest, OpError> {
+    let manifest: EnvManifest = serde_json::from_value(target.clone()).map_err(|e| {
+        OpError::InvalidArgument(format!(
+            "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
+        ))
+    })?;
+    check_manifest_matches_plan_env(&manifest, plan_env)?;
+    Ok(manifest)
+}
+
+/// Reject a broadcast (`_`-addressed) plan that declares anything beyond its own
+/// environment id.
+///
+/// A broadcast plan converges **every subscribed environment at once**, so the
+/// only thing it may safely carry is the plan's `binaries[]` — a self-update,
+/// which is uniform by nature and already digest-pinned under the DSSE
+/// signature. Every field of the target manifest is per-environment
+/// configuration: one `listen_addr` would rebind the whole fleet to the same
+/// port, one `packs[]` entry would rebind every env's capability slot, one
+/// `bundles[]` entry would push identical content everywhere. So a broadcast
+/// target must be **environment-id-only**.
+///
+/// Returns the first offending field. The manifest is destructured exhaustively
+/// on purpose: a new `EnvManifest` or `ManifestEnvironment` field fails to
+/// compile here until someone decides whether a broadcast plan may carry it.
+/// A `..` rest-pattern would let the next field silently default into the
+/// allowlist — which is exactly the fleet-wide mutation this guard exists to
+/// stop.
+fn broadcast_target_violation(manifest: &EnvManifest) -> Option<&'static str> {
+    let EnvManifest {
+        schema: _,
+        environment,
+        // `trust_root` / `updates` are refused for EVERY plan, broadcast or not,
+        // by the checks above; not re-reported here so the operator sees the
+        // specific takeover error rather than a generic scope one.
+        trust_root: _,
+        updates: _,
+        secrets,
+        packs,
+        bundles,
+        extensions,
+        messaging_endpoints,
+        cluster,
+        vault_bootstrap,
+    } = manifest;
+    let ManifestEnvironment {
+        id: _,
+        public_base_url,
+        name,
+        region,
+        tenant_org_id,
+        listen_addr,
+        gui_enabled,
+        default_bundle,
+    } = environment;
+
+    // Host config first — these are the fleet-rebinding ones.
+    if listen_addr.is_some() {
+        return Some("environment.listen_addr");
+    }
+    if public_base_url.is_some() {
+        return Some("environment.public_base_url");
+    }
+    if name.is_some() {
+        return Some("environment.name");
+    }
+    if region.is_some() {
+        return Some("environment.region");
+    }
+    if tenant_org_id.is_some() {
+        return Some("environment.tenant_org_id");
+    }
+    if gui_enabled.is_some() {
+        return Some("environment.gui_enabled");
+    }
+    if default_bundle.is_some() {
+        return Some("environment.default_bundle");
+    }
+    if !secrets.is_empty() {
+        return Some("secrets");
+    }
+    if !packs.is_empty() {
+        return Some("packs");
+    }
+    if !bundles.is_empty() {
+        return Some("bundles");
+    }
+    if !extensions.is_empty() {
+        return Some("extensions");
+    }
+    if !messaging_endpoints.is_empty() {
+        return Some("messaging_endpoints");
+    }
+    if cluster.is_some() {
+        return Some("cluster");
+    }
+    if vault_bootstrap.is_some() {
+        return Some("vault_bootstrap");
+    }
+    None
+}
+
+/// [`broadcast_target_violation`] as a fail-closed gate.
+fn check_broadcast_target_is_id_only(manifest: &EnvManifest) -> Result<(), OpError> {
+    if manifest.environment.id != BROADCAST_ENV_ID {
+        return Ok(());
+    }
+    if let Some(field) = broadcast_target_violation(manifest) {
+        return Err(OpError::InvalidArgument(format!(
+            "broadcast update plan (env `{BROADCAST_ENV_ID}`) declares `{field}`: a plan on the \
+             fleet channel is applied by EVERY subscribed environment, so its target manifest must \
+             carry nothing but `environment.id`. Publish per-environment content to that \
+             environment's own channel instead."
+        )));
+    }
+    Ok(())
 }
 
 /// Reject a target manifest whose apply/rollback this increment cannot yet
@@ -1662,6 +1855,24 @@ fn check_applyable_manifest(
                 .to_string(),
         ));
     }
+    // Same invariant for the trust root: a plan that seeds or rotates the
+    // env's signing-key trust anchor would gain permanent signing authority.
+    // Stripped at sign time by `strip_non_applyable_blocks`; refused here as
+    // the fail-closed backstop.
+    if manifest.trust_root.is_some() {
+        return Err(OpError::InvalidArgument(
+            "update plan target declares a `trust_root` block: a plan may not \
+             re-point the trust root it is verified against. Configure the \
+             trust root with `op env apply`."
+                .to_string(),
+        ));
+    }
+    // A broadcast plan converges every subscribed environment, so its target may
+    // carry nothing but the environment id. Checked after the takeover guards
+    // above (so those report their specific error) and before the per-env
+    // guards below (which reason about THIS env's runtime state — meaningless
+    // for a plan addressed to all of them).
+    check_broadcast_target_is_id_only(manifest)?;
     // secrets[] / messaging_endpoints[] both write dev-store secret material;
     // allow them only when a failed apply's rollback (the P0b snapshot) would
     // undo those writes — i.e. the effective sink is the snapshotted dev-store.
@@ -1828,6 +2039,31 @@ fn materialize_entry(entry: &mut Value, staged_blobs: &BTreeMap<String, PathBuf>
             );
         }
     }
+}
+
+/// Rewrite a broadcast target's `environment.id` from `_` to the environment
+/// actually being converged. A non-broadcast target is returned untouched.
+///
+/// `_` addresses a plan; it never names an environment. `env_apply` reconciles
+/// the environment its manifest names and refuses to create one, so handing it
+/// a `_` target fails the entire apply with "environment `_` not found" — after
+/// the plan has staged, verified and passed every gate. Same principle as
+/// `StageState.env_id` recording the local environment rather than `_`.
+///
+/// Safe only because [`check_broadcast_target_is_id_only`] has already run (in
+/// `reverify_staged` → `check_applyable_manifest`): a broadcast target is
+/// guaranteed to carry nothing but `environment.id`, so swapping that id yields
+/// a manifest with no per-environment content at all. If that guard is ever
+/// relaxed, this rewrite stops being a rename and starts silently retargeting
+/// whatever else the manifest declares.
+fn localize_broadcast_target(mut target: Value, env_id: &EnvId) -> Value {
+    let Some(env) = target.get_mut("environment").and_then(Value::as_object_mut) else {
+        return target;
+    };
+    if env.get("id").and_then(Value::as_str) == Some(BROADCAST_ENV_ID) {
+        env.insert("id".to_string(), Value::String(env_id.as_str().to_string()));
+    }
+    target
 }
 
 /// Write the plan's signed target manifest to a temp file and drive the
@@ -2090,19 +2326,31 @@ fn load_plan_source(
         &payload.plan_sig_file,
     ) {
         (Some(url), None, None) => {
-            // The plan is fetched over the enrolled mTLS identity, which is only
-            // presented over TLS — reject plaintext `http://` (except loopback,
-            // for a local dev server) so a remote endpoint can't be reached
-            // without the client cert.
             if !control_url_is_acceptable(url) {
                 return Err(OpError::InvalidArgument(
                     "plan_url must be an https:// URL; plaintext http:// is accepted only for a \
-                     loopback dev server. The enrolled mTLS client identity is presented only over \
-                     TLS, so a plaintext fetch would bypass it."
+                     loopback dev server."
                         .to_string(),
                 ));
             }
-            fetch_plan_over_mtls(store, env, env_id, url)
+            // Opportunistic mTLS: use the enrolled identity when available,
+            // fall back to an anonymous GET otherwise. Reads are public; the
+            // DSSE signature (verified after fetch) is the authenticity gate,
+            // not the client cert.
+            let identity = match env.pack_for_slot(greentic_deploy_spec::CapabilitySlot::Secrets) {
+                Some(secrets) => {
+                    let kind_path = secrets.kind.path();
+                    match require_tenant(env, env_id) {
+                        Ok(tenant) => load_identity(store, env, env_id, kind_path, &tenant)?,
+                        Err(_) => None,
+                    }
+                }
+                None => None,
+            };
+            match identity {
+                Some(_) => fetch_plan_over_mtls(store, env, env_id, url),
+                None => fetch_plan_anonymous(url),
+            }
         }
         (None, Some(plan), Some(sig)) => {
             let plan_bytes = std::fs::read(plan).map_err(|source| OpError::Io {
@@ -2166,6 +2414,37 @@ fn fetch_plan_over_mtls(
             client_key_pem: key_pem,
         })
         .map_err(|e| OpError::Conflict(format!("stored mTLS identity is unusable: {e}")))?;
+        let plan_bytes = mtls_get(&client, plan_url).await?;
+        let sig_bytes = mtls_get(&client, &sig_url).await?;
+        Ok::<(Vec<u8>, Vec<u8>), OpError>((plan_bytes, sig_bytes))
+    })
+}
+
+/// Fetch the plan document + `.sig` sidecar over a plain (server-auth-only)
+/// HTTP client. Used when the environment has no enrolled mTLS identity.
+/// The DSSE signature verified after fetch is the authenticity gate.
+fn fetch_plan_anonymous(plan_url: &str) -> Result<(Vec<u8>, Vec<u8>), OpError> {
+    let sig_url = {
+        let mut u = url::Url::parse(plan_url)
+            .map_err(|e| OpError::InvalidArgument(format!("plan_url: {e}")))?;
+        let sig_path = format!("{}.sig", u.path());
+        u.set_path(&sig_path);
+        u.to_string()
+    };
+    rt::sync_await(async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            // The plan endpoint is a direct, operator-configured URL already
+            // validated by `control_url_is_acceptable`. Refuse to follow
+            // redirects — as a hard error, not a silently-returned 3xx body — so
+            // an accepted https endpoint cannot redirect the plan/sig fetch to a
+            // plaintext http target and defeat that scheme check (the fleet
+            // did:web resolver takes the same stance).
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                attempt.error("refusing to follow a plan-fetch redirect")
+            }))
+            .build()
+            .map_err(|e| OpError::Fetch(format!("building HTTP client: {e}")))?;
         let plan_bytes = mtls_get(&client, plan_url).await?;
         let sig_bytes = mtls_get(&client, &sig_url).await?;
         Ok::<(Vec<u8>, Vec<u8>), OpError>((plan_bytes, sig_bytes))
@@ -2318,8 +2597,83 @@ fn resolve_release_artifacts(
         tag: format!("v{version}"),
         targets: targets.to_vec(),
         expected_target_count,
+        archive_prefix: None,
+        checksums_asset: None,
     };
     super::release_artifacts::derive_binary_artifacts(&spec)
+}
+
+/// A single entry in the `--release-specs-file` JSON array.
+#[derive(Debug, serde::Deserialize)]
+struct ReleaseSpecEntry {
+    name: String,
+    version: String,
+    repo: String,
+    tag: Option<String>,
+    archive_prefix: Option<String>,
+    checksums_asset: Option<String>,
+    targets: Option<Vec<String>>,
+    expected_target_count: Option<usize>,
+}
+
+/// Resolve `--release-specs-file` into pre-derived `BinaryArtifact`s from
+/// multiple GitHub releases. Fail-closed: rejects an empty file, an
+/// unparseable entry, a malformed `repo`, or any entry that yields zero
+/// artifacts (a silently-empty entry would look like "this package is
+/// unchanged" to clients, which is the exact silent-correctness hazard this
+/// feature exists to prevent).
+fn resolve_multi_release_artifacts(
+    path: &Path,
+) -> Result<Vec<greentic_update::plan::BinaryArtifact>, OpError> {
+    let contents = std::fs::read_to_string(path).map_err(|source| OpError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let entries: Vec<ReleaseSpecEntry> = serde_json::from_str(&contents).map_err(|e| {
+        OpError::InvalidArgument(format!("release-specs-file {}: {e}", path.display()))
+    })?;
+    if entries.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "release-specs-file {} is an empty array",
+            path.display()
+        )));
+    }
+
+    let mut all_artifacts = Vec::new();
+    for entry in &entries {
+        let (owner, repo) = parse_owner_repo(&entry.repo);
+        if owner.is_empty() || repo.is_empty() {
+            return Err(OpError::InvalidArgument(format!(
+                "release-specs-file: entry `{}` has malformed repo `{}`",
+                entry.name, entry.repo
+            )));
+        }
+        let tag = entry
+            .tag
+            .clone()
+            .unwrap_or_else(|| format!("v{}", entry.version));
+        let spec = super::release_artifacts::ReleaseSpec {
+            owner,
+            repo,
+            binary_name: entry.name.clone(),
+            version: entry.version.clone(),
+            tag,
+            targets: entry.targets.clone().unwrap_or_default(),
+            expected_target_count: entry.expected_target_count,
+            archive_prefix: entry.archive_prefix.clone(),
+            checksums_asset: entry.checksums_asset.clone(),
+        };
+        let artifacts = super::release_artifacts::derive_binary_artifacts(&spec)?;
+        if artifacts.is_empty() {
+            return Err(OpError::InvalidArgument(format!(
+                "release-specs-file: entry `{}` (tag {}) yielded zero artifacts",
+                entry.name, spec.tag,
+            )));
+        }
+        all_artifacts.extend(artifacts);
+    }
+
+    Ok(all_artifacts)
 }
 
 /// `op updates plan-build` — build and DSSE-sign an [`UpdatePlan`] carrying a
@@ -2350,13 +2704,17 @@ pub fn plan_build(
         .sequence
         .ok_or_else(|| OpError::InvalidArgument("--sequence is required".to_string()))?;
 
-    let derived_binaries = resolve_release_artifacts(
-        args.release.as_deref(),
-        args.release_repo.as_deref(),
-        args.release_binary_name.as_deref(),
-        &args.targets,
-        args.expected_target_count,
-    )?;
+    let derived_binaries = if let Some(ref specs_file) = args.release_specs_file {
+        resolve_multi_release_artifacts(specs_file)?
+    } else {
+        resolve_release_artifacts(
+            args.release.as_deref(),
+            args.release_repo.as_deref(),
+            args.release_binary_name.as_deref(),
+            &args.targets,
+            args.expected_target_count,
+        )?
+    };
 
     let signed = build_and_sign_plan(
         store,
@@ -2400,7 +2758,8 @@ pub fn plan_build(
             "key_id": signed.key_id,
             "plan_path": plan_path.display().to_string(),
             "sig_path": sig_path.display().to_string(),
-            "stripped_updates_block": signed.stripped_updates_block,
+            "stripped_updates_block": signed.stripped.updates,
+            "stripped_trust_root": signed.stripped.trust_root,
         }),
     ))
 }
@@ -2429,20 +2788,38 @@ struct SignedPlan {
     envelope_bytes: Vec<u8>,
     plan_sha256: String,
     key_id: String,
-    /// The target manifest declared an `updates` block and it was removed before
-    /// signing — reported so the operator learns their channel policy did not
-    /// ship inside the plan.
-    stripped_updates_block: bool,
+    /// Which non-applyable blocks were stripped from the target before signing.
+    stripped: StrippedBlocks,
 }
 
-/// Remove an `updates` block from a plan target, returning whether one was
-/// there. The update channel is operator-local state: a plan that could
-/// re-point `plan_endpoint` would control every plan that follows it. Stripped
-/// here at sign time; [`check_applyable_manifest`] refuses it at apply time.
-fn strip_updates_block(target: &mut serde_json::Value) -> bool {
-    target
-        .as_object_mut()
-        .is_some_and(|obj| obj.remove("updates").is_some())
+/// Remove blocks that [`check_applyable_manifest`] would reject from a plan
+/// target, returning which ones were present. Stripped here at sign time;
+/// `check_applyable_manifest` refuses them at apply time as the fail-closed
+/// backstop for plans built any other way.
+///
+/// Currently strips:
+/// - `updates` — the update channel is operator-local state; a plan that
+///   re-points `plan_endpoint` controls every plan that follows it.
+/// - `trust_root` — seeds or rotates the env's signing-key trust anchor; a
+///   plan that re-points it gains permanent signing authority.
+fn strip_non_applyable_blocks(target: &mut serde_json::Value) -> StrippedBlocks {
+    let Some(obj) = target.as_object_mut() else {
+        return StrippedBlocks {
+            updates: false,
+            trust_root: false,
+        };
+    };
+    StrippedBlocks {
+        updates: obj.remove("updates").is_some(),
+        trust_root: obj.remove("trust_root").is_some(),
+    }
+}
+
+/// Which non-applyable blocks were stripped from a plan target at sign time.
+#[derive(Debug, Clone, Copy)]
+struct StrippedBlocks {
+    updates: bool,
+    trust_root: bool,
 }
 
 /// Reject, before signing, a plan target the consumer is guaranteed to refuse.
@@ -2467,12 +2844,21 @@ fn validate_plan_target(target: &serde_json::Value, env_id: &EnvId) -> Result<()
         ))
     })?;
     manifest.validate_shape()?;
+    // The producer signs the header and the target together, so here the two
+    // must be identical — this is not the consumer's `plan_targets_env` wildcard
+    // (an operator publishing to `_` passes `_` as `env_id`).
     if manifest.environment.id != env_id.as_str() {
         return Err(OpError::InvalidArgument(format!(
             "plan target declares environment `{}`, but the plan is for `{env_id}`",
             manifest.environment.id
         )));
     }
+    // Refuse to SIGN a broadcast plan the fleet would reject at apply time. The
+    // consumer backstop in `check_applyable_manifest` is per-environment and
+    // fires once per subscriber per poll; catching it here means the operator
+    // learns at publish time instead of never (nothing reports fleet-wide
+    // rejection back to the publisher).
+    check_broadcast_target_is_id_only(&manifest)?;
     Ok(())
 }
 
@@ -2649,7 +3035,7 @@ fn build_and_sign_plan(
             "environment": { "id": env_id.as_str() },
         }),
     };
-    let stripped_updates_block = strip_updates_block(&mut target);
+    let stripped = strip_non_applyable_blocks(&mut target);
     // Validate the document we are about to sign — i.e. after the strip.
     validate_plan_target(&target, env_id)?;
 
@@ -2691,7 +3077,7 @@ fn build_and_sign_plan(
         envelope_bytes: built.envelope_bytes,
         plan_sha256: built.plan_sha256,
         key_id: built.key_id,
-        stripped_updates_block,
+        stripped,
     })
 }
 
@@ -2766,13 +3152,17 @@ pub fn publish(
         return Ok(OpOutcome::new(NOUN, "publish", publish_schema()));
     }
 
-    let derived_binaries = resolve_release_artifacts(
-        args.release.as_deref(),
-        args.release_repo.as_deref(),
-        args.release_binary_name.as_deref(),
-        &args.targets,
-        args.expected_target_count,
-    )?;
+    let derived_binaries = if let Some(ref specs_file) = args.release_specs_file {
+        resolve_multi_release_artifacts(specs_file)?
+    } else {
+        resolve_release_artifacts(
+            args.release.as_deref(),
+            args.release_repo.as_deref(),
+            args.release_binary_name.as_deref(),
+            &args.targets,
+            args.expected_target_count,
+        )?
+    };
 
     let token = args
         .upload_token
@@ -2881,7 +3271,8 @@ pub fn publish(
             "key_id": signed.key_id,
             "plan_endpoint": plan_endpoint,
             "status": "published",
-            "stripped_updates_block": signed.stripped_updates_block,
+            "stripped_updates_block": signed.stripped.updates,
+            "stripped_trust_root": signed.stripped.trust_root,
         }),
     ))
 }
@@ -4816,6 +5207,143 @@ mod tests {
         assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
 
+    // --- default plan endpoint (config-set) ---------------------------------
+
+    #[test]
+    fn config_set_enabling_without_endpoint_persists_default() {
+        // An operator enables the channel but supplies no --plan-endpoint and
+        // none is stored: the fleet default is persisted at write time so the
+        // runtime has somewhere to poll.
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let out = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(
+            cfg.plan_endpoint.as_deref(),
+            Some(DEFAULT_PLAN_ENDPOINT),
+            "enabling without an endpoint must persist the fleet default"
+        );
+        assert!(cfg.resolved_enabled());
+        // The outcome must surface the defaulting visibly — silently pointing a
+        // runtime at a Greentic-operated URL is the kind of thing that must
+        // appear in the operator's output.
+        assert_eq!(
+            out.result["defaulted_plan_endpoint"].as_str(),
+            Some(DEFAULT_PLAN_ENDPOINT),
+            "outcome must carry `defaulted_plan_endpoint` so the operator sees it"
+        );
+        assert!(
+            out.result["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains(DEFAULT_PLAN_ENDPOINT),
+            "outcome note must mention the default URL"
+        );
+    }
+
+    #[test]
+    fn config_set_enabling_with_stored_endpoint_leaves_it_alone() {
+        // An operator has already set a custom endpoint, then enables the
+        // channel without re-supplying --plan-endpoint: the stored endpoint
+        // must not be overwritten by the fleet default.
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        let custom = "https://custom.example.com/plans/latest";
+        // First: store a custom endpoint.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(false),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some(custom.into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        // Second: enable with no --plan-endpoint.
+        let out = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            out.result["plan_endpoint"].as_str(),
+            Some(custom),
+            "stored custom endpoint must not be overwritten by the default"
+        );
+        assert!(
+            out.result.get("defaulted_plan_endpoint").is_none()
+                || out.result["defaulted_plan_endpoint"].is_null(),
+            "no defaulting note when the endpoint was already stored"
+        );
+    }
+
+    #[test]
+    fn config_set_disabling_without_endpoint_does_not_default() {
+        // Disabling the channel with no endpoint must not inject the fleet
+        // default — deny-by-default means a disabled channel has no source.
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(false),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert!(
+            cfg.plan_endpoint.is_none(),
+            "disabling must not inject a plan_endpoint"
+        );
+        assert!(!cfg.resolved_enabled());
+    }
+
     #[test]
     fn config_set_unknown_env_is_not_found() {
         let dir = tempdir().unwrap();
@@ -6036,6 +6564,246 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert!(matches!(err, OpError::Conflict(m) if m.contains("corrupt")));
     }
 
+    // ---- anonymous plan-url fetch (Defect 3) ----
+
+    /// Tiny mock HTTP server that serves pre-canned responses for N sequential
+    /// connections (one response per connection). Mirrors the pattern in
+    /// `dispatch_remote::tests`.
+    struct PlanMockServer {
+        addr: std::net::SocketAddr,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    fn start_plan_mock(responses: Vec<(u16, Vec<u8>)>) -> PlanMockServer {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                // Consume request headers.
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let status_text = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {status_text}\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let w = reader.get_mut();
+                w.write_all(resp.as_bytes()).unwrap();
+                w.write_all(&body).unwrap();
+                w.flush().unwrap();
+            }
+        });
+        PlanMockServer {
+            addr,
+            _handle: handle,
+        }
+    }
+
+    /// Mock that answers `count` sequential connections with a `302` redirect to
+    /// `location`. Used to prove the anonymous fetch does NOT follow redirects.
+    fn start_redirect_mock(location: String, count: usize) -> PlanMockServer {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\n\
+                     Location: {location}\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                );
+                let w = reader.get_mut();
+                w.write_all(resp.as_bytes()).unwrap();
+                w.flush().unwrap();
+            }
+        });
+        PlanMockServer {
+            addr,
+            _handle: handle,
+        }
+    }
+
+    #[test]
+    fn plan_url_anonymous_refuses_redirects() {
+        // A plan server that 302-redirects the plan/sig fetch must NOT be
+        // followed: an accepted https endpoint could otherwise redirect to
+        // plaintext http, defeating the `control_url_is_acceptable` scheme
+        // check. With redirects refused, the 302 surfaces as a fetch error
+        // instead of transparently fetching the redirected target.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        // Where a followed redirect WOULD land (serves plan then sig).
+        let target = start_plan_mock(vec![
+            (200, b"redir-plan".to_vec()),
+            (200, b"redir-sig".to_vec()),
+        ]);
+        let location = format!("http://127.0.0.1:{}/plan", target.addr.port());
+        // Redirector answers both the plan and the sig request with a 302.
+        let redirector = start_redirect_mock(location, 2);
+
+        let plan_url = format!(
+            "http://127.0.0.1:{}/v1/environments/local/plan",
+            redirector.addr.port()
+        );
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some(plan_url),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        let err = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap_err();
+        assert!(
+            matches!(&err, OpError::Fetch(_)),
+            "a redirected plan fetch must fail (redirects refused), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_url_anonymous_fetch_succeeds_when_unenrolled() {
+        // An env with no secrets pack / no enrollment must still fetch a plan
+        // over a plain HTTP GET (the DSSE signature is the authenticity gate).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Env WITHOUT a secrets pack or tenant — not enrolled.
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        let plan_body = b"plan-document-bytes";
+        let sig_body = b"sig-envelope-bytes";
+        // The mock serves two connections: first the plan, then the .sig sidecar.
+        let mock = start_plan_mock(vec![(200, plan_body.to_vec()), (200, sig_body.to_vec())]);
+
+        let plan_url = format!(
+            "http://127.0.0.1:{}/v1/environments/local/plan",
+            mock.addr.port()
+        );
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some(plan_url),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        let (got_plan, got_sig) = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap();
+        assert_eq!(got_plan, plan_body);
+        assert_eq!(got_sig, sig_body);
+    }
+
+    #[test]
+    fn plan_url_uses_mtls_when_enrolled() {
+        // An env WITH a secrets pack + tenant + enrolled identity must
+        // still prefer the mTLS path. We can't spin up a real mTLS server
+        // in a unit test, so we just verify the code path picks the mTLS
+        // branch by confirming that `fetch_plan_over_mtls` is reached (it
+        // will fail trying to build the mTLS client from test PEMs, which
+        // is fine — the point is it doesn't fall through to anonymous).
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = dev_store_env_with_tenant();
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        // Persist a synthetic identity so load_identity returns Some.
+        let identity = StoredIdentity {
+            client_key_pem: "KEY".into(),
+            client_cert_pem: "CERT".into(),
+            ca_pem: "CA".into(),
+            ca_url: "https://ca.example".into(),
+        };
+        put_env_secret(
+            &store,
+            &loaded_env,
+            &env_id,
+            DEV_STORE_KIND_PATH,
+            &tls_rel_path("acme", IDENTITY_NAME),
+            &serde_json::to_string(&identity).unwrap(),
+        )
+        .unwrap();
+
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some("http://127.0.0.1:1/v1/plan".into()),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        // The mTLS path will fail because the test PEMs aren't real TLS
+        // material — the error proves the code entered that branch.
+        let err = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap_err();
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("mTLS")),
+            "expected mTLS path error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plan_url_hard_fails_on_corrupt_identity() {
+        // A corrupt identity blob must produce a hard error, never silently
+        // degrade to anonymous fetch.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = dev_store_env_with_tenant();
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let loaded_env = store.load(&env_id).unwrap();
+
+        put_env_secret(
+            &store,
+            &loaded_env,
+            &env_id,
+            DEV_STORE_KIND_PATH,
+            &tls_rel_path("acme", IDENTITY_NAME),
+            "not-json",
+        )
+        .unwrap();
+
+        let payload = UpdatesGetPayload {
+            environment_id: "local".into(),
+            plan_url: Some("http://127.0.0.1:1/v1/plan".into()),
+            plan_file: None,
+            plan_sig_file: None,
+        };
+        let err = load_plan_source(&store, &loaded_env, &env_id, &payload).unwrap_err();
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("corrupt")),
+            "expected corrupt-identity error, got: {err:?}"
+        );
+    }
+
     // ---- `get` ----
 
     use greentic_distributor_client::signing::{TrustRoot, TrustedKey};
@@ -6321,6 +7089,333 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    // ---- fleet broadcast channel (`_`) ----
+
+    /// Write a signed plan/envelope pair to disk and return the two paths, so a
+    /// test can drive `get_impl` through the local-file source.
+    fn plan_pair_on_disk(dir: &std::path::Path, plan_b: &[u8], sig_b: &[u8]) -> (PathBuf, PathBuf) {
+        let plan_file = dir.join("plan.json");
+        let sig_file = dir.join("plan.json.sig");
+        std::fs::write(&plan_file, plan_b).unwrap();
+        std::fs::write(&sig_file, sig_b).unwrap();
+        (plan_file, sig_file)
+    }
+
+    #[test]
+    fn get_admits_a_broadcast_plan_into_a_differently_named_env() {
+        // The whole point of the fleet channel: a plan addressed to `_` is
+        // applied by an env called something else entirely.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        assert_ne!(
+            env_id.as_str(),
+            BROADCAST_ENV_ID,
+            "fixture env must not be `_`"
+        );
+
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (plan_b, sig_b) = signed_plan_target(
+            BROADCAST_ENV_ID,
+            "plan-broadcast",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let out = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+        assert_eq!(out.result["stage"], "staged");
+        assert_eq!(out.result["plan_id"], "plan-broadcast");
+    }
+
+    #[test]
+    fn get_still_rejects_a_plan_for_another_named_env() {
+        // Widening to `_` must not widen to "any env id" — the exact-match arm
+        // is untouched.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+
+        let (plan_b, sig_b) = signed_plan_target(
+            "some-other-env",
+            "plan-foreign",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": "some-other-env"},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let err = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("some-other-env")));
+    }
+
+    #[test]
+    fn get_rejects_a_broadcast_header_whose_manifest_names_a_real_env() {
+        // The dangerous half-match: before `_` was accepted, checking the header
+        // and the manifest against the LOCAL id each implied they agreed with
+        // each other. That implication is gone, so the manifest is now compared
+        // to the header. A `_` header carrying a manifest for a named env would
+        // otherwise pass the header gate (broadcast) while reconciling another
+        // environment's desired state on every subscriber.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+
+        let (plan_b, sig_b) = signed_plan_target(
+            BROADCAST_ENV_ID,
+            "plan-half-match",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": "victim-env"},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let err = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("victim-env")));
+    }
+
+    #[test]
+    fn get_rejects_a_named_header_whose_manifest_is_broadcast() {
+        // The mirror image: a header naming this env, carrying a `_` manifest.
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+
+        let (plan_b, sig_b) = signed_plan_target(
+            env_id.as_str(),
+            "plan-mirror",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let (plan_file, sig_file) = plan_pair_on_disk(dir.path(), &plan_b, &sig_b);
+
+        let err = get_impl(
+            &store,
+            &OpFlags::default(),
+            Some(UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_file),
+                plan_sig_file: Some(sig_file),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)));
+    }
+
+    // ---- broadcast plans are environment-id-only ----
+
+    #[test]
+    fn broadcast_target_rejects_every_non_id_field() {
+        // Table-driven so the guard cannot be half-implemented: each entry is a
+        // field that, on the fleet channel, would be applied identically to
+        // EVERY subscribed environment.
+        let cases: &[(&str, Value)] = &[
+            (
+                "environment.listen_addr",
+                json!({"listen_addr": "0.0.0.0:9999"}),
+            ),
+            (
+                "environment.public_base_url",
+                json!({"public_base_url": "https://evil.example"}),
+            ),
+            ("environment.name", json!({"name": "renamed"})),
+            ("environment.region", json!({"region": "eu-west-1"})),
+            (
+                "environment.tenant_org_id",
+                json!({"tenant_org_id": "org-x"}),
+            ),
+            ("environment.gui_enabled", json!({"gui_enabled": true})),
+            (
+                "environment.default_bundle",
+                json!({"default_bundle": "acct"}),
+            ),
+        ];
+        for (field, extra) in cases {
+            let mut env_obj = json!({"id": BROADCAST_ENV_ID});
+            for (k, v) in extra.as_object().unwrap() {
+                env_obj[k] = v.clone();
+            }
+            let m = parse_manifest(json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": env_obj,
+            }));
+            let err = check_broadcast_target_is_id_only(&m).expect_err(&format!(
+                "`{field}` must be refused on the broadcast channel"
+            ));
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains(field)),
+                "error for `{field}` should name the field, got: {err:?}"
+            );
+        }
+
+        // Top-level collections / blocks.
+        let top_level: &[(&str, Value)] = &[
+            (
+                "secrets",
+                json!({"secrets": [{"path": "acme/_/tls/foo", "from_env": "FOO"}]}),
+            ),
+            (
+                "bundles",
+                json!({"bundles": [{"bundle_id": "b1", "bundle_path": "/x.gtbundle"}]}),
+            ),
+            (
+                "messaging_endpoints",
+                json!({"messaging_endpoints": [
+                    {"name": "tg", "provider_type": "telegram"}
+                ]}),
+            ),
+            (
+                "packs",
+                json!({"packs": [
+                    {"slot": "secrets", "kind": "greentic/secrets-dev", "pack_ref": "r"}
+                ]}),
+            ),
+            (
+                "extensions",
+                json!({"extensions": [
+                    {"kind": "greentic/ext", "pack_ref": "r"}
+                ]}),
+            ),
+            (
+                "cluster",
+                json!({"cluster": {"provider": "kind", "name": "c1"}}),
+            ),
+            (
+                "vault_bootstrap",
+                json!({"vault_bootstrap": {"deploy": "dev-in-cluster"}}),
+            ),
+        ];
+        for (field, extra) in top_level {
+            let mut doc = json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                doc[k] = v.clone();
+            }
+            let m = parse_manifest(doc);
+            let err = check_broadcast_target_is_id_only(&m).expect_err(&format!(
+                "`{field}` must be refused on the broadcast channel"
+            ));
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains(field)),
+                "error for `{field}` should name the field, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_target_accepts_an_id_only_manifest() {
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID},
+        }));
+        check_broadcast_target_is_id_only(&m).unwrap();
+    }
+
+    #[test]
+    fn the_id_only_rule_applies_only_to_broadcast_plans() {
+        // A per-environment plan may still carry host config — the restriction
+        // is a property of the CHANNEL, not of update plans in general.
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local", "listen_addr": "127.0.0.1:8080"},
+        }));
+        check_broadcast_target_is_id_only(&m).unwrap();
+    }
+
+    #[test]
+    fn publish_refuses_to_sign_a_broadcast_plan_carrying_host_config() {
+        // Producer-side: the operator learns at publish time. Nothing reports
+        // fleet-wide apply rejection back to the publisher, so without this the
+        // failure would be invisible.
+        let target = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID, "listen_addr": "0.0.0.0:9999"},
+        });
+        let broadcast_id = EnvId::try_from(BROADCAST_ENV_ID).unwrap();
+        let err = validate_plan_target(&target, &broadcast_id).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("environment.listen_addr")),
+            "got: {err:?}"
+        );
+
+        // The id-only form signs fine.
+        let ok = json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID},
+        });
+        validate_plan_target(&ok, &broadcast_id).unwrap();
     }
 
     #[test]
@@ -6703,6 +7798,48 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
+    fn admit_or_resume_regate_is_channel_scoped() {
+        use greentic_update::staging::UpdateStage;
+        let updates_dir = tempdir().unwrap();
+        let (priv9, tk9) = key_pair(9);
+        let build_trust = TrustRoot::new(vec![tk9.clone()]);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+
+        // A high-sequence BROADCAST plan (channel `_`) is already Applied.
+        let (pb, sb) = signed_plan(
+            "_",
+            "bcast",
+            100,
+            json!([]),
+            json!({}),
+            &priv9,
+            &tk9.key_id,
+            &build_trust,
+        );
+        let vb = verify_with(&pb, &sb, &tk9);
+        let applied = root.begin(&vb, &pb, &sb).unwrap();
+        applied.transition(UpdateStage::Inbox).unwrap();
+        applied.transition(UpdateStage::Staged).unwrap();
+        applied.transition(UpdateStage::Applying).unwrap();
+        applied.transition(UpdateStage::Applied).unwrap();
+
+        // A lower-sequence PER-ENV plan (channel `local`) stranded at `downloading`.
+        let (ps, ss, vs) = signed_local("perenv", 5, &priv9, &tk9);
+        root.begin(&vs, &ps, &ss).unwrap();
+        assert_eq!(
+            root.load("perenv").unwrap().unwrap().stage().unwrap(),
+            UpdateStage::Downloading
+        );
+
+        // Resuming it must be ADMITTED, not rejected: the broadcast watermark is
+        // on a different channel, so seq 5 on the per-env channel is not a
+        // downgrade. Before per-channel scoping, the unscoped max (100) wedged it.
+        let resumed = admit_or_resume(&root, &vs, &ps, &ss).unwrap();
+        assert_eq!(resumed.stage().unwrap(), UpdateStage::Downloading);
+    }
+
+    #[test]
     fn admit_or_resume_refuses_terminal_plan() {
         use greentic_update::staging::UpdateStage;
         let updates_dir = tempdir().unwrap();
@@ -6835,6 +7972,91 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap_err();
         assert!(matches!(err, OpError::NotFound(_)));
+    }
+
+    #[test]
+    fn apply_converges_a_broadcast_plan_end_to_end() {
+        // The APPLY half of broadcast support, which `get`-only tests miss
+        // entirely. `reverify_staged` re-runs the identity checks against the
+        // staged bytes before converging, so a broadcast plan can stage cleanly
+        // and then fail at the last step — a half-working feature that looks
+        // fine until an operator actually publishes to the fleet channel.
+        //
+        // Verified by mutation: feeding `deserialize_plan_manifest` the local
+        // env id instead of the plan header inside `reverify_staged` was caught
+        // by NOTHING in the 1906-test suite before this test existed.
+        use greentic_update::staging::UpdateStage;
+        let dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (priv7, tk7) = key_pair(7);
+        let env_id = env_trusting(&store, &tk7);
+        assert_ne!(
+            env_id.as_str(),
+            BROADCAST_ENV_ID,
+            "fixture env must not be `_`"
+        );
+
+        // A `_`-addressed, id-only plan staged into the `local` env's tree.
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (p, sig) = signed_plan_target(
+            BROADCAST_ENV_ID,
+            "plan-bcast-apply",
+            1,
+            json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": {"id": BROADCAST_ENV_ID},
+            }),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let v = verify_with(&p, &sig, &tk7);
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let staged = root.begin(&v, &p, &sig).unwrap();
+        advance_to_staged(&staged).unwrap();
+
+        let out = apply_updates_impl(
+            &store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-bcast-apply".into(),
+            }),
+            Some(updates_dir.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.result["stage"], "applied");
+        assert_eq!(
+            on_disk_stage(updates_dir.path(), "plan-bcast-apply"),
+            UpdateStage::Applied
+        );
+    }
+
+    #[test]
+    fn localize_broadcast_target_rewrites_only_the_broadcast_id() {
+        // Broadcast -> local rename.
+        let out = localize_broadcast_target(
+            json!({"schema": "greentic.env-manifest.v1", "environment": {"id": BROADCAST_ENV_ID}}),
+            &EnvId::try_from("prod").unwrap(),
+        );
+        assert_eq!(out["environment"]["id"], "prod");
+
+        // A named target is untouched — this must never retarget a plan that
+        // was addressed to a specific environment.
+        let out = localize_broadcast_target(
+            json!({"schema": "greentic.env-manifest.v1", "environment": {"id": "staging"}}),
+            &EnvId::try_from("prod").unwrap(),
+        );
+        assert_eq!(out["environment"]["id"], "staging");
+
+        // Malformed shapes pass through rather than panicking; the manifest
+        // deser gate upstream is what rejects them.
+        let out =
+            localize_broadcast_target(json!({"schema": "x"}), &EnvId::try_from("prod").unwrap());
+        assert_eq!(out, json!({"schema": "x"}));
     }
 
     #[test]
@@ -7532,6 +8754,44 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
+    fn guard_rejects_a_broadcast_target_carrying_host_config() {
+        // The APPLY-PATH backstop, distinct from the producer gate and from the
+        // direct unit tests: `check_applyable_manifest` must refuse this on its
+        // own. `op updates publish` already refuses to SIGN it, so a plan that
+        // reaches here was built some other way — a bespoke or compromised
+        // signer — which is precisely when a backstop has to hold.
+        //
+        // Without this test, deleting the `check_broadcast_target_is_id_only`
+        // call from `check_applyable_manifest` left the whole suite green
+        // (verified by mutation): every other broadcast test either calls the
+        // guard directly or goes through the producer path.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID, "listen_addr": "0.0.0.0:9999"},
+        }));
+        let err = check_applyable_manifest(&env, td.path(), &m, false).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(msg) if msg.contains("environment.listen_addr")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn guard_accepts_an_id_only_broadcast_target() {
+        // The paired positive: the backstop must not reject legitimate
+        // broadcast plans, or the fleet channel is dead on arrival.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": BROADCAST_ENV_ID},
+        }));
+        check_applyable_manifest(&env, td.path(), &m, false).unwrap();
+    }
+
+    #[test]
     fn guard_rejects_a_plan_target_that_repoints_the_update_channel() {
         // A signed plan whose target re-points `plan_endpoint` would control
         // every plan that follows it. Refused before anything is applied.
@@ -7545,6 +8805,24 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         let err = check_applyable_manifest(&env, td.path(), &m, false).unwrap_err();
         assert!(
             matches!(err, OpError::InvalidArgument(msg) if msg.contains("re-point the update channel")),
+            "unexpected error"
+        );
+    }
+
+    #[test]
+    fn guard_rejects_a_plan_target_that_repoints_the_trust_root() {
+        // A signed plan whose target re-points the trust root would gain
+        // permanent signing authority. Refused before anything is applied.
+        let env = make_env("local");
+        let td = tempdir().unwrap();
+        let m = parse_manifest(json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "local"},
+            "trust_root": "bootstrap"
+        }));
+        let err = check_applyable_manifest(&env, td.path(), &m, false).unwrap_err();
+        assert!(
+            matches!(err, OpError::InvalidArgument(msg) if msg.contains("re-point the trust root")),
             "unexpected error"
         );
     }
@@ -7876,6 +9154,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             release_binary_name: None,
             targets: vec![],
             expected_target_count: None,
+            release_specs_file: None,
             trust_root: None,
         }
     }
@@ -8121,6 +9400,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             release_binary_name: None,
             targets: vec![],
             expected_target_count: None,
+            release_specs_file: None,
             trust_root: None,
             all_envs: false,
             plan_server_url: None,
@@ -8268,6 +9548,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         args.target_file = Some(target_file);
         let outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
         assert_eq!(outcome.result["stripped_updates_block"], json!(true));
+        assert_eq!(outcome.result["stripped_trust_root"], json!(false));
 
         let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
         let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
@@ -8280,6 +9561,51 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             "the signed target still carries an `updates` block"
         );
         // The rest of the manifest is untouched.
+        assert_eq!(
+            verified.plan.target["bundles"][0]["bundle_id"].as_str(),
+            Some("app")
+        );
+    }
+
+    #[test]
+    fn plan_build_strips_a_trust_root_block_from_the_signed_target() {
+        let dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let (key_path, tk) = write_ephemeral_key(dir.path());
+        env_trusting(&store, &tk);
+
+        let target_file = dir.path().join("target.json");
+        std::fs::write(
+            &target_file,
+            r#"{"schema":"greentic.env-manifest.v1","environment":{"id":"local"},
+                "trust_root":"bootstrap",
+                "bundles":[{"bundle_id":"app","bundle_path":"/tmp/app.gtbundle","bundle_digest":"sha256:aa"}]}"#,
+        )
+        .unwrap();
+
+        let mut args = plan_build_args(
+            "local",
+            2,
+            vec![],
+            Some(key_path),
+            out_dir.path().to_path_buf(),
+        );
+        args.target_file = Some(target_file);
+        let outcome = plan_build(&store, &OpFlags::default(), args).unwrap();
+        assert_eq!(outcome.result["stripped_trust_root"], json!(true));
+        assert_eq!(outcome.result["stripped_updates_block"], json!(false));
+
+        let plan_bytes = std::fs::read(out_dir.path().join("plan.json")).unwrap();
+        let sig_bytes = std::fs::read(out_dir.path().join("plan.json.sig")).unwrap();
+        let env_dir = store.env_dir(&EnvId::try_from("local").unwrap()).unwrap();
+        let trust = store_trust_root::load(&env_dir).unwrap();
+        let verified =
+            greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust).unwrap();
+        assert!(
+            verified.plan.target.get("trust_root").is_none(),
+            "the signed target still carries a `trust_root` block"
+        );
         assert_eq!(
             verified.plan.target["bundles"][0]["bundle_id"].as_str(),
             Some("app")
@@ -8405,18 +9731,63 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
     }
 
     #[test]
-    fn strip_updates_block_reports_whether_one_was_present() {
+    fn strip_non_applyable_blocks_reports_whether_each_was_present() {
         let mut with = json!({"schema": "x", "updates": {"plan_endpoint": "https://u/p"}});
-        assert!(strip_updates_block(&mut with));
+        let s = strip_non_applyable_blocks(&mut with);
+        assert!(s.updates);
+        assert!(!s.trust_root);
         assert!(with.get("updates").is_none());
         assert_eq!(with["schema"], json!("x"));
 
         let mut without = json!({"schema": "x"});
-        assert!(!strip_updates_block(&mut without));
+        let s = strip_non_applyable_blocks(&mut without);
+        assert!(!s.updates);
+        assert!(!s.trust_root);
 
         // A non-object target (never produced here, but the helper must not panic).
         let mut scalar = json!("not-an-object");
-        assert!(!strip_updates_block(&mut scalar));
+        let s = strip_non_applyable_blocks(&mut scalar);
+        assert!(!s.updates);
+        assert!(!s.trust_root);
+    }
+
+    #[test]
+    fn strip_non_applyable_blocks_removes_trust_root() {
+        let mut target = json!({"schema": "x", "trust_root": "bootstrap"});
+        let s = strip_non_applyable_blocks(&mut target);
+        assert!(s.trust_root);
+        assert!(!s.updates);
+        assert!(target.get("trust_root").is_none());
+        assert_eq!(target["schema"], json!("x"));
+    }
+
+    #[test]
+    fn strip_non_applyable_blocks_removes_both_updates_and_trust_root() {
+        let mut target = json!({
+            "schema": "x",
+            "updates": {"plan_endpoint": "https://u/p"},
+            "trust_root": "bootstrap"
+        });
+        let s = strip_non_applyable_blocks(&mut target);
+        assert!(s.updates);
+        assert!(s.trust_root);
+        assert!(target.get("updates").is_none());
+        assert!(target.get("trust_root").is_none());
+        assert_eq!(target["schema"], json!("x"));
+    }
+
+    #[test]
+    fn strip_non_applyable_blocks_leaves_clean_manifest_unchanged() {
+        let mut target = json!({
+            "schema": "x",
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "app"}]
+        });
+        let original = target.clone();
+        let s = strip_non_applyable_blocks(&mut target);
+        assert!(!s.updates);
+        assert!(!s.trust_root);
+        assert_eq!(target, original);
     }
 
     #[test]
@@ -8630,6 +10001,50 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         let (owner2, repo2) = parse_owner_repo("greentic-start");
         assert_eq!(owner2, "greenticai");
         assert_eq!(repo2, "greentic-start");
+    }
+
+    // --- resolve_multi_release_artifacts tests --------------------------------
+
+    #[test]
+    fn multi_release_specs_empty_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let specs_path = dir.path().join("specs.json");
+        std::fs::write(&specs_path, "[]").unwrap();
+        let err = resolve_multi_release_artifacts(&specs_path).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("empty array")),
+            "expected empty-array error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_release_specs_malformed_json_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let specs_path = dir.path().join("specs.json");
+        std::fs::write(&specs_path, "not json").unwrap();
+        let err = resolve_multi_release_artifacts(&specs_path).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("release-specs-file")),
+            "expected parse error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_release_specs_malformed_repo_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let specs_path = dir.path().join("specs.json");
+        // repo with no slash resolves to ("greenticai", repo) via parse_owner_repo,
+        // but an empty string for repo is the malformed case.
+        std::fs::write(
+            &specs_path,
+            r#"[{"name":"x","version":"1.0.0","repo":"/bad"}]"#,
+        )
+        .unwrap();
+        let err = resolve_multi_release_artifacts(&specs_path).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("malformed repo")),
+            "expected malformed-repo error, got: {err:?}"
+        );
     }
 
     // ---- Phase A2: op updates export --------------------------------------
