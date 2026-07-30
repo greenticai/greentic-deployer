@@ -2699,9 +2699,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.30250846274"
+version = "1.2.0-dev.30452769385"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e38e14be50603a30154bd35d3510f5dd1976d1ac91c098a3b40959ca8067fec"
+checksum = "a8ec6f214ec5a9042254a4403c5e16b8d1c3982b22011b56c962e75f82a8c22a"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2733,9 +2733,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.30250846274"
+version = "1.2.0-dev.30452769385"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70be45775e969186612a3ecc4ca7b17d1feb167b9387b7aa663f5206d9eb3457"
+checksum = "fdbf4246e38a2d3613671313f08f94f721b9ef44bba3ef32b5ac40db0b5fb2a0"
 dependencies = [
  "backhand",
  "serde",
@@ -3177,9 +3177,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "1.2.0-dev.30432113510"
+version = "1.2.0-dev.30445743798"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ac1fb8dcf2d96786ada8993bc9472d2df6fe4ae46956ecda04e423d65bdd103"
+checksum = "da5728874d34ac5ad6586494eb1ce101e3a2c53240b7a3353a0209e4f0584eaa"
 dependencies = [
  "chrono",
  "flate2",
@@ -7696,7 +7696,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
