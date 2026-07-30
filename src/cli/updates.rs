@@ -150,6 +150,23 @@ pub struct UpdateConfigSetPayload {
     /// `plan_endpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_endpoint: Option<String>,
+    /// Base URL of an air-gap blob mirror serving content-addressed blobs at
+    /// `{blob_base_url}/sha256-<hex>`. `None` leaves the stored value unchanged;
+    /// must be https (or http when `insecure_http` is true / stored as true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_base_url: Option<String>,
+    /// Opt-in that allows plain-HTTP (non-TLS) plan/stream/blob endpoints on
+    /// non-loopback hosts — for air-gapped LANs where the mirror has no CA.
+    /// `None` leaves the stored value unchanged (absent resolves to `false`:
+    /// deny-by-default). Does NOT affect OCI insecure-registry settings, and
+    /// does NOT relax enrollment's `ca_url` (enrollment stays strict).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_http: Option<bool>,
+    /// When `true`, removes a previously configured `blob_base_url`. Conflicts
+    /// with `blob_base_url` — setting and clearing in the same command is
+    /// rejected fail-closed. `None` / absent leaves the stored value unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_blob_base_url: Option<bool>,
 }
 
 /// Filter for `op updates config-show` — read-only view of the update-channel
@@ -159,10 +176,83 @@ pub struct UpdateConfigShowFilter {
     pub environment_id: String,
 }
 
+/// Payload for `op updates export` — export a staged plan into a `.gtupdate`
+/// envelope for airgap transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesExportPayload {
+    pub environment_id: String,
+    /// Plan id of the staged plan to export (from a prior `op updates get`).
+    pub plan_id: String,
+    /// Output path for the `.gtupdate` envelope.
+    pub out: PathBuf,
+    /// Path to a signed import receipt from a prior import on the receiving
+    /// side. Blobs whose digests appear in the receipt's held-digest inventory
+    /// are skipped (delta export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_receipt: Option<PathBuf>,
+    /// DSSE signature sidecar for `base_receipt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_receipt_sig: Option<PathBuf>,
+    /// Target triples. When non-empty, only binary blobs whose target matches
+    /// are included; artifact/content blobs are always included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    /// PKCS#8 Ed25519 private key PEM path for signing the envelope manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id for the signing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    /// Path to a trust-root.json file for signature verification. Bypasses
+    /// the env-store trust root lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_root: Option<PathBuf>,
+}
+
 /// The dev-store/Vault secret path for one TLS artifact: `<tenant>/_/tls/<name>`
 /// (`<tenant>/<team>/<pack>/<name>` with the default team `_`).
 fn tls_rel_path(tenant: &str, name: &str) -> String {
     format!("{tenant}/_/{TLS_PACK}/{name}")
+}
+
+/// Whether a control-plane URL is acceptable given an explicit insecure-HTTP
+/// opt-in. HTTPS is always allowed. Plaintext `http://` is allowed to ANY host
+/// when `allow_insecure_http` is `true` — the operator has opted in for an
+/// air-gapped LAN where the mirror has no CA; trust in update content comes
+/// from DSSE signatures against the env trust root, not from transport. When
+/// `allow_insecure_http` is `false`, plaintext is allowed ONLY to a loopback
+/// host (same as the pre-C2 behavior). Every other scheme (`ftp://`, `file://`,
+/// etc.) is unconditionally rejected.
+///
+/// Security rationale: `insecure_http` is a per-env persisted opt-in that
+/// widens the URL policy for plan, stream, and blob endpoints on that
+/// environment only. Enrollment (`ca_url`) is intentionally excluded — it
+/// always calls the strict variant — so the trust-anchor bootstrap channel
+/// remains TLS-authenticated.
+pub(crate) fn control_url_is_acceptable_with_insecure(
+    raw: &str,
+    allow_insecure_http: bool,
+) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => {
+            if allow_insecure_http {
+                // Any host is acceptable when the operator opted in.
+                parsed.host().is_some()
+            } else {
+                match parsed.host() {
+                    Some(url::Host::Domain(host)) => host == "localhost",
+                    Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                    Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                    None => false,
+                }
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Whether a control-plane URL (the Cert-CA for enrollment, or the plan-fetch
@@ -173,18 +263,29 @@ fn tls_rel_path(tenant: &str, name: &str) -> String {
 /// validly-signed plan (fetch). A hostname that merely starts with `127.` (e.g.
 /// `127.0.0.1.evil.com`) parses as a domain, not a loopback IP, so it is refused.
 pub(crate) fn control_url_is_acceptable(raw: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(raw) else {
-        return false;
-    };
+    control_url_is_acceptable_with_insecure(raw, false)
+}
+
+/// The stored-state-independent half of config-set URL validation: trim,
+/// reject blank (with a field-specific hint), reject unparseable URLs and
+/// non-http(s) schemes. Host-level policy (loopback vs `insecure_http`) is
+/// deliberately NOT checked here — that needs the effective merged config,
+/// which only exists post-merge under the transact lock.
+fn early_check_url(field: &str, raw: &str, blank_hint: &str) -> Result<String, OpError> {
+    let ep = raw.trim();
+    if ep.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "{field} must not be blank ({blank_hint})"
+        )));
+    }
+    let parsed = url::Url::parse(ep)
+        .map_err(|_| OpError::InvalidArgument(format!("{field} {ep:?} is not a valid URL")))?;
     match parsed.scheme() {
-        "https" => true,
-        "http" => match parsed.host() {
-            Some(url::Host::Domain(host)) => host == "localhost",
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
-        },
-        _ => false,
+        "https" | "http" => Ok(ep.to_string()),
+        other => Err(OpError::InvalidArgument(format!(
+            "{field} scheme {other:?} is not acceptable \
+             (only https and http are allowed)"
+        ))),
     }
 }
 
@@ -1247,51 +1348,47 @@ pub fn config_set(
             "poll_interval_secs {secs} is below the {MIN_POLL_INTERVAL_SECS}s floor"
         )));
     }
+    // Early per-field URL checks: reject blanks, unparseable URLs, and
+    // non-http(s) schemes before the transact lock so the operator gets a
+    // clear error immediately. Host-level policy (loopback vs insecure_http)
+    // is decided *post-merge* under the lock against the effective merged
+    // config — the early check cannot know the stored insecure_http value.
+    // Blank values are rejected fail-closed rather than silently no-op'd: an
+    // operator who passes a blank value is trying to change something.
     let validated_plan_endpoint = payload
         .plan_endpoint
         .as_deref()
         .map(|raw| {
-            let ep = raw.trim();
-            if ep.is_empty() {
-                // Reject fail-closed rather than silently no-op: an operator who
-                // passes a blank value is trying to change something. To stop
-                // polling, disable the channel; to repoint, pass a new URL.
-                return Err(OpError::InvalidArgument(
-                    "plan_endpoint must not be blank (to stop polling, disable \
-                     the channel; to repoint, pass a new URL)"
-                        .to_string(),
-                ));
-            }
-            if !control_url_is_acceptable(ep) {
-                return Err(OpError::InvalidArgument(format!(
-                    "plan_endpoint {ep:?} is not an acceptable control URL \
-                     (https required; http only to loopback)"
-                )));
-            }
-            Ok(ep.to_string())
+            early_check_url(
+                "plan_endpoint",
+                raw,
+                "to stop polling, disable the channel; to repoint, pass a new URL",
+            )
         })
         .transpose()?;
     let validated_stream_endpoint = payload
         .stream_endpoint
         .as_deref()
         .map(|raw| {
-            let ep = raw.trim();
-            if ep.is_empty() {
-                return Err(OpError::InvalidArgument(
-                    "stream_endpoint must not be blank (omit the flag to leave \
-                     unchanged; unset derives from plan_endpoint)"
-                        .to_string(),
-                ));
-            }
-            if !control_url_is_acceptable(ep) {
-                return Err(OpError::InvalidArgument(format!(
-                    "stream_endpoint {ep:?} is not an acceptable control URL \
-                     (https required; http only to loopback)"
-                )));
-            }
-            Ok(ep.to_string())
+            early_check_url(
+                "stream_endpoint",
+                raw,
+                "omit the flag to leave unchanged; unset derives from plan_endpoint",
+            )
         })
         .transpose()?;
+    let validated_blob_base_url = payload
+        .blob_base_url
+        .as_deref()
+        .map(|raw| early_check_url("blob_base_url", raw, "omit the flag to leave unchanged"))
+        .transpose()?;
+    if payload.clear_blob_base_url == Some(true) && validated_blob_base_url.is_some() {
+        return Err(OpError::InvalidArgument(
+            "--clear-blob-base-url and --blob-base-url cannot be used together \
+             (set one or clear it, not both)"
+                .to_string(),
+        ));
+    }
     if !store.exists(&env_id)? {
         return Err(OpError::NotFound(format!(
             "environment `{env_id}` not found"
@@ -1336,12 +1433,31 @@ pub fn config_set(
     if validated_stream_endpoint.is_some() {
         fields.push("stream_endpoint");
     }
+    if validated_blob_base_url.is_some() || payload.clear_blob_base_url == Some(true) {
+        fields.push("blob_base_url");
+    }
+    if payload.insecure_http.is_some() {
+        fields.push("insecure_http");
+    }
 
+    let mut audit_target = json!({ "fields": fields });
+    // Security-sensitive fields carry their requested values into the audit
+    // target so a reviewer can distinguish "enabled insecure HTTP" from
+    // "disabled it" without correlating with a separate config snapshot.
+    if let Some(ih) = payload.insecure_http {
+        audit_target["insecure_http"] = json!(ih);
+    }
+    if let Some(ref ep) = validated_blob_base_url {
+        audit_target["blob_base_url"] = json!(ep);
+    }
+    if payload.clear_blob_base_url == Some(true) {
+        audit_target["blob_base_url"] = json!(null);
+    }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "config-set",
-        target: json!({ "fields": fields }),
+        target: audit_target,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
@@ -1383,6 +1499,38 @@ pub fn config_set(
                 if let Some(ep) = validated_stream_endpoint {
                     cfg.stream_endpoint = Some(ep);
                 }
+                if payload.clear_blob_base_url == Some(true) {
+                    cfg.blob_base_url = None;
+                } else if let Some(ep) = validated_blob_base_url {
+                    cfg.blob_base_url = Some(ep);
+                }
+                if let Some(ih) = payload.insecure_http {
+                    cfg.insecure_http = Some(ih);
+                }
+
+                // Post-merge host-policy gate: the authoritative check that
+                // decides whether a plain-HTTP non-loopback URL is acceptable.
+                // Early checks above only validate scheme sanity (http/https);
+                // this gate runs against the effective merged config so it sees
+                // the stored insecure_http even when the current command omits it.
+                let effective_insecure = cfg.resolved_insecure_http();
+                for (field, value) in [
+                    ("plan_endpoint", &cfg.plan_endpoint),
+                    ("stream_endpoint", &cfg.stream_endpoint),
+                    ("blob_base_url", &cfg.blob_base_url),
+                ] {
+                    if let Some(ep) = value
+                        && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
+                    {
+                        return Err(OpError::InvalidArgument(format!(
+                            "{field} {ep:?} is not acceptable under \
+                             insecure_http={effective_insecure}: https is required, \
+                             and plain http is allowed only to loopback unless \
+                             insecure_http=true"
+                        )));
+                    }
+                }
+
                 locked.save_update_channel(&cfg)?;
                 Ok((cfg, defaulted))
             },
@@ -1440,6 +1588,8 @@ fn config_view(cfg: &UpdateChannelConfig) -> Value {
         "plan_endpoint": cfg.plan_endpoint,
         "push_enabled": cfg.push_enabled,
         "stream_endpoint": cfg.stream_endpoint,
+        "blob_base_url": cfg.blob_base_url,
+        "insecure_http": cfg.insecure_http,
         "resolved": {
             "enabled": cfg.resolved_enabled(),
             "action": cfg.resolved_action().as_str(),
@@ -1448,6 +1598,8 @@ fn config_view(cfg: &UpdateChannelConfig) -> Value {
             "plan_endpoint": cfg.resolved_plan_endpoint(),
             "push_enabled": cfg.resolved_push_enabled(),
             "stream_endpoint": cfg.resolved_stream_endpoint(),
+            "blob_base_url": cfg.resolved_blob_base_url(),
+            "insecure_http": cfg.resolved_insecure_http(),
         }
     })
 }
@@ -2734,6 +2886,102 @@ fn load_trust_root_from_file(
 /// `op updates apply` is upsert-only, so the default minimal target is a no-op,
 /// and there is no binary for the runtime to swap. Refuse to sign it rather than
 /// mint a plan that reports `applied` without changing anything.
+/// Resolve the signing key for plan/envelope signing: an explicit
+/// `--signing-key` path, or the global operator key. Shared by `plan-build`
+/// (via [`build_and_sign_plan`]) and `export`.
+fn resolve_signing_key(
+    signing_key: Option<&Path>,
+) -> Result<(zeroize::Zeroizing<String>, String), OpError> {
+    match signing_key {
+        Some(key_path) => Ok(crate::operator_key::read_signing_key_at(key_path)?),
+        None => {
+            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "no --signing-key provided and the global operator key is unavailable: {e}. \
+                     Create or bootstrap the operator key first, or pass --signing-key <path>."
+                ))
+            })?;
+            Ok((op_key.private_pem, op_key.key_id))
+        }
+    }
+}
+
+/// Load the trust root from an explicit override path or the env store.
+fn resolve_trust_root(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    override_path: Option<&Path>,
+) -> Result<greentic_distributor_client::signing::TrustRoot, OpError> {
+    match override_path {
+        Some(path) => load_trust_root_from_file(path),
+        None => {
+            let env_dir = store.env_dir(env_id)?;
+            Ok(store_trust_root::load(&env_dir)?)
+        }
+    }
+}
+
+/// Resolve and preflight-verify a signing identity against the trust root.
+///
+/// Validates the key-id/signing-key flag pairing, loads the key, overrides the
+/// canonical id when `key_id_override` is given, then round-trips a probe
+/// receipt through the same sign+verify API the consumer uses. `consequence` is
+/// spliced into the error message so each call site keeps its context-specific
+/// phrasing (e.g. "the receiver would reject this envelope").
+fn preflight_signing_identity(
+    env_id: &EnvId,
+    signing_key: Option<&Path>,
+    key_id_override: Option<String>,
+    trust: &greentic_distributor_client::signing::TrustRoot,
+    consequence: &str,
+) -> Result<(zeroize::Zeroizing<String>, String), OpError> {
+    if key_id_override.is_some() && signing_key.is_none() {
+        return Err(OpError::InvalidArgument(
+            "--key-id requires --signing-key".to_string(),
+        ));
+    }
+    let (priv_pem, key_id) = resolve_signing_key(signing_key)?;
+    let key_id = key_id_override.unwrap_or(key_id);
+
+    let (probe_bytes, probe_sig) = greentic_update::envelope::build_import_receipt(
+        env_id.as_str(),
+        Vec::new(),
+        &priv_pem,
+        &key_id,
+    )
+    .map_err(|e| {
+        OpError::Conflict(format!(
+            "signing-identity preflight: build probe failed: {e}"
+        ))
+    })?;
+    greentic_update::envelope::verify_import_receipt(&probe_bytes, &probe_sig, trust).map_err(
+        |e| {
+            OpError::InvalidArgument(format!(
+                "signing identity `{key_id}` is not trusted by env `{env_id}`'s trust root \
+                 — {consequence}: {e}"
+            ))
+        },
+    )?;
+
+    Ok((priv_pem, key_id))
+}
+
+/// Build, sign, and write an import receipt for the given CAS inventory.
+fn sign_and_write_receipt(
+    root: &greentic_update::staging::UpdatesRoot,
+    env_id: &str,
+    inventory: Vec<String>,
+    priv_pem: &str,
+    key_id: &str,
+    label: &str,
+) -> Result<(), OpError> {
+    let (receipt_bytes, receipt_sig_bytes) =
+        greentic_update::envelope::build_import_receipt(env_id, inventory, priv_pem, key_id)
+            .map_err(|e| OpError::Conflict(format!("build {label} receipt: {e}")))?;
+    root.write_import_receipt(&receipt_bytes, &receipt_sig_bytes)
+        .map_err(|e| OpError::Conflict(format!("write {label} receipt: {e}")))
+}
+
 fn build_and_sign_plan(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -2764,27 +3012,9 @@ fn build_and_sign_plan(
     }
 
     // Resolve the signing key: explicit --signing-key or the global operator key.
-    let (priv_pem, key_id) = match content.signing_key {
-        Some(key_path) => crate::operator_key::read_signing_key_at(key_path)?,
-        None => {
-            let op_key = crate::operator_key::load_existing_only().map_err(|e| {
-                OpError::InvalidArgument(format!(
-                    "no --signing-key provided and the global operator key is unavailable: {e}. \
-                     Create or bootstrap the operator key first, or pass --signing-key <path>."
-                ))
-            })?;
-            (op_key.private_pem, op_key.key_id)
-        }
-    };
+    let (priv_pem, key_id) = resolve_signing_key(content.signing_key)?;
 
-    // Load the env trust root so build_update_plan can verify the key is trusted.
-    let trust = match content.trust_root {
-        Some(path) => load_trust_root_from_file(path)?,
-        None => {
-            let env_dir = store.env_dir(env_id)?;
-            store_trust_root::load(&env_dir)?
-        }
-    };
+    let trust = resolve_trust_root(store, env_id, content.trust_root)?;
 
     // Build the plan target from --target-file or a minimal valid env-manifest.
     let mut target: serde_json::Value = match content.target_file {
@@ -3301,6 +3531,1141 @@ fn publish_schema() -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// export: package a staged plan + blobs into a .gtupdate envelope
+// ---------------------------------------------------------------------------
+
+/// `op updates export <env> --plan-id <id> --out <path>` — export a staged plan
+/// and its content-addressed blobs into a `.gtupdate` envelope for airgap
+/// transfer. Supports delta export via `--base-receipt` (skips blobs the
+/// receiver already holds) and `--targets` filtering (includes only binary blobs
+/// for the listed targets; artifact/content blobs are always included).
+pub fn export(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesExportArgs,
+) -> Result<OpOutcome, OpError> {
+    export_impl(store, flags, args, None)
+}
+
+/// Body of [`export`], with an optional staging-root override so tests can point
+/// the FSM at a tempdir instead of `~/.greentic/updates`.
+fn export_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesExportArgs,
+    updates_root_override: Option<&std::path::Path>,
+) -> Result<OpOutcome, OpError> {
+    use std::collections::{HashMap, HashSet};
+
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "export", export_schema()));
+    }
+
+    // Build payload from CLI args or --answers.
+    let payload = {
+        let from_args = match (args.env_id, args.plan_id, args.out) {
+            (Some(environment_id), Some(plan_id), Some(out)) => Some(UpdatesExportPayload {
+                environment_id,
+                plan_id,
+                out,
+                base_receipt: args.base_receipt,
+                base_receipt_sig: args.base_receipt_sig,
+                targets: args.targets,
+                signing_key: args.signing_key,
+                key_id: args.key_id,
+                trust_root: args.trust_root,
+            }),
+            _ => None,
+        };
+        resolve_payload::<UpdatesExportPayload>(flags, from_args)?
+    };
+
+    let env_id = parse_env_id(&payload.environment_id)?;
+
+    // Load the staged plan.
+    let root = open_updates_root(&env_id, updates_root_override)?;
+    let staged = root
+        .load(&payload.plan_id)
+        .map_err(|e| OpError::Conflict(format!("load staged update plan: {e}")))?
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "no staged plan `{}` under env `{env_id}`; nothing to export",
+                payload.plan_id
+            ))
+        })?;
+
+    // Stage gate: reject plans still in Downloading (incomplete artifacts).
+    let stage = staged
+        .stage()
+        .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+    if stage == greentic_update::staging::UpdateStage::Downloading {
+        return Err(OpError::InvalidArgument(format!(
+            "plan `{}` is `downloading` (artifacts incomplete); wait for `op updates get` to \
+             finish staging before exporting",
+            payload.plan_id
+        )));
+    }
+
+    // Read plan + sig bytes.
+    let plan_bytes = staged
+        .plan_bytes()
+        .map_err(|e| OpError::Conflict(format!("read plan bytes: {e}")))?;
+    let sig_bytes = staged
+        .envelope_bytes()
+        .map_err(|e| OpError::Conflict(format!("read plan signature bytes: {e}")))?;
+
+    let plan = staged.plan();
+
+    // Resolve trust root and preflight the signing identity BEFORE any staging-
+    // tree mutations (--binary-blob writes below). This restores the invariant
+    // that export has zero side effects when the signing key is invalid.
+    let trust = resolve_trust_root(store, &env_id, payload.trust_root.as_deref())?;
+    let (priv_pem, key_id) = preflight_signing_identity(
+        &env_id,
+        payload.signing_key.as_deref(),
+        payload.key_id,
+        &trust,
+        "the receiver would reject this envelope",
+    )?;
+
+    // --binary-blob: inject user-supplied binary files into the staging tree
+    // BEFORE the missing-blob check so the existing fail-closed gate picks them
+    // up. Each supplied file must match exactly one plan binary by SHA-256;
+    // unmatched or duplicate-digest files are hard errors.
+    if !args.binary_blobs.is_empty() {
+        // Build a digest->BinaryArtifact lookup from the plan's binaries.
+        let plan_bin_by_digest: HashMap<&str, &greentic_update::plan::BinaryArtifact> = plan
+            .binaries
+            .iter()
+            .map(|b| (b.digest.as_str(), b))
+            .collect();
+
+        let mut seen_digests: HashSet<String> = HashSet::new();
+
+        for blob_path in &args.binary_blobs {
+            let bytes = std::fs::read(blob_path).map_err(|source| OpError::Io {
+                path: blob_path.clone(),
+                source,
+            })?;
+            let digest = format!("sha256:{}", greentic_update::plan::sha256_hex(&bytes));
+
+            let bin = plan_bin_by_digest.get(digest.as_str()).ok_or_else(|| {
+                OpError::InvalidArgument(format!(
+                    "--binary-blob `{}` has digest `{digest}` which matches no binary in the \
+                     plan; supply only files whose content is pinned by the plan's binaries list",
+                    blob_path.display()
+                ))
+            })?;
+
+            if !seen_digests.insert(digest.clone()) {
+                return Err(OpError::InvalidArgument(format!(
+                    "--binary-blob: two supplied files resolve to the same digest `{digest}` \
+                     (ambiguous input); supply each binary exactly once"
+                )));
+            }
+
+            // Write the blob directly to the staging tree path that
+            // `binary_blob_path` returns. `put_binary_blob` cannot be used here
+            // because it requires `UpdateStage::Downloading`, but the plan is
+            // already `Staged` (the stage gate above enforces this). Writing
+            // directly is safe: the digest was just verified from the file
+            // contents (sha256 match above), the path is content-addressed
+            // (same layout `put_binary_blob` would use), and the write is
+            // idempotent (overwrites identical bytes if the blob was already
+            // staged by a prior `op updates get`).
+            let dest = staged.binary_blob_path(bin).map_err(|e| {
+                OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name))
+            })?;
+            stage_blob_bytes(root.env_dir(), &dest, &bytes)?;
+        }
+    }
+
+    // Delta: if --base-receipt is given, verify and load its held digests.
+    // Resolved BEFORE blob collection so that held/filtered blobs are not
+    // required on disk.
+    let held_digests: HashSet<String> = if let Some(receipt_path) = &payload.base_receipt {
+        let receipt_sig_path = payload.base_receipt_sig.as_ref().ok_or_else(|| {
+            OpError::InvalidArgument(
+                "--base-receipt-sig is required when --base-receipt is given".to_string(),
+            )
+        })?;
+        let receipt_bytes = std::fs::read(receipt_path).map_err(|source| OpError::Io {
+            path: receipt_path.clone(),
+            source,
+        })?;
+        let receipt_sig_bytes = std::fs::read(receipt_sig_path).map_err(|source| OpError::Io {
+            path: receipt_sig_path.clone(),
+            source,
+        })?;
+        // Verify receipt signature against the env trust root.
+        let receipt = greentic_update::envelope::verify_import_receipt(
+            &receipt_bytes,
+            &receipt_sig_bytes,
+            &trust,
+        )
+        .map_err(|e| {
+            OpError::Conflict(format!("base receipt signature verification failed: {e}"))
+        })?;
+        // Bind the receipt to this environment — a receipt covering a different
+        // env must never drive a delta export.
+        if receipt.env_id != env_id.as_str() {
+            return Err(OpError::InvalidArgument(format!(
+                "base receipt covers env `{}`, not `{env_id}`",
+                receipt.env_id
+            )));
+        }
+        receipt.held_digests.into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+
+    // Target filter set.
+    let target_filter: HashSet<&str> = payload.targets.iter().map(|s| s.as_str()).collect();
+
+    // Collect all referenced blobs and verify that INCLUDED blobs exist on
+    // disk.  Blobs that will be skipped (held by the receiver via delta
+    // receipt, or excluded by target filter) are NOT required on disk.
+    let mut included: Vec<BlobEntry> = Vec::new();
+    let mut skipped_count: usize = 0;
+    let mut missing: Vec<String> = Vec::new();
+
+    let mut collect = |digest: &String, path: PathBuf, target: Option<String>| {
+        if path.exists() {
+            included.push(BlobEntry {
+                digest: digest.clone(),
+                path,
+                target,
+            });
+        } else {
+            missing.push(digest.clone());
+        }
+    };
+
+    for art in &plan.artifacts {
+        // Artifacts carry no target and are never target-filtered.
+        if held_digests.contains(&art.digest) {
+            skipped_count += 1;
+            continue;
+        }
+        let path = staged.artifact_blob_path(art).map_err(|e| {
+            OpError::Conflict(format!("artifact blob path for `{}`: {e}", art.name))
+        })?;
+        collect(&art.digest, path, None);
+    }
+    for bin in &plan.binaries {
+        // Delta: skip blobs held by the receiver.
+        if held_digests.contains(&bin.digest) {
+            skipped_count += 1;
+            continue;
+        }
+        // Target filtering: applies only to binary blobs.
+        if !target_filter.is_empty() && !target_filter.contains(bin.target.as_str()) {
+            skipped_count += 1;
+            continue;
+        }
+        let path = staged
+            .binary_blob_path(bin)
+            .map_err(|e| OpError::Conflict(format!("binary blob path for `{}`: {e}", bin.name)))?;
+        collect(&bin.digest, path, Some(bin.target.clone()));
+    }
+
+    if !missing.is_empty() {
+        return Err(OpError::Conflict(format!(
+            "export aborted: {} blob(s) missing on disk: {}",
+            missing.len(),
+            missing.join(", ")
+        )));
+    }
+
+    // Build the envelope into a temporary file in the same directory, then
+    // atomically persist it to the final path.  This avoids truncating an
+    // existing envelope before the new one is fully written: if any step fails,
+    // the temp file is cleaned up on drop and the original is preserved.
+    let out_parent = payload.out.parent().unwrap_or(std::path::Path::new("."));
+    let tmp_file = tempfile::NamedTempFile::new_in(out_parent).map_err(|source| OpError::Io {
+        path: out_parent.to_path_buf(),
+        source,
+    })?;
+    let mut builder =
+        greentic_update::envelope::EnvelopeBuilder::new(tmp_file.as_file(), &priv_pem, &key_id)
+            .map_err(|e| OpError::Conflict(format!("create envelope builder: {e}")))?;
+
+    builder
+        .add_plan(&plan_bytes, &sig_bytes)
+        .map_err(|e| OpError::Conflict(format!("add plan to envelope: {e}")))?;
+
+    let mut byte_total: u64 = 0;
+    for entry in &included {
+        let bytes = std::fs::read(&entry.path).map_err(|source| OpError::Io {
+            path: entry.path.clone(),
+            source,
+        })?;
+        byte_total += bytes.len() as u64;
+        builder
+            .add_blob(
+                &entry.digest,
+                &bytes,
+                "application/octet-stream",
+                entry.target.as_deref(),
+            )
+            .map_err(|e| {
+                OpError::Conflict(format!("add blob {} to envelope: {e}", entry.digest))
+            })?;
+    }
+
+    builder
+        .finish()
+        .map_err(|e| OpError::Conflict(format!("finish envelope: {e}")))?;
+
+    tmp_file.persist(&payload.out).map_err(|e| OpError::Io {
+        path: payload.out.clone(),
+        source: e.error,
+    })?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "export",
+        serde_json::json!({
+            "environment_id": env_id.as_str(),
+            "plan_id": payload.plan_id,
+            "out": payload.out.display().to_string(),
+            "blobs_included": included.len(),
+            "blobs_skipped": skipped_count,
+            "byte_total": byte_total,
+        }),
+    ))
+}
+
+/// Internal blob entry for the export pipeline. `target` is `Some(<triple>)`
+/// for binary blobs and `None` for artifact (content) blobs.
+struct BlobEntry {
+    digest: String,
+    path: PathBuf,
+    target: Option<String>,
+}
+
+/// Write `bytes` atomically to `dest` inside the staging tree rooted at
+/// `env_dir`, with symlink-ancestor guard and fsync.
+fn stage_blob_bytes(env_dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), OpError> {
+    crate::path_safety::assert_no_symlink_ancestors(env_dir, dest).map_err(|e| {
+        OpError::Conflict(format!(
+            "blob path `{}` escapes staging tree: {e}",
+            dest.display()
+        ))
+    })?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    atomic_write_as_op(dest, bytes)
+}
+
+/// [`crate::environment::atomic_write_bytes`] with its error mapped into
+/// [`OpError`]. Callers that write inside the env staging tree go through
+/// [`stage_blob_bytes`] for the symlink-ancestor guard; paths outside it
+/// (e.g. `--push-to` destinations) call this directly.
+fn atomic_write_as_op(dest: &Path, bytes: &[u8]) -> Result<(), OpError> {
+    crate::environment::atomic_write_bytes(dest, bytes).map_err(|e| match e {
+        crate::environment::AtomicWriteError::Io { path, source } => OpError::Io { path, source },
+        crate::environment::AtomicWriteError::Persist { target, source } => OpError::Io {
+            path: target,
+            source: source.error,
+        },
+        other => OpError::Io {
+            path: dest.to_path_buf(),
+            source: std::io::Error::other(other.to_string()),
+        },
+    })
+}
+
+fn export_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdatesExportPayload",
+        "type": "object",
+        "required": ["environment_id", "plan_id", "out"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "plan_id": {"type": "string", "description": "Plan id of the staged plan to export (from `op updates get`)."},
+            "out": {"type": "string", "description": "Output path for the `.gtupdate` envelope."},
+            "base_receipt": {"type": ["string", "null"], "description": "Path to a signed import receipt for delta export. Requires base_receipt_sig."},
+            "base_receipt_sig": {"type": ["string", "null"], "description": "DSSE signature sidecar for base_receipt."},
+            "targets": {"type": "array", "items": {"type": "string"}, "description": "Target triples for binary blob filtering. Empty = all."},
+            "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
+            "key_id": {"type": ["string", "null"], "description": "Key id for the signing key."},
+            "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."}
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// import: op updates import — import a .gtupdate envelope (airgap B2)
+// ---------------------------------------------------------------------------
+
+/// Payload for `op updates import`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdatesImportPayload {
+    environment_id: String,
+    envelope: PathBuf,
+    #[serde(default)]
+    stage: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signing_key: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_id: Option<String>,
+    #[serde(default = "default_staleness_days")]
+    staleness_days: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust_root: Option<PathBuf>,
+    /// Write a static serving directory after import. One directory per
+    /// environment; the dir is a cache, not an authority -- trust stays with
+    /// the DSSE envelope + trust root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_to: Option<PathBuf>,
+}
+
+fn default_staleness_days() -> u64 {
+    30
+}
+
+pub fn import(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesImportArgs,
+) -> Result<OpOutcome, OpError> {
+    import_impl(store, flags, args, None)
+}
+
+/// Body of [`import`], with an optional staging-root override so tests can
+/// point the FSM at a tempdir instead of `~/.greentic/updates`.
+fn import_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesImportArgs,
+    updates_root_override: Option<&std::path::Path>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "import", import_schema()));
+    }
+
+    let payload = {
+        let from_args = match (args.env_id, args.envelope) {
+            (Some(environment_id), Some(envelope)) => Some(UpdatesImportPayload {
+                environment_id,
+                envelope,
+                stage: args.stage,
+                signing_key: args.signing_key,
+                key_id: args.key_id,
+                staleness_days: args.staleness_days,
+                trust_root: args.trust_root,
+                push_to: args.push_to,
+            }),
+            _ => None,
+        };
+        resolve_payload::<UpdatesImportPayload>(flags, from_args)?
+    };
+
+    let env_id = parse_env_id(&payload.environment_id)?;
+
+    let trust = resolve_trust_root(store, &env_id, payload.trust_root.as_deref())?;
+
+    let (priv_pem, key_id) = preflight_signing_identity(
+        &env_id,
+        payload.signing_key.as_deref(),
+        payload.key_id,
+        &trust,
+        "the receipt would be unverifiable",
+    )?;
+
+    let root = open_updates_root(&env_id, updates_root_override)?;
+
+    // Quarantine: same filesystem as CAS/staging so renames are atomic.
+    // `TempDir` auto-cleans on drop on all paths (success and error).
+    let quarantine = tempfile::Builder::new()
+        .prefix(&format!("quarantine-{}-", std::process::id()))
+        .tempdir_in(root.env_dir())
+        .map_err(|source| OpError::Io {
+            path: root.env_dir().to_path_buf(),
+            source,
+        })?;
+
+    // 1. Scan the envelope into the quarantine directory.
+    let envelope_file = std::fs::File::open(&payload.envelope).map_err(|source| OpError::Io {
+        path: payload.envelope.clone(),
+        source,
+    })?;
+    let scanned = greentic_update::envelope::scan_envelope_to_dir(
+        envelope_file,
+        &trust,
+        &greentic_update::envelope::ScanLimits::default(),
+        quarantine.path(),
+    )
+    .map_err(|e| OpError::Conflict(format!("scan envelope: {e}")))?;
+
+    // 2. Verify the update plan against the trust root.
+    let plan_bytes = std::fs::read(&scanned.plan_path).map_err(|source| OpError::Io {
+        path: scanned.plan_path.clone(),
+        source,
+    })?;
+    let sig_bytes = std::fs::read(&scanned.sig_path).map_err(|source| OpError::Io {
+        path: scanned.sig_path.clone(),
+        source,
+    })?;
+    let verified = greentic_update::plan::verify_update_plan(&plan_bytes, &sig_bytes, &trust)
+        .map_err(|e| OpError::Conflict(format!("imported plan failed verification: {e}")))?;
+
+    // 3. Bind: plan.env_id must match --env-id AND the signed manifest must
+    //    name the same env (two-identity check, mirroring get_impl).
+    if verified.plan.env_id != env_id.as_str() {
+        return Err(OpError::InvalidArgument(format!(
+            "plan targets env `{}`, not `{env_id}`",
+            verified.plan.env_id
+        )));
+    }
+    let manifest: EnvManifest =
+        serde_json::from_value(verified.plan.target.clone()).map_err(|e| {
+            OpError::InvalidArgument(format!(
+                "plan target is not a valid {ENV_MANIFEST_SCHEMA_V1}: {e}"
+            ))
+        })?;
+    if manifest.environment.id != env_id.as_str() {
+        return Err(OpError::InvalidArgument(format!(
+            "plan target manifest names env `{}`, not `{env_id}`",
+            manifest.environment.id
+        )));
+    }
+
+    // 4. Staleness advisory.
+    let mut warnings: Vec<String> = Vec::new();
+    let plan_age = chrono::Utc::now()
+        .signed_duration_since(verified.plan.created_at)
+        .num_days();
+    if plan_age > payload.staleness_days as i64 {
+        let msg = format!(
+            "plan `{}` is {plan_age} days old (threshold: {} days)",
+            verified.plan.plan_id, payload.staleness_days
+        );
+        tracing::warn!("{msg}");
+        warnings.push(msg);
+    }
+
+    // 5. Preflight: every digest must be in the envelope OR already in CAS.
+    let envelope_digests: std::collections::HashSet<String> =
+        scanned.blob_paths.keys().cloned().collect();
+    root.preflight_digests(
+        &verified.plan.artifacts,
+        &verified.plan.binaries,
+        &envelope_digests,
+    )
+    .map_err(|e| OpError::Conflict(format!("import preflight failed: {e}")))?;
+
+    // 5b. Verify CAS integrity for digests NOT carried in the envelope.
+    //     `preflight_digests` uses the existence-only `cas_contains` check;
+    //     `cas_get` re-reads and re-hashes, catching on-disk corruption.
+    //     Placed before any CAS write / admission so a corrupt-CAS delta
+    //     import leaves zero new state. Reads each CAS-held blob once —
+    //     correctness over speed; these are the same blobs staging would read.
+    {
+        let mut corrupted: Vec<String> = Vec::new();
+        let all_required = verified
+            .plan
+            .artifacts
+            .iter()
+            .map(|a| &a.digest)
+            .chain(verified.plan.binaries.iter().map(|b| &b.digest));
+        for digest in all_required {
+            if !envelope_digests.contains(digest) && root.cas_get(digest).is_err() {
+                corrupted.push(digest.clone());
+            }
+        }
+        if !corrupted.is_empty() {
+            return Err(OpError::Conflict(format!(
+                "CAS integrity check failed — {} digest(s) are corrupt or unreadable: {}. \
+                 Re-import with a full (non-delta) envelope to repair.",
+                corrupted.len(),
+                corrupted.join(", "),
+            )));
+        }
+    }
+
+    // 6. Populate CAS with every envelope blob unconditionally. `cas_put`
+    //    re-verifies the digest and atomically overwrites the on-disk blob,
+    //    which repairs a corrupted CAS entry (bit-rot, partial write from a
+    //    prior crash). The `blobs_already_held` counter is still tracked for
+    //    reporting, checked before the put.
+    let mut blobs_imported: usize = 0;
+    let mut blobs_already_held: usize = 0;
+    for (digest, blob_path) in &scanned.blob_paths {
+        let already_held = root.cas_contains(digest).unwrap_or(false);
+        let blob_bytes = std::fs::read(blob_path).map_err(|source| OpError::Io {
+            path: blob_path.clone(),
+            source,
+        })?;
+        root.cas_put(digest, &blob_bytes)
+            .map_err(|e| OpError::Conflict(format!("cas_put `{digest}`: {e}")))?;
+        if already_held {
+            blobs_already_held += 1;
+        } else {
+            blobs_imported += 1;
+        }
+    }
+
+    // 7. Admit the plan through the staging FSM (starts at `downloading`).
+    let staged = admit_or_resume(&root, &verified, &plan_bytes, &sig_bytes)?;
+
+    // 8. Put binary blobs FIRST (while still `downloading` — put_binary_blob
+    //    requires this stage). Read from CAS.
+    {
+        let stage = staged
+            .stage()
+            .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+        if stage == greentic_update::staging::UpdateStage::Downloading {
+            for bin in &verified.plan.binaries {
+                if staged
+                    .binary_blob_path(bin)
+                    .map(|p| p.exists())
+                    .unwrap_or(false)
+                {
+                    continue; // already staged (idempotent resume)
+                }
+                let blob_bytes = root.cas_get(&bin.digest).map_err(|e| {
+                    OpError::Conflict(format!("cas_get binary `{}`: {e}", bin.digest))
+                })?;
+                staged.put_binary_blob(bin, &blob_bytes).map_err(|e| {
+                    OpError::Conflict(format!("put binary blob `{}`: {e}", bin.name))
+                })?;
+            }
+        }
+    }
+
+    // 9. Put artifacts from CAS, then promote to inbox (and staged if --stage).
+    let final_stage = {
+        use greentic_update::staging::UpdateStage;
+        let stage = staged
+            .stage()
+            .map_err(|e| OpError::Conflict(format!("read update staging stage: {e}")))?;
+        if stage == UpdateStage::Downloading {
+            let import_fetcher = ImportFetcher { root: &root };
+            for artifact in &verified.plan.artifacts {
+                let bytes = import_fetcher.fetch(artifact)?;
+                staged.put_artifact(artifact, &bytes).map_err(|e| {
+                    OpError::Conflict(format!("stage artifact `{}`: {e}", artifact.name))
+                })?;
+            }
+            // Promote to inbox.
+            let inbox_stage = staged
+                .transition(UpdateStage::Inbox)
+                .map_err(|e| OpError::Conflict(format!("advance update staging: {e}")))?
+                .stage;
+            if payload.stage {
+                staged
+                    .transition(UpdateStage::Staged)
+                    .map_err(|e| OpError::Conflict(format!("advance update staging: {e}")))?
+                    .stage
+            } else {
+                inbox_stage
+            }
+        } else if stage == UpdateStage::Inbox && payload.stage {
+            staged
+                .transition(UpdateStage::Staged)
+                .map_err(|e| OpError::Conflict(format!("advance update staging: {e}")))?
+                .stage
+        } else {
+            stage
+        }
+    };
+
+    let cas_inventory = root
+        .cas_list()
+        .map_err(|e| OpError::Conflict(format!("cas_list: {e}")))?;
+    sign_and_write_receipt(
+        &root,
+        env_id.as_str(),
+        cas_inventory,
+        &priv_pem,
+        &key_id,
+        "import",
+    )?;
+
+    let receipt_path = root.env_dir().join("import-receipt.json");
+
+    // Optional: write a static serving directory for in-gap HTTP serving.
+    // Placed AFTER the import is fully committed (CAS + staging + receipt).
+    // A push-to failure after a successful import is a hard error — the
+    // import itself already committed, so partial state is visible. The
+    // operator must fix the push-to target and re-run with the same
+    // envelope (idempotent).
+    let push_to_result = if let Some(ref push_to_path) = payload.push_to {
+        Some(
+            write_static_serving_dir(push_to_path, &plan_bytes, &sig_bytes, &verified, &root)
+                .map_err(|e| {
+                    OpError::Conflict(format!(
+                        "import committed successfully (receipt written), \
+                         only the --push-to write failed: {e}; \
+                         fix the push-to target and re-run the same import (idempotent)"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+
+    let mut result = serde_json::json!({
+        "environment_id": env_id.as_str(),
+        "plan_id": verified.plan.plan_id,
+        "plan_sha256": verified.plan_sha256,
+        "verified_key_ids": verified.verified_key_ids,
+        "stage": final_stage.as_str(),
+        "blobs_imported": blobs_imported,
+        "blobs_already_held": blobs_already_held,
+        "receipt_path": receipt_path.display().to_string(),
+    });
+    if !warnings.is_empty() {
+        result["warnings"] = serde_json::json!(warnings);
+    }
+    if let Some(pt) = push_to_result {
+        result["push_to"] = serde_json::json!({
+            "path": pt.path.display().to_string(),
+            "blobs_written": pt.blobs_written,
+            "blobs_skipped": pt.blobs_skipped,
+        });
+    }
+
+    Ok(OpOutcome::new(NOUN, "import", result))
+}
+
+// ---------------------------------------------------------------------------
+// push-to: write a static serving directory after import (C3)
+// ---------------------------------------------------------------------------
+
+/// Result of [`write_static_serving_dir`].
+struct PushToResult {
+    /// The push-to root directory that was written.
+    path: PathBuf,
+    /// Number of blob files actually written (excludes pre-existing blobs
+    /// whose file was already on disk — CAS content is immutable by digest).
+    blobs_written: usize,
+    /// Number of blob files skipped because they already existed on disk.
+    blobs_skipped: usize,
+}
+
+/// Write a static serving directory that an in-gap HTTP server can serve to
+/// fleet runtimes polling for updates.
+///
+/// # Layout
+///
+/// ```text
+/// <push_to>/
+///   plan/
+///     plan.json      — raw plan bytes (the exact bytes the DSSE signature covers)
+///     plan.json.sig  — raw DSSE envelope bytes
+///     meta           — JSON: {"sequence": <u64>, "plan_sha256": "<hex>"}
+///   blobs/
+///     sha256-<hex>   — one file per plan-referenced digest (binaries + artifacts)
+/// ```
+///
+/// # Ordering
+///
+/// A live reader must never see torn state. Files are written in dependency
+/// order: blobs first, then `plan/plan.json`, then `plan/plan.json.sig`, then
+/// `plan/meta` last. Each file via [`crate::environment::atomic_write_bytes`].
+///
+/// # Monotonic guard
+///
+/// If `<push_to>/plan/meta` exists and its `sequence` is strictly greater
+/// than the incoming plan's, the write is refused with [`OpError::Conflict`].
+/// Equal sequence proceeds (idempotent rewrite). A missing meta file means a
+/// fresh directory. An unreadable or corrupt meta file is a hard error — the
+/// operator must inspect or remove the directory.
+/// Serializes writers to the same push-to directory so the monotonic+digest
+/// guard is race-free. Readers are not affected (they never take the lock).
+fn write_static_serving_dir(
+    push_to: &std::path::Path,
+    plan_bytes: &[u8],
+    sig_bytes: &[u8],
+    verified: &greentic_update::plan::VerifiedUpdatePlan,
+    root: &greentic_update::staging::UpdatesRoot,
+) -> Result<PushToResult, OpError> {
+    // --- destination lock ---------------------------------------------------
+    // Create the push-to root first so the lock file's parent exists. The
+    // lock is per-DESTINATION (not per-env): it serializes concurrent writers
+    // to the same serving dir so the monotonic+digest guard below is
+    // race-free. Readers never take it. `EnvFlock` also guards against the
+    // lock file's inode being renamed away mid-wait.
+    std::fs::create_dir_all(push_to).map_err(|source| OpError::Io {
+        path: push_to.to_path_buf(),
+        source,
+    })?;
+    let lock_path = push_to.join(".push-lock");
+    let _lock_guard = crate::environment::file_lock::EnvFlock::try_acquire(&lock_path)
+        .map_err(|e| OpError::Conflict(format!("push-to lock `{}`: {e}", lock_path.display())))?
+        .ok_or_else(|| {
+            OpError::Conflict(format!(
+                "another --push-to write to `{}` is in progress; \
+                 retry when it completes",
+                push_to.display(),
+            ))
+        })?;
+
+    let plan_dir = push_to.join("plan");
+    let blobs_dir = push_to.join("blobs");
+
+    // --- monotonic + digest identity guard ---------------------------------
+    let meta_path = plan_dir.join("meta");
+    match std::fs::read(&meta_path) {
+        Ok(existing_bytes) => {
+            // Typed parse: a missing or wrong-typed field is exactly as
+            // corrupt as invalid JSON, and serde's error already names it.
+            // Unknown extra fields are tolerated (forward compat).
+            #[derive(serde::Deserialize)]
+            struct PushToMeta {
+                sequence: u64,
+                plan_sha256: String,
+            }
+            let existing: PushToMeta = serde_json::from_slice(&existing_bytes).map_err(|e| {
+                OpError::Conflict(format!(
+                    "push-to meta `{}` is corrupt ({}); \
+                         inspect or remove the directory before retrying",
+                    meta_path.display(),
+                    e,
+                ))
+            })?;
+            let (existing_seq, existing_sha) = (existing.sequence, existing.plan_sha256);
+            if existing_seq > verified.plan.sequence {
+                return Err(OpError::Conflict(format!(
+                    "push-to directory already serves sequence {existing_seq}, \
+                     refusing downgrade to sequence {}",
+                    verified.plan.sequence,
+                )));
+            }
+            // Same sequence but different plan digest would silently replace
+            // the served plan, splitting the fleet (consumers that already
+            // consumed seq N ignore the replacement).
+            if existing_seq == verified.plan.sequence && existing_sha != verified.plan_sha256 {
+                return Err(OpError::Conflict(format!(
+                    "push-to directory already serves sequence {} with plan digest \
+                     {existing_sha}, but the incoming plan has digest {}; \
+                     same sequence with a different plan — bump the sequence \
+                     to publish a new plan",
+                    verified.plan.sequence, verified.plan_sha256,
+                )));
+            }
+            // equal sequence AND equal digest → idempotent rewrite
+            // lower existing sequence → upgrade
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Fresh directory — proceed.
+        }
+        Err(e) => {
+            return Err(OpError::Conflict(format!(
+                "push-to meta `{}` is unreadable ({}); \
+                 inspect or remove the directory before retrying",
+                meta_path.display(),
+                e,
+            )));
+        }
+    }
+
+    // --- create directories ------------------------------------------------
+    std::fs::create_dir_all(&plan_dir).map_err(|source| OpError::Io {
+        path: plan_dir.clone(),
+        source,
+    })?;
+    std::fs::create_dir_all(&blobs_dir).map_err(|source| OpError::Io {
+        path: blobs_dir.clone(),
+        source,
+    })?;
+
+    // --- blobs first -------------------------------------------------------
+    let all_digests = verified
+        .plan
+        .artifacts
+        .iter()
+        .map(|a| a.digest.as_str())
+        .chain(verified.plan.binaries.iter().map(|b| b.digest.as_str()));
+
+    let mut blobs_written: usize = 0;
+    let mut blobs_skipped: usize = 0;
+    for digest in all_digests {
+        // Convert `sha256:<hex>` → `sha256-<hex>` for the filename.
+        let file_name = digest.replacen(':', "-", 1);
+        let blob_path = blobs_dir.join(&file_name);
+
+        // Pre-existing blob files are trusted by filename alone: CAS content
+        // is immutable by digest, and every consumer digest-verifies what it
+        // fetches — a corrupted pre-existing file is caught by readers, not
+        // by this writer. Non-regular entries (dirs, symlinks, fifos) are
+        // rejected — they indicate tampering or misconfiguration.
+        match std::fs::symlink_metadata(&blob_path) {
+            Ok(m) if m.file_type().is_file() => {
+                blobs_skipped += 1;
+                continue;
+            }
+            Ok(m) => {
+                let kind = m.file_type();
+                let kind_str = if kind.is_dir() {
+                    "directory"
+                } else if kind.is_symlink() {
+                    "symlink"
+                } else {
+                    "non-regular file"
+                };
+                return Err(OpError::Conflict(format!(
+                    "push-to blob path `{}` exists but is a {kind_str}; \
+                     inspect and remove it before retrying",
+                    blob_path.display(),
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Not present — write below.
+            }
+            Err(source) => {
+                return Err(OpError::Io {
+                    path: blob_path,
+                    source,
+                });
+            }
+        }
+
+        let blob_bytes = root.cas_get(digest).map_err(|e| {
+            OpError::Conflict(format!(
+                "push-to: cas_get `{digest}` failed — plan-referenced digest \
+                 missing from CAS after successful import: {e}"
+            ))
+        })?;
+        atomic_write_as_op(&blob_path, &blob_bytes)?;
+        blobs_written += 1;
+    }
+
+    // --- plan files (order: plan.json, plan.json.sig, meta LAST) -----------
+    atomic_write_as_op(&plan_dir.join("plan.json"), plan_bytes)?;
+    atomic_write_as_op(&plan_dir.join("plan.json.sig"), sig_bytes)?;
+
+    let meta = serde_json::json!({
+        "sequence": verified.plan.sequence,
+        "plan_sha256": verified.plan_sha256,
+    });
+    let meta_bytes = serde_json::to_vec_pretty(&meta)
+        .map_err(|e| OpError::Conflict(format!("push-to: serialize meta: {e}")))?;
+    atomic_write_as_op(&meta_path, &meta_bytes)?;
+
+    Ok(PushToResult {
+        path: push_to.to_path_buf(),
+        blobs_written,
+        blobs_skipped,
+    })
+}
+
+/// An [`ArtifactFetcher`] that reads blobs from the durable import CAS by
+/// digest. Accepts artifacts with `source=None` — the defining difference
+/// from [`DistArtifactFetcher`], which rejects them.
+struct ImportFetcher<'a> {
+    root: &'a greentic_update::staging::UpdatesRoot,
+}
+
+impl ArtifactFetcher for ImportFetcher<'_> {
+    fn fetch(&self, artifact: &greentic_update::plan::PlanArtifact) -> Result<Vec<u8>, OpError> {
+        self.root
+            .cas_get(&artifact.digest)
+            .map_err(|e| OpError::Fetch(format!("cas_get artifact `{}`: {e}", artifact.name)))
+    }
+}
+
+fn import_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdatesImportPayload",
+        "type": "object",
+        "required": ["environment_id", "envelope"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "envelope": {"type": "string", "description": "Path to the `.gtupdate` envelope to import."},
+            "stage": {"type": "boolean", "description": "Promote to Staged after import. Default: false."},
+            "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
+            "key_id": {"type": ["string", "null"], "description": "Key id for the signing key."},
+            "staleness_days": {"type": "integer", "description": "Advisory staleness threshold in days. Default: 30."},
+            "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."},
+            "push_to": {"type": ["string", "null"], "description": "Write a static serving directory after import. One directory per environment; the dir is a cache, not an authority -- trust stays DSSE + trust root."}
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// cas-gc: op updates cas-gc — garbage-collect orphaned CAS blobs (R8)
+// ---------------------------------------------------------------------------
+
+/// Payload for `op updates cas-gc`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdatesCasGcPayload {
+    environment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signing_key: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust_root: Option<PathBuf>,
+}
+
+pub fn cas_gc(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesCasGcArgs,
+) -> Result<OpOutcome, OpError> {
+    cas_gc_impl(store, flags, args, None)
+}
+
+/// Body of [`cas_gc`], with an optional updates-root override for testing.
+///
+/// **Concurrency caveat:** `cas-gc` must not run concurrently with
+/// `op updates import` on the same environment. GC's reference snapshot and
+/// the import's CAS-populate/admission are not mutually serialized; a
+/// concurrent GC can evict blobs of a plan admitted after the snapshot.
+/// Recovery: re-run the import with the full envelope. A lock-held GC inside
+/// `greentic-update` is a tracked follow-up.
+fn cas_gc_impl(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    args: crate::cli::dispatch::UpdatesCasGcArgs,
+    updates_root_override: Option<&std::path::Path>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "cas-gc", cas_gc_schema()));
+    }
+
+    let payload = {
+        let from_args = args.env_id.map(|environment_id| UpdatesCasGcPayload {
+            environment_id,
+            signing_key: args.signing_key,
+            key_id: args.key_id,
+            trust_root: args.trust_root,
+        });
+        resolve_payload::<UpdatesCasGcPayload>(flags, from_args)?
+    };
+
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let root = open_updates_root(&env_id, updates_root_override)?;
+
+    let trust = resolve_trust_root(store, &env_id, payload.trust_root.as_deref())?;
+    let (priv_pem, key_id) = preflight_signing_identity(
+        &env_id,
+        payload.signing_key.as_deref(),
+        payload.key_id,
+        &trust,
+        "receipt signing would fail",
+    )?;
+
+    // Collect all digests referenced by any non-evicted staged plan.
+    // `list_strict` fails closed on a corrupt plan marker (present but
+    // unreadable state.json) rather than silently skipping it — a skipped
+    // plan would make its blobs look orphaned, causing data loss.
+    let plans = root.list_strict().map_err(|e| {
+        OpError::Conflict(format!(
+            "cannot safely gc: plan scan found a corrupt marker — \
+             its blobs would look orphaned. Repair or remove the \
+             corrupt plan directory before retrying: {e}"
+        ))
+    })?;
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for state in &plans {
+        if state.stage.is_terminal() {
+            continue;
+        }
+        if let Some(plan) = root
+            .load(&state.plan_id)
+            .map_err(|e| OpError::Conflict(format!("load plan `{}`: {e}", state.plan_id)))?
+        {
+            for art in &plan.plan().artifacts {
+                referenced.insert(art.digest.clone());
+            }
+            for bin in &plan.plan().binaries {
+                referenced.insert(bin.digest.clone());
+            }
+        }
+    }
+
+    // List all CAS blobs and compute the eviction set.
+    let all_blobs = root
+        .cas_list()
+        .map_err(|e| OpError::Conflict(format!("cas_list: {e}")))?;
+    let mut to_evict: Vec<String> = Vec::new();
+    let mut kept: usize = 0;
+    for digest in &all_blobs {
+        if referenced.contains(digest) {
+            kept += 1;
+        } else {
+            to_evict.push(digest.clone());
+        }
+    }
+
+    // Crash-consistency invariant: at every crash point the receipt on disk
+    // must under-claim (never over-claim) what the CAS holds, so a delta
+    // export against it over-sends — always correct, never silently incomplete.
+    //
+    // When evicting, first write an EMPTY receipt (under-claims everything),
+    // then remove CAS blobs, then write the true post-eviction receipt.
+    // A crash between eviction and the final receipt leaves the empty receipt,
+    // which forces a full (non-delta) export — safe, just redundant.
+    if !to_evict.is_empty() {
+        sign_and_write_receipt(
+            &root,
+            env_id.as_str(),
+            Vec::new(),
+            &priv_pem,
+            &key_id,
+            "empty",
+        )?;
+    }
+
+    for digest in &to_evict {
+        root.cas_remove(digest)
+            .map_err(|e| OpError::Conflict(format!("cas_remove `{digest}`: {e}")))?;
+    }
+    let evicted = to_evict.len();
+
+    let post_gc_inventory = root
+        .cas_list()
+        .map_err(|e| OpError::Conflict(format!("cas_list post-gc: {e}")))?;
+    sign_and_write_receipt(
+        &root,
+        env_id.as_str(),
+        post_gc_inventory,
+        &priv_pem,
+        &key_id,
+        "post-gc",
+    )?;
+
+    Ok(OpOutcome::new(
+        NOUN,
+        "cas-gc",
+        serde_json::json!({
+            "environment_id": env_id.as_str(),
+            "evicted": evicted,
+            "kept": kept,
+        }),
+    ))
+}
+
+fn cas_gc_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "UpdatesCasGcPayload",
+        "type": "object",
+        "required": ["environment_id"],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
+            "key_id": {"type": ["string", "null"], "description": "Key id for the signing key."},
+            "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."}
+        }
+    })
+}
+
 fn parse_env_id(raw: &str) -> Result<EnvId, OpError> {
     EnvId::try_from(raw).map_err(|e| OpError::InvalidArgument(format!("environment_id: {e}")))
 }
@@ -3405,7 +4770,10 @@ fn config_set_schema() -> Value {
             "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"},
             "plan_endpoint": {"type": ["string", "null"], "description": "base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`); null leaves the stored value unchanged; must be https (or http to loopback)"},
             "push_enabled": {"type": ["boolean", "null"], "description": "whether the runtime subscribes to a pushed update stream (SSE); null leaves the stored value unchanged (unset resolves to true)"},
-            "stream_endpoint": {"type": ["string", "null"], "description": "SSE stream endpoint URL; null leaves the stored value unchanged (unset derives from plan_endpoint); must be https (or http to loopback)"}
+            "stream_endpoint": {"type": ["string", "null"], "description": "SSE stream endpoint URL; null leaves the stored value unchanged (unset derives from plan_endpoint); must be https (or http to loopback)"},
+            "blob_base_url": {"type": ["string", "null"], "description": "base URL of an air-gap blob mirror serving content-addressed blobs at {base}/sha256-<hex>; null leaves the stored value unchanged; must be https (or http when insecure_http is true)"},
+            "insecure_http": {"type": ["boolean", "null"], "description": "allow plain-HTTP (non-TLS) plan/stream/blob endpoints on non-loopback hosts; null leaves the stored value unchanged (absent resolves to false, deny-by-default); does NOT affect OCI insecure registries or enrollment ca_url"},
+            "clear_blob_base_url": {"type": ["boolean", "null"], "description": "when true, removes a previously configured blob_base_url; conflicts with blob_base_url (setting and clearing in the same command is rejected)"}
         }
     })
 }
@@ -3494,6 +4862,10 @@ mod tests {
                 plan_endpoint: Some("https://updates.example.com/plans/latest".into()),
                 push_enabled: Some(false),
                 stream_endpoint: Some("https://updates.example.com/updates/stream".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -3555,6 +4927,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -3587,6 +4963,10 @@ mod tests {
             plan_endpoint: None,
             push_enabled: Some(false),
             stream_endpoint: Some("https://example.com/stream".into()),
+            blob_base_url: None,
+            insecure_http: None,
+
+            clear_blob_base_url: None,
         });
         set(UpdateConfigSetPayload {
             environment_id: "local".into(),
@@ -3596,6 +4976,10 @@ mod tests {
             plan_endpoint: None,
             push_enabled: None,
             stream_endpoint: None,
+            blob_base_url: None,
+            insecure_http: None,
+
+            clear_blob_base_url: None,
         });
         let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
         assert_eq!(cfg.enabled, Some(true)); // preserved across the second set
@@ -3624,6 +5008,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3650,6 +5038,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3671,6 +5063,10 @@ mod tests {
                 plan_endpoint: Some("http://example.com/plan".into()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3696,6 +5092,10 @@ mod tests {
                 plan_endpoint: Some("   ".into()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3717,6 +5117,10 @@ mod tests {
                 plan_endpoint: Some("".into()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3744,6 +5148,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: Some("http://example.com/stream".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3767,6 +5175,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: Some("   ".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3784,6 +5196,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: Some("".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3931,6 +5347,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -3973,6 +5393,10 @@ mod tests {
                         plan_endpoint: None,
                         push_enabled: None,
                         stream_endpoint: None,
+                        blob_base_url: None,
+                        insecure_http: None,
+
+                        clear_blob_base_url: None,
                     }),
                 )
                 .unwrap();
@@ -3990,6 +5414,10 @@ mod tests {
                         plan_endpoint: None,
                         push_enabled: None,
                         stream_endpoint: None,
+                        blob_base_url: None,
+                        insecure_http: None,
+
+                        clear_blob_base_url: None,
                     }),
                 )
                 .unwrap();
@@ -4030,6 +5458,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4037,6 +5469,604 @@ mod tests {
             !env_dir.join("update-channel.json").exists(),
             "sidecar must not be written for a corrupt env"
         );
+    }
+
+    // --- blob_base_url + insecure_http (C2 air-gap config) -------------------
+
+    #[test]
+    fn config_set_blob_base_url_and_insecure_http_persist_and_round_trip() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("https://updates.example.com/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan:9443/blobs".into()),
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(
+            cfg.blob_base_url.as_deref(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(cfg.insecure_http, Some(true));
+        // Verify resolved accessors.
+        assert_eq!(
+            cfg.resolved_blob_base_url(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert!(cfg.resolved_insecure_http());
+        // Read back via config-show and verify the view.
+        let out = config_show(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigShowFilter {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            out.result["blob_base_url"].as_str(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(out.result["insecure_http"].as_bool(), Some(true));
+        assert_eq!(
+            out.result["resolved"]["blob_base_url"].as_str(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(
+            out.result["resolved"]["insecure_http"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn config_set_insecure_http_true_admits_plain_http_plan_endpoint_same_command() {
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        // Plain-HTTP non-loopback plan_endpoint + insecure_http=true in the
+        // same command must be accepted.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn config_set_plain_http_plan_endpoint_without_insecure_rejected() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        // Plain-HTTP non-loopback plan_endpoint WITHOUT insecure_http → rejected.
+        // This pins the existing strict behavior.
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_plain_http_blob_base_url_without_insecure_rejected() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("http://mirror.lan/blobs".into()),
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_plain_http_blob_base_url_with_insecure_accepted() {
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("http://mirror.lan/blobs".into()),
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn config_set_ftp_blob_base_url_rejected_even_with_insecure() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("ftp://mirror.lan/blobs".into()),
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scheme") && msg.contains("ftp"),
+            "error should name the rejected scheme: {msg}"
+        );
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_insecure_downgrade_rejects_stored_plain_http_plan_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        // Step 1: store insecure_http=true + plain-HTTP non-loopback plan_endpoint.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        // Step 2: set insecure_http=false alone → must fail naming plan_endpoint.
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(false),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("plan_endpoint"),
+            "error should name the offending field: {msg}"
+        );
+        // Config is still intact — nothing was written by the failed command.
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.insecure_http, Some(true));
+        assert_eq!(cfg.plan_endpoint.as_deref(), Some("http://mirror.lan/plan"));
+    }
+
+    #[test]
+    fn config_set_stored_insecure_admits_plain_http_endpoint_without_restating() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Step 1: enable insecure_http with an https plan_endpoint.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("https://updates.example.com/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+
+        // Step 2: repoint plan_endpoint to plain-HTTP non-loopback WITHOUT
+        // restating insecure_http — the stored value (true) must be honoured.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.plan_endpoint.as_deref(), Some("http://mirror.lan/plan"));
+        assert_eq!(cfg.insecure_http, Some(true));
+
+        // Step 3: repoint stream_endpoint the same way — also accepted.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("http://mirror.lan/stream".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("http://mirror.lan/stream")
+        );
+        assert_eq!(cfg.insecure_http, Some(true));
+    }
+
+    #[test]
+    fn config_set_rejects_blank_blob_base_url() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("   ".into()),
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(msg.contains("blank"), "error should mention 'blank': {msg}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_https_blob_base_url_accepted_without_insecure() {
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan/blobs".into()),
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    // ---- audit distinguishability for security-sensitive fields ----------------
+
+    #[test]
+    fn config_set_audit_records_insecure_http_values() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Set insecure_http=true and verify the audit target carries the value.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+
+        // Set insecure_http=false — second audit line.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(false),
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let audit_raw =
+            std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = audit_raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // Find the two config-set audit events (there may be a preceding
+        // create-env event from store_with_env).
+        let cs_events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["verb"] == "config-set")
+            .collect();
+        assert!(
+            cs_events.len() >= 2,
+            "expected at least 2 config-set audit events, got {}: {audit_raw}",
+            cs_events.len()
+        );
+        let first = &cs_events[0]["target"];
+        let second = &cs_events[1]["target"];
+        assert_eq!(
+            first["insecure_http"],
+            serde_json::json!(true),
+            "first audit entry must record insecure_http=true: {first}"
+        );
+        assert_eq!(
+            second["insecure_http"],
+            serde_json::json!(false),
+            "second audit entry must record insecure_http=false: {second}"
+        );
+    }
+
+    // ---- clear-blob-base-url -------------------------------------------------
+
+    #[test]
+    fn config_set_clear_blob_base_url_removes_stored_value() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Step 1: set a blob_base_url.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan/blobs".into()),
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        assert!(
+            store
+                .load_update_channel(&env_id)
+                .unwrap()
+                .unwrap()
+                .blob_base_url
+                .is_some(),
+            "precondition: blob_base_url must be set"
+        );
+
+        // Step 2: clear it.
+        let out = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: Some(true),
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert!(
+            cfg.blob_base_url.is_none(),
+            "blob_base_url must be None after clearing"
+        );
+        // config_view reflects null.
+        assert!(
+            out.result["blob_base_url"].is_null(),
+            "config_view must show null: {:?}",
+            out.result["blob_base_url"]
+        );
+        assert!(
+            out.result["resolved"]["blob_base_url"].is_null(),
+            "resolved blob_base_url must be null: {:?}",
+            out.result["resolved"]["blob_base_url"]
+        );
+
+        // Step 3: a subsequent config-set without either flag leaves it None.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert!(
+            cfg.blob_base_url.is_none(),
+            "blob_base_url must remain None after unrelated config-set"
+        );
+
+        // Verify audit records the clearing as blob_base_url: null.
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let audit_raw =
+            std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let clear_event: Vec<serde_json::Value> = audit_raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|e: &serde_json::Value| {
+                e["verb"] == "config-set" && e["target"]["blob_base_url"].is_null()
+            })
+            .collect();
+        assert!(
+            !clear_event.is_empty(),
+            "audit must contain a config-set entry with blob_base_url: null: {audit_raw}"
+        );
+    }
+
+    #[test]
+    fn config_set_clear_and_set_blob_base_url_together_rejected() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan/blobs".into()),
+                insecure_http: None,
+                clear_blob_base_url: Some(true),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("clear") && msg.contains("blob"),
+            "error should mention the conflict: {msg}"
+        );
+        // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
 
     // A self-signed X.509 cert (public material only) used to exercise the
@@ -5490,6 +7520,17 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
 
     fn digest_of(bytes: &[u8]) -> String {
         format!("sha256:{}", greentic_update::plan::sha256_hex(bytes))
+    }
+
+    fn write_test_key(dir: &std::path::Path, pem: &str) -> PathBuf {
+        let key_path = dir.join("signing-key.pem");
+        std::fs::write(&key_path, pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        key_path
     }
 
     /// Build+sign a plan carrying `artifacts`, verify it, and admit it to a
@@ -7427,6 +9468,10 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
                 plan_endpoint: Some(endpoint.to_string()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -7988,5 +10033,3242 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             matches!(&err, OpError::InvalidArgument(m) if m.contains("malformed repo")),
             "expected malformed-repo error, got: {err:?}"
         );
+    }
+
+    // ---- Phase A2: op updates export --------------------------------------
+
+    /// Build, sign, and stage a plan with artifacts + binaries, returning the
+    /// key pair for further signing. Stages everything to `Staged`.
+    fn stage_plan_with_blobs(
+        updates_dir: &std::path::Path,
+        store_dir: &std::path::Path,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)], // (name, bytes, target)
+    ) -> (String, TrustedKey, PathBuf) {
+        use greentic_update::staging::UpdatesRoot;
+
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(store_dir);
+        env_trusting(&store, &tk);
+        let build_trust = TrustRoot::new(vec![tk.clone()]);
+
+        let artifacts: Vec<Value> = art_payloads
+            .iter()
+            .map(|(name, bytes)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+        let binaries: Vec<Value> = bin_payloads
+            .iter()
+            .map(|(name, bytes, target)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "target": target,
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-export",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": "nonce-export",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": artifacts,
+            "binaries": binaries,
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv_pem, &tk.key_id, &build_trust)
+                .unwrap();
+        let verified = verify_with(&built.plan_bytes, &built.envelope_bytes, &tk);
+        let root = UpdatesRoot::open_in(updates_dir, "local").unwrap();
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+
+        // Put artifact blobs.
+        for (name, bytes) in art_payloads {
+            let art = staged
+                .plan()
+                .artifacts
+                .iter()
+                .find(|a| a.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_artifact(&art, bytes).unwrap();
+        }
+        // Put binary blobs.
+        for (name, bytes, _target) in bin_payloads {
+            let bin = staged
+                .plan()
+                .binaries
+                .iter()
+                .find(|b| b.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_binary_blob(&bin, bytes).unwrap();
+        }
+
+        advance_to_staged(&staged).unwrap();
+
+        let key_path = write_test_key(store_dir, &priv_pem);
+        (priv_pem, tk, key_path)
+    }
+
+    fn export_args(
+        env_id: &str,
+        plan_id: &str,
+        out: PathBuf,
+        signing_key: PathBuf,
+        key_id: &str,
+    ) -> crate::cli::dispatch::UpdatesExportArgs {
+        crate::cli::dispatch::UpdatesExportArgs {
+            env_id: Some(env_id.into()),
+            plan_id: Some(plan_id.into()),
+            out: Some(out),
+            base_receipt: None,
+            base_receipt_sig: None,
+            targets: vec![],
+            signing_key: Some(signing_key),
+            key_id: Some(key_id.into()),
+            trust_root: None,
+            binary_blobs: vec![],
+        }
+    }
+
+    /// Scan an exported envelope back with `tk` as the sole trusted key.
+    /// Returns the scan result plus the quarantine dir guard that owns the
+    /// extracted files (dropping it deletes them).
+    fn scan_exported(
+        path: &std::path::Path,
+        tk: &TrustedKey,
+    ) -> (
+        greentic_update::envelope::ScannedEnvelopeRef,
+        tempfile::TempDir,
+    ) {
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let quarantine = tempdir().unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        let scanned = greentic_update::envelope::scan_envelope_to_dir(
+            file,
+            &trust,
+            &greentic_update::envelope::ScanLimits::default(),
+            quarantine.path(),
+        )
+        .unwrap();
+        (scanned, quarantine)
+    }
+
+    #[test]
+    fn export_full_round_trip() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content-alpha";
+        let bin_data = b"binary-executable-bytes";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        let out_path = out_dir.path().join("export.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.op, "export");
+        assert_eq!(out.noun, NOUN);
+        assert_eq!(out.result["plan_id"], "plan-export");
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 0);
+        assert!(out.result["byte_total"].as_u64().unwrap() > 0);
+        assert!(out_path.exists());
+
+        // Scan the envelope back and verify its contents.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+
+        assert_eq!(scanned.manifest.plan_id, "plan-export");
+        assert_eq!(scanned.manifest.env_id, "local");
+
+        // Plan bytes round-trip.
+        let scanned_plan_bytes = std::fs::read(&scanned.plan_path).unwrap();
+        let scanned_plan: greentic_update::plan::UpdatePlan =
+            serde_json::from_slice(&scanned_plan_bytes).unwrap();
+        assert_eq!(scanned_plan.plan_id, "plan-export");
+
+        // Blob fidelity.
+        let art_digest = digest_of(art_data);
+        let bin_digest = digest_of(bin_data);
+        assert!(scanned.blob_paths.contains_key(&art_digest));
+        assert!(scanned.blob_paths.contains_key(&bin_digest));
+        assert_eq!(
+            std::fs::read(scanned.blob_paths.get(&art_digest).unwrap()).unwrap(),
+            art_data
+        );
+        assert_eq!(
+            std::fs::read(scanned.blob_paths.get(&bin_digest).unwrap()).unwrap(),
+            bin_data
+        );
+    }
+
+    #[test]
+    fn export_delta_skips_held_blobs() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-alpha";
+        let bin_data = b"binary-beta";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Build a receipt that claims the artifact digest is already held.
+        let held = vec![digest_of(art_data)];
+        let (receipt_bytes, receipt_sig_bytes) =
+            greentic_update::envelope::build_import_receipt("local", held, &priv_pem, &tk.key_id)
+                .unwrap();
+        let receipt_path = out_dir.path().join("receipt.json");
+        let receipt_sig_path = out_dir.path().join("receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        let out_path = out_dir.path().join("delta.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.result["blobs_included"], 1, "only the binary");
+        assert_eq!(out.result["blobs_skipped"], 1, "the artifact was held");
+
+        // Scan and verify only the binary blob is present.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+
+        let art_digest = digest_of(art_data);
+        let bin_digest = digest_of(bin_data);
+        assert!(
+            !scanned.blob_paths.contains_key(&art_digest),
+            "held artifact should be absent"
+        );
+        assert!(
+            scanned.blob_paths.contains_key(&bin_digest),
+            "binary should be present"
+        );
+    }
+
+    #[test]
+    fn export_filters_binary_targets() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"content-artifact";
+        let bin_linux = b"linux-binary";
+        let bin_macos = b"macos-binary";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[
+                ("gtc", bin_linux, "x86_64-unknown-linux-gnu"),
+                ("gtc-mac", bin_macos, "aarch64-apple-darwin"),
+            ],
+        );
+
+        let out_path = out_dir.path().join("filtered.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        // Only include Linux binaries.
+        args.targets = vec!["x86_64-unknown-linux-gnu".into()];
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // Artifact + linux binary included, macos binary skipped.
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 1);
+
+        // Verify the envelope contents.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+
+        let art_digest = digest_of(art_data);
+        let linux_digest = digest_of(bin_linux);
+        let macos_digest = digest_of(bin_macos);
+        assert!(
+            scanned.blob_paths.contains_key(&art_digest),
+            "artifact always included"
+        );
+        assert!(
+            scanned.blob_paths.contains_key(&linux_digest),
+            "linux binary included"
+        );
+        assert!(
+            !scanned.blob_paths.contains_key(&macos_digest),
+            "macos binary filtered out"
+        );
+    }
+
+    #[test]
+    fn export_rejects_downloading_plan() {
+        use greentic_update::staging::UpdatesRoot;
+
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let (priv7, tk7) = key_pair(7);
+        env_trusting(&store, &tk7);
+
+        // Stage a plan that is still in Downloading (don't advance).
+        let build_trust = TrustRoot::new(vec![tk7.clone()]);
+        let (plan_b, sig_b) = signed_plan(
+            "local",
+            "plan-dl",
+            1,
+            json!([
+                {"name": "a1", "version": "1.0.0", "digest": digest_of(b"x"), "source": "file:///a1"},
+            ]),
+            json!({}),
+            &priv7,
+            &tk7.key_id,
+            &build_trust,
+        );
+        let verified = verify_with(&plan_b, &sig_b, &tk7);
+        let root = UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.begin(&verified, &plan_b, &sig_b).unwrap();
+
+        let key_path = store_dir.path().join("key.pem");
+        std::fs::write(&key_path, &priv7).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let args = export_args(
+            "local",
+            "plan-dl",
+            out_dir.path().join("out.gtupdate"),
+            key_path,
+            &tk7.key_id,
+        );
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("downloading")),
+            "expected downloading rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_rejects_bad_receipt_sig() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Build a receipt signed by a DIFFERENT key (untrusted).
+        let (priv_other, tk_other) = key_pair(9);
+        let held = vec![digest_of(art_data)];
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "local",
+            held,
+            &priv_other,
+            &tk_other.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("bad-receipt.json");
+        let receipt_sig_path = out_dir.path().join("bad-receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        let out_path = out_dir.path().join("bad.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("receipt")),
+            "expected receipt verification error, got: {err:?}"
+        );
+        // Fail-closed: no envelope file written.
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_base_receipt_without_sig() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let out_path = out_dir.path().join("out.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        // Set base_receipt but omit base_receipt_sig — bypasses clap's
+        // `requires` guard, exercising the code-level validation.
+        args.base_receipt = Some(out_dir.path().join("receipt.json"));
+        args.base_receipt_sig = None;
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("base-receipt-sig")),
+            "expected base-receipt-sig rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_key_id_without_signing_key() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, tk, _key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let out_path = out_dir.path().join("out.gtupdate");
+        // Build args manually — signing_key: None, key_id: Some.
+        let args = crate::cli::dispatch::UpdatesExportArgs {
+            env_id: Some("local".into()),
+            plan_id: Some("plan-export".into()),
+            out: Some(out_path.clone()),
+            base_receipt: None,
+            base_receipt_sig: None,
+            targets: vec![],
+            signing_key: None,
+            key_id: Some(tk.key_id.clone()),
+            trust_root: None,
+            binary_blobs: vec![],
+        };
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("--key-id requires --signing-key")),
+            "expected key-id-without-signing-key rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_receipt_for_other_env() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Build a VALID signed receipt whose env_id is a different environment.
+        let held = vec![digest_of(art_data)];
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "other-env",
+            held,
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("other-receipt.json");
+        let receipt_sig_path = out_dir.path().join("other-receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        let out_path = out_dir.path().join("bad.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("other-env") && m.contains("local")),
+            "expected env mismatch rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_untrusted_signing_key() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, _tk, _key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Generate a fresh key NOT registered in the env trust root.
+        let (untrusted_priv, untrusted_tk) = key_pair(99);
+        let untrusted_key_path = store_dir.path().join("untrusted-key.pem");
+        std::fs::write(&untrusted_key_path, &untrusted_priv).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&untrusted_key_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let out_path = out_dir.path().join("untrusted.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            untrusted_key_path,
+            &untrusted_tk.key_id,
+        );
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not trusted")),
+            "expected untrusted-key rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_rejects_mislabeled_key_id() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-content";
+        let (_priv_pem, _tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Use the trusted signing key but with a wrong key id.
+        let out_path = out_dir.path().join("mislabeled.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            "not-the-registered-id",
+        );
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not trusted")),
+            "expected mislabeled-key-id rejection, got: {err:?}"
+        );
+        assert!(!out_path.exists());
+    }
+
+    #[test]
+    fn export_schema_fn() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let args = crate::cli::dispatch::UpdatesExportArgs {
+            env_id: None,
+            plan_id: None,
+            out: None,
+            base_receipt: None,
+            base_receipt_sig: None,
+            targets: vec![],
+            signing_key: None,
+            key_id: None,
+            trust_root: None,
+            binary_blobs: vec![],
+        };
+        let out = export_impl(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            args,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.op, "export");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["plan_id"].is_object());
+        assert!(out.result["properties"]["out"].is_object());
+        assert!(out.result["properties"]["base_receipt"].is_object());
+        assert!(out.result["properties"]["targets"].is_object());
+    }
+
+    // ---- Phase B2: import + cas-gc ----------------------------------------
+
+    /// Like [`stage_plan_with_blobs`] but with a configurable plan id and
+    /// sequence number, for testing monotonic-guard and idempotency scenarios.
+    fn stage_plan_with_blobs_seq(
+        updates_dir: &std::path::Path,
+        store_dir: &std::path::Path,
+        plan_id: &str,
+        sequence: u64,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (String, TrustedKey, PathBuf) {
+        use greentic_update::staging::UpdatesRoot;
+
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(store_dir);
+        env_trusting(&store, &tk);
+        let build_trust = TrustRoot::new(vec![tk.clone()]);
+
+        let artifacts: Vec<Value> = art_payloads
+            .iter()
+            .map(|(name, bytes)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+        let binaries: Vec<Value> = bin_payloads
+            .iter()
+            .map(|(name, bytes, target)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "target": target,
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": plan_id,
+            "env_id": "local",
+            "sequence": sequence,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": format!("nonce-{plan_id}"),
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": artifacts,
+            "binaries": binaries,
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv_pem, &tk.key_id, &build_trust)
+                .unwrap();
+        let verified = verify_with(&built.plan_bytes, &built.envelope_bytes, &tk);
+        let root = UpdatesRoot::open_in(updates_dir, "local").unwrap();
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+
+        for (name, bytes) in art_payloads {
+            let art = staged
+                .plan()
+                .artifacts
+                .iter()
+                .find(|a| a.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_artifact(&art, bytes).unwrap();
+        }
+        for (name, bytes, _target) in bin_payloads {
+            let bin = staged
+                .plan()
+                .binaries
+                .iter()
+                .find(|b| b.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_binary_blob(&bin, bytes).unwrap();
+        }
+
+        advance_to_staged(&staged).unwrap();
+
+        let key_path = write_test_key(store_dir, &priv_pem);
+        (priv_pem, tk, key_path)
+    }
+
+    /// Like [`build_envelope_for_import`] but with a configurable plan id and
+    /// sequence number.
+    fn build_envelope_for_import_seq(
+        store_dir: &std::path::Path,
+        updates_dir: &std::path::Path,
+        out_path: &std::path::Path,
+        plan_id: &str,
+        sequence: u64,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (String, TrustedKey, PathBuf) {
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs_seq(
+            updates_dir,
+            store_dir,
+            plan_id,
+            sequence,
+            art_payloads,
+            bin_payloads,
+        );
+        let store = LocalFsStore::new(store_dir);
+        let args = export_args(
+            "local",
+            plan_id,
+            out_path.to_path_buf(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        export_impl(&store, &OpFlags::default(), args, Some(updates_dir)).unwrap();
+        (priv_pem, tk, key_path)
+    }
+
+    /// Export a staged plan into a `.gtupdate` envelope file — a test fixture
+    /// that builds an envelope the import tests can feed to `import_impl`.
+    fn build_envelope_for_import(
+        store_dir: &std::path::Path,
+        updates_dir: &std::path::Path,
+        out_path: &std::path::Path,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (String, TrustedKey, PathBuf) {
+        let (priv_pem, tk, key_path) =
+            stage_plan_with_blobs(updates_dir, store_dir, art_payloads, bin_payloads);
+        let store = LocalFsStore::new(store_dir);
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.to_path_buf(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        export_impl(&store, &OpFlags::default(), args, Some(updates_dir)).unwrap();
+        (priv_pem, tk, key_path)
+    }
+
+    fn import_args(
+        env_id: &str,
+        envelope: PathBuf,
+        signing_key: PathBuf,
+        key_id: &str,
+    ) -> crate::cli::dispatch::UpdatesImportArgs {
+        crate::cli::dispatch::UpdatesImportArgs {
+            env_id: Some(env_id.into()),
+            envelope: Some(envelope),
+            stage: false,
+            signing_key: Some(signing_key),
+            key_id: Some(key_id.into()),
+            staleness_days: 30,
+            trust_root: None,
+            push_to: None,
+        }
+    }
+
+    fn cas_gc_args(
+        env_id: &str,
+        signing_key: PathBuf,
+        key_id: &str,
+    ) -> crate::cli::dispatch::UpdatesCasGcArgs {
+        crate::cli::dispatch::UpdatesCasGcArgs {
+            env_id: Some(env_id.into()),
+            signing_key: Some(signing_key),
+            key_id: Some(key_id.into()),
+            trust_root: None,
+        }
+    }
+
+    /// Set up the import side: env store with trusted key + signing key on disk.
+    fn setup_import_side(store_dir: &std::path::Path, tk: &TrustedKey) -> (LocalFsStore, PathBuf) {
+        let store = LocalFsStore::new(store_dir);
+        env_trusting(&store, tk);
+        let (priv_pem, _) = key_pair(7);
+        let key_path = write_test_key(store_dir, &priv_pem);
+        (store, key_path)
+    }
+
+    #[test]
+    fn import_full_envelope_to_inbox() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"artifact-for-import";
+        let bin_data = b"binary-for-import";
+        let envelope_path = out_dir.path().join("full.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.op, "import");
+        assert_eq!(out.noun, NOUN);
+        assert_eq!(out.result["plan_id"], "plan-export");
+        assert_eq!(out.result["stage"], "inbox");
+        assert_eq!(out.result["blobs_imported"], 2);
+        assert_eq!(out.result["blobs_already_held"], 0);
+        assert!(out.result["receipt_path"].as_str().is_some());
+    }
+
+    #[test]
+    fn import_with_stage_flag_promotes() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"artifact-staged";
+        let envelope_path = out_dir.path().join("stage.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.stage = true;
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.result["stage"], "staged");
+    }
+
+    #[test]
+    fn import_staleness_warns_old_plan() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"stale-content";
+        let envelope_path = out_dir.path().join("stale.gtupdate");
+        // Plan created_at is "2026-07-02T00:00:00Z" — over 27 days ago.
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        // Set staleness-days to 1 so the plan is considered stale.
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.staleness_days = 1;
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        // Import succeeds (advisory, not hard reject).
+        assert_eq!(out.result["plan_id"], "plan-export");
+        // Warnings field present.
+        let warnings = out.result["warnings"].as_array().unwrap();
+        assert!(!warnings.is_empty());
+        assert!(warnings[0].as_str().unwrap().contains("days old"));
+    }
+
+    #[test]
+    fn import_preflight_rejects_missing_blob() {
+        // Build an envelope that references a blob we'll remove from its
+        // archive before import. The simplest way: build an envelope, then
+        // craft a *different* plan that references a different digest but
+        // import from the original envelope.
+        //
+        // Instead, we use a simpler approach: build a plan with both art+bin,
+        // export it, then import the FULL envelope into an import env. Then
+        // build a NEW envelope with a different blob set, import to SAME
+        // import env. The delta will have the second blob, but the import
+        // env's CAS won't have it. Actually, let's just test by importing
+        // from a crafted envelope that has the plan but not all blobs.
+        //
+        // Simplest: we can use `scan_envelope_to_dir` constraints. But the
+        // simplest test: build an envelope with art+bin, then manually remove
+        // a blob from the quarantine before import. But import_impl does its
+        // own scan...
+        //
+        // Better approach: create an envelope whose plan references a blob
+        // that is neither in the envelope nor in CAS. We can do this by
+        // building a plan with an extra binary reference, exporting only a
+        // subset. But export won't allow that.
+        //
+        // Let's go with: build an envelope normally, import it (works).
+        // Then manually delete a CAS blob and try importing a delta envelope
+        // that doesn't carry that blob. The preflight fails because the
+        // digest isn't in the envelope AND isn't in CAS.
+        //
+        // Actually, the design says preflight checks envelope_digests + CAS.
+        // The simplest fail case: import an envelope that carries FEWER blobs
+        // than the plan needs, and CAS is empty. We need to construct such an
+        // envelope. We can't via normal export (it exports all referenced).
+        //
+        // Simplest: build an envelope with ONE artifact. Then manually
+        // construct a plan that references TWO artifacts but the envelope only
+        // has one. Use EnvelopeBuilder directly.
+        let store_dir = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(store_dir.path());
+        env_trusting(&store, &tk);
+        let build_trust = TrustRoot::new(vec![tk.clone()]);
+
+        // Build a plan that references TWO artifacts.
+        let art_a = b"alpha-bytes";
+        let art_b = b"beta-bytes";
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-preflight",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-28T00:00:00Z",
+            "nonce": "nonce-pf",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": [
+                {"name": "art-a", "version": "1.0.0", "digest": digest_of(art_a)},
+                {"name": "art-b", "version": "1.0.0", "digest": digest_of(art_b)},
+            ],
+            "binaries": [],
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv_pem, &tk.key_id, &build_trust)
+                .unwrap();
+
+        // Build an envelope that includes the plan but only ONE blob.
+        let envelope_path = out_dir.path().join("partial.gtupdate");
+        let file = std::fs::File::create(&envelope_path).unwrap();
+        let mut builder =
+            greentic_update::envelope::EnvelopeBuilder::new(&file, &priv_pem, &tk.key_id).unwrap();
+        builder
+            .add_plan(&built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+        builder
+            .add_blob(&digest_of(art_a), art_a, "application/octet-stream", None)
+            .unwrap();
+        // Deliberately skip art_b.
+        builder.finish().unwrap();
+        drop(file);
+
+        let key_path = write_test_key(store_dir.path(), &priv_pem);
+
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let err = import_impl(
+            &store,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("preflight")),
+            "expected preflight failure, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn import_writes_receipt() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"receipt-artifact";
+        let bin_data = b"receipt-binary";
+        let envelope_path = out_dir.path().join("receipt.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        // Read the receipt back and verify it contains the imported digests.
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        let (receipt_bytes, receipt_sig_bytes) = root.read_import_receipt().unwrap().unwrap();
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let receipt = greentic_update::envelope::verify_import_receipt(
+            &receipt_bytes,
+            &receipt_sig_bytes,
+            &trust,
+        )
+        .unwrap();
+        assert_eq!(receipt.env_id, "local");
+        assert!(receipt.held_digests.contains(&digest_of(art_data)));
+        assert!(receipt.held_digests.contains(&digest_of(bin_data)));
+    }
+
+    #[test]
+    fn import_rejects_bad_envelope_sig() {
+        let store_dir = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let (priv_pem, tk) = key_pair(7);
+        let (priv_bad, _tk_bad) = key_pair(8);
+        let store = LocalFsStore::new(store_dir.path());
+        env_trusting(&store, &tk);
+        let build_trust = TrustRoot::new(vec![tk.clone()]);
+
+        let art_data = b"bad-sig-art";
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-bad-sig",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-28T00:00:00Z",
+            "nonce": "nonce-bs",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": [{"name": "art-a", "version": "1.0.0", "digest": digest_of(art_data)}],
+            "binaries": [],
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv_pem, &tk.key_id, &build_trust)
+                .unwrap();
+
+        // Build envelope signed by the UNTRUSTED key.
+        let envelope_path = out_dir.path().join("bad-sig.gtupdate");
+        let file = std::fs::File::create(&envelope_path).unwrap();
+        let mut builder =
+            greentic_update::envelope::EnvelopeBuilder::new(&file, &priv_bad, &_tk_bad.key_id)
+                .unwrap();
+        builder
+            .add_plan(&built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+        builder
+            .add_blob(
+                &digest_of(art_data),
+                art_data,
+                "application/octet-stream",
+                None,
+            )
+            .unwrap();
+        builder.finish().unwrap();
+        drop(file);
+
+        let key_path = write_test_key(store_dir.path(), &priv_pem);
+
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let err = import_impl(
+            &store,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must fail at scan (envelope sig check), before any CAS write.
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("scan envelope")),
+            "expected scan failure for untrusted envelope sig, got: {err:?}"
+        );
+        // No CAS blobs should exist.
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        assert!(root.cas_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_rejects_bad_plan_sig() {
+        let store_dir = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let (priv_pem, tk) = key_pair(7);
+        let (priv_bad, tk_bad) = key_pair(8);
+        let store = LocalFsStore::new(store_dir.path());
+        env_trusting(&store, &tk);
+        // Build the plan signed by the BAD key — the env trust root does not
+        // include it, so plan verification must fail.
+        let bad_trust = TrustRoot::new(vec![tk_bad.clone()]);
+
+        let art_data = b"plan-bad-sig-art";
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": "plan-bad-plan-sig",
+            "env_id": "local",
+            "sequence": 1,
+            "created_at": "2026-07-28T00:00:00Z",
+            "nonce": "nonce-bps",
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": [{"name": "art-a", "version": "1.0.0", "digest": digest_of(art_data)}],
+            "binaries": [],
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv_bad, &tk_bad.key_id, &bad_trust)
+                .unwrap();
+
+        // Build envelope signed by the TRUSTED key (envelope sig OK), but
+        // plan is signed by the bad key (plan sig check fails on import).
+        let envelope_path = out_dir.path().join("bad-plan-sig.gtupdate");
+        let file = std::fs::File::create(&envelope_path).unwrap();
+        let mut builder =
+            greentic_update::envelope::EnvelopeBuilder::new(&file, &priv_pem, &tk.key_id).unwrap();
+        builder
+            .add_plan(&built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+        builder
+            .add_blob(
+                &digest_of(art_data),
+                art_data,
+                "application/octet-stream",
+                None,
+            )
+            .unwrap();
+        builder.finish().unwrap();
+        drop(file);
+
+        let key_path = write_test_key(store_dir.path(), &priv_pem);
+
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let err = import_impl(
+            &store,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // The scan succeeds (envelope manifest sig checks out with tk), but
+        // the plan.json.sig is signed by the bad key. scan_envelope_to_dir
+        // verifies the plan sig inside the scanner, so this should fail there.
+        // If not (i.e., scanner doesn't verify plan sig against the same trust
+        // root), it fails at step 2 (verify_update_plan).
+        assert!(
+            matches!(&err, OpError::Conflict(_)),
+            "expected plan sig failure, got: {err:?}"
+        );
+        // No CAS blobs should exist.
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        assert!(root.cas_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_rejects_plan_for_other_env() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"other-env-art";
+        let envelope_path = out_dir.path().join("other-env.gtupdate");
+        // The envelope is built for env "local".
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let import_s = LocalFsStore::new(import_store.path());
+        // Create env "production" instead.
+        let env = crate::cli::tests_common::make_env("production");
+        import_s.save(&env).unwrap();
+        let prod_id = EnvId::try_from("production").unwrap();
+        let env_dir = import_s.env_dir(&prod_id).unwrap();
+        store_trust_root::add_trusted_key(&env_dir, tk.clone()).unwrap();
+
+        let (priv_pem, _) = key_pair(7);
+        let key_path = write_test_key(import_store.path(), &priv_pem);
+
+        // Import with --env-id production, but envelope is for env "local".
+        let args = import_args("production", envelope_path, key_path, &tk.key_id);
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("not `production`")),
+            "expected env mismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn import_fetcher_reads_cas() {
+        let dir = tempdir().unwrap();
+        let root = greentic_update::staging::UpdatesRoot::open_in(dir.path(), "local").unwrap();
+        let data = b"cas-test-blob";
+        let digest = digest_of(data);
+        root.cas_put(&digest, data).unwrap();
+
+        let fetcher = ImportFetcher { root: &root };
+        let artifact = greentic_update::plan::PlanArtifact {
+            name: "test".into(),
+            version: "1.0.0".into(),
+            digest: digest.clone(),
+            source: None,
+        };
+        let bytes = fetcher.fetch(&artifact).unwrap();
+        assert_eq!(bytes, data);
+    }
+
+    #[test]
+    fn import_does_not_break_get_source_none_rejection() {
+        // Regression: DistArtifactFetcher MUST still reject source=None.
+        let artifact = greentic_update::plan::PlanArtifact {
+            name: "no-source".into(),
+            version: "1.0.0".into(),
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
+            source: None,
+        };
+        let err = DistArtifactFetcher::new().fetch(&artifact).unwrap_err();
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("no source")),
+            "DistArtifactFetcher must reject source=None, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn import_delta_with_receipt_and_partial_envelope() {
+        // Pre-seed CAS with one blob, import an envelope missing that blob
+        // but carrying a different one. Succeeds via CAS resolution.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"delta-artifact";
+        let bin_data = b"delta-binary";
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(export_store.path());
+        env_trusting(&store, &tk);
+
+        // Stage the plan with both blobs.
+        let (_export_priv, _tk2, key_path) = stage_plan_with_blobs(
+            export_updates.path(),
+            export_store.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Build a full receipt claiming the artifact is already held.
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "local",
+            vec![digest_of(art_data)],
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("receipt.json");
+        let receipt_sig_path = out_dir.path().join("receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        // Delta export: skip the held artifact.
+        let envelope_path = out_dir.path().join("delta.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            envelope_path.clone(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+        export_impl(
+            &store,
+            &OpFlags::default(),
+            args,
+            Some(export_updates.path()),
+        )
+        .unwrap();
+
+        // Set up import env with the artifact already in CAS.
+        let import_s = LocalFsStore::new(import_store.path());
+        env_trusting(&import_s, &tk);
+        let import_root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        import_root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        let import_key_path = write_test_key(import_store.path(), &priv_pem);
+
+        let import_a = import_args("local", envelope_path, import_key_path, &tk.key_id);
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            import_a,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        // The binary was imported from the envelope, the artifact was already
+        // in CAS. Both resolve for the plan.
+        assert_eq!(out.result["blobs_imported"], 1, "only the binary");
+        assert_eq!(
+            out.result["blobs_already_held"], 0,
+            "artifact not in envelope"
+        );
+        assert_eq!(out.result["plan_id"], "plan-export");
+    }
+
+    #[test]
+    fn import_schema_fn() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let args = crate::cli::dispatch::UpdatesImportArgs {
+            env_id: None,
+            envelope: None,
+            stage: false,
+            signing_key: None,
+            key_id: None,
+            staleness_days: 30,
+            trust_root: None,
+            push_to: None,
+        };
+        let out = import_impl(
+            &store,
+            &OpFlags {
+                schema_only: true,
+                ..OpFlags::default()
+            },
+            args,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.op, "import");
+        assert_eq!(out.noun, NOUN);
+        assert!(out.result["properties"]["envelope"].is_object());
+        assert!(out.result["properties"]["staleness_days"].is_object());
+    }
+
+    #[test]
+    fn cas_gc_keeps_referenced() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"gc-keep-art";
+        let bin_data = b"gc-keep-bin";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Put the same blobs into CAS.
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+        root.cas_put(&digest_of(bin_data), bin_data).unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let out = cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.result["evicted"], 0);
+        assert_eq!(out.result["kept"], 2);
+    }
+
+    #[test]
+    fn cas_gc_evicts_orphans() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"gc-evict-art";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        // Put the referenced blob + an orphan.
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+        let orphan = b"orphaned-blob-data";
+        root.cas_put(&digest_of(orphan), orphan).unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let out = cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.result["evicted"], 1);
+        assert_eq!(out.result["kept"], 1);
+        // Orphan is gone.
+        assert!(!root.cas_contains(&digest_of(orphan)).unwrap());
+        // Referenced is still there.
+        assert!(root.cas_contains(&digest_of(art_data)).unwrap());
+    }
+
+    #[test]
+    fn cas_gc_rewrites_receipt() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"gc-receipt-art";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+        let orphan = b"orphan-receipt-blob";
+        root.cas_put(&digest_of(orphan), orphan).unwrap();
+
+        // Write a receipt that includes both blobs.
+        let (rb, rs) = greentic_update::envelope::build_import_receipt(
+            "local",
+            vec![digest_of(art_data), digest_of(orphan)],
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        root.write_import_receipt(&rb, &rs).unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // Read the receipt back: orphan's digest should be gone.
+        let (receipt_bytes, receipt_sig_bytes) = root.read_import_receipt().unwrap().unwrap();
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let receipt = greentic_update::envelope::verify_import_receipt(
+            &receipt_bytes,
+            &receipt_sig_bytes,
+            &trust,
+        )
+        .unwrap();
+        assert!(
+            receipt.held_digests.contains(&digest_of(art_data)),
+            "referenced blob must remain in receipt"
+        );
+        assert!(
+            !receipt.held_digests.contains(&digest_of(orphan)),
+            "orphan must be evicted from receipt"
+        );
+    }
+
+    #[test]
+    fn export_trust_root_override() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"trust-override-art";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Write the trust root to a file (bypass env store).
+        let trust_root_path = out_dir.path().join("trust-root.json");
+        let env_dir = LocalFsStore::new(store_dir.path())
+            .env_dir(&EnvId::try_from("local").unwrap())
+            .unwrap();
+        let trust_root_bytes = std::fs::read(env_dir.join("trust-root.json")).unwrap();
+        std::fs::write(&trust_root_path, &trust_root_bytes).unwrap();
+
+        let out_path = out_dir.path().join("trust-override.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.trust_root = Some(trust_root_path);
+
+        // Use a DIFFERENT store dir so the env-dir trust root lookup fails —
+        // proves the override is honored.
+        let empty_store = tempdir().unwrap();
+        let store = LocalFsStore::new(empty_store.path());
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.result["plan_id"], "plan-export");
+        assert_eq!(out.result["blobs_included"], 1);
+    }
+
+    #[test]
+    fn import_trust_root_override() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"trust-import-override-art";
+        let envelope_path = out_dir.path().join("trust-import.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Write the trust root to a file.
+        let trust_root_path = out_dir.path().join("trust-root.json");
+        let env_dir = LocalFsStore::new(export_store.path())
+            .env_dir(&EnvId::try_from("local").unwrap())
+            .unwrap();
+        let trust_root_bytes = std::fs::read(env_dir.join("trust-root.json")).unwrap();
+        std::fs::write(&trust_root_path, &trust_root_bytes).unwrap();
+
+        // Use an empty store so env-dir lookup would fail.
+        let empty_store = tempdir().unwrap();
+        let store = LocalFsStore::new(empty_store.path());
+
+        let (priv_pem, _) = key_pair(7);
+        let key_path = write_test_key(out_dir.path(), &priv_pem);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.trust_root = Some(trust_root_path);
+
+        let out = import_impl(
+            &store,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.result["plan_id"], "plan-export");
+    }
+
+    /// The import outcome must carry `plan_sha256` and `verified_key_ids`
+    /// from the deploy-side `verify_update_plan` call (defense-in-depth: the
+    /// scanner already verified, but the deploy code re-verifies from the
+    /// quarantine bytes). Removing that re-verification zeros
+    /// `verified_key_ids` and may alter `plan_sha256`.
+    #[test]
+    fn import_outcome_carries_plan_verification_fields() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"verify-fields-art";
+        let envelope_path = out_dir.path().join("verify-fields.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        // plan_sha256 must be present and be bare hex (no scheme prefix).
+        let sha = out.result["plan_sha256"].as_str().unwrap();
+        assert!(
+            !sha.contains(':'),
+            "plan_sha256 must be bare hex from verify_update_plan, got: {sha}"
+        );
+        assert_eq!(sha.len(), 64, "SHA-256 hex must be 64 chars");
+
+        // verified_key_ids must be non-empty: the plan was signed by a
+        // trusted key that verify_update_plan must resolve.
+        let key_ids = out.result["verified_key_ids"].as_array().unwrap();
+        assert!(
+            !key_ids.is_empty(),
+            "verified_key_ids must be populated by verify_update_plan"
+        );
+        assert!(
+            key_ids.iter().any(|k| k.as_str() == Some(&tk.key_id)),
+            "expected signing key `{}` in verified_key_ids, got: {:?}",
+            tk.key_id,
+            key_ids
+        );
+    }
+
+    #[test]
+    fn import_rejects_untrusted_signing_key_before_side_effects() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"untrusted-key-art";
+        let envelope_path = out_dir.path().join("untrusted.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Set up the import env with the SAME trust root (envelope is trusted).
+        let import_s = LocalFsStore::new(import_store.path());
+        env_trusting(&import_s, &tk);
+
+        // Use a DIFFERENT key for receipt signing — not in the trust root.
+        let (untrusted_pem, untrusted_tk) = key_pair(42);
+        let key_path = import_store.path().join("untrusted-signing-key.pem");
+        std::fs::write(&key_path, &untrusted_pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let args = import_args("local", envelope_path, key_path, &untrusted_tk.key_id);
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must reject with InvalidArgument mentioning signing identity.
+        match &err {
+            OpError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("signing identity"),
+                    "expected signing identity error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got: {other:?}"),
+        }
+
+        // CAS must be empty — preflight ran before any durable side effects.
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        let cas = root.cas_list().unwrap();
+        assert!(
+            cas.is_empty(),
+            "CAS should be empty after preflight rejection, found: {cas:?}"
+        );
+    }
+
+    #[test]
+    fn cas_gc_evicts_terminal_plan_blobs() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"terminal-plan-art";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // The plan is at Staged. Transition it to Rejected (terminal).
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        let loaded = root.load("plan-export").unwrap().unwrap();
+        loaded
+            .transition(greentic_update::staging::UpdateStage::Rejected)
+            .unwrap();
+
+        // Seed CAS with the plan's artifact digest.
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let out = cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // Terminal plan's blobs should be evicted.
+        assert_eq!(
+            out.result["evicted"], 1,
+            "terminal plan blob should be evicted"
+        );
+        assert_eq!(out.result["kept"], 0);
+        assert!(
+            !root.cas_contains(&digest_of(art_data)).unwrap(),
+            "blob referenced only by terminal plan should be gone"
+        );
+    }
+
+    #[test]
+    fn cas_gc_crash_between_evict_and_receipt_underclaims() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"gc-crash-art";
+        let (_priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        // Add an orphan whose CAS path is replaced with a non-empty directory
+        // so that `cas_remove` will error (simulating a crash in the eviction
+        // window).
+        let orphan = b"orphan-crash-blob";
+        let orphan_digest = digest_of(orphan);
+        root.cas_put(&orphan_digest, orphan).unwrap();
+
+        // Replace the orphan's CAS file with a non-empty directory.
+        let hex = orphan_digest.strip_prefix("sha256:").unwrap();
+        let orphan_path = root.env_dir().join("cas").join(format!("sha256-{hex}"));
+        std::fs::remove_file(&orphan_path).unwrap();
+        std::fs::create_dir(&orphan_path).unwrap();
+        std::fs::write(orphan_path.join("sentinel"), b"block removal").unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let err =
+            cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        // cas_gc must fail because cas_remove hit the directory.
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("cas_remove")),
+            "expected cas_remove failure, got: {err:?}"
+        );
+
+        // The receipt on disk must be the EMPTY one written before eviction
+        // started — under-claiming, not the stale pre-GC inventory.
+        let (receipt_bytes, receipt_sig_bytes) = root.read_import_receipt().unwrap().unwrap();
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let receipt = greentic_update::envelope::verify_import_receipt(
+            &receipt_bytes,
+            &receipt_sig_bytes,
+            &trust,
+        )
+        .unwrap();
+        assert!(
+            receipt.held_digests.is_empty(),
+            "after eviction failure the receipt must under-claim (empty), got: {:?}",
+            receipt.held_digests
+        );
+
+        // Clean up the sentinel directory so tempdir drop succeeds.
+        let _ = std::fs::remove_dir_all(&orphan_path);
+    }
+
+    #[test]
+    fn import_repairs_corrupted_cas_blob() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"repair-artifact";
+        let envelope_path = out_dir.path().join("repair.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Pre-seed the import CAS with a CORRUPTED blob (wrong bytes, same digest key).
+        let import_root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        let digest = digest_of(art_data);
+        // Write the correct blob first so the file exists at the right path...
+        import_root.cas_put(&digest, art_data).unwrap();
+        // ...then overwrite the file directly with garbage.
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        let blob_path = import_root
+            .env_dir()
+            .join("cas")
+            .join(format!("sha256-{hex}"));
+        std::fs::write(&blob_path, b"corrupted-bytes-not-matching-digest").unwrap();
+        // Sanity: cas_get should now fail (hash mismatch).
+        assert!(
+            import_root.cas_get(&digest).is_err(),
+            "corrupted blob should fail cas_get"
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        // Import the full envelope — it carries the correct blob.
+        let args = import_args("local", envelope_path, key_path, &tk.key_id);
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        assert_eq!(out.result["plan_id"], "plan-export");
+        // The blob was already held (corrupted), so reported as already_held.
+        // But the unconditional cas_put repaired it.
+        assert_eq!(out.result["blobs_already_held"], 1);
+
+        // Verify the repair: cas_get now succeeds and returns correct bytes.
+        let repaired = import_root.cas_get(&digest).unwrap();
+        assert_eq!(
+            repaired, art_data,
+            "cas_put during import must repair the corrupted blob"
+        );
+    }
+
+    #[test]
+    fn import_delta_rejects_corrupted_cas_blob() {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"delta-corrupt-artifact";
+        let bin_data = b"delta-corrupt-binary";
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(export_store.path());
+        env_trusting(&store, &tk);
+
+        let (_export_priv, _tk2, key_path) = stage_plan_with_blobs(
+            export_updates.path(),
+            export_store.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Build a receipt claiming the artifact is already held so the delta
+        // export will skip it.
+        let (receipt_bytes, receipt_sig_bytes) = greentic_update::envelope::build_import_receipt(
+            "local",
+            vec![digest_of(art_data)],
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        let receipt_path = out_dir.path().join("receipt.json");
+        let receipt_sig_path = out_dir.path().join("receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        // Delta export: skip the held artifact.
+        let envelope_path = out_dir.path().join("delta-corrupt.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            envelope_path.clone(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+        export_impl(
+            &store,
+            &OpFlags::default(),
+            args,
+            Some(export_updates.path()),
+        )
+        .unwrap();
+
+        // Set up import env with the artifact in CAS, then CORRUPT it.
+        let (import_s, import_key_path) = setup_import_side(import_store.path(), &tk);
+        let import_root =
+            greentic_update::staging::UpdatesRoot::open_in(import_updates.path(), "local").unwrap();
+        import_root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        let art_hex = digest_of(art_data)
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_string();
+        let blob_path = import_root
+            .env_dir()
+            .join("cas")
+            .join(format!("sha256-{art_hex}"));
+        std::fs::write(&blob_path, b"corrupted-delta").unwrap();
+
+        let import_a = import_args("local", envelope_path, import_key_path, &tk.key_id);
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            import_a,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must fail closed naming the corrupted digest.
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("CAS integrity")),
+            "expected CAS integrity failure, got: {err:?}"
+        );
+
+        // No new plan should have been admitted.
+        let plans = import_root.list().unwrap();
+        assert!(
+            plans.is_empty(),
+            "no plan should be admitted after integrity failure"
+        );
+
+        // No new receipt should exist.
+        assert!(
+            import_root.read_import_receipt().unwrap().is_none(),
+            "no receipt should be written after integrity failure"
+        );
+    }
+
+    // ---- Phase B4: --binary-blob flag + E2E ---------------------------------
+
+    /// Like [`stage_plan_with_blobs`] but removes binary blobs after staging.
+    /// The FSM transition does not verify blob existence, so blobs are staged
+    /// then removed; export's missing-blob gate fires unless `--binary-blob`
+    /// re-injects them.
+    fn stage_plan_without_binary_blobs(
+        updates_dir: &std::path::Path,
+        store_dir: &std::path::Path,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (String, TrustedKey, PathBuf) {
+        let result = stage_plan_with_blobs(updates_dir, store_dir, art_payloads, bin_payloads);
+
+        // Remove binary blobs so export must re-inject them via --binary-blob.
+        let root = greentic_update::staging::UpdatesRoot::open_in(updates_dir, "local").unwrap();
+        let staged = root.load("plan-export").unwrap().unwrap();
+        for bin in &staged.plan().binaries {
+            let blob_path = staged.binary_blob_path(bin).unwrap();
+            if blob_path.exists() {
+                std::fs::remove_file(&blob_path).unwrap();
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn export_binary_blob_flag_injects_and_exports() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"artifact-for-blob-flag";
+        let bin_data = b"binary-for-blob-flag";
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Write the binary bytes to a file the flag will point at.
+        let bin_file = out_dir.path().join("gtc-linux");
+        std::fs::write(&bin_file, bin_data).unwrap();
+
+        let out_path = out_dir.path().join("export.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.binary_blobs = vec![bin_file];
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 0);
+
+        // Verify the envelope contains both blobs.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+        let art_digest = digest_of(art_data);
+        let bin_digest = digest_of(bin_data);
+        assert!(scanned.blob_paths.contains_key(&art_digest));
+        assert!(scanned.blob_paths.contains_key(&bin_digest));
+        assert_eq!(
+            std::fs::read(scanned.blob_paths.get(&bin_digest).unwrap()).unwrap(),
+            bin_data
+        );
+    }
+
+    #[test]
+    fn export_binary_blob_no_match_fails_closed() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-no-match";
+        let bin_data = b"bin-no-match";
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Supply a file whose content does not match any plan binary digest.
+        let wrong_file = out_dir.path().join("wrong-binary");
+        std::fs::write(&wrong_file, b"unrelated-content-no-match").unwrap();
+
+        let out_path = out_dir.path().join("should-not-exist.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.binary_blobs = vec![wrong_file];
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("matches no binary")),
+            "expected no-match error naming digest, got: {err:?}"
+        );
+        // The error must name the computed digest of the supplied file.
+        if let OpError::InvalidArgument(m) = &err {
+            let expected_digest = digest_of(b"unrelated-content-no-match");
+            assert!(
+                m.contains(&expected_digest),
+                "error should name the computed digest `{expected_digest}`, got: {m}"
+            );
+        }
+        assert!(!out_path.exists(), "no envelope should be written on error");
+    }
+
+    #[test]
+    fn export_binary_blob_duplicate_digest_fails_closed() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-dup";
+        let bin_data = b"bin-dup-content";
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Supply two files with identical content (same digest).
+        let file_a = out_dir.path().join("bin-copy-a");
+        let file_b = out_dir.path().join("bin-copy-b");
+        std::fs::write(&file_a, bin_data).unwrap();
+        std::fs::write(&file_b, bin_data).unwrap();
+
+        let out_path = out_dir.path().join("should-not-exist.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.binary_blobs = vec![file_a, file_b];
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::InvalidArgument(m) if m.contains("same digest")),
+            "expected duplicate-digest error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn export_without_binary_blob_flag_fails_closed_on_missing_binaries() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-no-flag";
+        let bin_data = b"bin-no-flag";
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Do NOT supply --binary-blob — the export must fail because the binary
+        // blob is missing from the staging tree.
+        let out_path = out_dir.path().join("should-not-exist.gtupdate");
+        let args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+
+        let err =
+            export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("missing on disk")),
+            "expected missing-blob error, got: {err:?}"
+        );
+        // The error must name the missing digest.
+        if let OpError::Conflict(m) = &err {
+            assert!(
+                m.contains(&digest_of(bin_data)),
+                "error should name the missing digest"
+            );
+        }
+    }
+
+    #[test]
+    fn export_binary_blob_with_targets_filters_correctly() {
+        // Two plan binaries for different targets, both supplied via
+        // --binary-blob. When --targets selects only one platform, the envelope
+        // must include 1 artifact + 1 matching binary (blobs_included = 2) and
+        // skip 1 non-matching binary (blobs_skipped = 1).
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-targets-filter";
+        let bin_linux = b"bin-linux-content";
+        let bin_macos = b"bin-macos-content";
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[
+                ("gtc-linux", bin_linux, "x86_64-unknown-linux-gnu"),
+                ("gtc-macos", bin_macos, "aarch64-apple-darwin"),
+            ],
+        );
+
+        // Write both binary files.
+        let linux_file = out_dir.path().join("gtc-linux");
+        let macos_file = out_dir.path().join("gtc-macos");
+        std::fs::write(&linux_file, bin_linux).unwrap();
+        std::fs::write(&macos_file, bin_macos).unwrap();
+
+        let out_path = out_dir.path().join("targets-filter.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.binary_blobs = vec![linux_file, macos_file];
+        args.targets = vec!["x86_64-unknown-linux-gnu".to_string()];
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // 1 artifact + 1 matching binary included; 1 non-matching binary skipped.
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 1);
+
+        // Verify the envelope contains the artifact and the linux binary, but
+        // not the macos binary.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+        assert!(scanned.blob_paths.contains_key(&digest_of(art_data)));
+        assert!(scanned.blob_paths.contains_key(&digest_of(bin_linux)));
+        assert!(!scanned.blob_paths.contains_key(&digest_of(bin_macos)));
+    }
+
+    #[test]
+    fn export_targets_filter_tolerates_absent_nontarget_blob() {
+        // Plan with two binaries (different targets). Only the selected
+        // target's file is supplied via --binary-blob; the non-target binary
+        // blob is absent from disk. Export with --targets selecting only
+        // one target must SUCCEED because the absent binary is excluded by
+        // the filter and therefore not required on disk.
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-target-tolerate";
+        let bin_linux = b"linux-binary-tolerate";
+        let bin_macos = b"macos-binary-tolerate";
+
+        // Stage plan with both binaries, then remove the macos blob from disk.
+        let (_priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[
+                ("gtc-linux", bin_linux, "x86_64-unknown-linux-gnu"),
+                ("gtc-macos", bin_macos, "aarch64-apple-darwin"),
+            ],
+        );
+
+        // Only supply the linux binary via --binary-blob.
+        let linux_file = out_dir.path().join("gtc-linux");
+        std::fs::write(&linux_file, bin_linux).unwrap();
+
+        let out_path = out_dir.path().join("target-tolerate.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        args.binary_blobs = vec![linux_file];
+        args.targets = vec!["x86_64-unknown-linux-gnu".to_string()];
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // 1 artifact + 1 linux binary included; 1 macos binary skipped.
+        assert_eq!(out.result["blobs_included"], 2);
+        assert_eq!(out.result["blobs_skipped"], 1);
+
+        // Verify the envelope contains only the artifact and the linux binary.
+        let (scanned, _quarantine) = scan_exported(&out_path, &tk);
+        assert!(
+            scanned.blob_paths.contains_key(&digest_of(art_data)),
+            "artifact always included"
+        );
+        assert!(
+            scanned.blob_paths.contains_key(&digest_of(bin_linux)),
+            "linux binary included"
+        );
+        assert!(
+            !scanned.blob_paths.contains_key(&digest_of(bin_macos)),
+            "macos binary filtered out"
+        );
+    }
+
+    #[test]
+    fn export_delta_tolerates_absent_receipt_held_blob() {
+        // A plan whose binary blob is absent locally but whose digest
+        // appears in a trusted import receipt. Delta export must SUCCEED
+        // with that blob skipped. Without the receipt the same export must
+        // fail closed naming the missing digest.
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+
+        let art_data = b"art-delta-tolerate";
+        let bin_data = b"bin-delta-tolerate";
+
+        // Stage plan, then remove the binary blob from disk.
+        let (priv_pem, tk, key_path) = stage_plan_without_binary_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Build a receipt claiming the binary digest is already held.
+        let held = vec![digest_of(bin_data)];
+        let (receipt_bytes, receipt_sig_bytes) =
+            greentic_update::envelope::build_import_receipt("local", held, &priv_pem, &tk.key_id)
+                .unwrap();
+        let receipt_path = out_dir.path().join("receipt.json");
+        let receipt_sig_path = out_dir.path().join("receipt.json.sig");
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        std::fs::write(&receipt_sig_path, &receipt_sig_bytes).unwrap();
+
+        // Delta export with the receipt — binary blob is absent but held,
+        // so the export must succeed.
+        let out_path = out_dir.path().join("delta-tolerate.gtupdate");
+        let mut args = export_args(
+            "local",
+            "plan-export",
+            out_path.clone(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        args.base_receipt = Some(receipt_path);
+        args.base_receipt_sig = Some(receipt_sig_path);
+
+        let out = export_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap();
+
+        // Artifact included (on disk), binary skipped (held by receipt).
+        assert_eq!(out.result["blobs_included"], 1, "only the artifact");
+        assert_eq!(out.result["blobs_skipped"], 1, "binary held by receipt");
+        assert!(out_path.exists());
+
+        // Without the receipt, the same export must fail on the missing binary.
+        let fail_path = out_dir.path().join("should-not-exist.gtupdate");
+        let args_no_receipt = export_args(
+            "local",
+            "plan-export",
+            fail_path.clone(),
+            key_path,
+            &tk.key_id,
+        );
+        let err = export_impl(
+            &store,
+            &OpFlags::default(),
+            args_no_receipt,
+            Some(updates_dir.path()),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("missing on disk")),
+            "expected missing-blob error, got: {err:?}"
+        );
+        if let OpError::Conflict(m) = &err {
+            assert!(
+                m.contains(&digest_of(bin_data)),
+                "error should name the missing digest"
+            );
+        }
+        assert!(!fail_path.exists(), "no envelope on error");
+    }
+
+    #[test]
+    fn airgap_export_import_apply_e2e() {
+        // Full airgap round-trip: export (with --binary-blob) -> sneakernet ->
+        // import (--stage) -> apply -> delta export. Exercises every production
+        // impl fn end to end with NO http mock/server — network isolation is
+        // proven by construction: export reads only local staging, import reads
+        // only the envelope file, and apply drives the local env store.
+        use greentic_update::staging::{UpdateStage, UpdatesRoot};
+
+        let export_store_dir = tempdir().unwrap();
+        let export_updates_dir = tempdir().unwrap();
+        let import_store_dir = tempdir().unwrap();
+        let import_updates_dir = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"e2e-content-artifact-alpha";
+        let bin_data = b"e2e-binary-executable-bytes";
+
+        // 1. Stage the plan with artifacts; binary blobs removed so they MUST
+        //    enter via --binary-blob.
+        let (priv_pem, tk, export_key_path) = stage_plan_without_binary_blobs(
+            export_updates_dir.path(),
+            export_store_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Write the binary to a temp file for --binary-blob.
+        let bin_file = out_dir.path().join("gtc-linux-bin");
+        std::fs::write(&bin_file, bin_data).unwrap();
+
+        // 2. Export via the production export_impl with --binary-blob.
+        let envelope_path = out_dir.path().join("e2e-full.gtupdate");
+        let export_store = LocalFsStore::new(export_store_dir.path());
+        let mut full_args = export_args(
+            "local",
+            "plan-export",
+            envelope_path.clone(),
+            export_key_path,
+            &tk.key_id,
+        );
+        full_args.binary_blobs = vec![bin_file];
+
+        let export_out = export_impl(
+            &export_store,
+            &OpFlags::default(),
+            full_args,
+            Some(export_updates_dir.path()),
+        )
+        .unwrap();
+        assert_eq!(export_out.result["blobs_included"], 2);
+        assert!(envelope_path.exists());
+
+        // 3. Import on the receiving side with --stage.
+        let (import_store, import_key_path) = setup_import_side(import_store_dir.path(), &tk);
+        let mut imp_args = import_args(
+            "local",
+            envelope_path.clone(),
+            import_key_path.clone(),
+            &tk.key_id,
+        );
+        imp_args.stage = true;
+
+        let import_out = import_impl(
+            &import_store,
+            &OpFlags::default(),
+            imp_args,
+            Some(import_updates_dir.path()),
+        )
+        .unwrap();
+        assert_eq!(import_out.result["stage"], "staged");
+        assert_eq!(import_out.result["plan_id"], "plan-export");
+        assert_eq!(import_out.result["blobs_imported"], 2);
+
+        // 4. Verify the imported binary blob on disk.
+        let import_root = UpdatesRoot::open_in(import_updates_dir.path(), "local").unwrap();
+        let import_staged = import_root.load("plan-export").unwrap().unwrap();
+        assert_eq!(import_staged.stage().unwrap(), UpdateStage::Staged);
+
+        // verify_binary_on_disk re-reads and re-hashes.
+        let imported_bin = import_staged.plan().binaries[0].clone();
+        let verified_bytes = import_staged.verify_binary_on_disk(&imported_bin).unwrap();
+        assert_eq!(verified_bytes, bin_data, "binary blob byte-equality");
+
+        // 5. Apply the plan.
+        let apply_out = apply_updates_impl(
+            &import_store,
+            &OpFlags::default(),
+            Some(ApplyUpdatesPayload {
+                environment_id: "local".into(),
+                plan_id: "plan-export".into(),
+            }),
+            Some(import_updates_dir.path()),
+        )
+        .unwrap();
+        assert_eq!(apply_out.result["stage"], "applied");
+
+        // 6. Read the import receipt for the delta export.
+        let receipt_path = import_root.env_dir().join("import-receipt.json");
+        let receipt_sig_path = import_root.env_dir().join("import-receipt.json.sig");
+        assert!(receipt_path.exists(), "receipt must exist after apply");
+        assert!(receipt_sig_path.exists(), "receipt sig must exist");
+
+        // 7. Delta export from the EXPORT side using the import receipt.
+        let delta_path = out_dir.path().join("e2e-delta.gtupdate");
+        // Re-stage the plan with all blobs for a clean export source (the
+        // export side keeps its original staging tree which now has the
+        // binary blob from step 2).
+        let mut delta = export_args(
+            "local",
+            "plan-export",
+            delta_path.clone(),
+            write_test_key(export_store_dir.path(), &priv_pem),
+            &tk.key_id,
+        );
+        delta.base_receipt = Some(receipt_path);
+        delta.base_receipt_sig = Some(receipt_sig_path);
+
+        let delta_out = export_impl(
+            &export_store,
+            &OpFlags::default(),
+            delta,
+            Some(export_updates_dir.path()),
+        )
+        .unwrap();
+
+        // The receiver holds both digests in CAS (the import receipt covers
+        // the full CAS inventory), so the delta envelope should carry zero
+        // blobs.
+        assert_eq!(delta_out.result["blobs_skipped"], 2);
+        assert_eq!(delta_out.result["blobs_included"], 0);
+
+        // Delta envelope must be strictly smaller than the full one.
+        let full_size = std::fs::metadata(&envelope_path).unwrap().len();
+        let delta_size = std::fs::metadata(&delta_path).unwrap().len();
+        assert!(
+            delta_size < full_size,
+            "delta ({delta_size}) must be smaller than full ({full_size})"
+        );
+    }
+
+    #[test]
+    fn cas_gc_refuses_corrupt_plan_marker() {
+        let store_dir = tempdir().unwrap();
+        let updates_dir = tempdir().unwrap();
+
+        let art_data = b"gc-corrupt-marker-art";
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs(
+            updates_dir.path(),
+            store_dir.path(),
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let root =
+            greentic_update::staging::UpdatesRoot::open_in(updates_dir.path(), "local").unwrap();
+        root.cas_put(&digest_of(art_data), art_data).unwrap();
+
+        // Write an existing receipt so we can verify it is NOT replaced.
+        let (rb, rs) = greentic_update::envelope::build_import_receipt(
+            "local",
+            vec![digest_of(art_data)],
+            &priv_pem,
+            &tk.key_id,
+        )
+        .unwrap();
+        root.write_import_receipt(&rb, &rs).unwrap();
+        let original_receipt = root.read_import_receipt().unwrap().unwrap();
+
+        // Corrupt the plan's state.json with invalid JSON.
+        let state_path = updates_dir
+            .path()
+            .join("local")
+            .join("plan-export")
+            .join("state.json");
+        std::fs::write(&state_path, b"{ not valid json").unwrap();
+
+        let store = LocalFsStore::new(store_dir.path());
+        let args = cas_gc_args("local", key_path, &tk.key_id);
+        let err =
+            cas_gc_impl(&store, &OpFlags::default(), args, Some(updates_dir.path())).unwrap_err();
+
+        // Must fail mentioning the corrupt marker.
+        assert!(
+            matches!(&err, OpError::Conflict(m) if m.contains("corrupt")),
+            "expected corrupt marker failure, got: {err:?}"
+        );
+
+        // CAS blobs must still exist (nothing evicted).
+        assert!(
+            root.cas_contains(&digest_of(art_data)).unwrap(),
+            "referenced blob must survive failed gc"
+        );
+
+        // Receipt must be unchanged (no empty receipt was written).
+        let current_receipt = root.read_import_receipt().unwrap().unwrap();
+        assert_eq!(
+            original_receipt.0, current_receipt.0,
+            "receipt bytes must be unchanged after failed gc"
+        );
+        assert_eq!(
+            original_receipt.1, current_receipt.1,
+            "receipt sig must be unchanged after failed gc"
+        );
+    }
+
+    // ---- Phase C3: import --push-to static serving directory ----------------
+
+    /// Helper: run import_impl with --push-to and return the outcome.
+    fn import_with_push_to(
+        push_to: &std::path::Path,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (OpOutcome, tempfile::TempDir, tempfile::TempDir) {
+        import_with_push_to_seq(push_to, "plan-export", 1, art_payloads, bin_payloads)
+    }
+
+    /// Like [`import_with_push_to`] but with a configurable plan id and
+    /// sequence for monotonic-guard tests.
+    fn import_with_push_to_seq(
+        push_to: &std::path::Path,
+        plan_id: &str,
+        sequence: u64,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (OpOutcome, tempfile::TempDir, tempfile::TempDir) {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("push-to.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import_seq(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            plan_id,
+            sequence,
+            art_payloads,
+            bin_payloads,
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to.to_path_buf());
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        (out, import_store, import_updates)
+    }
+
+    #[test]
+    fn push_to_writes_full_layout() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"push-to-artifact";
+        let bin_data = b"push-to-binary";
+
+        let (out, _is, _iu) = import_with_push_to(
+            push_to_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Outcome must report push_to.
+        let pt = &out.result["push_to"];
+        assert!(pt.is_object(), "push_to must be present in outcome");
+        assert_eq!(
+            pt["path"].as_str().unwrap(),
+            push_to_dir.path().display().to_string()
+        );
+        assert_eq!(pt["blobs_written"].as_u64(), Some(2));
+        assert_eq!(
+            pt["blobs_skipped"].as_u64(),
+            Some(0),
+            "fresh dir must have zero skipped blobs"
+        );
+
+        // plan/plan.json must be the raw plan bytes from the envelope.
+        let plan_json = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+        // Verify it parses as a valid update plan.
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_slice(&plan_json).unwrap();
+        assert_eq!(plan.plan_id, "plan-export");
+        assert_eq!(plan.sequence, 1);
+
+        // plan/plan.json.sig must exist and be non-empty.
+        let sig = std::fs::read(push_to_dir.path().join("plan/plan.json.sig")).unwrap();
+        assert!(!sig.is_empty(), "sig must be non-empty");
+
+        // plan/meta must parse to {sequence, plan_sha256}.
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(meta["sequence"].as_u64(), Some(1));
+        let sha = meta["plan_sha256"].as_str().unwrap();
+        assert_eq!(sha.len(), 64, "plan_sha256 must be 64-char hex");
+        assert!(
+            !sha.contains(':'),
+            "plan_sha256 must be bare hex, got: {sha}"
+        );
+        // The served plan.json must be the EXACT bytes the DSSE signature (and
+        // meta.plan_sha256) cover — the poll loop digest-checks the download
+        // against meta, so a re-serialized plan (even a semantically identical
+        // one) would fail every fleet fetch.
+        assert_eq!(
+            greentic_update::plan::sha256_hex(&plan_json),
+            sha,
+            "served plan.json bytes must hash to meta.plan_sha256"
+        );
+
+        // Every plan-referenced digest must be present under blobs/.
+        let art_digest = digest_of(art_data);
+        let bin_digest = digest_of(bin_data);
+        let art_blob_name = art_digest.replacen(':', "-", 1);
+        let bin_blob_name = bin_digest.replacen(':', "-", 1);
+        let art_blob =
+            std::fs::read(push_to_dir.path().join("blobs").join(&art_blob_name)).unwrap();
+        assert_eq!(art_blob, art_data, "artifact blob must match source");
+        let bin_blob =
+            std::fs::read(push_to_dir.path().join("blobs").join(&bin_blob_name)).unwrap();
+        assert_eq!(bin_blob, bin_data, "binary blob must match source");
+    }
+
+    #[test]
+    fn push_to_monotonic_rejects_downgrade() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"monotonic-artifact";
+
+        // First import: sequence 2.
+        let (_out, _is, _iu) = import_with_push_to_seq(
+            push_to_dir.path(),
+            "plan-seq2",
+            2,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Verify seq=2 is served.
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(meta["sequence"].as_u64(), Some(2));
+
+        // Snapshot the plan files so we can confirm they are untouched.
+        let plan_before = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+        let sig_before = std::fs::read(push_to_dir.path().join("plan/plan.json.sig")).unwrap();
+
+        // Second import: sequence 1 into the SAME push-to dir.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("downgrade.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import_seq(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            "plan-seq1",
+            1,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must be Conflict mentioning both sequences AND stating the import
+        // committed (Finding 1 contract).
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains('2') && msg.contains('1'),
+                    "error must name both sequences, got: {msg}"
+                );
+                assert!(
+                    msg.contains("import committed"),
+                    "error must state the import committed, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got: {other:?}"),
+        }
+
+        // Dir still serves seq=2 — files untouched.
+        let meta_after = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        assert_eq!(meta_bytes, meta_after, "meta must be untouched");
+        assert_eq!(
+            plan_before,
+            std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap(),
+            "plan.json must be untouched"
+        );
+        assert_eq!(
+            sig_before,
+            std::fs::read(push_to_dir.path().join("plan/plan.json.sig")).unwrap(),
+            "plan.json.sig must be untouched"
+        );
+    }
+
+    #[test]
+    fn push_to_same_sequence_is_idempotent() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"idempotent-artifact";
+
+        // First push.
+        let (_out1, _is, _iu) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+
+        // Second push with same sequence — must succeed.
+        let (out2, _is2, _iu2) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+
+        assert_eq!(
+            out2.result["push_to"]["blobs_written"].as_u64(),
+            Some(0),
+            "blobs should be skipped on idempotent re-push"
+        );
+
+        // Meta still valid.
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(meta["sequence"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn push_to_blob_idempotency_skips_existing() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"blob-idem-artifact";
+        let bin_data = b"blob-idem-binary";
+
+        // Pre-create the artifact blob in the push-to blobs dir.
+        let blobs_dir = push_to_dir.path().join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let art_digest = digest_of(art_data);
+        let art_blob_name = art_digest.replacen(':', "-", 1);
+        std::fs::write(blobs_dir.join(&art_blob_name), art_data).unwrap();
+
+        // Import with push-to — the artifact blob already exists, only the
+        // binary blob should be written.
+        let (out, _is, _iu) = import_with_push_to(
+            push_to_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        assert_eq!(
+            out.result["push_to"]["blobs_written"].as_u64(),
+            Some(1),
+            "only the binary blob should be written; artifact blob was pre-existing"
+        );
+        assert_eq!(
+            out.result["push_to"]["blobs_skipped"].as_u64(),
+            Some(1),
+            "the pre-existing artifact blob must be counted as skipped"
+        );
+    }
+
+    #[test]
+    fn push_to_corrupt_meta_is_hard_error() {
+        let push_to_dir = tempdir().unwrap();
+
+        // Pre-create a corrupt meta file.
+        let plan_dir = push_to_dir.path().join("plan");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        std::fs::write(plan_dir.join("meta"), b"{ not valid json").unwrap();
+
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"corrupt-meta-art";
+        let envelope_path = out_dir.path().join("corrupt-meta.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("corrupt"),
+                    "error must mention corruption, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for corrupt meta, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_to_meta_wire_contract() {
+        // Verify the meta file's shape matches what greentic-start's poll
+        // loop expects: {"sequence": <u64>, "plan_sha256": "<64-char hex>"}.
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"wire-contract-art";
+
+        let (_out, _is, _iu) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+
+        // Must have exactly two fields.
+        let obj = meta.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            2,
+            "meta must have exactly sequence + plan_sha256, got: {obj:?}"
+        );
+
+        // sequence must be a u64.
+        assert!(meta["sequence"].is_u64(), "sequence must be u64");
+
+        // plan_sha256 must be a 64-char lowercase hex string.
+        let sha = meta["plan_sha256"].as_str().unwrap();
+        assert_eq!(sha.len(), 64);
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "plan_sha256 must be hex, got: {sha}"
+        );
+        assert_eq!(
+            sha,
+            &sha.to_ascii_lowercase(),
+            "plan_sha256 must be lowercase"
+        );
+    }
+
+    #[test]
+    fn push_to_same_seq_different_plan_is_conflict() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"same-seq-diff-plan-art";
+
+        // First import: plan_id "plan-A", sequence 1.
+        let (_out1, _is, _iu) = import_with_push_to_seq(
+            push_to_dir.path(),
+            "plan-A",
+            1,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Snapshot plan.json so we can verify it is untouched after rejection.
+        let plan_before = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+
+        // Second import: plan_id "plan-B", same sequence 1, different content
+        // → different plan_sha256.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("diff-plan.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import_seq(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            "plan-B",
+            1,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must be Conflict mentioning both digests or "different plan".
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("different plan") || msg.contains("bump the sequence"),
+                    "error must mention digest mismatch, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for same-seq different-plan, got: {other:?}"),
+        }
+
+        // Dir still serves the first plan — plan.json bytes unchanged.
+        let plan_after = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+        assert_eq!(
+            plan_before, plan_after,
+            "plan.json must be untouched after same-seq digest mismatch"
+        );
+    }
+
+    #[test]
+    fn push_to_lock_contention_is_conflict() {
+        use fs4::fs_std::FileExt;
+
+        let push_to_dir = tempdir().unwrap();
+        std::fs::create_dir_all(push_to_dir.path()).unwrap();
+
+        // Pre-acquire the exclusive flock that write_static_serving_dir uses.
+        let lock_path = push_to_dir.path().join(".push-lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            lock_file.try_lock_exclusive().unwrap(),
+            "must acquire lock in test setup"
+        );
+
+        // Attempt an import-with-push-to — must fail with Conflict.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"lock-contention-art";
+        let envelope_path = out_dir.path().join("lock-test.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("in progress"),
+                    "error must mention in-progress write, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for lock contention, got: {other:?}"),
+        }
+
+        // Release the lock and verify a fresh import succeeds.
+        drop(lock_file);
+        let (_out, _is, _iu) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+        assert!(
+            _out.result["push_to"].is_object(),
+            "import must succeed after lock release"
+        );
+    }
+
+    #[test]
+    fn push_to_non_regular_blob_dir_is_conflict() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"non-regular-blob-art";
+
+        // Pre-create the blob path as a DIRECTORY.
+        let art_digest = digest_of(art_data);
+        let blob_name = art_digest.replacen(':', "-", 1);
+        let blobs_dir = push_to_dir.path().join("blobs");
+        std::fs::create_dir_all(blobs_dir.join(&blob_name)).unwrap();
+
+        // Attempt import — must fail with Conflict naming the path.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("non-regular.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("directory"),
+                    "error must name the file kind, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&blob_name),
+                    "error must name the blob path, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for directory blob, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_to_non_regular_blob_symlink_is_conflict() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"symlink-blob-art";
+
+        // Pre-create the blob path as a symlink.
+        let art_digest = digest_of(art_data);
+        let blob_name = art_digest.replacen(':', "-", 1);
+        let blobs_dir = push_to_dir.path().join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/null", blobs_dir.join(&blob_name)).unwrap();
+
+        // Attempt import — must fail with Conflict naming symlink.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("symlink.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("symlink"),
+                    "error must name the file kind, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for symlink blob, got: {other:?}"),
+        }
     }
 }

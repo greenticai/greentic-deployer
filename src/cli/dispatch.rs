@@ -386,6 +386,13 @@ pub enum EnvVerb {
         env_id: String,
         #[arg(long)]
         confirm: bool,
+        /// Purge local state only, skipping provider-resource teardown. Use when
+        /// the env owns cloud resources (e.g. Cloud Run) this build cannot tear
+        /// down, or they are already gone — the resources are left for manual
+        /// cleanup. Without it, destroying such an env refuses rather than
+        /// orphaning the cloud resources.
+        #[arg(long)]
+        force_local: bool,
     },
     /// Migrate the legacy `dev` environment to `<target>` (typically `local`).
     /// Run with `--check` to scan without touching state; `--apply` performs
@@ -733,6 +740,25 @@ pub enum UpdatesVerb {
     /// server's current one plus one, and the endpoint defaults to the env's
     /// configured `plan_endpoint`. The signing key never leaves this machine.
     Publish(UpdatesPublishArgs),
+    /// Export a staged update plan and its blobs into a `.gtupdate` envelope
+    /// for airgap transfer. Supports delta export via `--base-receipt` (skips
+    /// blobs the receiver already holds) and `--targets` filtering (includes
+    /// only binary blobs for the listed targets).
+    Export(UpdatesExportArgs),
+    /// Import a `.gtupdate` envelope into the local staging tree (airgap
+    /// import). Scans, verifies, populates the durable import CAS, admits the
+    /// plan through the staging FSM, and optionally promotes to `Staged`.
+    Import(UpdatesImportArgs),
+    /// Garbage-collect orphaned CAS blobs that are no longer referenced by any
+    /// non-evicted staged plan, then rewrite the import receipt.
+    ///
+    /// **Concurrency caveat:** `cas-gc` must not run concurrently with
+    /// `op updates import` on the same environment. GC's reference snapshot
+    /// and the import's CAS-populate/admission are not mutually serialized;
+    /// a concurrent GC can evict blobs of a plan admitted after the snapshot.
+    /// Recovery: re-run the import with the full envelope. A lock-held GC
+    /// inside `greentic-update` is a tracked follow-up.
+    CasGc(UpdatesCasGcArgs),
 }
 
 #[derive(Args, Debug)]
@@ -793,6 +819,21 @@ pub struct UpdatesConfigSetArgs {
     /// plan-endpoint).
     #[arg(long = "stream-endpoint")]
     pub stream_endpoint: Option<String>,
+    /// Base URL of an air-gap blob mirror serving content-addressed blobs at
+    /// `{base}/sha256-<hex>`. Must be https (or http when `--insecure-http true`).
+    /// Omit to leave unchanged.
+    #[arg(long = "blob-base-url")]
+    pub blob_base_url: Option<String>,
+    /// Allow plain-HTTP (non-TLS) plan/stream/blob endpoints on non-loopback
+    /// hosts. Deny-by-default (`false`). Does NOT affect OCI insecure registries
+    /// and does NOT relax enrollment's ca_url (enrollment stays strict). Omit to
+    /// leave unchanged.
+    #[arg(long = "insecure-http")]
+    pub insecure_http: Option<bool>,
+    /// Remove a previously configured blob-base-url. Conflicts with
+    /// `--blob-base-url` (set one or clear it, not both).
+    #[arg(long = "clear-blob-base-url", conflicts_with = "blob_base_url")]
+    pub clear_blob_base_url: bool,
 }
 
 #[derive(Args, Debug)]
@@ -973,6 +1014,102 @@ pub struct UpdatesGetArgs {
     /// DSSE envelope sidecar for `--plan-file`.
     #[arg(long = "plan-sig-file", requires = "plan_file")]
     pub plan_sig_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesExportArgs {
+    /// Target environment id.
+    pub env_id: Option<String>,
+    /// Plan id of the staged plan to export (from a prior `op updates get`).
+    #[arg(long = "plan-id")]
+    pub plan_id: Option<String>,
+    /// Output path for the `.gtupdate` envelope.
+    #[arg(long = "out")]
+    pub out: Option<PathBuf>,
+    /// Path to a signed import receipt from a prior import on the receiving
+    /// side. Blobs whose digests appear in the receipt's held-digest inventory
+    /// are skipped (delta export). Requires `--base-receipt-sig`.
+    #[arg(long = "base-receipt", requires = "base_receipt_sig")]
+    pub base_receipt: Option<PathBuf>,
+    /// DSSE signature sidecar for `--base-receipt`.
+    #[arg(long = "base-receipt-sig", requires = "base_receipt")]
+    pub base_receipt_sig: Option<PathBuf>,
+    /// Comma-separated target triples. When set, only binary blobs whose
+    /// target matches are included; artifact/content blobs are always included.
+    #[arg(long = "targets", value_delimiter = ',')]
+    pub targets: Vec<String>,
+    /// PKCS#8 Ed25519 private key PEM for signing the envelope manifest.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id to sign under, overriding the key's canonical id — for when the
+    /// receiver's trust root registers this key under a different id. The id
+    /// must still resolve in the env trust root (the export preflight enforces
+    /// this).
+    #[arg(long = "key-id", requires = "signing_key")]
+    pub key_id: Option<String>,
+    /// Path to a trust-root.json file for envelope signing verification.
+    /// Bypasses the env-store trust root lookup, enabling CI runners
+    /// with no local env dir.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
+    /// Path to a local binary file to include in the export. The file's
+    /// SHA-256 must match a `binaries[].digest` in the staged plan. Repeat
+    /// for each binary (e.g. `--binary-blob gtc-linux --binary-blob
+    /// gtc-macos`). When the plan carries binaries and they are not already
+    /// staged, omitting this flag causes the export to fail closed (missing
+    /// blobs).
+    #[arg(long = "binary-blob")]
+    pub binary_blobs: Vec<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesImportArgs {
+    /// Target environment id.
+    pub env_id: Option<String>,
+    /// Path to the `.gtupdate` envelope to import.
+    #[arg(long = "envelope")]
+    pub envelope: Option<PathBuf>,
+    /// Promote the imported plan from `Inbox` to `Staged` after import.
+    #[arg(long)]
+    pub stage: bool,
+    /// PKCS#8 Ed25519 private key PEM for signing the import receipt.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id to sign under, overriding the key's canonical id. Requires
+    /// `--signing-key`.
+    #[arg(long = "key-id", requires = "signing_key")]
+    pub key_id: Option<String>,
+    /// Advisory staleness threshold in days. Plans older than this many days
+    /// produce a warning but are still imported. Default: 30.
+    #[arg(long = "staleness-days", default_value = "30")]
+    pub staleness_days: u64,
+    /// Path to a trust-root.json file for signature verification.
+    /// Bypasses the env-store trust root lookup.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
+    /// Write a static serving directory after import. One directory per
+    /// environment; an in-gap HTTP server (nginx/caddy with rewrites) serves
+    /// this tree to fleet runtimes. The directory is a cache, not an
+    /// authority -- trust stays with the DSSE envelope + trust root.
+    #[arg(long = "push-to")]
+    pub push_to: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdatesCasGcArgs {
+    /// Target environment id.
+    pub env_id: Option<String>,
+    /// PKCS#8 Ed25519 private key PEM for re-signing the import receipt.
+    #[arg(long = "signing-key")]
+    pub signing_key: Option<PathBuf>,
+    /// Key id to sign under, overriding the key's canonical id. Requires
+    /// `--signing-key`.
+    #[arg(long = "key-id", requires = "signing_key")]
+    pub key_id: Option<String>,
+    /// Path to a trust-root.json file for the signing-identity preflight.
+    /// Bypasses the env-store trust root lookup.
+    #[arg(long = "trust-root")]
+    pub trust_root: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1389,6 +1526,9 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 UpdatesVerb::ConfigShow { .. } => "config-show",
                 UpdatesVerb::PlanBuild(_) => "plan-build",
                 UpdatesVerb::Publish(_) => "publish",
+                UpdatesVerb::Export(_) => "export",
+                UpdatesVerb::Import(_) => "import",
+                UpdatesVerb::CasGc(_) => "cas-gc",
             },
         ),
     }
@@ -1443,9 +1583,11 @@ fn dispatch_env(
         EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
         EnvVerb::ApplyRevision(args) => super::env::apply_revision(store, registry, flags, args)?,
         EnvVerb::ApplyTraffic(args) => super::env::apply_traffic(store, registry, flags, args)?,
-        EnvVerb::Destroy { env_id, confirm } => {
-            super::env::destroy(store, flags, &env_id, confirm)?
-        }
+        EnvVerb::Destroy {
+            env_id,
+            confirm,
+            force_local,
+        } => super::env::destroy(store, flags, &env_id, confirm, force_local)?,
         EnvVerb::MigrateDev {
             target,
             check,
@@ -1738,6 +1880,13 @@ fn dispatch_updates(
                         plan_endpoint: args.plan_endpoint,
                         push_enabled: args.push_enabled,
                         stream_endpoint: args.stream_endpoint,
+                        blob_base_url: args.blob_base_url,
+                        insecure_http: args.insecure_http,
+                        clear_blob_base_url: if args.clear_blob_base_url {
+                            Some(true)
+                        } else {
+                            None
+                        },
                     });
             super::updates::config_set(store, flags, payload)?
         }
@@ -1748,6 +1897,9 @@ fn dispatch_updates(
         }
         UpdatesVerb::PlanBuild(args) => super::updates::plan_build(store, flags, args)?,
         UpdatesVerb::Publish(args) => super::updates::publish(store, flags, args)?,
+        UpdatesVerb::Export(args) => super::updates::export(store, flags, args)?,
+        UpdatesVerb::Import(args) => super::updates::import(store, flags, args)?,
+        UpdatesVerb::CasGc(args) => super::updates::cas_gc(store, flags, args)?,
     };
     print_outcome(&outcome)
 }
