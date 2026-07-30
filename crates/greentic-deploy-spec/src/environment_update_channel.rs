@@ -356,6 +356,19 @@ mod tests {
         EnvId::try_from(id).unwrap()
     }
 
+    /// Simulates a binary old enough to know only the original schema fields —
+    /// everything newer lands in its catch-all. Shared by the per-field-batch
+    /// forward-compat tests.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OldConfig {
+        schema: SchemaVersion,
+        environment_id: EnvId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+        #[serde(flatten)]
+        unknown: serde_json::Map<String, serde_json::Value>,
+    }
+
     #[test]
     fn disabled_resolves_deny_by_default() {
         let cfg = UpdateChannelConfig::disabled(env("local"));
@@ -684,15 +697,6 @@ mod tests {
         let on_disk = serde_json::to_value(&cfg).unwrap();
 
         // Simulate an old binary that does NOT know push_enabled / stream_endpoint.
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct OldConfig {
-            schema: SchemaVersion,
-            environment_id: EnvId,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            enabled: Option<bool>,
-            #[serde(flatten)]
-            unknown: serde_json::Map<String, serde_json::Value>,
-        }
         let old: OldConfig = serde_json::from_value(on_disk.clone()).unwrap();
         assert_eq!(old.enabled, Some(true));
         // push_enabled and stream_endpoint survive as unknown keys.
@@ -836,15 +840,6 @@ mod tests {
         let on_disk = serde_json::to_value(&cfg).unwrap();
 
         // Simulate an old binary that does NOT know blob_base_url / insecure_http.
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct OldConfig {
-            schema: SchemaVersion,
-            environment_id: EnvId,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            enabled: Option<bool>,
-            #[serde(flatten)]
-            unknown: serde_json::Map<String, serde_json::Value>,
-        }
         let mut old: OldConfig = serde_json::from_value(on_disk).unwrap();
         assert_eq!(old.enabled, Some(true));
         // blob_base_url and insecure_http survive as unknown keys.
