@@ -2089,6 +2089,7 @@ fn updates_step(
             stream_endpoint,
             blob_base_url: None,
             insecure_http: None,
+            clear_blob_base_url: None,
         })),
     })
 }

@@ -817,6 +817,10 @@ pub struct UpdatesConfigSetArgs {
     /// leave unchanged.
     #[arg(long = "insecure-http")]
     pub insecure_http: Option<bool>,
+    /// Remove a previously configured blob-base-url. Conflicts with
+    /// `--blob-base-url` (set one or clear it, not both).
+    #[arg(long = "clear-blob-base-url", conflicts_with = "blob_base_url")]
+    pub clear_blob_base_url: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1810,6 +1814,11 @@ fn dispatch_updates(
                         stream_endpoint: args.stream_endpoint,
                         blob_base_url: args.blob_base_url,
                         insecure_http: args.insecure_http,
+                        clear_blob_base_url: if args.clear_blob_base_url {
+                            Some(true)
+                        } else {
+                            None
+                        },
                     });
             super::updates::config_set(store, flags, payload)?
         }
