@@ -214,6 +214,21 @@ pub struct UpdateChannelConfig {
     /// set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_endpoint: Option<String>,
+    /// Base URL of an in-gap blob mirror that serves content-addressed blobs at
+    /// `{blob_base_url}/sha256-<hex>`. The runtime uses it as a fallback source
+    /// for a plan-referenced binary whose in-band staged blob is missing. `None`
+    /// → no mirror is configured and the in-band path is the only source. This
+    /// is operator policy, carries nothing secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_base_url: Option<String>,
+    /// Opt-in that allows plain-HTTP (non-TLS) plan/stream/blob endpoints on
+    /// non-loopback hosts — for air-gapped LANs where the mirror has no CA.
+    /// `None` → resolved to `false`: deny-by-default. Trust in update content
+    /// comes from DSSE signatures against the env trust root, not from transport,
+    /// but plaintext HTTP is still opt-in only. Does **not** affect OCI
+    /// insecure-registry settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_http: Option<bool>,
     /// Forward-compatibility catch-all. Any keys in the on-disk
     /// `update-channel.json` that this binary's schema does not recognize are
     /// captured here and re-emitted verbatim on save. `config-set` is a
@@ -246,6 +261,8 @@ impl UpdateChannelConfig {
             plan_endpoint: None,
             push_enabled: None,
             stream_endpoint: None,
+            blob_base_url: None,
+            insecure_http: None,
             unknown: serde_json::Map::new(),
         }
     }
@@ -316,6 +333,18 @@ impl UpdateChannelConfig {
         plan_ep
             .strip_suffix("/plan")
             .map(|base| format!("{base}/updates/stream"))
+    }
+
+    /// Resolved blob-mirror base URL (`None` when unset — the in-band staged
+    /// path is the only blob source).
+    pub fn resolved_blob_base_url(&self) -> Option<&str> {
+        self.blob_base_url.as_deref()
+    }
+
+    /// `None` → `false`. Plain-HTTP endpoints on non-loopback hosts are
+    /// deny-by-default; the operator must opt in explicitly.
+    pub fn resolved_insecure_http(&self) -> bool {
+        self.insecure_http.unwrap_or(false)
     }
 }
 
@@ -707,5 +736,122 @@ mod tests {
         ] {
             assert_eq!(UpdateAction::parse(action.as_str()), Some(action));
         }
+    }
+
+    // --- blob_base_url + insecure_http ---
+
+    #[test]
+    fn disabled_resolves_blob_and_insecure_deny_by_default() {
+        let cfg = UpdateChannelConfig::disabled(env("local"));
+        assert_eq!(cfg.resolved_blob_base_url(), None);
+        assert!(!cfg.resolved_insecure_http());
+
+        // Explicit false stays false.
+        let mut cfg2 = UpdateChannelConfig::disabled(env("local"));
+        cfg2.insecure_http = Some(false);
+        assert!(!cfg2.resolved_insecure_http());
+
+        // Explicit true resolves true.
+        cfg2.insecure_http = Some(true);
+        assert!(cfg2.resolved_insecure_http());
+    }
+
+    #[test]
+    fn blob_and_insecure_fields_round_trip_through_serde() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.blob_base_url = Some("https://mirror.lan:9443/blobs".into());
+        cfg.insecure_http = Some(true);
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            json.get("blob_base_url").and_then(|v| v.as_str()),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(
+            json.get("insecure_http").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let back: UpdateChannelConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.blob_base_url.as_deref(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(back.insecure_http, Some(true));
+    }
+
+    #[test]
+    fn blob_and_insecure_fields_omitted_when_none() {
+        let cfg = UpdateChannelConfig::disabled(env("local"));
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("blob_base_url").is_none());
+        assert!(json.get("insecure_http").is_none());
+    }
+
+    #[test]
+    fn unknown_catch_all_still_works_with_blob_fields() {
+        let on_disk = serde_json::json!({
+            "schema": UpdateChannelConfig::schema_str(),
+            "environment_id": "local",
+            "blob_base_url": "http://mirror.lan/blobs",
+            "insecure_http": true,
+            "future_field_3": 42,
+        });
+        let cfg: UpdateChannelConfig = serde_json::from_value(on_disk).unwrap();
+        assert_eq!(
+            cfg.blob_base_url.as_deref(),
+            Some("http://mirror.lan/blobs")
+        );
+        assert_eq!(cfg.insecure_http, Some(true));
+        assert_eq!(
+            cfg.unknown.get("future_field_3"),
+            Some(&serde_json::json!(42))
+        );
+        assert!(!cfg.unknown.contains_key("blob_base_url"));
+        assert!(!cfg.unknown.contains_key("insecure_http"));
+    }
+
+    #[test]
+    fn new_binary_blob_config_parses_on_old_binary_schema() {
+        // A config written by the NEW binary (with blob fields) must still
+        // parse when an older binary reads it — the new keys land in `unknown`
+        // and survive a read-modify-write cycle.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.blob_base_url = Some("http://mirror.lan/blobs".into());
+        cfg.insecure_http = Some(true);
+        let on_disk = serde_json::to_value(&cfg).unwrap();
+
+        // Simulate an old binary that does NOT know blob_base_url / insecure_http.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldConfig {
+            schema: SchemaVersion,
+            environment_id: EnvId,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            enabled: Option<bool>,
+            #[serde(flatten)]
+            unknown: serde_json::Map<String, serde_json::Value>,
+        }
+        let mut old: OldConfig = serde_json::from_value(on_disk).unwrap();
+        assert_eq!(old.enabled, Some(true));
+        // blob_base_url and insecure_http survive as unknown keys.
+        assert_eq!(
+            old.unknown.get("blob_base_url"),
+            Some(&serde_json::json!("http://mirror.lan/blobs"))
+        );
+        assert_eq!(
+            old.unknown.get("insecure_http"),
+            Some(&serde_json::json!(true))
+        );
+
+        // The old binary mutates a known field and re-serializes.
+        old.enabled = Some(false);
+        let rewritten = serde_json::to_value(&old).unwrap();
+        // The new binary reads back: blob fields survived the round-trip.
+        let back: UpdateChannelConfig = serde_json::from_value(rewritten).unwrap();
+        assert_eq!(
+            back.blob_base_url.as_deref(),
+            Some("http://mirror.lan/blobs")
+        );
+        assert_eq!(back.insecure_http, Some(true));
+        assert_eq!(back.enabled, Some(false));
     }
 }
