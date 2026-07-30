@@ -148,6 +148,23 @@ pub struct UpdateConfigSetPayload {
     /// `plan_endpoint`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_endpoint: Option<String>,
+    /// Base URL of an air-gap blob mirror serving content-addressed blobs at
+    /// `{blob_base_url}/sha256-<hex>`. `None` leaves the stored value unchanged;
+    /// must be https (or http when `insecure_http` is true / stored as true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_base_url: Option<String>,
+    /// Opt-in that allows plain-HTTP (non-TLS) plan/stream/blob endpoints on
+    /// non-loopback hosts — for air-gapped LANs where the mirror has no CA.
+    /// `None` leaves the stored value unchanged (absent resolves to `false`:
+    /// deny-by-default). Does NOT affect OCI insecure-registry settings, and
+    /// does NOT relax enrollment's `ca_url` (enrollment stays strict).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_http: Option<bool>,
+    /// When `true`, removes a previously configured `blob_base_url`. Conflicts
+    /// with `blob_base_url` — setting and clearing in the same command is
+    /// rejected fail-closed. `None` / absent leaves the stored value unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_blob_base_url: Option<bool>,
 }
 
 /// Filter for `op updates config-show` — read-only view of the update-channel
@@ -196,6 +213,46 @@ fn tls_rel_path(tenant: &str, name: &str) -> String {
     format!("{tenant}/_/{TLS_PACK}/{name}")
 }
 
+/// Whether a control-plane URL is acceptable given an explicit insecure-HTTP
+/// opt-in. HTTPS is always allowed. Plaintext `http://` is allowed to ANY host
+/// when `allow_insecure_http` is `true` — the operator has opted in for an
+/// air-gapped LAN where the mirror has no CA; trust in update content comes
+/// from DSSE signatures against the env trust root, not from transport. When
+/// `allow_insecure_http` is `false`, plaintext is allowed ONLY to a loopback
+/// host (same as the pre-C2 behavior). Every other scheme (`ftp://`, `file://`,
+/// etc.) is unconditionally rejected.
+///
+/// Security rationale: `insecure_http` is a per-env persisted opt-in that
+/// widens the URL policy for plan, stream, and blob endpoints on that
+/// environment only. Enrollment (`ca_url`) is intentionally excluded — it
+/// always calls the strict variant — so the trust-anchor bootstrap channel
+/// remains TLS-authenticated.
+pub(crate) fn control_url_is_acceptable_with_insecure(
+    raw: &str,
+    allow_insecure_http: bool,
+) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => {
+            if allow_insecure_http {
+                // Any host is acceptable when the operator opted in.
+                parsed.host().is_some()
+            } else {
+                match parsed.host() {
+                    Some(url::Host::Domain(host)) => host == "localhost",
+                    Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                    Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                    None => false,
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Whether a control-plane URL (the Cert-CA for enrollment, or the plan-fetch
 /// endpoint for `get`) is acceptable. HTTPS is always allowed. Plaintext
 /// `http://` is allowed ONLY to a loopback host, for local development: over
@@ -204,18 +261,29 @@ fn tls_rel_path(tenant: &str, name: &str) -> String {
 /// validly-signed plan (fetch). A hostname that merely starts with `127.` (e.g.
 /// `127.0.0.1.evil.com`) parses as a domain, not a loopback IP, so it is refused.
 pub(crate) fn control_url_is_acceptable(raw: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(raw) else {
-        return false;
-    };
+    control_url_is_acceptable_with_insecure(raw, false)
+}
+
+/// The stored-state-independent half of config-set URL validation: trim,
+/// reject blank (with a field-specific hint), reject unparseable URLs and
+/// non-http(s) schemes. Host-level policy (loopback vs `insecure_http`) is
+/// deliberately NOT checked here — that needs the effective merged config,
+/// which only exists post-merge under the transact lock.
+fn early_check_url(field: &str, raw: &str, blank_hint: &str) -> Result<String, OpError> {
+    let ep = raw.trim();
+    if ep.is_empty() {
+        return Err(OpError::InvalidArgument(format!(
+            "{field} must not be blank ({blank_hint})"
+        )));
+    }
+    let parsed = url::Url::parse(ep)
+        .map_err(|_| OpError::InvalidArgument(format!("{field} {ep:?} is not a valid URL")))?;
     match parsed.scheme() {
-        "https" => true,
-        "http" => match parsed.host() {
-            Some(url::Host::Domain(host)) => host == "localhost",
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
-        },
-        _ => false,
+        "https" | "http" => Ok(ep.to_string()),
+        other => Err(OpError::InvalidArgument(format!(
+            "{field} scheme {other:?} is not acceptable \
+             (only https and http are allowed)"
+        ))),
     }
 }
 
@@ -1271,51 +1339,47 @@ pub fn config_set(
             "poll_interval_secs {secs} is below the {MIN_POLL_INTERVAL_SECS}s floor"
         )));
     }
+    // Early per-field URL checks: reject blanks, unparseable URLs, and
+    // non-http(s) schemes before the transact lock so the operator gets a
+    // clear error immediately. Host-level policy (loopback vs insecure_http)
+    // is decided *post-merge* under the lock against the effective merged
+    // config — the early check cannot know the stored insecure_http value.
+    // Blank values are rejected fail-closed rather than silently no-op'd: an
+    // operator who passes a blank value is trying to change something.
     let validated_plan_endpoint = payload
         .plan_endpoint
         .as_deref()
         .map(|raw| {
-            let ep = raw.trim();
-            if ep.is_empty() {
-                // Reject fail-closed rather than silently no-op: an operator who
-                // passes a blank value is trying to change something. To stop
-                // polling, disable the channel; to repoint, pass a new URL.
-                return Err(OpError::InvalidArgument(
-                    "plan_endpoint must not be blank (to stop polling, disable \
-                     the channel; to repoint, pass a new URL)"
-                        .to_string(),
-                ));
-            }
-            if !control_url_is_acceptable(ep) {
-                return Err(OpError::InvalidArgument(format!(
-                    "plan_endpoint {ep:?} is not an acceptable control URL \
-                     (https required; http only to loopback)"
-                )));
-            }
-            Ok(ep.to_string())
+            early_check_url(
+                "plan_endpoint",
+                raw,
+                "to stop polling, disable the channel; to repoint, pass a new URL",
+            )
         })
         .transpose()?;
     let validated_stream_endpoint = payload
         .stream_endpoint
         .as_deref()
         .map(|raw| {
-            let ep = raw.trim();
-            if ep.is_empty() {
-                return Err(OpError::InvalidArgument(
-                    "stream_endpoint must not be blank (omit the flag to leave \
-                     unchanged; unset derives from plan_endpoint)"
-                        .to_string(),
-                ));
-            }
-            if !control_url_is_acceptable(ep) {
-                return Err(OpError::InvalidArgument(format!(
-                    "stream_endpoint {ep:?} is not an acceptable control URL \
-                     (https required; http only to loopback)"
-                )));
-            }
-            Ok(ep.to_string())
+            early_check_url(
+                "stream_endpoint",
+                raw,
+                "omit the flag to leave unchanged; unset derives from plan_endpoint",
+            )
         })
         .transpose()?;
+    let validated_blob_base_url = payload
+        .blob_base_url
+        .as_deref()
+        .map(|raw| early_check_url("blob_base_url", raw, "omit the flag to leave unchanged"))
+        .transpose()?;
+    if payload.clear_blob_base_url == Some(true) && validated_blob_base_url.is_some() {
+        return Err(OpError::InvalidArgument(
+            "--clear-blob-base-url and --blob-base-url cannot be used together \
+             (set one or clear it, not both)"
+                .to_string(),
+        ));
+    }
     if !store.exists(&env_id)? {
         return Err(OpError::NotFound(format!(
             "environment `{env_id}` not found"
@@ -1344,12 +1408,31 @@ pub fn config_set(
     if validated_stream_endpoint.is_some() {
         fields.push("stream_endpoint");
     }
+    if validated_blob_base_url.is_some() || payload.clear_blob_base_url == Some(true) {
+        fields.push("blob_base_url");
+    }
+    if payload.insecure_http.is_some() {
+        fields.push("insecure_http");
+    }
 
+    let mut audit_target = json!({ "fields": fields });
+    // Security-sensitive fields carry their requested values into the audit
+    // target so a reviewer can distinguish "enabled insecure HTTP" from
+    // "disabled it" without correlating with a separate config snapshot.
+    if let Some(ih) = payload.insecure_http {
+        audit_target["insecure_http"] = json!(ih);
+    }
+    if let Some(ref ep) = validated_blob_base_url {
+        audit_target["blob_base_url"] = json!(ep);
+    }
+    if payload.clear_blob_base_url == Some(true) {
+        audit_target["blob_base_url"] = json!(null);
+    }
     let ctx = AuditCtx {
         env_id: env_id.clone(),
         noun: NOUN,
         verb: "config-set",
-        target: json!({ "fields": fields }),
+        target: audit_target,
         idempotency_key: None,
     };
     audit_and_record(store, ctx, |_committed| {
@@ -1382,6 +1465,38 @@ pub fn config_set(
             if let Some(ep) = validated_stream_endpoint {
                 cfg.stream_endpoint = Some(ep);
             }
+            if payload.clear_blob_base_url == Some(true) {
+                cfg.blob_base_url = None;
+            } else if let Some(ep) = validated_blob_base_url {
+                cfg.blob_base_url = Some(ep);
+            }
+            if let Some(ih) = payload.insecure_http {
+                cfg.insecure_http = Some(ih);
+            }
+
+            // Post-merge host-policy gate: the authoritative check that
+            // decides whether a plain-HTTP non-loopback URL is acceptable.
+            // Early checks above only validate scheme sanity (http/https);
+            // this gate runs against the effective merged config so it sees
+            // the stored insecure_http even when the current command omits it.
+            let effective_insecure = cfg.resolved_insecure_http();
+            for (field, value) in [
+                ("plan_endpoint", &cfg.plan_endpoint),
+                ("stream_endpoint", &cfg.stream_endpoint),
+                ("blob_base_url", &cfg.blob_base_url),
+            ] {
+                if let Some(ep) = value
+                    && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
+                {
+                    return Err(OpError::InvalidArgument(format!(
+                        "{field} {ep:?} is not acceptable under \
+                         insecure_http={effective_insecure}: https is required, \
+                         and plain http is allowed only to loopback unless \
+                         insecure_http=true"
+                    )));
+                }
+            }
+
             locked.save_update_channel(&cfg)?;
             Ok(cfg)
         })?;
@@ -1428,6 +1543,8 @@ fn config_view(cfg: &UpdateChannelConfig) -> Value {
         "plan_endpoint": cfg.plan_endpoint,
         "push_enabled": cfg.push_enabled,
         "stream_endpoint": cfg.stream_endpoint,
+        "blob_base_url": cfg.blob_base_url,
+        "insecure_http": cfg.insecure_http,
         "resolved": {
             "enabled": cfg.resolved_enabled(),
             "action": cfg.resolved_action().as_str(),
@@ -1436,6 +1553,8 @@ fn config_view(cfg: &UpdateChannelConfig) -> Value {
             "plan_endpoint": cfg.resolved_plan_endpoint(),
             "push_enabled": cfg.resolved_push_enabled(),
             "stream_endpoint": cfg.resolved_stream_endpoint(),
+            "blob_base_url": cfg.resolved_blob_base_url(),
+            "insecure_http": cfg.resolved_insecure_http(),
         }
     })
 }
@@ -3995,7 +4114,10 @@ fn config_set_schema() -> Value {
             "poll_interval_secs": {"type": ["integer", "null"], "minimum": MIN_POLL_INTERVAL_SECS, "description": "fallback poll interval in seconds; null leaves the stored value unchanged (unset resolves to 3600)"},
             "plan_endpoint": {"type": ["string", "null"], "description": "base URL to poll for the latest signed update plan (`{url}` + `{url}.sig`); null leaves the stored value unchanged; must be https (or http to loopback)"},
             "push_enabled": {"type": ["boolean", "null"], "description": "whether the runtime subscribes to a pushed update stream (SSE); null leaves the stored value unchanged (unset resolves to true)"},
-            "stream_endpoint": {"type": ["string", "null"], "description": "SSE stream endpoint URL; null leaves the stored value unchanged (unset derives from plan_endpoint); must be https (or http to loopback)"}
+            "stream_endpoint": {"type": ["string", "null"], "description": "SSE stream endpoint URL; null leaves the stored value unchanged (unset derives from plan_endpoint); must be https (or http to loopback)"},
+            "blob_base_url": {"type": ["string", "null"], "description": "base URL of an air-gap blob mirror serving content-addressed blobs at {base}/sha256-<hex>; null leaves the stored value unchanged; must be https (or http when insecure_http is true)"},
+            "insecure_http": {"type": ["boolean", "null"], "description": "allow plain-HTTP (non-TLS) plan/stream/blob endpoints on non-loopback hosts; null leaves the stored value unchanged (absent resolves to false, deny-by-default); does NOT affect OCI insecure registries or enrollment ca_url"},
+            "clear_blob_base_url": {"type": ["boolean", "null"], "description": "when true, removes a previously configured blob_base_url; conflicts with blob_base_url (setting and clearing in the same command is rejected)"}
         }
     })
 }
@@ -4084,6 +4206,10 @@ mod tests {
                 plan_endpoint: Some("https://updates.example.com/plans/latest".into()),
                 push_enabled: Some(false),
                 stream_endpoint: Some("https://updates.example.com/updates/stream".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -4145,6 +4271,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -4177,6 +4307,10 @@ mod tests {
             plan_endpoint: None,
             push_enabled: Some(false),
             stream_endpoint: Some("https://example.com/stream".into()),
+            blob_base_url: None,
+            insecure_http: None,
+
+            clear_blob_base_url: None,
         });
         set(UpdateConfigSetPayload {
             environment_id: "local".into(),
@@ -4186,6 +4320,10 @@ mod tests {
             plan_endpoint: None,
             push_enabled: None,
             stream_endpoint: None,
+            blob_base_url: None,
+            insecure_http: None,
+
+            clear_blob_base_url: None,
         });
         let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
         assert_eq!(cfg.enabled, Some(true)); // preserved across the second set
@@ -4214,6 +4352,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4240,6 +4382,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4261,6 +4407,10 @@ mod tests {
                 plan_endpoint: Some("http://example.com/plan".into()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4286,6 +4436,10 @@ mod tests {
                 plan_endpoint: Some("   ".into()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4307,6 +4461,10 @@ mod tests {
                 plan_endpoint: Some("".into()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4334,6 +4492,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: Some("http://example.com/stream".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4357,6 +4519,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: Some("   ".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4374,6 +4540,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: Some("".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4396,6 +4566,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4438,6 +4612,10 @@ mod tests {
                         plan_endpoint: None,
                         push_enabled: None,
                         stream_endpoint: None,
+                        blob_base_url: None,
+                        insecure_http: None,
+
+                        clear_blob_base_url: None,
                     }),
                 )
                 .unwrap();
@@ -4455,6 +4633,10 @@ mod tests {
                         plan_endpoint: None,
                         push_enabled: None,
                         stream_endpoint: None,
+                        blob_base_url: None,
+                        insecure_http: None,
+
+                        clear_blob_base_url: None,
                     }),
                 )
                 .unwrap();
@@ -4495,6 +4677,10 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap_err();
@@ -4502,6 +4688,604 @@ mod tests {
             !env_dir.join("update-channel.json").exists(),
             "sidecar must not be written for a corrupt env"
         );
+    }
+
+    // --- blob_base_url + insecure_http (C2 air-gap config) -------------------
+
+    #[test]
+    fn config_set_blob_base_url_and_insecure_http_persist_and_round_trip() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("https://updates.example.com/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan:9443/blobs".into()),
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(
+            cfg.blob_base_url.as_deref(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(cfg.insecure_http, Some(true));
+        // Verify resolved accessors.
+        assert_eq!(
+            cfg.resolved_blob_base_url(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert!(cfg.resolved_insecure_http());
+        // Read back via config-show and verify the view.
+        let out = config_show(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigShowFilter {
+                environment_id: "local".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            out.result["blob_base_url"].as_str(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(out.result["insecure_http"].as_bool(), Some(true));
+        assert_eq!(
+            out.result["resolved"]["blob_base_url"].as_str(),
+            Some("https://mirror.lan:9443/blobs")
+        );
+        assert_eq!(
+            out.result["resolved"]["insecure_http"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn config_set_insecure_http_true_admits_plain_http_plan_endpoint_same_command() {
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        // Plain-HTTP non-loopback plan_endpoint + insecure_http=true in the
+        // same command must be accepted.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn config_set_plain_http_plan_endpoint_without_insecure_rejected() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        // Plain-HTTP non-loopback plan_endpoint WITHOUT insecure_http → rejected.
+        // This pins the existing strict behavior.
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_plain_http_blob_base_url_without_insecure_rejected() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("http://mirror.lan/blobs".into()),
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_plain_http_blob_base_url_with_insecure_accepted() {
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("http://mirror.lan/blobs".into()),
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn config_set_ftp_blob_base_url_rejected_even_with_insecure() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("ftp://mirror.lan/blobs".into()),
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scheme") && msg.contains("ftp"),
+            "error should name the rejected scheme: {msg}"
+        );
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_insecure_downgrade_rejects_stored_plain_http_plan_endpoint() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        // Step 1: store insecure_http=true + plain-HTTP non-loopback plan_endpoint.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        // Step 2: set insecure_http=false alone → must fail naming plan_endpoint.
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(false),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("plan_endpoint"),
+            "error should name the offending field: {msg}"
+        );
+        // Config is still intact — nothing was written by the failed command.
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.insecure_http, Some(true));
+        assert_eq!(cfg.plan_endpoint.as_deref(), Some("http://mirror.lan/plan"));
+    }
+
+    #[test]
+    fn config_set_stored_insecure_admits_plain_http_endpoint_without_restating() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Step 1: enable insecure_http with an https plan_endpoint.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("https://updates.example.com/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+
+        // Step 2: repoint plan_endpoint to plain-HTTP non-loopback WITHOUT
+        // restating insecure_http — the stored value (true) must be honoured.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.plan_endpoint.as_deref(), Some("http://mirror.lan/plan"));
+        assert_eq!(cfg.insecure_http, Some(true));
+
+        // Step 3: repoint stream_endpoint the same way — also accepted.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("http://mirror.lan/stream".into()),
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("http://mirror.lan/stream")
+        );
+        assert_eq!(cfg.insecure_http, Some(true));
+    }
+
+    #[test]
+    fn config_set_rejects_blank_blob_base_url() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("   ".into()),
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(msg.contains("blank"), "error should mention 'blank': {msg}");
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_set_https_blob_base_url_accepted_without_insecure() {
+        let dir = tempdir().unwrap();
+        let (store, _) = store_with_env(dir.path(), "local");
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan/blobs".into()),
+                insecure_http: None,
+
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    // ---- audit distinguishability for security-sensitive fields ----------------
+
+    #[test]
+    fn config_set_audit_records_insecure_http_values() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Set insecure_http=true and verify the audit target carries the value.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+
+        // Set insecure_http=false — second audit line.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(false),
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let audit_raw =
+            std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = audit_raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // Find the two config-set audit events (there may be a preceding
+        // create-env event from store_with_env).
+        let cs_events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["verb"] == "config-set")
+            .collect();
+        assert!(
+            cs_events.len() >= 2,
+            "expected at least 2 config-set audit events, got {}: {audit_raw}",
+            cs_events.len()
+        );
+        let first = &cs_events[0]["target"];
+        let second = &cs_events[1]["target"];
+        assert_eq!(
+            first["insecure_http"],
+            serde_json::json!(true),
+            "first audit entry must record insecure_http=true: {first}"
+        );
+        assert_eq!(
+            second["insecure_http"],
+            serde_json::json!(false),
+            "second audit entry must record insecure_http=false: {second}"
+        );
+    }
+
+    // ---- clear-blob-base-url -------------------------------------------------
+
+    #[test]
+    fn config_set_clear_blob_base_url_removes_stored_value() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Step 1: set a blob_base_url.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan/blobs".into()),
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        assert!(
+            store
+                .load_update_channel(&env_id)
+                .unwrap()
+                .unwrap()
+                .blob_base_url
+                .is_some(),
+            "precondition: blob_base_url must be set"
+        );
+
+        // Step 2: clear it.
+        let out = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: Some(true),
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert!(
+            cfg.blob_base_url.is_none(),
+            "blob_base_url must be None after clearing"
+        );
+        // config_view reflects null.
+        assert!(
+            out.result["blob_base_url"].is_null(),
+            "config_view must show null: {:?}",
+            out.result["blob_base_url"]
+        );
+        assert!(
+            out.result["resolved"]["blob_base_url"].is_null(),
+            "resolved blob_base_url must be null: {:?}",
+            out.result["resolved"]["blob_base_url"]
+        );
+
+        // Step 3: a subsequent config-set without either flag leaves it None.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: Some(true),
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert!(
+            cfg.blob_base_url.is_none(),
+            "blob_base_url must remain None after unrelated config-set"
+        );
+
+        // Verify audit records the clearing as blob_base_url: null.
+        let env_dir = store.env_dir(&env_id).unwrap();
+        let audit_raw =
+            std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let clear_event: Vec<serde_json::Value> = audit_raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|e: &serde_json::Value| {
+                e["verb"] == "config-set" && e["target"]["blob_base_url"].is_null()
+            })
+            .collect();
+        assert!(
+            !clear_event.is_empty(),
+            "audit must contain a config-set entry with blob_base_url: null: {audit_raw}"
+        );
+    }
+
+    #[test]
+    fn config_set_clear_and_set_blob_base_url_together_rejected() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        let err = config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: Some("https://mirror.lan/blobs".into()),
+                insecure_http: None,
+                clear_blob_base_url: Some(true),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("clear") && msg.contains("blob"),
+            "error should mention the conflict: {msg}"
+        );
+        // Fail-closed: nothing was written.
+        assert!(store.load_update_channel(&env_id).unwrap().is_none());
     }
 
     // A self-signed X.509 cert (public material only) used to exercise the
@@ -7151,6 +7935,10 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
                 plan_endpoint: Some(endpoint.to_string()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
