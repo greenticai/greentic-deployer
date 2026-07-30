@@ -23,8 +23,18 @@ use greentic_deploy_spec::{
 };
 use greentic_distributor_client::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use greentic_secrets_lib::core::rt;
-use greentic_update::plan::{BROADCAST_ENV_ID, plan_targets_env};
 use serde::{Deserialize, Serialize};
+
+/// Fleet broadcast environment id. Plans addressed to this id are accepted by
+/// every subscribed environment. Defined locally because the dev-lane
+/// `greentic-update` does not export it yet (main-only addition).
+const BROADCAST_ENV_ID: &str = "_";
+
+/// Whether a plan addressed to `plan_env` should be accepted by `local_env` —
+/// an exact match, or the fleet broadcast channel.
+fn plan_targets_env(plan_env: &str, local_env: &str) -> bool {
+    plan_env == local_env || plan_env == BROADCAST_ENV_ID
+}
 use serde_json::{Value, json};
 
 use crate::environment::{
@@ -721,14 +731,14 @@ fn admit_or_resume(
 /// Snapshot the applied-plan set for a resume-time re-gate (best-effort — not
 /// under the staging lock; the atomic gate is `begin_checked`).
 ///
-/// `channel` is the resuming plan's target env (`_` for broadcast, the env name
-/// for per-env). The downgrade watermark is scoped to it — matching the
-/// authoritative `begin_checked` gate (greentic-update >= 1.1.2) — so a plan
-/// resuming after its env migrated channels is not wedged by the other channel's
-/// higher applied sequence. `StageState.channel` is backfilled by `list()`.
+/// NOTE: The stable-lane `greentic-update` (>= 1.1.2) has per-channel downgrade
+/// scoping via `StageState.channel`. The dev-lane version does not yet have that
+/// field, so we use all applied plans for the watermark — conservative (may
+/// reject valid cross-channel downgrades) but safe (never admits a real
+/// downgrade).
 fn current_admission_facts(
     root: &greentic_update::staging::UpdatesRoot,
-    channel: &str,
+    _channel: &str,
 ) -> Result<greentic_update::staging::AdmissionFacts, OpError> {
     let applied: Vec<_> = root
         .list()
@@ -737,13 +747,7 @@ fn current_admission_facts(
         .filter(|s| s.stage == greentic_update::staging::UpdateStage::Applied)
         .collect();
     Ok(greentic_update::staging::AdmissionFacts {
-        // Per-channel downgrade watermark (see the doc note above).
-        latest_applied_sequence: applied
-            .iter()
-            .filter(|s| s.channel.as_deref() == Some(channel))
-            .map(|s| s.sequence)
-            .max(),
-        // `requires` is environment-wide — keep every applied id across channels.
+        latest_applied_sequence: applied.iter().map(|s| s.sequence).max(),
         applied_plan_ids: applied.into_iter().map(|s| s.plan_id).collect(),
     })
 }
@@ -5227,6 +5231,9 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -5274,6 +5281,9 @@ mod tests {
                 plan_endpoint: Some(custom.into()),
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -5289,6 +5299,9 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
@@ -5321,6 +5334,9 @@ mod tests {
                 plan_endpoint: None,
                 push_enabled: None,
                 stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+                clear_blob_base_url: None,
             }),
         )
         .unwrap();
