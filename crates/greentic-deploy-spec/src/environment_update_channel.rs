@@ -772,10 +772,10 @@ mod tests {
         );
         let back: UpdateChannelConfig = serde_json::from_value(json).unwrap();
         assert_eq!(
-            back.blob_base_url.as_deref(),
+            back.resolved_blob_base_url(),
             Some("https://mirror.lan:9443/blobs")
         );
-        assert_eq!(back.insecure_http, Some(true));
+        assert!(back.resolved_insecure_http());
     }
 
     #[test]
@@ -784,6 +784,21 @@ mod tests {
         let json = serde_json::to_value(&cfg).unwrap();
         assert!(json.get("blob_base_url").is_none());
         assert!(json.get("insecure_http").is_none());
+    }
+
+    #[test]
+    fn wrong_typed_insecure_http_is_a_parse_error() {
+        // A malformed value for a security-sensitive key must be a LOUD parse
+        // error, never silently captured into `unknown` (which would make the
+        // config read as deny-by-default `false` while the operator believes
+        // they enabled it).
+        let on_disk = serde_json::json!({
+            "schema": UpdateChannelConfig::schema_str(),
+            "environment_id": "local",
+            "insecure_http": "true",
+        });
+        let err = serde_json::from_value::<UpdateChannelConfig>(on_disk);
+        assert!(err.is_err(), "string \"true\" must not parse: {err:?}");
     }
 
     #[test]
