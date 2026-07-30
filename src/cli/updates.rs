@@ -1311,12 +1311,11 @@ pub fn config_set(
             "poll_interval_secs {secs} is below the {MIN_POLL_INTERVAL_SECS}s floor"
         )));
     }
-    // The payload's own insecure_http governs the early per-field URL checks:
-    // when the operator passes `--insecure-http true` in the same command, the
-    // early check admits plain HTTP to any host. When insecure_http is absent
-    // (stored value might be true), the early check is strict — the authoritative
-    // post-merge check inside the transact lock reads the effective stored value.
-    let early_insecure = payload.insecure_http.unwrap_or(false);
+    // Early per-field URL checks: reject blanks, unparseable URLs, and
+    // non-http(s) schemes before the transact lock so the operator gets a
+    // clear error immediately. Host-level policy (loopback vs insecure_http)
+    // is decided *post-merge* under the lock against the effective merged
+    // config — the early check cannot know the stored insecure_http value.
     let validated_plan_endpoint = payload
         .plan_endpoint
         .as_deref()
@@ -1332,11 +1331,17 @@ pub fn config_set(
                         .to_string(),
                 ));
             }
-            if !control_url_is_acceptable_with_insecure(ep, early_insecure) {
-                return Err(OpError::InvalidArgument(format!(
-                    "plan_endpoint {ep:?} is not an acceptable control URL \
-                     (https required; http only to loopback)"
-                )));
+            let parsed = url::Url::parse(ep).map_err(|_| {
+                OpError::InvalidArgument(format!("plan_endpoint {ep:?} is not a valid URL"))
+            })?;
+            match parsed.scheme() {
+                "https" | "http" => {}
+                other => {
+                    return Err(OpError::InvalidArgument(format!(
+                        "plan_endpoint scheme {other:?} is not acceptable \
+                         (only https and http are allowed)"
+                    )));
+                }
             }
             Ok(ep.to_string())
         })
@@ -1353,11 +1358,17 @@ pub fn config_set(
                         .to_string(),
                 ));
             }
-            if !control_url_is_acceptable_with_insecure(ep, early_insecure) {
-                return Err(OpError::InvalidArgument(format!(
-                    "stream_endpoint {ep:?} is not an acceptable control URL \
-                     (https required; http only to loopback)"
-                )));
+            let parsed = url::Url::parse(ep).map_err(|_| {
+                OpError::InvalidArgument(format!("stream_endpoint {ep:?} is not a valid URL"))
+            })?;
+            match parsed.scheme() {
+                "https" | "http" => {}
+                other => {
+                    return Err(OpError::InvalidArgument(format!(
+                        "stream_endpoint scheme {other:?} is not acceptable \
+                         (only https and http are allowed)"
+                    )));
+                }
             }
             Ok(ep.to_string())
         })
@@ -1471,42 +1482,40 @@ pub fn config_set(
                 cfg.insecure_http = Some(ih);
             }
 
-            // Post-merge insecure-aware validation: now that all fields are
-            // merged (payload over stored), re-check every URL endpoint against
-            // the effective insecure_http flag. This is the authoritative gate:
-            // the early per-field checks above catch the common no-insecure case
-            // with clear messages, but this check covers cross-field interactions
-            // (e.g. setting insecure_http=false with a stored plain-HTTP endpoint,
-            // or setting a plain-HTTP endpoint while insecure_http is true).
+            // Post-merge host-policy gate: the authoritative check that
+            // decides whether a plain-HTTP non-loopback URL is acceptable.
+            // Early checks above only validate scheme sanity (http/https);
+            // this gate runs against the effective merged config so it sees
+            // the stored insecure_http even when the current command omits it.
             let effective_insecure = cfg.resolved_insecure_http();
             if let Some(ref ep) = cfg.plan_endpoint
                 && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
             {
                 return Err(OpError::InvalidArgument(format!(
-                    "plan_endpoint {ep:?} is not acceptable with the effective \
-                     insecure_http={effective_insecure} policy (https required; \
-                     http to non-loopback hosts requires insecure_http=true); \
-                     repoint the endpoint before disabling insecure_http"
+                    "plan_endpoint {ep:?} is not acceptable under \
+                     insecure_http={effective_insecure}: https is required, \
+                     and plain http is allowed only to loopback unless \
+                     insecure_http=true"
                 )));
             }
             if let Some(ref ep) = cfg.stream_endpoint
                 && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
             {
                 return Err(OpError::InvalidArgument(format!(
-                    "stream_endpoint {ep:?} is not acceptable with the effective \
-                     insecure_http={effective_insecure} policy (https required; \
-                     http to non-loopback hosts requires insecure_http=true); \
-                     repoint the endpoint before disabling insecure_http"
+                    "stream_endpoint {ep:?} is not acceptable under \
+                     insecure_http={effective_insecure}: https is required, \
+                     and plain http is allowed only to loopback unless \
+                     insecure_http=true"
                 )));
             }
             if let Some(ref ep) = cfg.blob_base_url
                 && !control_url_is_acceptable_with_insecure(ep, effective_insecure)
             {
                 return Err(OpError::InvalidArgument(format!(
-                    "blob_base_url {ep:?} is not acceptable with the effective \
-                     insecure_http={effective_insecure} policy (https required; \
-                     http to non-loopback hosts requires insecure_http=true); \
-                     repoint the endpoint before disabling insecure_http"
+                    "blob_base_url {ep:?} is not acceptable under \
+                     insecure_http={effective_insecure}: https is required, \
+                     and plain http is allowed only to loopback unless \
+                     insecure_http=true"
                 )));
             }
 
@@ -4902,6 +4911,76 @@ mod tests {
         let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
         assert_eq!(cfg.insecure_http, Some(true));
         assert_eq!(cfg.plan_endpoint.as_deref(), Some("http://mirror.lan/plan"));
+    }
+
+    #[test]
+    fn config_set_stored_insecure_admits_plain_http_endpoint_without_restating() {
+        let dir = tempdir().unwrap();
+        let (store, env_id) = store_with_env(dir.path(), "local");
+
+        // Step 1: enable insecure_http with an https plan_endpoint.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("https://updates.example.com/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: Some(true),
+            }),
+        )
+        .unwrap();
+
+        // Step 2: repoint plan_endpoint to plain-HTTP non-loopback WITHOUT
+        // restating insecure_http — the stored value (true) must be honoured.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: Some("http://mirror.lan/plan".into()),
+                push_enabled: None,
+                stream_endpoint: None,
+                blob_base_url: None,
+                insecure_http: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(cfg.plan_endpoint.as_deref(), Some("http://mirror.lan/plan"));
+        assert_eq!(cfg.insecure_http, Some(true));
+
+        // Step 3: repoint stream_endpoint the same way — also accepted.
+        config_set(
+            &store,
+            &OpFlags::default(),
+            Some(UpdateConfigSetPayload {
+                environment_id: "local".into(),
+                enabled: None,
+                on_notify: None,
+                poll_interval_secs: None,
+                plan_endpoint: None,
+                push_enabled: None,
+                stream_endpoint: Some("http://mirror.lan/stream".into()),
+                blob_base_url: None,
+                insecure_http: None,
+            }),
+        )
+        .unwrap();
+        let cfg = store.load_update_channel(&env_id).unwrap().unwrap();
+        assert_eq!(
+            cfg.stream_endpoint.as_deref(),
+            Some("http://mirror.lan/stream")
+        );
+        assert_eq!(cfg.insecure_http, Some(true));
     }
 
     #[test]
