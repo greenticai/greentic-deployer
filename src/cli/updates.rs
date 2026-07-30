@@ -3801,13 +3801,16 @@ fn import_impl(
     // operator must fix the push-to target and re-run with the same
     // envelope (idempotent).
     let push_to_result = if let Some(ref push_to_path) = payload.push_to {
-        Some(write_static_serving_dir(
-            push_to_path,
-            &plan_bytes,
-            &sig_bytes,
-            &verified,
-            &root,
-        )?)
+        Some(
+            write_static_serving_dir(push_to_path, &plan_bytes, &sig_bytes, &verified, &root)
+                .map_err(|e| {
+                    OpError::Conflict(format!(
+                        "import committed successfully (receipt written), \
+                         only the --push-to write failed: {e}; \
+                         fix the push-to target and re-run the same import (idempotent)"
+                    ))
+                })?,
+        )
     } else {
         None
     };
@@ -3829,6 +3832,7 @@ fn import_impl(
         result["push_to"] = serde_json::json!({
             "path": pt.path.display().to_string(),
             "blobs_written": pt.blobs_written,
+            "blobs_skipped": pt.blobs_skipped,
         });
     }
 
@@ -3846,6 +3850,8 @@ struct PushToResult {
     /// Number of blob files actually written (excludes pre-existing blobs
     /// whose file was already on disk — CAS content is immutable by digest).
     blobs_written: usize,
+    /// Number of blob files skipped because they already existed on disk.
+    blobs_skipped: usize,
 }
 
 /// Write a static serving directory that an in-gap HTTP server can serve to
@@ -3948,13 +3954,18 @@ fn write_static_serving_dir(
         .collect();
 
     let mut blobs_written: usize = 0;
+    let mut blobs_skipped: usize = 0;
     for digest in &all_digests {
         // Convert `sha256:<hex>` → `sha256-<hex>` for the filename.
         let file_name = digest.replacen(':', "-", 1);
         let blob_path = blobs_dir.join(&file_name);
 
-        // Skip blobs already on disk — CAS content is immutable by digest.
+        // Pre-existing blob files are trusted by filename alone: CAS content
+        // is immutable by digest, and every consumer digest-verifies what it
+        // fetches — a corrupted pre-existing file is caught by readers, not
+        // by this writer.
         if blob_path.exists() {
+            blobs_skipped += 1;
             continue;
         }
 
@@ -3983,6 +3994,7 @@ fn write_static_serving_dir(
     Ok(PushToResult {
         path: push_to.to_path_buf(),
         blobs_written,
+        blobs_skipped,
     })
 }
 
@@ -11282,6 +11294,11 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             push_to_dir.path().display().to_string()
         );
         assert_eq!(pt["blobs_written"].as_u64(), Some(2));
+        assert_eq!(
+            pt["blobs_skipped"].as_u64(),
+            Some(0),
+            "fresh dir must have zero skipped blobs"
+        );
 
         // plan/plan.json must be the raw plan bytes from the envelope.
         let plan_json = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
@@ -11371,12 +11388,17 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         )
         .unwrap_err();
 
-        // Must be Conflict mentioning both sequences.
+        // Must be Conflict mentioning both sequences AND stating the import
+        // committed (Finding 1 contract).
         match &err {
             OpError::Conflict(msg) => {
                 assert!(
                     msg.contains('2') && msg.contains('1'),
                     "error must name both sequences, got: {msg}"
+                );
+                assert!(
+                    msg.contains("import committed"),
+                    "error must state the import committed, got: {msg}"
                 );
             }
             other => panic!("expected Conflict, got: {other:?}"),
@@ -11447,6 +11469,11 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             out.result["push_to"]["blobs_written"].as_u64(),
             Some(1),
             "only the binary blob should be written; artifact blob was pre-existing"
+        );
+        assert_eq!(
+            out.result["push_to"]["blobs_skipped"].as_u64(),
+            Some(1),
+            "the pre-existing artifact blob must be counted as skipped"
         );
     }
 
