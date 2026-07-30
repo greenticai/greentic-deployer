@@ -3239,9 +3239,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "1.2.0-dev.30445743798"
+version = "1.2.0-dev.30553549034"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da5728874d34ac5ad6586494eb1ce101e3a2c53240b7a3353a0209e4f0584eaa"
+checksum = "4fe903c8dd09eba6d507b2add302a1f97ea169a54d071ee1bbaae6e56d714103"
 dependencies = [
  "chrono",
  "flate2",
@@ -3254,7 +3254,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tar",
  "tempfile",
  "thiserror 2.0.19",
