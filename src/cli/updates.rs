@@ -3469,6 +3469,14 @@ fn stage_blob_bytes(env_dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), OpE
             source,
         })?;
     }
+    atomic_write_as_op(dest, bytes)
+}
+
+/// [`crate::environment::atomic_write_bytes`] with its error mapped into
+/// [`OpError`]. Callers that write inside the env staging tree go through
+/// [`stage_blob_bytes`] for the symlink-ancestor guard; paths outside it
+/// (e.g. `--push-to` destinations) call this directly.
+fn atomic_write_as_op(dest: &Path, bytes: &[u8]) -> Result<(), OpError> {
     crate::environment::atomic_write_bytes(dest, bytes).map_err(|e| match e {
         crate::environment::AtomicWriteError::Io { path, source } => OpError::Io { path, source },
         crate::environment::AtomicWriteError::Persist { target, source } => OpError::Io {
@@ -3891,44 +3899,26 @@ fn write_static_serving_dir(
     verified: &greentic_update::plan::VerifiedUpdatePlan,
     root: &greentic_update::staging::UpdatesRoot,
 ) -> Result<PushToResult, OpError> {
-    use fs4::fs_std::FileExt;
-
-    // --- destination lock (Fix 2) ------------------------------------------
-    // Create the push-to root first so the lock file's parent exists.
+    // --- destination lock ---------------------------------------------------
+    // Create the push-to root first so the lock file's parent exists. The
+    // lock is per-DESTINATION (not per-env): it serializes concurrent writers
+    // to the same serving dir so the monotonic+digest guard below is
+    // race-free. Readers never take it. `EnvFlock` also guards against the
+    // lock file's inode being renamed away mid-wait.
     std::fs::create_dir_all(push_to).map_err(|source| OpError::Io {
         path: push_to.to_path_buf(),
         source,
     })?;
     let lock_path = push_to.join(".push-lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|source| OpError::Io {
-            path: lock_path.clone(),
-            source,
-        })?;
-    match lock_file.try_lock_exclusive() {
-        Ok(true) => {} // acquired
-        Ok(false) => {
-            return Err(OpError::Conflict(format!(
+    let _lock_guard = crate::environment::file_lock::EnvFlock::try_acquire(&lock_path)
+        .map_err(|e| OpError::Conflict(format!("push-to lock `{}`: {e}", lock_path.display())))?
+        .ok_or_else(|| {
+            OpError::Conflict(format!(
                 "another --push-to write to `{}` is in progress; \
                  retry when it completes",
                 push_to.display(),
-            )));
-        }
-        Err(source) => {
-            return Err(OpError::Io {
-                path: lock_path,
-                source,
-            });
-        }
-    }
-    // Hold `_lock_file` (and the flock) for the remainder of this function;
-    // drop releases the OS-level lock.
-    let _lock_guard = lock_file;
+            ))
+        })?;
 
     let plan_dir = push_to.join("plan");
     let blobs_dir = push_to.join("blobs");
@@ -3937,29 +3927,23 @@ fn write_static_serving_dir(
     let meta_path = plan_dir.join("meta");
     match std::fs::read(&meta_path) {
         Ok(existing_bytes) => {
-            let existing: serde_json::Value =
-                serde_json::from_slice(&existing_bytes).map_err(|e| {
-                    OpError::Conflict(format!(
-                        "push-to meta `{}` is corrupt ({}); \
+            // Typed parse: a missing or wrong-typed field is exactly as
+            // corrupt as invalid JSON, and serde's error already names it.
+            // Unknown extra fields are tolerated (forward compat).
+            #[derive(serde::Deserialize)]
+            struct PushToMeta {
+                sequence: u64,
+                plan_sha256: String,
+            }
+            let existing: PushToMeta = serde_json::from_slice(&existing_bytes).map_err(|e| {
+                OpError::Conflict(format!(
+                    "push-to meta `{}` is corrupt ({}); \
                          inspect or remove the directory before retrying",
-                        meta_path.display(),
-                        e,
-                    ))
-                })?;
-            let existing_seq = existing["sequence"].as_u64().ok_or_else(|| {
-                OpError::Conflict(format!(
-                    "push-to meta `{}` is corrupt (missing or non-integer `sequence`); \
-                     inspect or remove the directory before retrying",
                     meta_path.display(),
+                    e,
                 ))
             })?;
-            let existing_sha = existing["plan_sha256"].as_str().ok_or_else(|| {
-                OpError::Conflict(format!(
-                    "push-to meta `{}` is corrupt (missing or non-string `plan_sha256`); \
-                     inspect or remove the directory before retrying",
-                    meta_path.display(),
-                ))
-            })?;
+            let (existing_seq, existing_sha) = (existing.sequence, existing.plan_sha256);
             if existing_seq > verified.plan.sequence {
                 return Err(OpError::Conflict(format!(
                     "push-to directory already serves sequence {existing_seq}, \
@@ -4006,17 +3990,16 @@ fn write_static_serving_dir(
     })?;
 
     // --- blobs first -------------------------------------------------------
-    let all_digests: Vec<&str> = verified
+    let all_digests = verified
         .plan
         .artifacts
         .iter()
         .map(|a| a.digest.as_str())
-        .chain(verified.plan.binaries.iter().map(|b| b.digest.as_str()))
-        .collect();
+        .chain(verified.plan.binaries.iter().map(|b| b.digest.as_str()));
 
     let mut blobs_written: usize = 0;
     let mut blobs_skipped: usize = 0;
-    for digest in &all_digests {
+    for digest in all_digests {
         // Convert `sha256:<hex>` → `sha256-<hex>` for the filename.
         let file_name = digest.replacen(':', "-", 1);
         let blob_path = blobs_dir.join(&file_name);
@@ -4063,13 +4046,13 @@ fn write_static_serving_dir(
                  missing from CAS after successful import: {e}"
             ))
         })?;
-        atomic_write_for_push_to(&blob_path, &blob_bytes)?;
+        atomic_write_as_op(&blob_path, &blob_bytes)?;
         blobs_written += 1;
     }
 
     // --- plan files (order: plan.json, plan.json.sig, meta LAST) -----------
-    atomic_write_for_push_to(&plan_dir.join("plan.json"), plan_bytes)?;
-    atomic_write_for_push_to(&plan_dir.join("plan.json.sig"), sig_bytes)?;
+    atomic_write_as_op(&plan_dir.join("plan.json"), plan_bytes)?;
+    atomic_write_as_op(&plan_dir.join("plan.json.sig"), sig_bytes)?;
 
     let meta = serde_json::json!({
         "sequence": verified.plan.sequence,
@@ -4077,29 +4060,12 @@ fn write_static_serving_dir(
     });
     let meta_bytes = serde_json::to_vec_pretty(&meta)
         .map_err(|e| OpError::Conflict(format!("push-to: serialize meta: {e}")))?;
-    atomic_write_for_push_to(&meta_path, &meta_bytes)?;
+    atomic_write_as_op(&meta_path, &meta_bytes)?;
 
     Ok(PushToResult {
         path: push_to.to_path_buf(),
         blobs_written,
         blobs_skipped,
-    })
-}
-
-/// Thin wrapper around [`crate::environment::atomic_write_bytes`] with
-/// error mapping suitable for push-to paths (which are outside the
-/// updates-root and therefore outside `stage_blob_bytes`'s symlink guard).
-fn atomic_write_for_push_to(dest: &std::path::Path, bytes: &[u8]) -> Result<(), OpError> {
-    crate::environment::atomic_write_bytes(dest, bytes).map_err(|e| match e {
-        crate::environment::AtomicWriteError::Io { path, source } => OpError::Io { path, source },
-        crate::environment::AtomicWriteError::Persist { target, source } => OpError::Io {
-            path: target,
-            source: source.error,
-        },
-        other => OpError::Io {
-            path: dest.to_path_buf(),
-            source: std::io::Error::other(other.to_string()),
-        },
     })
 }
 
