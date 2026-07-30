@@ -1038,6 +1038,12 @@ pub struct UpdatesImportArgs {
     /// Bypasses the env-store trust root lookup.
     #[arg(long = "trust-root")]
     pub trust_root: Option<PathBuf>,
+    /// Write a static serving directory after import. One directory per
+    /// environment; an in-gap HTTP server (nginx/caddy with rewrites) serves
+    /// this tree to fleet runtimes. The directory is a cache, not an
+    /// authority -- trust stays with the DSSE envelope + trust root.
+    #[arg(long = "push-to")]
+    pub push_to: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

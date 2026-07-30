@@ -3522,6 +3522,11 @@ struct UpdatesImportPayload {
     staleness_days: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trust_root: Option<PathBuf>,
+    /// Write a static serving directory after import. One directory per
+    /// environment; the dir is a cache, not an authority -- trust stays with
+    /// the DSSE envelope + trust root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push_to: Option<PathBuf>,
 }
 
 fn default_staleness_days() -> u64 {
@@ -3558,6 +3563,7 @@ fn import_impl(
                 key_id: args.key_id,
                 staleness_days: args.staleness_days,
                 trust_root: args.trust_root,
+                push_to: args.push_to,
             }),
             _ => None,
         };
@@ -3788,6 +3794,24 @@ fn import_impl(
 
     let receipt_path = root.env_dir().join("import-receipt.json");
 
+    // Optional: write a static serving directory for in-gap HTTP serving.
+    // Placed AFTER the import is fully committed (CAS + staging + receipt).
+    // A push-to failure after a successful import is a hard error — the
+    // import itself already committed, so partial state is visible. The
+    // operator must fix the push-to target and re-run with the same
+    // envelope (idempotent).
+    let push_to_result = if let Some(ref push_to_path) = payload.push_to {
+        Some(write_static_serving_dir(
+            push_to_path,
+            &plan_bytes,
+            &sig_bytes,
+            &verified,
+            &root,
+        )?)
+    } else {
+        None
+    };
+
     let mut result = serde_json::json!({
         "environment_id": env_id.as_str(),
         "plan_id": verified.plan.plan_id,
@@ -3801,8 +3825,182 @@ fn import_impl(
     if !warnings.is_empty() {
         result["warnings"] = serde_json::json!(warnings);
     }
+    if let Some(pt) = push_to_result {
+        result["push_to"] = serde_json::json!({
+            "path": pt.path.display().to_string(),
+            "blobs_written": pt.blobs_written,
+        });
+    }
 
     Ok(OpOutcome::new(NOUN, "import", result))
+}
+
+// ---------------------------------------------------------------------------
+// push-to: write a static serving directory after import (C3)
+// ---------------------------------------------------------------------------
+
+/// Result of [`write_static_serving_dir`].
+struct PushToResult {
+    /// The push-to root directory that was written.
+    path: PathBuf,
+    /// Number of blob files actually written (excludes pre-existing blobs
+    /// whose file was already on disk — CAS content is immutable by digest).
+    blobs_written: usize,
+}
+
+/// Write a static serving directory that an in-gap HTTP server can serve to
+/// fleet runtimes polling for updates.
+///
+/// # Layout
+///
+/// ```text
+/// <push_to>/
+///   plan/
+///     plan.json      — raw plan bytes (the exact bytes the DSSE signature covers)
+///     plan.json.sig  — raw DSSE envelope bytes
+///     meta           — JSON: {"sequence": <u64>, "plan_sha256": "<hex>"}
+///   blobs/
+///     sha256-<hex>   — one file per plan-referenced digest (binaries + artifacts)
+/// ```
+///
+/// # Ordering
+///
+/// A live reader must never see torn state. Files are written in dependency
+/// order: blobs first, then `plan/plan.json`, then `plan/plan.json.sig`, then
+/// `plan/meta` last. Each file via [`crate::environment::atomic_write_bytes`].
+///
+/// # Monotonic guard
+///
+/// If `<push_to>/plan/meta` exists and its `sequence` is strictly greater
+/// than the incoming plan's, the write is refused with [`OpError::Conflict`].
+/// Equal sequence proceeds (idempotent rewrite). A missing meta file means a
+/// fresh directory. An unreadable or corrupt meta file is a hard error — the
+/// operator must inspect or remove the directory.
+fn write_static_serving_dir(
+    push_to: &std::path::Path,
+    plan_bytes: &[u8],
+    sig_bytes: &[u8],
+    verified: &greentic_update::plan::VerifiedUpdatePlan,
+    root: &greentic_update::staging::UpdatesRoot,
+) -> Result<PushToResult, OpError> {
+    let plan_dir = push_to.join("plan");
+    let blobs_dir = push_to.join("blobs");
+
+    // --- monotonic guard ---------------------------------------------------
+    let meta_path = plan_dir.join("meta");
+    match std::fs::read(&meta_path) {
+        Ok(existing_bytes) => {
+            let existing: serde_json::Value =
+                serde_json::from_slice(&existing_bytes).map_err(|e| {
+                    OpError::Conflict(format!(
+                        "push-to meta `{}` is corrupt ({}); \
+                         inspect or remove the directory before retrying",
+                        meta_path.display(),
+                        e,
+                    ))
+                })?;
+            let existing_seq = existing["sequence"].as_u64().ok_or_else(|| {
+                OpError::Conflict(format!(
+                    "push-to meta `{}` is corrupt (missing or non-integer `sequence`); \
+                     inspect or remove the directory before retrying",
+                    meta_path.display(),
+                ))
+            })?;
+            if existing_seq > verified.plan.sequence {
+                return Err(OpError::Conflict(format!(
+                    "push-to directory already serves sequence {existing_seq}, \
+                     refusing downgrade to sequence {}",
+                    verified.plan.sequence,
+                )));
+            }
+            // equal or lower existing → proceed (idempotent rewrite or upgrade)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Fresh directory — proceed.
+        }
+        Err(e) => {
+            return Err(OpError::Conflict(format!(
+                "push-to meta `{}` is unreadable ({}); \
+                 inspect or remove the directory before retrying",
+                meta_path.display(),
+                e,
+            )));
+        }
+    }
+
+    // --- create directories ------------------------------------------------
+    std::fs::create_dir_all(&plan_dir).map_err(|source| OpError::Io {
+        path: plan_dir.clone(),
+        source,
+    })?;
+    std::fs::create_dir_all(&blobs_dir).map_err(|source| OpError::Io {
+        path: blobs_dir.clone(),
+        source,
+    })?;
+
+    // --- blobs first -------------------------------------------------------
+    let all_digests: Vec<&str> = verified
+        .plan
+        .artifacts
+        .iter()
+        .map(|a| a.digest.as_str())
+        .chain(verified.plan.binaries.iter().map(|b| b.digest.as_str()))
+        .collect();
+
+    let mut blobs_written: usize = 0;
+    for digest in &all_digests {
+        // Convert `sha256:<hex>` → `sha256-<hex>` for the filename.
+        let file_name = digest.replacen(':', "-", 1);
+        let blob_path = blobs_dir.join(&file_name);
+
+        // Skip blobs already on disk — CAS content is immutable by digest.
+        if blob_path.exists() {
+            continue;
+        }
+
+        let blob_bytes = root.cas_get(digest).map_err(|e| {
+            OpError::Conflict(format!(
+                "push-to: cas_get `{digest}` failed — plan-referenced digest \
+                 missing from CAS after successful import: {e}"
+            ))
+        })?;
+        atomic_write_for_push_to(&blob_path, &blob_bytes)?;
+        blobs_written += 1;
+    }
+
+    // --- plan files (order: plan.json, plan.json.sig, meta LAST) -----------
+    atomic_write_for_push_to(&plan_dir.join("plan.json"), plan_bytes)?;
+    atomic_write_for_push_to(&plan_dir.join("plan.json.sig"), sig_bytes)?;
+
+    let meta = serde_json::json!({
+        "sequence": verified.plan.sequence,
+        "plan_sha256": verified.plan_sha256,
+    });
+    let meta_bytes = serde_json::to_vec_pretty(&meta)
+        .map_err(|e| OpError::Conflict(format!("push-to: serialize meta: {e}")))?;
+    atomic_write_for_push_to(&meta_path, &meta_bytes)?;
+
+    Ok(PushToResult {
+        path: push_to.to_path_buf(),
+        blobs_written,
+    })
+}
+
+/// Thin wrapper around [`crate::environment::atomic_write_bytes`] with
+/// error mapping suitable for push-to paths (which are outside the
+/// updates-root and therefore outside `stage_blob_bytes`'s symlink guard).
+fn atomic_write_for_push_to(dest: &std::path::Path, bytes: &[u8]) -> Result<(), OpError> {
+    crate::environment::atomic_write_bytes(dest, bytes).map_err(|e| match e {
+        crate::environment::AtomicWriteError::Io { path, source } => OpError::Io { path, source },
+        crate::environment::AtomicWriteError::Persist { target, source } => OpError::Io {
+            path: target,
+            source: source.error,
+        },
+        other => OpError::Io {
+            path: dest.to_path_buf(),
+            source: std::io::Error::other(other.to_string()),
+        },
+    })
 }
 
 /// An [`ArtifactFetcher`] that reads blobs from the durable import CAS by
@@ -3834,7 +4032,8 @@ fn import_schema() -> Value {
             "signing_key": {"type": ["string", "null"], "description": "PKCS#8 Ed25519 private key PEM path. Default: global operator key."},
             "key_id": {"type": ["string", "null"], "description": "Key id for the signing key."},
             "staleness_days": {"type": "integer", "description": "Advisory staleness threshold in days. Default: 30."},
-            "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."}
+            "trust_root": {"type": ["string", "null"], "description": "Path to a trust-root.json file. Bypasses env-store lookup."},
+            "push_to": {"type": ["string", "null"], "description": "Write a static serving directory after import. One directory per environment; the dir is a cache, not an authority -- trust stays DSSE + trust root."}
         }
     })
 }
@@ -9025,6 +9224,126 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
 
     // ---- Phase B2: import + cas-gc ----------------------------------------
 
+    /// Like [`stage_plan_with_blobs`] but with a configurable plan id and
+    /// sequence number, for testing monotonic-guard and idempotency scenarios.
+    fn stage_plan_with_blobs_seq(
+        updates_dir: &std::path::Path,
+        store_dir: &std::path::Path,
+        plan_id: &str,
+        sequence: u64,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (String, TrustedKey, PathBuf) {
+        use greentic_update::staging::UpdatesRoot;
+
+        let (priv_pem, tk) = key_pair(7);
+        let store = LocalFsStore::new(store_dir);
+        env_trusting(&store, &tk);
+        let build_trust = TrustRoot::new(vec![tk.clone()]);
+
+        let artifacts: Vec<Value> = art_payloads
+            .iter()
+            .map(|(name, bytes)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+        let binaries: Vec<Value> = bin_payloads
+            .iter()
+            .map(|(name, bytes, target)| {
+                json!({
+                    "name": name,
+                    "version": "1.0.0",
+                    "target": target,
+                    "digest": digest_of(bytes),
+                })
+            })
+            .collect();
+
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_value(json!({
+            "schema": "greentic.update-plan.v1",
+            "plan_id": plan_id,
+            "env_id": "local",
+            "sequence": sequence,
+            "created_at": "2026-07-02T00:00:00Z",
+            "nonce": format!("nonce-{plan_id}"),
+            "target": {"schema": "greentic.env-manifest.v1", "environment": {"id": "local"}},
+            "artifacts": artifacts,
+            "binaries": binaries,
+            "compat": {},
+            "rollback": {"policy": "auto", "health_timeout_s": 120, "on_fail": "restore"},
+        }))
+        .unwrap();
+        let built =
+            greentic_update::plan::build_update_plan(&plan, &priv_pem, &tk.key_id, &build_trust)
+                .unwrap();
+        let verified = verify_with(&built.plan_bytes, &built.envelope_bytes, &tk);
+        let root = UpdatesRoot::open_in(updates_dir, "local").unwrap();
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+
+        for (name, bytes) in art_payloads {
+            let art = staged
+                .plan()
+                .artifacts
+                .iter()
+                .find(|a| a.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_artifact(&art, bytes).unwrap();
+        }
+        for (name, bytes, _target) in bin_payloads {
+            let bin = staged
+                .plan()
+                .binaries
+                .iter()
+                .find(|b| b.name == *name)
+                .unwrap()
+                .clone();
+            staged.put_binary_blob(&bin, bytes).unwrap();
+        }
+
+        advance_to_staged(&staged).unwrap();
+
+        let key_path = write_test_key(store_dir, &priv_pem);
+        (priv_pem, tk, key_path)
+    }
+
+    /// Like [`build_envelope_for_import`] but with a configurable plan id and
+    /// sequence number.
+    fn build_envelope_for_import_seq(
+        store_dir: &std::path::Path,
+        updates_dir: &std::path::Path,
+        out_path: &std::path::Path,
+        plan_id: &str,
+        sequence: u64,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (String, TrustedKey, PathBuf) {
+        let (priv_pem, tk, key_path) = stage_plan_with_blobs_seq(
+            updates_dir,
+            store_dir,
+            plan_id,
+            sequence,
+            art_payloads,
+            bin_payloads,
+        );
+        let store = LocalFsStore::new(store_dir);
+        let args = export_args(
+            "local",
+            plan_id,
+            out_path.to_path_buf(),
+            key_path.clone(),
+            &tk.key_id,
+        );
+        export_impl(&store, &OpFlags::default(), args, Some(updates_dir)).unwrap();
+        (priv_pem, tk, key_path)
+    }
+
     /// Export a staged plan into a `.gtupdate` envelope file — a test fixture
     /// that builds an envelope the import tests can feed to `import_impl`.
     fn build_envelope_for_import(
@@ -9062,6 +9381,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             key_id: Some(key_id.into()),
             staleness_days: 30,
             trust_root: None,
+            push_to: None,
         }
     }
 
@@ -9677,6 +9997,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
             key_id: None,
             staleness_days: 30,
             trust_root: None,
+            push_to: None,
         };
         let out = import_impl(
             &store,
@@ -10886,6 +11207,332 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
         assert_eq!(
             original_receipt.1, current_receipt.1,
             "receipt sig must be unchanged after failed gc"
+        );
+    }
+
+    // ---- Phase C3: import --push-to static serving directory ----------------
+
+    /// Helper: run import_impl with --push-to and return the outcome.
+    fn import_with_push_to(
+        push_to: &std::path::Path,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (OpOutcome, tempfile::TempDir, tempfile::TempDir) {
+        import_with_push_to_seq(push_to, "plan-export", 1, art_payloads, bin_payloads)
+    }
+
+    /// Like [`import_with_push_to`] but with a configurable plan id and
+    /// sequence for monotonic-guard tests.
+    fn import_with_push_to_seq(
+        push_to: &std::path::Path,
+        plan_id: &str,
+        sequence: u64,
+        art_payloads: &[(&str, &[u8])],
+        bin_payloads: &[(&str, &[u8], &str)],
+    ) -> (OpOutcome, tempfile::TempDir, tempfile::TempDir) {
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("push-to.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import_seq(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            plan_id,
+            sequence,
+            art_payloads,
+            bin_payloads,
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to.to_path_buf());
+        let out = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap();
+
+        (out, import_store, import_updates)
+    }
+
+    #[test]
+    fn push_to_writes_full_layout() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"push-to-artifact";
+        let bin_data = b"push-to-binary";
+
+        let (out, _is, _iu) = import_with_push_to(
+            push_to_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        // Outcome must report push_to.
+        let pt = &out.result["push_to"];
+        assert!(pt.is_object(), "push_to must be present in outcome");
+        assert_eq!(
+            pt["path"].as_str().unwrap(),
+            push_to_dir.path().display().to_string()
+        );
+        assert_eq!(pt["blobs_written"].as_u64(), Some(2));
+
+        // plan/plan.json must be the raw plan bytes from the envelope.
+        let plan_json = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+        // Verify it parses as a valid update plan.
+        let plan: greentic_update::plan::UpdatePlan = serde_json::from_slice(&plan_json).unwrap();
+        assert_eq!(plan.plan_id, "plan-export");
+        assert_eq!(plan.sequence, 1);
+
+        // plan/plan.json.sig must exist and be non-empty.
+        let sig = std::fs::read(push_to_dir.path().join("plan/plan.json.sig")).unwrap();
+        assert!(!sig.is_empty(), "sig must be non-empty");
+
+        // plan/meta must parse to {sequence, plan_sha256}.
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(meta["sequence"].as_u64(), Some(1));
+        let sha = meta["plan_sha256"].as_str().unwrap();
+        assert_eq!(sha.len(), 64, "plan_sha256 must be 64-char hex");
+        assert!(
+            !sha.contains(':'),
+            "plan_sha256 must be bare hex, got: {sha}"
+        );
+
+        // Every plan-referenced digest must be present under blobs/.
+        let art_digest = digest_of(art_data);
+        let bin_digest = digest_of(bin_data);
+        let art_blob_name = art_digest.replacen(':', "-", 1);
+        let bin_blob_name = bin_digest.replacen(':', "-", 1);
+        let art_blob =
+            std::fs::read(push_to_dir.path().join("blobs").join(&art_blob_name)).unwrap();
+        assert_eq!(art_blob, art_data, "artifact blob must match source");
+        let bin_blob =
+            std::fs::read(push_to_dir.path().join("blobs").join(&bin_blob_name)).unwrap();
+        assert_eq!(bin_blob, bin_data, "binary blob must match source");
+    }
+
+    #[test]
+    fn push_to_monotonic_rejects_downgrade() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"monotonic-artifact";
+
+        // First import: sequence 2.
+        let (_out, _is, _iu) = import_with_push_to_seq(
+            push_to_dir.path(),
+            "plan-seq2",
+            2,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        // Verify seq=2 is served.
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(meta["sequence"].as_u64(), Some(2));
+
+        // Snapshot the plan files so we can confirm they are untouched.
+        let plan_before = std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap();
+        let sig_before = std::fs::read(push_to_dir.path().join("plan/plan.json.sig")).unwrap();
+
+        // Second import: sequence 1 into the SAME push-to dir.
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let envelope_path = out_dir.path().join("downgrade.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import_seq(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            "plan-seq1",
+            1,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        // Must be Conflict mentioning both sequences.
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains('2') && msg.contains('1'),
+                    "error must name both sequences, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got: {other:?}"),
+        }
+
+        // Dir still serves seq=2 — files untouched.
+        let meta_after = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        assert_eq!(meta_bytes, meta_after, "meta must be untouched");
+        assert_eq!(
+            plan_before,
+            std::fs::read(push_to_dir.path().join("plan/plan.json")).unwrap(),
+            "plan.json must be untouched"
+        );
+        assert_eq!(
+            sig_before,
+            std::fs::read(push_to_dir.path().join("plan/plan.json.sig")).unwrap(),
+            "plan.json.sig must be untouched"
+        );
+    }
+
+    #[test]
+    fn push_to_same_sequence_is_idempotent() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"idempotent-artifact";
+
+        // First push.
+        let (_out1, _is, _iu) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+
+        // Second push with same sequence — must succeed.
+        let (out2, _is2, _iu2) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+
+        assert_eq!(
+            out2.result["push_to"]["blobs_written"].as_u64(),
+            Some(0),
+            "blobs should be skipped on idempotent re-push"
+        );
+
+        // Meta still valid.
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+        assert_eq!(meta["sequence"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn push_to_blob_idempotency_skips_existing() {
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"blob-idem-artifact";
+        let bin_data = b"blob-idem-binary";
+
+        // Pre-create the artifact blob in the push-to blobs dir.
+        let blobs_dir = push_to_dir.path().join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let art_digest = digest_of(art_data);
+        let art_blob_name = art_digest.replacen(':', "-", 1);
+        std::fs::write(blobs_dir.join(&art_blob_name), art_data).unwrap();
+
+        // Import with push-to — the artifact blob already exists, only the
+        // binary blob should be written.
+        let (out, _is, _iu) = import_with_push_to(
+            push_to_dir.path(),
+            &[("pack-a", art_data)],
+            &[("gtc", bin_data, "x86_64-unknown-linux-gnu")],
+        );
+
+        assert_eq!(
+            out.result["push_to"]["blobs_written"].as_u64(),
+            Some(1),
+            "only the binary blob should be written; artifact blob was pre-existing"
+        );
+    }
+
+    #[test]
+    fn push_to_corrupt_meta_is_hard_error() {
+        let push_to_dir = tempdir().unwrap();
+
+        // Pre-create a corrupt meta file.
+        let plan_dir = push_to_dir.path().join("plan");
+        std::fs::create_dir_all(&plan_dir).unwrap();
+        std::fs::write(plan_dir.join("meta"), b"{ not valid json").unwrap();
+
+        let export_store = tempdir().unwrap();
+        let export_updates = tempdir().unwrap();
+        let import_store = tempdir().unwrap();
+        let import_updates = tempdir().unwrap();
+        let out_dir = tempdir().unwrap();
+
+        let art_data = b"corrupt-meta-art";
+        let envelope_path = out_dir.path().join("corrupt-meta.gtupdate");
+        let (_priv, tk, _export_key) = build_envelope_for_import(
+            export_store.path(),
+            export_updates.path(),
+            &envelope_path,
+            &[("pack-a", art_data)],
+            &[],
+        );
+
+        let (import_s, key_path) = setup_import_side(import_store.path(), &tk);
+
+        let mut args = import_args("local", envelope_path, key_path, &tk.key_id);
+        args.push_to = Some(push_to_dir.path().to_path_buf());
+        let err = import_impl(
+            &import_s,
+            &OpFlags::default(),
+            args,
+            Some(import_updates.path()),
+        )
+        .unwrap_err();
+
+        match &err {
+            OpError::Conflict(msg) => {
+                assert!(
+                    msg.contains("corrupt"),
+                    "error must mention corruption, got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict for corrupt meta, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_to_meta_wire_contract() {
+        // Verify the meta file's shape matches what greentic-start's poll
+        // loop expects: {"sequence": <u64>, "plan_sha256": "<64-char hex>"}.
+        let push_to_dir = tempdir().unwrap();
+        let art_data = b"wire-contract-art";
+
+        let (_out, _is, _iu) =
+            import_with_push_to(push_to_dir.path(), &[("pack-a", art_data)], &[]);
+
+        let meta_bytes = std::fs::read(push_to_dir.path().join("plan/meta")).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).unwrap();
+
+        // Must have exactly two fields.
+        let obj = meta.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            2,
+            "meta must have exactly sequence + plan_sha256, got: {obj:?}"
+        );
+
+        // sequence must be a u64.
+        assert!(meta["sequence"].is_u64(), "sequence must be u64");
+
+        // plan_sha256 must be a 64-char lowercase hex string.
+        let sha = meta["plan_sha256"].as_str().unwrap();
+        assert_eq!(sha.len(), 64);
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "plan_sha256 must be hex, got: {sha}"
+        );
+        assert_eq!(
+            sha,
+            &sha.to_ascii_lowercase(),
+            "plan_sha256 must be lowercase"
         );
     }
 }
