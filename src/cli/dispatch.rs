@@ -806,6 +806,17 @@ pub struct UpdatesConfigSetArgs {
     /// plan-endpoint).
     #[arg(long = "stream-endpoint")]
     pub stream_endpoint: Option<String>,
+    /// Base URL of an air-gap blob mirror serving content-addressed blobs at
+    /// `{base}/sha256-<hex>`. Must be https (or http when `--insecure-http true`).
+    /// Omit to leave unchanged.
+    #[arg(long = "blob-base-url")]
+    pub blob_base_url: Option<String>,
+    /// Allow plain-HTTP (non-TLS) plan/stream/blob endpoints on non-loopback
+    /// hosts. Deny-by-default (`false`). Does NOT affect OCI insecure registries
+    /// and does NOT relax enrollment's ca_url (enrollment stays strict). Omit to
+    /// leave unchanged.
+    #[arg(long = "insecure-http")]
+    pub insecure_http: Option<bool>,
 }
 
 #[derive(Args, Debug)]
@@ -1797,6 +1808,8 @@ fn dispatch_updates(
                         plan_endpoint: args.plan_endpoint,
                         push_enabled: args.push_enabled,
                         stream_endpoint: args.stream_endpoint,
+                        blob_base_url: args.blob_base_url,
+                        insecure_http: args.insecure_http,
                     });
             super::updates::config_set(store, flags, payload)?
         }

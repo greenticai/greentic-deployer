@@ -2087,6 +2087,8 @@ fn updates_step(
             plan_endpoint: Some(endpoint),
             push_enabled: updates.push_enabled,
             stream_endpoint,
+            blob_base_url: None,
+            insecure_http: None,
         })),
     })
 }
