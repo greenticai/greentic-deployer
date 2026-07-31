@@ -166,6 +166,43 @@ snapshot. Recovery: re-import with the full envelope.
 
 ---
 
+## 8. In-gap serving (Tier 2)
+
+The steps above (Tier 1) require a per-machine USB import. To serve the
+whole in-gap fleet from one import point, add `--push-to` to the import
+command:
+
+```bash
+greentic-deployer op updates import <ENV_ID> \
+  --envelope /mnt/usb/update.gtupdate \
+  --signing-key operator-key.pem \
+  --stage \
+  --push-to /srv/mirror
+```
+
+Then point an HTTP file server (nginx, Caddy) at `/srv/mirror` and
+configure each environment to poll it:
+
+```bash
+greentic-deployer op updates config-set <ENV_ID> \
+  --plan-endpoint http://mirror.lan:8080/plan \
+  --blob-base-url http://mirror.lan:8080/blobs \
+  --insecure-http true \
+  --push-enabled false \
+  --enabled true
+```
+
+`--push-enabled false` is required: push defaults to on, and a static
+mirror cannot serve the pushed-update stream it would try to open.
+
+The `--push-to` directory needs two URL rewrites (`/plan` and
+`/plan.sig`) and a dotfile-blocking rule. Verified nginx and Caddy
+configs, the full request contract, caching guidance, the security
+model, and troubleshooting are in
+[airgap-serving.md](airgap-serving.md).
+
+---
+
 ## Troubleshooting
 
 ### "blob(s) missing on disk" on export
