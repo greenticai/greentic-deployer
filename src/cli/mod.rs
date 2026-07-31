@@ -255,6 +255,15 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
         crate::environment::StoreError::NotYetImplemented(detail) => {
             OpError::NotYetImplemented(detail)
         }
+        // Provider teardown could not complete (failed, or refused because this
+        // build cannot tear the resources down) — the env was NOT destroyed.
+        // Surface as a conflict so the operator sees the destroy did not proceed.
+        crate::environment::StoreError::ProviderTeardown(msg) => {
+            OpError::Conflict(format!("provider teardown failed: {msg}"))
+        }
+        unavailable @ crate::environment::StoreError::ProviderTeardownUnavailable { .. } => {
+            OpError::Conflict(unavailable.to_string())
+        }
         // PR-3a.6: the typed revision-lifecycle verbs (`warm_revision` /
         // `drain_revision` / `archive_revision`) wrap their inner
         // `LifecycleError` in this variant so the structured detail

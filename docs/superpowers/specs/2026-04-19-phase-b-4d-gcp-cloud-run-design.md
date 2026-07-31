@@ -1,7 +1,18 @@
 # Phase B #4d — GCP Cloud Run Deploy Extension
 
+> ## ⚠️ SUPERSEDED — historical record, do not implement
+>
+> Greentic deploys to Cloud Run through the **env-pack** deployer
+> (`greentic.deployer.gcp-cloudrun@1.0.0`, `src/env_packs/gcp_cloudrun/`), driven
+> by `op env up` / `op env apply-revision`. See
+> **[`docs/cloudrun-deployment.md`](../../cloudrun-deployment.md)**.
+>
+> This spec designs a *different, never-built* approach: the
+> `ext apply --target gcp-cloud-run-local` **extension** path over the
+> `greentic.deploy.gcp` Terraform pack. Retained for design history only.
+
 - **Date:** 2026-04-19
-- **Status:** Draft, pending user review
+- **Status:** Superseded (was: Draft, pending user review)
 - **Branch:** `spec/phase-b-4d-gcp-cloud-run`
 - **Owner:** TBD
 - **Related:**

@@ -1,0 +1,1478 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A digital worker that costs nothing while idle — Greentic on Cloud Run</title>
+<meta name="description" content="Reproduce the Greentic Cloud Run demo on any machine: one command puts a webchat + Telegram digital worker on a public https://….run.app URL that scales to zero. Commands in fish and bash.">
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   Tokens. Neutrals are biased toward the pine accent, never pure grey.
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  --ground:      #F6F8F5;
+  --surface:     #FFFFFF;
+  --surface-alt: #EDF1EC;
+  --ink:         #12211C;
+  --ink-soft:    #37473F;
+  --muted:       #64756D;
+  --rule:        #D6DED6;
+  --rule-soft:   #E5EAE4;
+  --accent:      #1F6F5C;
+  --accent-deep: #14503F;
+  --accent-wash: #E3EFE9;
+  --caution:     #8A6410;
+  --caution-wash:#F6EEDA;
+  --danger:      #8C2F39;
+  --danger-wash: #F5E5E5;
+  --term-bg:     #10201B;
+  --term-ink:    #D6E4DC;
+  --term-dim:    #6E8A7E;
+  --term-accent: #6FD3AC;
+
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --serif: Charter, "Bitstream Charter", "Iowan Old Style", "Source Serif Pro", Georgia, "Times New Roman", serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, "JetBrains Mono", "DejaVu Sans Mono", Consolas, monospace;
+
+  --col: 34rem;      /* reading measure, ~68ch at body size */
+  --gutter: 7.5rem;  /* hanging margin for step numbers */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground:      #0D1412;
+    --surface:     #141D1A;
+    --surface-alt: #182220;
+    --ink:         #E4EAE5;
+    --ink-soft:    #BCC9C2;
+    --muted:       #8A9A92;
+    --rule:        #27332E;
+    --rule-soft:   #1D2825;
+    --accent:      #57C4A1;
+    --accent-deep: #7FD8BB;
+    --accent-wash: #14261F;
+    --caution:     #D2A64A;
+    --caution-wash:#241D0F;
+    --danger:      #D98089;
+    --danger-wash: #261416;
+    --term-bg:     #08100D;
+    --term-ink:    #C9DCD3;
+    --term-dim:    #5F796E;
+    --term-accent: #6FD3AC;
+  }
+}
+:root[data-theme="dark"] {
+  --ground:#0D1412; --surface:#141D1A; --surface-alt:#182220;
+  --ink:#E4EAE5; --ink-soft:#BCC9C2; --muted:#8A9A92;
+  --rule:#27332E; --rule-soft:#1D2825;
+  --accent:#57C4A1; --accent-deep:#7FD8BB; --accent-wash:#14261F;
+  --caution:#D2A64A; --caution-wash:#241D0F;
+  --danger:#D98089; --danger-wash:#261416;
+  --term-bg:#08100D; --term-ink:#C9DCD3; --term-dim:#5F796E; --term-accent:#6FD3AC;
+}
+:root[data-theme="light"] {
+  --ground:#F6F8F5; --surface:#FFFFFF; --surface-alt:#EDF1EC;
+  --ink:#12211C; --ink-soft:#37473F; --muted:#64756D;
+  --rule:#D6DED6; --rule-soft:#E5EAE4;
+  --accent:#1F6F5C; --accent-deep:#14503F; --accent-wash:#E3EFE9;
+  --caution:#8A6410; --caution-wash:#F6EEDA;
+  --danger:#8C2F39; --danger-wash:#F5E5E5;
+  --term-bg:#10201B; --term-ink:#D6E4DC; --term-dim:#6E8A7E; --term-accent:#6FD3AC;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.62;
+  font-synthesis-weight: none;
+}
+
+/* ── Header ───────────────────────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  background: color-mix(in srgb, var(--ground) 92%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule);
+}
+.topbar-in {
+  max-width: calc(var(--col) + var(--gutter) + 15rem);
+  margin: 0 auto;
+  padding: .6rem 1.5rem;
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+}
+.wordmark {
+  font-family: var(--mono);
+  font-size: .74rem; font-weight: 600;
+  letter-spacing: .14em; text-transform: uppercase;
+  color: var(--muted);
+  margin-right: auto;
+}
+.wordmark b { color: var(--accent); font-weight: 600; }
+
+.shellpick {
+  display: flex; align-items: center; gap: .5rem;
+  font-family: var(--mono); font-size: .7rem;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+}
+.seg { display: flex; border: 1px solid var(--rule); border-radius: 2px; overflow: hidden; }
+.seg button {
+  font: inherit; letter-spacing: .1em;
+  background: transparent; color: var(--muted);
+  border: 0; padding: .35rem .7rem; cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button:hover { color: var(--ink); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+:root[data-theme="dark"] .seg button[aria-pressed="true"],
+:root:not([data-theme="light"]) .seg button[aria-pressed="true"] { color: #08100D; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .seg button[aria-pressed="true"] { color: #fff; }
+}
+.seg button:focus-visible { outline: 2px solid var(--accent-deep); outline-offset: -2px; }
+
+/* ── Page frame ───────────────────────────────────────────────────────── */
+main { max-width: calc(var(--col) + var(--gutter) + 15rem); margin: 0 auto; padding: 0 1.5rem 8rem; }
+.band { padding-left: var(--gutter); position: relative; }
+@media (max-width: 60rem) { :root { --gutter: 0rem; } .band { padding-left: 0; } }
+
+.col { max-width: var(--col); }
+.wide { max-width: calc(var(--col) + 7rem); }
+
+/* ── Hero ─────────────────────────────────────────────────────────────── */
+.hero { padding: 4.5rem 0 2.5rem; }
+.eyebrow {
+  font-family: var(--mono); font-size: .7rem; font-weight: 500;
+  letter-spacing: .18em; text-transform: uppercase; color: var(--accent);
+  margin: 0 0 1.1rem;
+}
+h1 {
+  font-family: var(--sans);
+  font-size: clamp(2.1rem, 5.5vw, 3.4rem);
+  line-height: 1.03;
+  letter-spacing: -.035em;
+  font-weight: 800;
+  text-wrap: balance;
+  margin: 0 0 1.2rem;
+  max-width: 18ch;
+}
+.standfirst {
+  font-size: 1.2rem; line-height: 1.55; color: var(--ink-soft);
+  max-width: 40rem; margin: 0 0 2rem;
+}
+.standfirst strong { color: var(--ink); font-weight: 600; }
+
+.facts {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+  max-width: calc(var(--col) + 7rem);
+}
+.fact { padding: 1.1rem 1.2rem 1.1rem 0; }
+.fact + .fact { border-left: 1px solid var(--rule-soft); padding-left: 1.2rem; }
+@media (max-width: 34rem) {
+  .fact + .fact { border-left: 0; border-top: 1px solid var(--rule-soft); padding-left: 0; }
+}
+.fact dt {
+  font-family: var(--mono); font-size: .65rem; letter-spacing: .13em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: .4rem;
+}
+.fact dd {
+  margin: 0; font-family: var(--sans); font-weight: 700;
+  font-size: 1.55rem; letter-spacing: -.02em; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.fact dd span { font-size: .8rem; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+
+/* ── Sections ─────────────────────────────────────────────────────────── */
+section { padding-top: 3.5rem; scroll-margin-top: 3.5rem; }
+h2 {
+  font-family: var(--sans); font-weight: 750;
+  font-size: clamp(1.5rem, 3vw, 2.05rem);
+  letter-spacing: -.028em; line-height: 1.12;
+  text-wrap: balance; margin: 0 0 1rem; max-width: 24ch;
+}
+h3 {
+  font-family: var(--sans); font-weight: 700;
+  font-size: 1.1rem; letter-spacing: -.012em; line-height: 1.3;
+  margin: 2.4rem 0 .7rem; max-width: 34ch;
+}
+h4 {
+  font-family: var(--mono); font-weight: 600; font-size: .74rem;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+  margin: 2rem 0 .6rem;
+}
+p { margin: 0 0 1.1rem; max-width: var(--col); }
+.wide > p, .wide p { max-width: var(--col); }
+strong { font-weight: 700; }
+em { font-style: italic; }
+code {
+  font-family: var(--mono); font-size: .86em;
+  background: var(--surface-alt); color: var(--ink);
+  padding: .08em .26em; border-radius: 2px;
+  word-break: break-word;
+}
+a { color: var(--accent-deep); text-underline-offset: .18em; text-decoration-thickness: 1px; }
+a:hover { color: var(--accent); }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+ul, ol { max-width: var(--col); padding-left: 1.15rem; margin: 0 0 1.2rem; }
+li { margin-bottom: .5rem; }
+li > code { font-size: .82em; }
+
+/* Section rule with a mono marker hanging in the gutter */
+.marker {
+  display: block; border-top: 1px solid var(--rule); padding-top: 1.3rem; position: relative;
+}
+.marker::before {
+  content: attr(data-mark);
+  font-family: var(--mono); font-size: .68rem; font-weight: 600;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--accent);
+  position: absolute; top: 1.35rem; left: calc(-1 * var(--gutter));
+  width: calc(var(--gutter) - 1.5rem); text-align: right;
+}
+@media (max-width: 60rem) {
+  .marker::before { position: static; display: block; text-align: left; margin-bottom: .7rem; width: auto; }
+}
+
+/* ── Steps ────────────────────────────────────────────────────────────── */
+.step { border-top: 1px solid var(--rule-soft); padding-top: 1.5rem; margin-top: 2.5rem; position: relative; }
+.step:first-of-type { border-top: 1px solid var(--rule); }
+.step > .num {
+  font-family: var(--mono); font-size: 1.5rem; font-weight: 600;
+  color: var(--accent); font-variant-numeric: tabular-nums;
+  position: absolute; top: 1.25rem; left: calc(-1 * var(--gutter));
+  width: calc(var(--gutter) - 1.5rem); text-align: right; letter-spacing: -.03em;
+}
+.step > .num small { display: block; font-size: .6rem; letter-spacing: .13em; text-transform: uppercase; color: var(--muted); margin-top: .2rem; }
+@media (max-width: 60rem) {
+  .step > .num { position: static; text-align: left; width: auto; margin-bottom: .4rem; }
+  .step > .num small { display: inline; margin-left: .6rem; }
+}
+.step h3 { margin-top: 0; font-size: 1.25rem; }
+.once {
+  font-family: var(--mono); font-size: .62rem; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--accent); background: var(--accent-wash);
+  padding: .2em .5em; border-radius: 2px; vertical-align: .18em; margin-left: .5rem; white-space: nowrap;
+}
+
+/* ── Code blocks ──────────────────────────────────────────────────────── */
+.cmd { margin: 1.2rem 0 1.4rem; max-width: calc(var(--col) + 7rem); }
+.cmd-head {
+  display: flex; align-items: center; gap: .6rem;
+  font-family: var(--mono); font-size: .64rem; letter-spacing: .13em;
+  text-transform: uppercase; color: var(--term-dim);
+  background: var(--term-bg); padding: .5rem .85rem .1rem;
+  border-radius: 3px 3px 0 0;
+}
+.cmd-head .tag { color: var(--term-accent); }
+.cmd-head .note { color: var(--term-dim); letter-spacing: .06em; text-transform: none; font-size: .68rem; }
+.copy {
+  margin-left: auto; font: inherit; letter-spacing: .12em;
+  background: transparent; border: 1px solid color-mix(in srgb, var(--term-dim) 45%, transparent);
+  color: var(--term-dim); border-radius: 2px; padding: .18em .5em; cursor: pointer;
+  transition: color .15s, border-color .15s;
+}
+.copy:hover { color: var(--term-accent); border-color: var(--term-accent); }
+.copy:focus-visible { outline: 2px solid var(--term-accent); outline-offset: 1px; }
+pre {
+  margin: 0; background: var(--term-bg); color: var(--term-ink);
+  font-family: var(--mono); font-size: .82rem; line-height: 1.65;
+  padding: .85rem 1rem 1rem; border-radius: 0 0 3px 3px;
+  overflow-x: auto; tab-size: 2;
+}
+pre code { background: none; padding: 0; font-size: inherit; color: inherit; word-break: normal; }
+pre .c { color: var(--term-dim); }          /* comment */
+pre .k { color: var(--term-accent); }        /* command / keyword */
+pre .s { color: #C3D8A0; }                   /* string */
+pre .o { color: #E0B978; }                   /* output / value */
+
+/* console-style output block */
+.out { background: var(--surface); border: 1px solid var(--rule); color: var(--ink-soft); }
+.out .p { color: var(--accent); }
+.out .d { color: var(--muted); }
+
+/* shell switching */
+[data-shell] { display: none; }
+:root[data-shellpref="fish"] [data-shell="fish"],
+:root[data-shellpref="bash"] [data-shell="bash"],
+[data-shell="both"] { display: block; }
+
+/* ── Callouts ─────────────────────────────────────────────────────────── */
+.note-box {
+  border-left: 3px solid var(--accent); background: var(--accent-wash);
+  padding: .9rem 1.1rem; margin: 1.4rem 0; max-width: calc(var(--col) + 3rem);
+}
+.note-box.trap { border-left-color: var(--danger); background: var(--danger-wash); }
+.note-box.warn { border-left-color: var(--caution); background: var(--caution-wash); }
+.note-box p:last-child { margin-bottom: 0; }
+.note-box .lbl {
+  font-family: var(--mono); font-size: .64rem; font-weight: 600;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--accent);
+  display: block; margin-bottom: .45rem;
+}
+.note-box.trap .lbl { color: var(--danger); }
+.note-box.warn .lbl { color: var(--caution); }
+.note-box p { font-size: .96rem; }
+
+/* ── Tables ───────────────────────────────────────────────────────────── */
+.tablewrap { overflow-x: auto; margin: 1.4rem 0 1.6rem; max-width: calc(var(--col) + 7rem); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+th, td { text-align: left; padding: .6rem .8rem .6rem 0; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+th {
+  font-family: var(--mono); font-size: .63rem; font-weight: 600;
+  letter-spacing: .13em; text-transform: uppercase; color: var(--muted);
+  border-bottom: 1px solid var(--rule); white-space: nowrap;
+}
+td code { font-size: .8em; }
+tbody tr:last-child td { border-bottom: 1px solid var(--rule); }
+td.n { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.yes { color: var(--accent); font-weight: 600; }
+.no  { color: var(--danger); font-weight: 600; }
+
+/* ── Flow diagram ─────────────────────────────────────────────────────── */
+.flow {
+  display: grid; gap: .5rem; margin: 1.6rem 0 2rem;
+  max-width: calc(var(--col) + 7rem);
+  font-family: var(--mono); font-size: .78rem;
+}
+.flow-row {
+  display: grid; grid-template-columns: 8.5rem 1fr; gap: .9rem; align-items: start;
+  padding: .7rem 0; border-top: 1px solid var(--rule-soft);
+}
+.flow-row:first-child { border-top: 1px solid var(--rule); }
+.flow-row:last-child { border-bottom: 1px solid var(--rule); }
+.flow-who {
+  color: var(--accent); font-weight: 600; font-size: .66rem;
+  letter-spacing: .11em; text-transform: uppercase; padding-top: .18em;
+}
+.flow-what { color: var(--ink-soft); font-family: var(--serif); font-size: .95rem; line-height: 1.5; }
+.flow-what b { font-family: var(--mono); font-size: .8rem; color: var(--ink); font-weight: 600; }
+@media (max-width: 34rem) { .flow-row { grid-template-columns: 1fr; gap: .25rem; } }
+
+/* ── Footer ───────────────────────────────────────────────────────────── */
+footer {
+  border-top: 1px solid var(--rule); margin-top: 5rem; padding-top: 2rem;
+  font-size: .9rem; color: var(--muted);
+}
+footer p { max-width: 42rem; }
+footer code { font-size: .84em; }
+
+.toc {
+  border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+  padding: 1.2rem 0; margin: 2.5rem 0 0;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: .4rem 1.5rem; max-width: calc(var(--col) + 7rem);
+}
+.toc a {
+  font-family: var(--mono); font-size: .73rem; letter-spacing: .04em;
+  text-decoration: none; color: var(--ink-soft); display: block; padding: .18rem 0;
+}
+.toc a:hover { color: var(--accent); }
+.toc a span { color: var(--muted); margin-right: .5rem; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-in">
+    <div class="wordmark"><b>greentic</b> · cloud run demo</div>
+    <div class="shellpick">
+      <span>shell</span>
+      <div class="seg" role="group" aria-label="Choose your shell">
+        <button type="button" id="pick-fish" aria-pressed="true">fish</button>
+        <button type="button" id="pick-bash" aria-pressed="false">bash / zsh</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<!-- ─── HERO ───────────────────────────────────────────────────────────── -->
+<div class="band">
+<div class="hero">
+  <p class="eyebrow">Verified live · 2026-07-20 · europe-west1</p>
+  <h1>A digital worker that costs nothing while idle.</h1>
+  <p class="standfirst">
+    One command puts a Greentic worker on <strong>Google Cloud Run</strong> — public, on a real
+    <code>https://….run.app</code> URL, answering in a browser chat window and on Telegram.
+    When nobody is talking to it, it <strong>scales to zero and bills no compute</strong>.
+    Everything below is copy-pasteable verbatim, in your shell, on any machine.
+  </p>
+
+  <dl class="facts">
+    <div class="fact"><dt>Deploy to live URL</dt><dd>46<span> s</span></dd></div>
+    <div class="fact"><dt>Cloud resources created</dt><dd>2</dd></div>
+    <div class="fact"><dt>Idle compute bill</dt><dd>$0</dd></div>
+    <div class="fact"><dt>Commands to type</dt><dd>9</dd></div>
+  </dl>
+
+  <nav class="toc" aria-label="Contents">
+    <a href="#what"><span>01</span>What it is</a>
+    <a href="#cloudrun"><span>02</span>How Cloud Run works</a>
+    <a href="#anatomy"><span>03</span>Anatomy of a deploy</a>
+    <a href="#internals"><span>04</span>How it talks to Google</a>
+    <a href="#commands"><span>05</span>The commands</a>
+    <a href="#verify"><span>06</span>Verifying it</a>
+    <a href="#chat"><span>07</span>Talking to it</a>
+    <a href="#cost"><span>08</span>What it costs</a>
+    <a href="#traps"><span>09</span>Traps</a>
+  </nav>
+</div>
+</div>
+
+<!-- ─── 01 WHAT IT IS ──────────────────────────────────────────────────── -->
+<div class="band">
+<section id="what">
+  <div class="marker" data-mark="01 / what"></div>
+  <h2>What you are actually deploying</h2>
+
+  <p>
+    Greentic is a deterministic runtime for digital workers. You describe an
+    environment in <strong>one JSON file</strong>, and a deployer turns that file into
+    running infrastructure. This demo uses the <code>gcp-cloudrun</code> deployer, so the
+    infrastructure is a single Cloud Run service.
+  </p>
+  <p>
+    The worker itself is a <strong>bundle</strong> — a signed, content-addressed archive pulled from
+    public GHCR at container boot. This one carries three packs:
+  </p>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Pack</th><th>What it gives you</th></tr></thead>
+    <tbody>
+      <tr><td><code>webchat-bot</code></td><td>The bot flow — the deterministic graph that decides what to say.</td></tr>
+      <tr><td><code>messaging-webchat-gui</code></td><td>A browser chat SPA served publicly at <code>/v1/web/webchat/default/</code>. No login, CORS on, talks DirectLine.</td></tr>
+      <tr><td><code>messaging-telegram</code></td><td>A Telegram provider. Optional — it only activates if you seed a bot token.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>
+    Nothing about the worker is built on your machine and nothing is pushed to your project.
+    The container image and the bundle are both pulled from public GHCR, pinned by digest.
+    Your Google project ends up holding exactly two objects.
+  </p>
+
+  <h3>What you need first</h3>
+  <ul>
+    <li>A GCP project with <strong>billing enabled</strong> (the free tier covers this demo, but Cloud Run requires billing to be on).</li>
+    <li><code>gcloud</code>, installed and authenticated.</li>
+    <li>A Rust toolchain with <code>cargo-binstall</code> — or any way to get one binary onto your <code>PATH</code>.</li>
+    <li>~5 minutes. Steps 1–4 are once per project; after that the deploy is a single command.</li>
+  </ul>
+</section>
+</div>
+
+<!-- ─── 02 HOW CLOUD RUN WORKS ─────────────────────────────────────────── -->
+<div class="band">
+<section id="cloudrun">
+  <div class="marker" data-mark="02 / platform"></div>
+  <h2>How a Google Cloud Run deployment actually operates</h2>
+
+  <p>
+    Cloud Run is worth understanding before you deploy to it, because half the surprises in
+    this demo come from the platform rather than from Greentic. Four ideas carry everything.
+  </p>
+
+  <h3>A service is a name; a revision is the thing that runs</h3>
+  <p>
+    You create a <strong>service</strong> — a stable name and a stable URL. Every deploy creates a new
+    immutable <strong>revision</strong>: a container image plus its environment, its CPU and memory,
+    its identity. Traffic is then <em>split</em> across revisions by percentage, which is why
+    blue/green and canary come free — a 50/50 split is one API call, and rolling back is
+    pointing 100% at the previous revision.
+  </p>
+  <p>
+    Greentic names the service <code>gtc-svc-{deployment_ulid}</code>, so the deployment ID is
+    legible in the console.
+  </p>
+
+  <h3>Scaling is request-driven, and zero is a legal number</h3>
+  <p>
+    Cloud Run starts containers when requests arrive and stops them when they stop. With
+    <code>min_instances = 0</code> (the default here), an idle service runs <strong>no containers at
+    all</strong> and bills <strong>no CPU and no memory</strong>. You pay for request-time compute,
+    rounded to 100 ms, and nothing else.
+  </p>
+  <p>
+    The cost is a <strong>cold start</strong>: the first request after an idle period waits for the
+    container to boot, pull its config, and load its bundle. Setting <code>min_instances = 1</code>
+    removes the cold start and reintroduces a permanent bill — which defeats the point of
+    being here.
+  </p>
+
+  <h3>Configuration arrives as a secret, not as environment variables</h3>
+  <p>
+    The container does not get its environment as a pile of env vars. Greentic writes a single
+    <strong>seed</strong> — the whole environment document — into <strong>Secret Manager</strong> as
+    <code>gtc-{env_id}-environment</code>, and mounts it into the revision. The container reads the
+    seed at boot, discovers which bundle to run, and pulls it.
+  </p>
+  <p>
+    That indirection is what makes the deploy small: the bundle reference, the routes, and the
+    provider secrets all ride inside one document, and the only thing the revision needs is
+    permission to read it.
+  </p>
+
+  <h3>Two identities, and neither one is the other</h3>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Identity</th><th>Who it is</th><th>What it needs</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>Deployer</b></td>
+        <td>You — ambient Application Default Credentials, written by <code>gcloud auth application-default login</code>.</td>
+        <td>Permission to create services and secrets. On a personal project you are owner, so this is already true.</td>
+      </tr>
+      <tr>
+        <td><b>Runtime</b></td>
+        <td>The service account the container runs as: <code>gtc-{env_id}-runtime</code>.</td>
+        <td><strong>Zero project-level roles.</strong> Its one permission — read the seed — is granted <em>on the secret itself</em>, at deploy time.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    That is the security posture in one line: resource-scoped, not project-scoped. Verified
+    after a real run, the runtime service account holds no project IAM bindings at all.
+  </p>
+
+  <div class="note-box">
+    <span class="lbl">Where the URL comes from</span>
+    <p>
+      You do not ask Cloud Run for a URL — it assigns one and returns it on the deploy response.
+      There is no second API call to discover it. That matters later: the runtime learns its own
+      public address from the first request that reaches it, which is how the Telegram webhook
+      registers itself with no manual step.
+    </p>
+  </div>
+
+  <div class="note-box warn">
+    <span class="lbl">Google answers some requests for you</span>
+    <p>
+      Cloud Run's frontend <strong>swallows <code>/healthz</code></strong> and returns Google's own
+      branded 404 — the request never reaches your container. <code>/health</code>, <code>/livez</code>,
+      <code>/readyz</code> and <code>/status</code> all arrive normally. Probe <code>/readyz</code>,
+      never <code>/healthz</code>, or you will spend an hour debugging a healthy worker.
+    </p>
+  </div>
+</section>
+</div>
+
+<!-- ─── 03 ANATOMY ─────────────────────────────────────────────────────── -->
+<div class="band">
+<section id="anatomy">
+  <div class="marker" data-mark="03 / anatomy"></div>
+  <h2>What the one command does</h2>
+  <p>
+    <code>env up</code> prints a six-step plan and then executes it. Each step is idempotent, so
+    re-running the command is safe — the plan comes back all <em>no-op</em> and you get the same URL.
+  </p>
+
+  <div class="flow">
+    <div class="flow-row"><div class="flow-who">1 · local</div><div class="flow-what"><b>ensure-environment</b> — create the local environment record under <code>./state</code>.</div></div>
+    <div class="flow-row"><div class="flow-who">2 · local</div><div class="flow-what"><b>update-host-config</b> — resolve the host settings for the target.</div></div>
+    <div class="flow-row"><div class="flow-who">3 · local</div><div class="flow-what"><b>bootstrap-trust-root</b> — establish the signing trust root for this environment.</div></div>
+    <div class="flow-row"><div class="flow-who">4 · local</div><div class="flow-what"><b>update-pack-binding</b> — bind the <code>deployer</code> slot to the Cloud Run handler.</div></div>
+    <div class="flow-row"><div class="flow-who">5 · local</div><div class="flow-what"><b>update-pack-binding</b> — bind the <code>secrets</code> slot, and write any <code>from_env</code> secrets into the dev-store.</div></div>
+    <div class="flow-row"><div class="flow-who">6 · google</div><div class="flow-what"><b>deploy-bundle</b> — stage the seed into Secret Manager, create the service and its first revision, grant the runtime SA read on that secret, grant <code>allUsers</code> invoker, warm it, and return the URL.</div></div>
+  </div>
+
+  <p>
+    Only the last step touches Google. Everything before it is local state, which is why
+    <code>--dry-run</code> works with no credentials at all.
+  </p>
+
+  <h3>Then, inside the container</h3>
+  <p>
+    The revision boots, reads its seed from the mounted secret, resolves
+    <code>bundle_source_uri</code> — an OCI reference, pinned by digest — pulls the bundle from
+    public GHCR, loads its packs, and starts serving. <code>/status</code> reports
+    <code>bundles_active: 1</code> once all of that has happened.
+  </p>
+</section>
+</div>
+
+<!-- ─── 04 MACHINERY ───────────────────────────────────────────────────── -->
+<div class="band">
+<section id="internals">
+  <div class="marker" data-mark="04 / machinery"></div>
+  <h2>How it talks to Google</h2>
+  <p>
+    Two questions worth answering before you trust a deploy tool with a cloud account: what does it
+    actually call, and as whom?
+  </p>
+
+  <h3>It does not shell out to <code>gcloud</code></h3>
+  <p>
+    The Cloud Run deployer contains no CLI invocations at all. It links Google's official Rust
+    client libraries and speaks to the API directly:
+  </p>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Library</th><th>What it drives</th></tr></thead>
+    <tbody>
+      <tr><td><code>google-cloud-run-v2</code></td><td>Services and Revisions — create, update, poll readiness, shift traffic.</td></tr>
+      <tr><td><code>google-cloud-secretmanager-v1</code></td><td>Staging the seed as a version-pinned secret.</td></tr>
+      <tr><td><code>google-cloud-iam-v1</code></td><td>The invoker policy and the secret-accessor grant.</td></tr>
+      <tr><td><code>google-cloud-auth</code></td><td>Resolving credentials, minting and refreshing tokens.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>
+    Clients are built against the <strong>regional</strong> endpoint
+    <code>https://&lt;region&gt;-run.googleapis.com</code>, so long-running operations poll the
+    region that owns them. Secret Manager is global and uses its default endpoint.
+  </p>
+
+  <div class="note-box">
+    <span class="lbl">Which means <code>gcloud</code> is optional</span>
+    <p>
+      You need it for exactly two things in this demo: to <strong>log in</strong> (it writes the
+      credentials file), and to <strong>look at things afterwards</strong>. The deploy itself would
+      run on a machine with no <code>gcloud</code> installed at all.
+    </p>
+  </div>
+
+  <p>
+    That is worth calling out because it is <em>not</em> how every provider here works. The AWS path
+    shells out to the <code>aws</code> CLI, Azure to <code>az</code>, and the Kubernetes path to
+    <code>kubectl</code>. Cloud Run is the one written as a typed client — no output parsing, no
+    dependency on a CLI version, and API errors arrive as structured codes rather than exit statuses.
+  </p>
+  <p>
+    One exception, so it doesn't surprise you: there is an older <strong>Terraform</strong> path in
+    the codebase that renders shell snippets containing <code>gcloud</code> for
+    <code>terraform import</code>. It is guarded by a <code>command -v gcloud</code> check and
+    <code>env up</code> never goes near it.
+  </p>
+
+  <h3>Where your credentials come from</h3>
+  <p>There are two branches, and only one of them runs in this demo.</p>
+
+  <div class="flow">
+    <div class="flow-row">
+      <div class="flow-who">bound</div>
+      <div class="flow-what">
+        The environment declares its own deployer identity. The material is credential JSON —
+        either a service-account key or a <b>Workload Identity Federation</b> config — resolved
+        from an environment variable, then the local secret store.
+      </div>
+    </div>
+    <div class="flow-row">
+      <div class="flow-who">ambient</div>
+      <div class="flow-what">
+        Nothing is bound, so it uses the standard <b>Application Default Credentials</b> chain:
+        <code>GOOGLE_APPLICATION_CREDENTIALS</code>, then the file
+        <code>gcloud auth application-default login</code> writes, then the metadata server.
+      </div>
+    </div>
+  </div>
+
+  <p>
+    <strong>This demo takes the second branch.</strong> That is why logging in is the only credential
+    step — nothing is bound, so the deploy runs as you, and on a personal project you are owner.
+    Whichever branch resolves, the credential is injected into all three clients at construction, and
+    the auth library handles token refresh from there.
+  </p>
+
+  <div class="note-box">
+    <span class="lbl">A bound credential never falls back</span>
+    <p>
+      If an environment declares an identity and that identity cannot be read or parsed, the deploy
+      <strong>fails</strong>. It does not quietly continue as your ambient login. The reasoning is
+      worth stating plainly: an environment that asks for a narrow, scoped service account must not
+      silently run as your much broader personal credentials because a file was missing.
+    </p>
+  </div>
+
+  <div class="note-box warn">
+    <span class="lbl">It often cannot tell you who you are</span>
+    <p>
+      The deployer can only report your principal when the credential is a service-account key file,
+      because that is the one form where the email is legible. With ordinary <code>gcloud</code>
+      login it prints an unknown-principal placeholder — the auth library hands out a token and
+      nothing else. That is a real limitation, not a bug you need to chase.
+    </p>
+  </div>
+
+  <h3>What the deployer is allowed to do</h3>
+  <p>
+    The permissions a live deploy exercises are a pinned list in the source — fifteen of them, across
+    Cloud Run services and revisions, Secret Manager, and one <code>iam.serviceAccounts.actAs</code>
+    so it can hand the runtime identity to the revision.
+  </p>
+  <p>
+    A test asserts that list is a subset of what the preflight validates. So <strong>adding an API
+    call without declaring its permission fails CI</strong> rather than failing on a customer's first
+    deploy. The preflight itself asks Google directly — a <code>testIamPermissions</code> call
+    against the project and against the runtime service account — instead of guessing from role names.
+  </p>
+
+  <h3>Three ordering decisions inside the deploy</h3>
+  <p>
+    Step 6 of the plan is not a straight line, and the places it deviates are the interesting ones.
+  </p>
+
+  <h4>Public access is granted last</h4>
+  <p>
+    The invoker policy is applied only <em>after</em> the new revision is proven ready. It has to be:
+    that policy is <strong>service-wide</strong>, not per-revision. Applying it earlier would change
+    access on the revision currently serving traffic even if this deploy then fails — turning a
+    public service private is an outage, and the reverse exposes production on a failed deploy.
+  </p>
+
+  <h4>The seed secret is claimed, not checked</h4>
+  <p>
+    The secret name comes partly from a free-text answer, so two environments in one project can
+    resolve to the same name while having different runtime identities. Checking "does it exist?"
+    and then creating it would let two deploys racing each other both see <em>no</em>, and the loser's
+    seed would land in the winner's secret — handing one environment's service account read access
+    over the other's secrets. So the name is claimed in a single operation, with an ownership stamp,
+    and a secret owned by another environment is refused.
+  </p>
+
+  <h4>Concurrent writes lose, then retry</h4>
+  <p>
+    Service updates carry the version tag they were computed from. If something else changed the
+    service in between, the write is rejected and the deployer re-reads and recomputes rather than
+    overwriting what it never saw. Retries are bounded, so a genuine conflict surfaces as an error
+    instead of spinning.
+  </p>
+</section>
+</div>
+
+<!-- ─── 05 COMMANDS ────────────────────────────────────────────────────── -->
+<div class="band">
+<section id="commands">
+  <div class="marker" data-mark="05 / commands"></div>
+  <h2>The commands, start to finish</h2>
+  <p>
+    Pick your shell at the top of the page and every block below switches. Set your project once
+    in step 0 and there is <strong>nothing left to hand-edit</strong> anywhere after it.
+  </p>
+
+  <div class="note-box">
+    <span class="lbl">fish vs bash — only two real differences</span>
+    <p>
+      Modern fish takes <code>$(…)</code>, <code>&amp;&amp;</code>, <code>||</code> and even
+      <code>VAR=value cmd</code> prefixes. What differs: fish has <strong>no heredocs</strong>
+      (use a quoted multi-line string), and fish rejects bare <code>=</code> assignment
+      (use <code>set</code>). Everything else on this page is byte-identical in both.
+    </p>
+  </div>
+
+  <!-- STEP 0 -->
+  <div class="step">
+    <div class="num">0<small>setup</small></div>
+    <h3>Name your project</h3>
+    <p>Two variables. Every command after this one reads them.</p>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag" data-shell="fish">fish</span><span class="tag" data-shell="bash">bash / zsh</span></div>
+      <pre data-shell="fish"><code><span class="k">set</span> -x PROJECT <span class="s">your-gcp-project-id</span>
+<span class="k">set</span> -x REGION  <span class="s">europe-west1</span>
+
+<span class="k">mkdir</span> -p ~/cloudrun-demo; <span class="k">cd</span> ~/cloudrun-demo</code></pre>
+      <pre data-shell="bash"><code><span class="k">export</span> PROJECT=<span class="s">your-gcp-project-id</span>
+<span class="k">export</span> REGION=<span class="s">europe-west1</span>
+
+<span class="k">mkdir</span> -p ~/cloudrun-demo; <span class="k">cd</span> ~/cloudrun-demo</code></pre>
+    </div>
+  </div>
+
+  <!-- STEP 1 -->
+  <div class="step">
+    <div class="num">1<small>once</small></div>
+    <h3>Install a deployer that can do Cloud Run <span class="once">once per machine</span></h3>
+    <p>
+      The Cloud Run deployer is a Cargo feature, <code>deploy-gcp-cloudrun</code>. It is a
+      <em>default</em> feature — but it only exists on the <code>develop</code> lane, so a stable
+      <code>gtc</code> has no Cloud Run deployer compiled in at all. On develop, binary crates
+      publish under a sibling <code>-dev</code> name:
+    </p>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag">both shells</span><span class="note">identical in fish and bash</span></div>
+      <pre data-shell="both"><code><span class="k">cargo</span> binstall greentic-deployer-dev</code></pre>
+    </div>
+
+    <div class="note-box trap">
+      <span class="lbl">A stale copy looks exactly like a fresh one</span>
+      <p>
+        <code>--version</code> prints <code>greentic-deployer 1.2.0-dev.0</code> for every nightly —
+        the build identity lives only in the crates.io version, not in the binary. So an old
+        <code>greentic-deployer-dev</code> on your <code>PATH</code> is indistinguishable from a
+        current one. If anything below fails strangely, re-run the binstall first.
+      </p>
+    </div>
+
+    <p>
+      To keep it out of your <code>~/.cargo/bin</code>, install it somewhere disposable and point
+      the demo at it:
+    </p>
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag">both shells</span></div>
+      <pre data-shell="both"><code><span class="k">cargo</span> binstall --root /tmp/gtc-dev greentic-deployer-dev
+<span class="c"># → /tmp/gtc-dev/bin/greentic-deployer-dev</span></code></pre>
+    </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="step">
+    <div class="num">2<small>once</small></div>
+    <h3>Point gcloud at your project and log in <span class="once">once per machine</span></h3>
+    <p>
+      The deployer takes no <code>--key-file</code>. It runs as the ambient Application Default
+      Credentials chain — which is a <em>different</em> credential store from
+      <code>gcloud auth login</code>. You need the ADC one.
+    </p>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag">both shells</span></div>
+      <pre data-shell="both"><code><span class="k">gcloud</span> config set project $PROJECT
+<span class="k">gcloud</span> auth application-default login</code></pre>
+    </div>
+
+    <p>Check it without deploying anything:</p>
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag">both shells</span></div>
+      <pre data-shell="both"><code><span class="k">gcloud</span> config get-value project
+<span class="k">gcloud</span> auth application-default print-access-token &gt;/dev/null &amp;&amp; <span class="k">echo</span> <span class="s">"ADC OK"</span></code></pre>
+    </div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div class="step">
+    <div class="num">3<small>once</small></div>
+    <h3>Enable four APIs <span class="once">once per project</span></h3>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag">both shells</span></div>
+      <pre data-shell="both"><code><span class="k">gcloud</span> services enable \
+  run.googleapis.com \
+  secretmanager.googleapis.com \
+  artifactregistry.googleapis.com \
+  logging.googleapis.com \
+  --project $PROJECT</code></pre>
+    </div>
+
+    <ul>
+      <li><code>run</code> — create the service and its revisions.</li>
+      <li><code>secretmanager</code> — the seed the container boots from.</li>
+      <li><code>artifactregistry</code> — needed for the <em>API surface</em> even though this demo creates no repo; the image and bundle both come from public GHCR.</li>
+      <li><code>logging</code> — so <code>gcloud logging read</code> works when a boot fails.</li>
+    </ul>
+    <p>Enabling an API costs nothing, and they stay enabled after cleanup.</p>
+  </div>
+
+  <!-- STEP 4 -->
+  <div class="step">
+    <div class="num">4<small>once</small></div>
+    <h3>Create the runtime service account <span class="once">once per project</span></h3>
+    <p>
+      This is the identity the <em>container</em> runs as — not the identity that deploys.
+      Naming is <code>gtc-{env_id}-runtime</code>, so environment <code>local</code> gives you
+      <code>gtc-local-runtime</code>.
+    </p>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag">both shells</span></div>
+      <pre data-shell="both"><code><span class="k">gcloud</span> iam service-accounts create gtc-local-runtime \
+  --display-name <span class="s">"Greentic runtime for env local"</span> \
+  --project $PROJECT</code></pre>
+    </div>
+
+    <div class="note-box">
+      <span class="lbl">Grant it nothing</span>
+      <p>
+        It needs no project-level role. The one permission it requires — reading the seed — is
+        bound on the secret itself at deploy time. After a real run,
+        <code>get-iam-policy</code> filtered to this member returns empty.
+      </p>
+    </div>
+  </div>
+
+  <!-- STEP 5 -->
+  <div class="step">
+    <div class="num">5<small>manifest</small></div>
+    <h3>Write the one file that describes the environment</h3>
+    <p>
+      <code>env up</code> consumes a <code>greentic.env-manifest.v1</code> document — not a bag of
+      answers. Note the <strong>absent cluster block</strong>: Cloud Run has no cluster, so the
+      deployer's entire configuration is three keys plus a pinned image.
+    </p>
+    <p>
+      The two variable slots are written as <code>@@…@@</code> markers and substituted on the way
+      out, which keeps the JSON byte-identical in both shells.
+    </p>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag" data-shell="fish">fish</span><span class="tag" data-shell="bash">bash / zsh</span><span class="note" data-shell="fish">fish has no heredocs — quoted string instead</span><button class="copy" type="button">copy</button></div>
+      <pre data-shell="fish"><code><span class="k">echo</span> <span class="s">'{
+  "schema": "greentic.env-manifest.v1",
+  "environment": { "id": "local", "name": "cloudrun-byhand" },
+  "trust_root": "bootstrap",
+  "packs": [
+    { "slot": "deployer",
+      "kind": "greentic.deployer.gcp-cloudrun@1.0.0",
+      "pack_ref": "builtin",
+      "answers": {
+        "project": "@@PROJECT@@",
+        "region": "@@REGION@@",
+        "access_mode": "public",
+        "runtime_image_digest": "sha256:c122d86143293afec4389dbb57e4a8e9510849a0dd548207acd3892d63582920"
+      } },
+    { "slot": "secrets", "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "builtin" }
+  ],
+  "bundles": [
+    { "bundle_id": "cloudrun-byhand",
+      "bundle_source_uri": "oci://ghcr.io/greenticai/greentic-demo-bundles/webchat-bot:webchat-tg-v1",
+      "bundle_digest": "sha256:7608e322abf305172e20f7bab0607a36c0b0cc09c1d6869c7e5ba7ebfc094c47",
+      "route_binding": { "path_prefixes": ["/"] } }
+  ]
+}'</span> | <span class="k">sed</span> -e <span class="s">"s|@@PROJECT@@|$PROJECT|"</span> -e <span class="s">"s|@@REGION@@|$REGION|"</span> &gt; cloudrun.env.json
+
+<span class="c"># the check — must print your real project, not the markers</span>
+<span class="k">python3</span> -m json.tool cloudrun.env.json | <span class="k">grep</span> -E <span class="s">'"(project|region)"'</span></code></pre>
+      <pre data-shell="bash"><code><span class="k">cat</span> &gt; cloudrun.env.json &lt;&lt;EOF
+{
+  "schema": "greentic.env-manifest.v1",
+  "environment": { "id": "local", "name": "cloudrun-byhand" },
+  "trust_root": "bootstrap",
+  "packs": [
+    { "slot": "deployer",
+      "kind": "greentic.deployer.gcp-cloudrun@1.0.0",
+      "pack_ref": "builtin",
+      "answers": {
+        "project": "$PROJECT",
+        "region": "$REGION",
+        "access_mode": "public",
+        "runtime_image_digest": "sha256:c122d86143293afec4389dbb57e4a8e9510849a0dd548207acd3892d63582920"
+      } },
+    { "slot": "secrets", "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "builtin" }
+  ],
+  "bundles": [
+    { "bundle_id": "cloudrun-byhand",
+      "bundle_source_uri": "oci://ghcr.io/greenticai/greentic-demo-bundles/webchat-bot:webchat-tg-v1",
+      "bundle_digest": "sha256:7608e322abf305172e20f7bab0607a36c0b0cc09c1d6869c7e5ba7ebfc094c47",
+      "route_binding": { "path_prefixes": ["/"] } }
+  ]
+}
+EOF
+
+<span class="c"># the check — must print your real project, not \$PROJECT</span>
+<span class="k">python3</span> -m json.tool cloudrun.env.json | <span class="k">grep</span> -E <span class="s">'"(project|region)"'</span></code></pre>
+    </div>
+
+    <p>It should print your real values:</p>
+    <div class="cmd">
+      <div class="cmd-head" style="background:var(--surface-alt);color:var(--muted);border:1px solid var(--rule);border-bottom:0;"><span class="tag" style="color:var(--accent)">expected output</span></div>
+      <pre class="out" data-shell="both"><code>        <span class="d">"project":</span> <span class="p">"my-gcp-project"</span>,
+        <span class="d">"region":</span> <span class="p">"europe-west1"</span>,</code></pre>
+    </div>
+
+    <h4>Why each key is there</h4>
+    <ul>
+      <li><code>access_mode: "public"</code> — grants <code>allUsers</code> → <code>roles/run.invoker</code>, so the URL works without a token. Use <code>"authenticated"</code> and callers need an identity token.</li>
+      <li><code>runtime_image_digest</code> — pins the container image. Load-bearing: leave it out and the deployer uses the moving <code>:develop</code> tag, which Cloud Run caches for about an hour and which can resolve to a build too old to serve the webchat SPA or self-register the Telegram webhook.</li>
+      <li><code>bundle_source_uri</code> — must be an <strong>OCI URI, not a local path</strong>. Cloud Run pulls the bundle over the network at container boot; a path on your laptop is meaningless to it.</li>
+      <li><code>bundle_digest</code> — pins the content, so the boot is reproducible even though the tag can move.</li>
+      <li><code>route_binding.path_prefixes: ["/"]</code> — this bundle serves everything.</li>
+    </ul>
+  </div>
+
+  <!-- STEP 5.5 -->
+  <div class="step">
+    <div class="num">5½<small>optional</small></div>
+    <h3>Telegram — declare the token in the manifest</h3>
+    <p>
+      Skip this to run webchat-only. To wire up the Telegram provider that ships in the bundle,
+      add a top-level <code>secrets</code> array — a sibling of <code>packs</code> and
+      <code>bundles</code> — and export the token. The manifest names the
+      <strong>environment variable</strong>; the value never enters the file.
+    </p>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag">cloudrun.env.json</span><span class="note">add alongside packs / bundles</span></div>
+      <pre data-shell="both"><code>  <span class="o">"secrets"</span>: [
+    { <span class="o">"path"</span>: <span class="s">"default/_/messaging-telegram/telegram_bot_token"</span>,
+      <span class="o">"from_env"</span>: <span class="s">"TELEGRAM_BOT_TOKEN"</span> }
+  ],</code></pre>
+    </div>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag" data-shell="fish">fish</span><span class="tag" data-shell="bash">bash / zsh</span><span class="note">get the token from @BotFather</span></div>
+      <pre data-shell="fish"><code><span class="k">set</span> -x TELEGRAM_BOT_TOKEN <span class="s">123456:your-token-here</span></code></pre>
+      <pre data-shell="bash"><code><span class="k">export</span> TELEGRAM_BOT_TOKEN=<span class="s">123456:your-token-here</span></code></pre>
+    </div>
+
+    <p>
+      That is the whole integration. <code>env up</code> resolves the variable at apply time,
+      writes it to the per-environment dev-store, and stages it into the Cloud Run seed — all
+      inside the single command in step 6. No separate <code>secrets put</code>, no temp file
+      holding a token.
+    </p>
+    <ul>
+      <li>The <code>path</code> is <code>&lt;tenant&gt;/&lt;team&gt;/&lt;pack&gt;/&lt;name&gt;</code>. <code>_</code> is the default team — a literal <code>default</code> team is rejected.</li>
+      <li>If the variable is unset on a mutating run, <code>env up</code> treats it as a missing input and refuses. On a TTY it prompts instead, masked.</li>
+    </ul>
+
+    <div class="note-box warn">
+      <span class="lbl">Rotate anything you paste</span>
+      <p>
+        A bot token is a bearer credential. If one has ever been in a chat window, a log, a
+        screenshot, or a shell history file, rotate it in @BotFather. Also note that
+        <code>env destroy</code> cannot clear the Telegram-side webhook — that lives on Telegram's
+        servers, not in GCP.
+      </p>
+    </div>
+  </div>
+
+  <!-- STEP 6 -->
+  <div class="step">
+    <div class="num">6<small>deploy</small></div>
+    <h3>The one command</h3>
+    <p>
+      Progress lines go to <strong>stderr</strong> and the JSON envelope to <strong>stdout</strong>,
+      so redirecting stdout to a file still lets you watch the plan scroll past.
+    </p>
+
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag" data-shell="fish">fish</span><span class="tag" data-shell="bash">bash / zsh</span><button class="copy" type="button">copy</button></div>
+      <pre data-shell="fish"><code><span class="k">greentic-deployer-dev</span> op --store-root ./state \
+  --answers cloudrun.env.json env up --yes &gt; up.json
+
+<span class="k">set</span> -x URL (<span class="k">python3</span> -c <span class="s">"import json;print(json.load(open('up.json'))['result']['endpoint_url'])"</span>)
+<span class="k">set</span> -x SVC (<span class="k">python3</span> -c <span class="s">"import json;print(json.load(open('up.json'))['result']['warmed'][0])"</span>)
+<span class="k">echo</span> <span class="s">"$URL  ($SVC)"</span></code></pre>
+      <pre data-shell="bash"><code><span class="k">greentic-deployer-dev</span> op --store-root ./state \
+  --answers cloudrun.env.json env up --yes &gt; up.json
+
+<span class="k">export</span> URL=$(<span class="k">python3</span> -c <span class="s">"import json;print(json.load(open('up.json'))['result']['endpoint_url'])"</span>)
+<span class="k">export</span> SVC=$(<span class="k">python3</span> -c <span class="s">"import json;print(json.load(open('up.json'))['result']['warmed'][0])"</span>)
+<span class="k">echo</span> <span class="s">"$URL  ($SVC)"</span></code></pre>
+    </div>
+
+    <ul>
+      <li><code>--store-root ./state</code> — where the environment lives locally. Omit it and it defaults to <code>~/.greentic/environments</code>; keeping it local makes the demo self-contained and disposable.</li>
+      <li><code>--answers</code> is a <strong>global</strong> flag, so it goes <em>before</em> <code>env up</code>, not after.</li>
+      <li><code>--yes</code> skips the confirmation prompt.</li>
+    </ul>
+
+    <p>Real output, about 46 seconds:</p>
+    <div class="cmd">
+      <div class="cmd-head" style="background:var(--surface-alt);color:var(--muted);border:1px solid var(--rule);border-bottom:0;"><span class="tag" style="color:var(--accent)">observed</span></div>
+      <pre class="out" data-shell="both"><code><span class="d">[1/6]</span> ensure-environment     local            create…
+<span class="d">[2/6]</span> update-host-config     local            create…
+<span class="d">[3/6]</span> bootstrap-trust-root   local            create…
+<span class="d">[4/6]</span> update-pack-binding    deployer         update…
+<span class="d">[5/6]</span> update-pack-binding    secrets          update…
+<span class="d">[6/6]</span> deploy-bundle          cloudrun-byhand  create…
+{"noun":"env","op":"up","result":{
+  "applied_splits":1,
+  "endpoint_url":<span class="p">"https://gtc-svc-01kxr5arxfhjay9krstpnrp99t-…-ew.a.run.app"</span>,
+  "environment_id":"local",
+  "kind":"greentic.deployer.gcp-cloudrun@1.0.0",
+  "warmed":["gtc-svc-01kxr5arxfhjay9krstpnrp99t"]}}</code></pre>
+    </div>
+
+    <p>
+      If you lose the shell, both values are recoverable without redeploying:
+    </p>
+    <div class="cmd">
+      <div class="cmd-head"><span class="tag" data-shell="fish">fish</span><span class="tag" data-shell="bash">bash / zsh</span></div>
+      <pre data-shell="fish"><code><span class="k">set</span> -x SVC (<span class="k">gcloud</span> run services list --project $PROJECT --region $REGION \
+  --format=<span class="s">'value(metadata.name)'</span>)
+<span class="k">set</span> -x URL (<span class="k">gcloud</span> run services describe $SVC --project $PROJECT --region $REGION \
+  --format=<span class="s">'value(status.url)'</span>)</code></pre>
+      <pre data-shell="bash"><code><span class="k">export</span> SVC=$(<span class="k">gcloud</span> run services list --project $PROJECT --region $REGION \
+  --format=<span class="s">'value(metadata.name)'</span>)
+<span class="k">export</span> URL=$(<span class="k">gcloud</span> run services describe $SVC --project $PROJECT --region $REGION \
+  --format=<span class="s">'value(status.url)'</span>)</code></pre>
+    </div>
+  </div>
+</section>
+</div>
+
+<!-- ─── 06 VERIFY ──────────────────────────────────────────────────────── -->
+<div class="band">
+<section id="verify">
+  <div class="marker" data-mark="06 / verify"></div>
+  <h2>“Up” and “working” are different claims</h2>
+
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="k">curl</span> -s -o /dev/null -w <span class="s">'%{http_code}\n'</span> <span class="s">"$URL/readyz"</span>
+<span class="k">curl</span> -s <span class="s">"$URL/status"</span> | <span class="k">python3</span> -m json.tool</code></pre>
+  </div>
+
+  <div class="cmd">
+    <div class="cmd-head" style="background:var(--surface-alt);color:var(--muted);border:1px solid var(--rule);border-bottom:0;"><span class="tag" style="color:var(--accent)">this is the real check</span></div>
+    <pre class="out" data-shell="both"><code>{
+    <span class="d">"schema":</span> "greentic.status.v1",
+    <span class="d">"env_id":</span> "local",
+    <span class="d">"bundles_active":</span> <span class="p">1</span>,
+    <span class="d">"deployments_routed":</span> <span class="p">1</span>,
+    <span class="d">"revisions_active":</span> <span class="p">1</span>
+}</code></pre>
+  </div>
+
+  <p>
+    <code>/readyz</code> is a <em>static route</em>. It returns <code>200 ok</code> from a runtime
+    that pulled no bundle and loaded nothing at all. <code>bundles_active</code> is non-zero only
+    once the seed parsed, the bundle pulled from GHCR, and its packs loaded.
+  </p>
+
+  <div class="note-box trap">
+    <span class="lbl">The failure this demo exists to catch</span>
+    <p>
+      <strong><code>bundles_active: 0</code> next to a green <code>/readyz</code></strong> is the
+      signature of a broken bundle reference. The service is up; the worker is not there.
+      A liveness probe will never tell you.
+    </p>
+  </div>
+
+  <h3>Who answered — you or Google?</h3>
+  <p>
+    Worth knowing when a path 404s unexpectedly. A response with no <code>server</code> header came
+    from Google's frontend; one carrying <code>server: Google Frontend</code> genuinely reached
+    your container.
+  </p>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="k">curl</span> -sD- -o /dev/null <span class="s">"$URL/healthz"</span> | <span class="k">grep</span> -iE <span class="s">'^(HTTP|server)'</span>
+<span class="c"># HTTP/2 404                 ← no server header: Google answered, not you</span>
+
+<span class="k">curl</span> -sD- -o /dev/null <span class="s">"$URL/nope"</span> | <span class="k">grep</span> -iE <span class="s">'^(HTTP|server)'</span>
+<span class="c"># HTTP/2 405</span>
+<span class="c"># server: Google Frontend    ← reached the container, which 405'd</span></code></pre>
+  </div>
+
+  <h3>When it is broken, read the container's own logs</h3>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span><span class="note">double quotes — the filter interpolates $SVC</span></div>
+    <pre data-shell="both"><code><span class="k">gcloud</span> logging read \
+  <span class="s">"resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SVC\""</span> \
+  --project $PROJECT --limit 50 --freshness 1h</code></pre>
+  </div>
+</section>
+</div>
+
+<!-- ─── 07 CHAT ────────────────────────────────────────────────────────── -->
+<div class="band">
+<section id="chat">
+  <div class="marker" data-mark="07 / talk to it"></div>
+  <h2>Talking to the worker</h2>
+
+  <h3>In a browser</h3>
+  <p>
+    The chat SPA is a public static route — no login, CORS on — backed by DirectLine underneath.
+    Open it:
+  </p>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="k">echo</span> <span class="s">"$URL/v1/web/webchat/default/"</span>
+
+<span class="c"># headless check: 200 + text/html. A 405 means the image is too old.</span>
+<span class="k">curl</span> -s -o /dev/null -w <span class="s">'%{http_code}\n'</span> <span class="s">"$URL/v1/web/webchat/default/"</span></code></pre>
+  </div>
+  <p>
+    Under the hood, <code>POST …/token</code> mints a session JWT,
+    <code>POST …/v3/directline/conversations</code> opens a conversation, and the bot answers with
+    an Adaptive Card. All of it works <strong>from pack presence alone</strong> — no messaging
+    endpoint has to be registered anywhere.
+  </p>
+
+  <h3>On Telegram — the webhook registers itself</h3>
+  <p>
+    If you seeded a token in step 5½, you do <strong>not</strong> run <code>setWebhook</code>.
+    On Cloud Run the runtime derives its own public URL from the first inbound request's
+    <code>Host</code> header — pinned to this service's own <code>&lt;name&gt;-*.run.app</code>
+    address, so a forged <code>Host</code> cannot hijack the registration — and calls the
+    provider's <code>setup_webhook</code> for you.
+  </p>
+  <p>
+    The <code>curl "$URL/status"</code> you already ran <em>was</em> that first request. So the
+    webhook is registering as you read this. Confirm it:
+  </p>
+
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="c"># token check + the bot's @username</span>
+<span class="k">curl</span> -s <span class="s">"https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe"</span> | <span class="k">python3</span> -m json.tool
+
+<span class="c"># poll until the runtime has registered it (a few seconds)</span>
+<span class="k">curl</span> -s <span class="s">"https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"</span> | <span class="k">python3</span> -m json.tool
+<span class="c">#   "url": "https://&lt;name&gt;-….run.app/webhook/telegram"   ← set by the runtime</span></code></pre>
+  </div>
+
+  <p>Then message the bot. It replies through the deployment.</p>
+
+  <div class="note-box warn">
+    <span class="lbl">Fallback on an older image</span>
+    <p>
+      Self-registration needs the runtime image pinned in step 5. On an older build the webhook
+      URL stays empty — then, and only then, register it by hand.
+    </p>
+  </div>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span><span class="note">only if auto-registration did not happen</span></div>
+    <pre data-shell="both"><code><span class="k">curl</span> -s <span class="s">"https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook"</span> \
+  --data-urlencode <span class="s">"url=$URL/webhook/telegram"</span> -d drop_pending_updates=true</code></pre>
+  </div>
+</section>
+</div>
+
+<!-- ─── 08 COST ────────────────────────────────────────────────────────── -->
+<div class="band">
+<section id="cost">
+  <div class="marker" data-mark="08 / cost"></div>
+  <h2>What exists, what it costs, what survives teardown</h2>
+
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="k">gcloud</span> run services list --project $PROJECT --region $REGION
+<span class="k">gcloud</span> secrets list --project $PROJECT</code></pre>
+  </div>
+  <div class="cmd">
+    <div class="cmd-head" style="background:var(--surface-alt);color:var(--muted);border:1px solid var(--rule);border-bottom:0;"><span class="tag" style="color:var(--accent)">the entire cloud footprint</span></div>
+    <pre class="out" data-shell="both"><code>NAME
+<span class="p">gtc-svc-01kxr5arxfhjay9krstpnrp99t</span>   <span class="d">← the Service</span>
+NAME
+<span class="p">gtc-local-environment</span>                <span class="d">← the seed</span></code></pre>
+  </div>
+
+  <p>
+    Two objects. Leave it fifteen minutes without traffic and the container count drops to zero —
+    visible in the console under <em>Metrics → Container instance count</em>. No compute is billed
+    at zero instances.
+  </p>
+
+  <h3>Tear it down</h3>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="k">greentic-deployer-dev</span> op --store-root ./state env destroy local --confirm</code></pre>
+  </div>
+  <p>
+    Note the ordering: <strong>cloud resources are torn down before local state is removed</strong>.
+    If teardown fails, the environment stays intact so you can retry, rather than orphaning cloud
+    resources you can no longer name.
+  </p>
+
+  <h3>Does it clean up everything? Honestly, no</h3>
+  <p>
+    <code>env destroy</code> removes everything it created <em>per run</em>. It does not remove the
+    one-time setup, and it was never meant to. Measured immediately after a real destroy:
+  </p>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Fate</th><th>Thing</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td class="yes">Removed</td><td>Cloud Run service <code>gtc-svc-…</code></td><td class="n">—</td></tr>
+      <tr><td class="yes">Removed</td><td>Secret <code>gtc-local-environment</code> + its IAM binding</td><td class="n">—</td></tr>
+      <tr><td class="yes">Removed</td><td>The <code>allUsers</code> invoker binding</td><td class="n">—</td></tr>
+      <tr><td class="yes">Removed</td><td>Local <code>./state/local</code></td><td class="n">—</td></tr>
+      <tr><td>Left behind</td><td>Service account <code>gtc-local-runtime</code> — zero roles</td><td class="n">$0</td></tr>
+      <tr><td>Left behind</td><td>Four enabled APIs</td><td class="n">$0 while unused</td></tr>
+      <tr><td>Left behind</td><td>Cloud Logging entries</td><td class="n">free tier, ~30 days</td></tr>
+      <tr><td class="no">Never existed</td><td>An Artifact Registry repo</td><td class="n">$0</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>
+    <strong>No Artifact Registry repo is ever created</strong>, which is why standing storage cost is
+    zero — the image and the bundle are both pulled from public GHCR. The deployer never creates
+    one; its <code>ar_repo</code> answer only <em>points at</em> a repo you provisioned yourself.
+  </p>
+  <p>
+    So the honest claim is not “it costs nothing.” It is: <strong>zero Cloud Run compute while
+    idle, plus a short enumerated list of standing charges</strong> — in practice the seed secret's
+    active versions, a few cents a month, and nothing at all after a destroy.
+  </p>
+
+  <h4>To remove even the leftovers</h4>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="k">gcloud</span> iam service-accounts delete \
+  gtc-local-runtime@$PROJECT.iam.gserviceaccount.com --project $PROJECT --quiet
+<span class="k">gcloud</span> services disable run.googleapis.com secretmanager.googleapis.com \
+  --project $PROJECT --force</code></pre>
+  </div>
+  <p>
+    Or delete the project. The only way to be certain a cloud project costs nothing is for it not
+    to exist.
+  </p>
+</section>
+</div>
+
+<!-- ─── 09 TRAPS ───────────────────────────────────────────────────────── -->
+<div class="band">
+<section id="traps">
+  <div class="marker" data-mark="09 / traps"></div>
+  <h2>Four ways this bites you</h2>
+  <p>
+    All four were found by running the demo, not by reading the code. They are the reason the
+    script probes rather than assumes.
+  </p>
+
+  <h3>A build that cannot deploy Cloud Run plans a perfect deploy anyway</h3>
+  <p>
+    Run this against a stable <code>1.1.16</code>, which has no Cloud Run deployer compiled in at
+    all, and it does not say so:
+  </p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>What you'd check</th><th>On a build that <em>cannot</em> deploy Cloud Run</th></tr></thead>
+    <tbody>
+      <tr><td><code>op env --help</code></td><td>still lists <code>up</code> — it is the generic verb</td></tr>
+      <tr><td><code>op env up --dry-run</code></td><td>green six-step plan, <code>kind → …gcp-cloudrun</code></td></tr>
+      <tr><td><code>op env apply --yes</code></td><td><strong>exit 0</strong>, <code>changed: 6</code>, <code>verify.failures: []</code></td></tr>
+      <tr><td><code>op env doctor</code></td><td><code>unknown_kinds: ["greentic.deployer.gcp-cloudrun@1.0.0"]</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    Three of the four happily plan and <em>bind</em> a deployer kind the binary cannot execute.
+    Only <code>doctor</code> resolves the binding against the handler registry, so it is the only
+    one that tells the truth. Probe with it, on a throwaway store, before you trust anything:
+  </p>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag" data-shell="fish">fish</span><span class="tag" data-shell="bash">bash / zsh</span><span class="note">makes no cloud calls</span></div>
+    <pre data-shell="fish"><code><span class="k">set</span> S (<span class="k">mktemp</span> -d)
+<span class="k">greentic-deployer-dev</span> op --store-root $S --answers cloudrun.env.json env apply --yes &gt;/dev/null
+<span class="k">greentic-deployer-dev</span> op --store-root $S env doctor local | <span class="k">python3</span> -m json.tool | <span class="k">grep</span> -A1 unknown_kinds
+<span class="k">rm</span> -rf $S
+<span class="c">#   "unknown_kinds": [],                                       ← good</span>
+<span class="c">#   "unknown_kinds": ["greentic.deployer.gcp-cloudrun@1.0.0"]  ← no Cloud Run in this build</span></code></pre>
+    <pre data-shell="bash"><code>S=$(<span class="k">mktemp</span> -d)
+<span class="k">greentic-deployer-dev</span> op --store-root $S --answers cloudrun.env.json env apply --yes &gt;/dev/null
+<span class="k">greentic-deployer-dev</span> op --store-root $S env doctor local | <span class="k">python3</span> -m json.tool | <span class="k">grep</span> -A1 unknown_kinds
+<span class="k">rm</span> -rf $S
+<span class="c">#   "unknown_kinds": [],                                       ← good</span>
+<span class="c">#   "unknown_kinds": ["greentic.deployer.gcp-cloudrun@1.0.0"]  ← no Cloud Run in this build</span></code></pre>
+  </div>
+
+  <div class="note-box trap">
+    <span class="lbl">An absent NO is not a YES</span>
+    <p>
+      The probe's first cut asked only “does <code>unknown_kinds</code> <em>contain</em>
+      gcp-cloudrun?” — and passed a binary that has no <code>op env up</code> at all:
+      <code>doctor</code> never ran, the answer was empty, and empty is not a match. It now demands
+      a parseable report whose <code>bound_slots</code> includes <code>deployer</code> and whose
+      <code>unknown_kinds</code> excludes cloudrun, and refuses on anything else.
+    </p>
+  </div>
+
+  <h3>Tag caching hands you yesterday's runtime</h3>
+  <p>
+    Cloud Run caches image tags for roughly an hour. Deploy against a moving <code>:develop</code>
+    tag and you can get a build old enough that the webchat route 405s or the Telegram webhook
+    never registers — with no error anywhere to explain it. Pin
+    <code>runtime_image_digest</code>. To find a newer one:
+  </p>
+  <div class="cmd">
+    <div class="cmd-head"><span class="tag">both shells</span></div>
+    <pre data-shell="both"><code><span class="k">gh</span> api /orgs/greenticai/packages/container/greentic-start-distroless/versions \
+  --jq <span class="s">'.[] | select(.metadata.container.tags[]?=="develop") | .name'</span></code></pre>
+  </div>
+
+  <h3>The pack matters as much as the image</h3>
+  <p>
+    Webchat GUI packs older than <code>0.5.10</code> did not declare the
+    <code>render_plan</code> / <code>encode</code> / <code>send_payload</code> egress operations, so
+    the bot's reply was silently rejected by the runner's declared-ops allowlist. The chat loaded
+    and simply never answered. The bundle pinned here is past that.
+  </p>
+
+  <h3><code>gtc op</code> is not the same binary</h3>
+  <p>
+    <code>gtc op …</code> delegates to <code>greentic-operator</code> — a different crate on its own
+    release cadence. It inherits the deployer's default features, so Cloud Run will ride along
+    automatically once a stable release carries it; but today's operator does not have it. That is
+    why every command on this page names <code>greentic-deployer-dev</code> explicitly.
+  </p>
+</section>
+</div>
+
+<!-- ─── FOOTER ─────────────────────────────────────────────────────────── -->
+<div class="band">
+<footer>
+  <p>
+    Every command on this page was executed against a real Google Cloud project
+    (<code>europe-west1</code>) and the outputs shown are real, trimmed. The teardown was verified
+    by an independent sweep — <code>run services list</code>, <code>secrets list</code>,
+    <code>artifacts repositories list</code> — all three returning <em>Listed 0 items</em>.
+  </p>
+  <p>
+    One caveat stated plainly: the Telegram <strong>self-registration</strong> path is covered by
+    unit and mutation tests, but a live Cloud Run round-trip of it is still outstanding. That is
+    why the manual <code>setWebhook</code> fallback is documented above rather than deleted.
+  </p>
+  <p style="color:var(--accent);font-family:var(--mono);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;margin-top:2rem;">
+    Greentic — deterministic digital workers
+  </p>
+</footer>
+</div>
+
+</main>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var fish = document.getElementById('pick-fish');
+  var bash = document.getElementById('pick-bash');
+
+  function setShell(s) {
+    root.setAttribute('data-shellpref', s);
+    fish.setAttribute('aria-pressed', String(s === 'fish'));
+    bash.setAttribute('aria-pressed', String(s === 'bash'));
+    try { localStorage.setItem('shellpref', s); } catch (e) {}
+  }
+
+  var saved = null;
+  try { saved = localStorage.getItem('shellpref'); } catch (e) {}
+  setShell(saved === 'bash' ? 'bash' : 'fish');
+
+  fish.addEventListener('click', function () { setShell('fish'); });
+  bash.addEventListener('click', function () { setShell('bash'); });
+
+  // Copy the visible variant of a command block.
+  document.querySelectorAll('.copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var block = btn.closest('.cmd');
+      if (!block) return;
+      var pre = Array.prototype.find.call(block.querySelectorAll('pre'), function (p) {
+        return p.offsetParent !== null;
+      });
+      if (!pre) return;
+      var text = pre.innerText.replace(/ /g, ' ');
+      navigator.clipboard.writeText(text).then(function () {
+        var was = btn.textContent;
+        btn.textContent = 'copied';
+        setTimeout(function () { btn.textContent = was; }, 1400);
+      }).catch(function () {
+        btn.textContent = 'select manually';
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>

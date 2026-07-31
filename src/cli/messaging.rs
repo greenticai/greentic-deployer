@@ -1023,6 +1023,11 @@ pub(crate) fn provision_webhook_secret(
 /// Write the webhook secret VALUE into the env-pack dev-store. Mirrors the
 /// `cli/secrets.rs put` idiom: same `dev_store_put` + `resolve_dev_store_path`
 /// pattern (sidecar flock, dedicated OS thread, own current-thread runtime).
+///
+/// `secret_ref` can be caller-supplied (an endpoint may carry its own webhook
+/// ref, reused verbatim across rotations), so a ref aimed at the deployer's own
+/// credential path would otherwise overwrite the env's bound deployer credential
+/// with a webhook secret on rotation. `dev_store_put` refuses that.
 fn write_webhook_secret_to_devstore(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -1971,6 +1976,48 @@ mod tests {
             r.as_str(),
             format!("secret://vault-demo/tenant-default/_/messaging-{eid_lower}/webhook_secret")
         );
+    }
+
+    /// An endpoint carries its own webhook ref, reused verbatim on rotation. A
+    /// ref aimed at the deployer's reserved credential path would therefore let
+    /// a rotation overwrite the env's live bound deployer credential with a
+    /// webhook secret — breaking every later deployer verb, and writing material
+    /// that staging strips anyway. The write must fail closed, and must leave the
+    /// existing credential byte-for-byte intact.
+    #[test]
+    fn provision_webhook_secret_refuses_to_clobber_a_reserved_credential_path() {
+        let (_dir, store, _) = seeded_store_with_bundles(&[]);
+        let env_id = EnvId::try_from("local").unwrap();
+        let eid = MessagingEndpointId::new();
+
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            let reserved = SecretRef::try_new(format!("secret://local/{path}")).unwrap();
+
+            // The env's real bound deployer credential lives here.
+            let env_dir = store.env_dir(&env_id).unwrap();
+            crate::cli::secrets::put_credential_material(&env_dir, &reserved, "REAL-DEPLOYER-CRED")
+                .unwrap();
+
+            let err = provision_webhook_secret(
+                &store,
+                &env_id,
+                &eid,
+                Some("default"),
+                true,
+                Some(&reserved),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")),
+                "a webhook secret must not be writable at the reserved deployer \
+                 credential path `{path}`; got {err:?}"
+            );
+            assert_eq!(
+                read_devstore_value(&store, &reserved),
+                "REAL-DEPLOYER-CRED",
+                "the bound deployer credential at `{path}` must be untouched"
+            );
+        }
     }
 
     #[test]
