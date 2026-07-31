@@ -3029,7 +3029,7 @@ dependencies = [
 [[package]]
 name = "greentic-secrets-api"
 version = "1.3.0-research.2"
-source = "git+https://github.com/greenticai/greentic-secrets.git?rev=2e491e3c2c8b7355785193ac839c02ba9116a630#2e491e3c2c8b7355785193ac839c02ba9116a630"
+source = "git+https://github.com/greenticai/greentic-secrets.git?rev=dc7f40ae8bbb2c453c417ed031fcf64a79a53b72#dc7f40ae8bbb2c453c417ed031fcf64a79a53b72"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3067,7 +3067,7 @@ dependencies = [
 [[package]]
 name = "greentic-secrets-core"
 version = "1.3.0-research.2"
-source = "git+https://github.com/greenticai/greentic-secrets.git?rev=2e491e3c2c8b7355785193ac839c02ba9116a630#2e491e3c2c8b7355785193ac839c02ba9116a630"
+source = "git+https://github.com/greenticai/greentic-secrets.git?rev=dc7f40ae8bbb2c453c417ed031fcf64a79a53b72#dc7f40ae8bbb2c453c417ed031fcf64a79a53b72"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3108,7 +3108,7 @@ dependencies = [
 [[package]]
 name = "greentic-secrets-lib"
 version = "1.3.0-research.2"
-source = "git+https://github.com/greenticai/greentic-secrets.git?rev=2e491e3c2c8b7355785193ac839c02ba9116a630#2e491e3c2c8b7355785193ac839c02ba9116a630"
+source = "git+https://github.com/greenticai/greentic-secrets.git?rev=dc7f40ae8bbb2c453c417ed031fcf64a79a53b72#dc7f40ae8bbb2c453c417ed031fcf64a79a53b72"
 dependencies = [
  "async-trait",
  "greentic-secrets-api 1.3.0-research.2",
@@ -3139,7 +3139,7 @@ dependencies = [
 [[package]]
 name = "greentic-secrets-provider-dev"
 version = "1.3.0-research.2"
-source = "git+https://github.com/greenticai/greentic-secrets.git?rev=2e491e3c2c8b7355785193ac839c02ba9116a630#2e491e3c2c8b7355785193ac839c02ba9116a630"
+source = "git+https://github.com/greenticai/greentic-secrets.git?rev=dc7f40ae8bbb2c453c417ed031fcf64a79a53b72#dc7f40ae8bbb2c453c417ed031fcf64a79a53b72"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3149,13 +3149,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tracing",
 ]
 
 [[package]]
 name = "greentic-secrets-provider-vault-kv"
 version = "1.3.0-research.2"
-source = "git+https://github.com/greenticai/greentic-secrets.git?rev=2e491e3c2c8b7355785193ac839c02ba9116a630#2e491e3c2c8b7355785193ac839c02ba9116a630"
+source = "git+https://github.com/greenticai/greentic-secrets.git?rev=dc7f40ae8bbb2c453c417ed031fcf64a79a53b72#dc7f40ae8bbb2c453c417ed031fcf64a79a53b72"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3185,7 +3186,7 @@ dependencies = [
 [[package]]
 name = "greentic-secrets-spec"
 version = "1.3.0-research.2"
-source = "git+https://github.com/greenticai/greentic-secrets.git?rev=2e491e3c2c8b7355785193ac839c02ba9116a630#2e491e3c2c8b7355785193ac839c02ba9116a630"
+source = "git+https://github.com/greenticai/greentic-secrets.git?rev=dc7f40ae8bbb2c453c417ed031fcf64a79a53b72#dc7f40ae8bbb2c453c417ed031fcf64a79a53b72"
 dependencies = [
  "async-trait",
  "greentic-types",

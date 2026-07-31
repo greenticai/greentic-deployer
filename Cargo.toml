@@ -170,7 +170,7 @@ version = "=1.3.0-research.1"
 # `op env up` / secrets vault-provisioning path needs. The crates.io
 # =1.3.0-research.1 predates the vault re-export.
 git = "https://github.com/greenticai/greentic-secrets.git"
-rev = "2e491e3c2c8b7355785193ac839c02ba9116a630"
+rev = "dc7f40ae8bbb2c453c417ed031fcf64a79a53b72"
 features = [
     "providers-dev",
     "providers-vault",
@@ -413,4 +413,4 @@ greentic-deploy-spec = "=1.3.0-research.1"
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
 # normal dep, so no resolution change.
-greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets.git", rev = "2e491e3c2c8b7355785193ac839c02ba9116a630" }
+greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets.git", rev = "dc7f40ae8bbb2c453c417ed031fcf64a79a53b72" }
