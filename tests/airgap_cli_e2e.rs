@@ -5,6 +5,7 @@
 //! import -> delta-export. Every step runs inside tempdirs with HOME overridden,
 //! no network access, and no real user state.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -356,6 +357,34 @@ fn airgap_cli_round_trip() {
         delta_size < full_size,
         "delta ({delta_size}) must be smaller than full ({full_size})"
     );
+}
+
+/// Recursively collect every file under `root` into a sorted map of
+/// (relative-path, content). Used to snapshot the serving directory so we
+/// can detect any mutation — including stray blob writes — after a rejected
+/// publish.
+fn snapshot_dir(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut map = BTreeMap::new();
+    fn walk(dir: &Path, root: &Path, map: &mut BTreeMap<String, Vec<u8>>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, map);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    let content = std::fs::read(&path).unwrap();
+                    map.insert(rel, content);
+                }
+            }
+        }
+    }
+    walk(root, root, &mut map);
+    map
 }
 
 /// Build a plan at a given sequence, get it, export it, and return the
@@ -779,6 +808,8 @@ fn tier2_push_to_monotonic_multi_import() {
     let plan_json_after_2 = plan_json_bytes.clone();
     let plan_sig_after_2 = sig_bytes.clone();
     let meta_after_2 = meta_bytes_2.clone();
+    // Full-tree snapshot: catches stray blob writes that the per-file checks miss.
+    let serving_snapshot_after_2 = snapshot_dir(&push_to_dir);
 
     // ---------------------------------------------------------------
     // Import #3: sequence 1 with --push-to (MUST fail: downgrade)
@@ -843,6 +874,12 @@ fn tier2_push_to_monotonic_multi_import() {
         2,
         "plan/meta sequence must still be 2 after rejected downgrade"
     );
+    // Full-tree check: no stray files (e.g. blobs) written before the reject.
+    assert_eq!(
+        snapshot_dir(&push_to_dir),
+        serving_snapshot_after_2,
+        "complete serving directory (plan + blobs) must be unchanged after rejected import #3"
+    );
 
     // ---------------------------------------------------------------
     // Import #4: same sequence 2, different plan digest (MUST fail:
@@ -898,5 +935,13 @@ fn tier2_push_to_monotonic_multi_import() {
     assert_eq!(
         meta_after_4, meta_after_2,
         "plan/meta must be byte-identical after rejected import #4"
+    );
+    // Full-tree check: import #4 uses a different payload (binary B), so an
+    // implementation that writes the new blob before rejecting the
+    // same-sequence conflict would leave a stray file here.
+    assert_eq!(
+        snapshot_dir(&push_to_dir),
+        serving_snapshot_after_2,
+        "complete serving directory (plan + blobs) must be unchanged after rejected import #4"
     );
 }
