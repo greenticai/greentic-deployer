@@ -110,10 +110,8 @@ hyphen before requesting.
 Both configs below listen on **8080**, matching the `mirror.lan:8080`
 endpoints used in the client examples. If you change one, change the
 other -- a mismatch leaves every machine polling a closed port, and the
-only symptom is that nothing ever converges. Running these in a
-container adds a second place to get it right: publish the port
-(`-p 8080:8080`) so the container's listener is reachable at the port
-the clients were told to use.
+only symptom is that nothing ever converges. In a container, also
+publish the port (`-p 8080:8080`).
 
 ### nginx
 
@@ -286,8 +284,7 @@ expires. There is no error, no retry, no log line -- machines simply
 believe they are up to date.
 
 Do **not** put a caching reverse proxy between the mirror and the fleet
-unless it respects these `Cache-Control` headers. A proxy that caches
-`/plan/meta` will silently stall the fleet.
+unless it respects these `Cache-Control` headers.
 
 ---
 
@@ -316,8 +313,8 @@ subscribes to a server-sent-event stream unless told not to. When
 `--stream-endpoint` is unset the runtime derives one by stripping the
 `/plan` suffix off the plan endpoint and appending `/updates/stream`, so
 the example above would have the runtime open an SSE connection to
-`http://mirror.lan:8080/updates/stream` -- a route a static file server
-does not serve, and which the configs above answer with 404. Tier 2 is
+`http://mirror.lan:8080/updates/stream`, which the configs above answer
+with 404. Tier 2 is
 poll-only; the live plan server that serves that stream is a separate,
 deferred piece of work.
 
@@ -327,8 +324,7 @@ Verify with:
 greentic-deployer op updates config-show <ENV_ID>
 ```
 
-The `resolved` block in the output shows the effective values after
-defaults are applied. For a Tier 2 mirror the one to check is
+The `resolved` block shows effective values including defaults. For a Tier 2 mirror the one to check is
 `resolved.push_enabled`, which must be `false`.
 
 `resolved.stream_endpoint` will still show a derived
@@ -336,8 +332,7 @@ defaults are applied. For a Tier 2 mirror the one to check is
 only looks at the plan endpoint and does not consult `push_enabled`.
 That value is inert: the runtime gates streaming on `push_enabled`
 alone, so a populated `stream_endpoint` next to
-`resolved.push_enabled: false` is expected and is not a
-misconfiguration.
+`resolved.push_enabled: false` is expected.
 
 ### Flag notes
 
@@ -355,11 +350,8 @@ misconfiguration.
 - **`--on-notify`** -- what to do when a new plan is found. `stage`
   (default) stages it for later `apply`; `record-only` records without
   staging; `apply` opts the environment into converging on its own, with
-  no operator step. `apply` is what makes an in-gap fleet self-converge,
-  but the executor lives in the runtime: a `greentic-start` predating
-  `on_update` reads the legacy `on_notify` mirror and stages instead of
-  failing, so an old runtime silently degrades to `stage` rather than
-  converging. Check the version floor below before relying on `apply`.
+  no operator step. `apply` has a minimum runtime version -- see
+  [Version floors](#version-floors) before relying on it.
 - **`--push-enabled false`** -- strongly recommended here; see above.
   Defaults to `true`, which a static mirror cannot satisfy.
 - **`--enabled true`** -- enables the poll loop.
@@ -457,14 +449,83 @@ code path entirely.
 
 ---
 
+## Serving more than one environment
+
+`--push-to` writes **one directory per environment** -- the plan,
+sequence guard and blobs in it all belong to a single env. Two
+environments must never share a destination.
+
+Give each its own directory under a common root and its own URL prefix:
+
+```
+/srv/mirror/
+  <env-a>/plan/... , <env-a>/blobs/...
+  <env-b>/plan/... , <env-b>/blobs/...
+```
+
+Each environment then gets its own import and its own `config-set`
+pointing at its own prefix (`http://mirror.lan:8080/<env-id>/plan` and
+`.../<env-id>/blobs`). The server configs above need no structural
+change -- the two rewrites and the dotfile rule apply per prefix.
+
+---
+
+## Disk growth on the mirror
+
+The `--push-to` writer only ever **adds** blobs. It never removes one,
+and `op updates cas-gc` does not apply here -- that collects the
+environment's CAS import store, not a serving directory. Successive
+imports that ship binaries therefore grow `blobs/` without bound;
+content-only plans add nothing.
+
+There is no automated collection for a serving directory today. Any
+`blobs/sha256-<hex>` file not referenced by the currently served
+`plan/plan.json` can be deleted safely: blobs are content-addressed, so
+a later plan needing the same digest simply has it rewritten on the next
+import.
+
+---
+
+## Confirming a machine converged
+
+There is no deployer-side verb that reports a given machine's applied
+sequence. In particular `op updates status` reports **enrollment and
+certificate** state, not convergence -- it will happily say `enrolled`
+on a machine that has never fetched a plan.
+
+Verify from the runtime's own operator log instead. The poll loop emits
+one of:
+
+- `update-notify: staged update plan for env <ENV>` -- fetched and
+  verified, awaiting an apply
+- `update-notify: applied update plan <PLAN_ID> to env <ENV>` -- fully
+  converged
+- `update-poll: .../meta fetch failed for env <ENV>: ...` -- the mirror
+  was unreachable this cycle
+
+Cross-check the plan id or sequence against `plan/meta` on the mirror to
+confirm the machine is on the sequence you pushed.
+
+---
+
+## Before the first import
+
+An empty serving directory has no `plan/meta`, so the mirror answers
+404 and every machine logs `update-poll: .../meta fetch failed` once per
+poll interval. This is harmless and needs no operator action: the loop
+leaves its last-known sequence untouched and retries on the next cycle,
+so the warnings stop by themselves after the first
+`import --push-to`. Configuring the fleet before the first import is
+therefore safe -- expect the noise until the mirror has content.
+
+---
+
 ## Trailing-slash footgun
 
 `plan_endpoint` must **not** end with a trailing slash. The client
-strips trailing slashes via `trim_end_matches('/')`, so this only
-matters if the endpoint is misconfigured before the client normalizes
-it. If the web server receives requests with a trailing slash (e.g.
-from a misconfigured intermediate proxy), two of three plan requests
-fail:
+strips trailing slashes via `trim_end_matches('/')`. If the web server
+still receives a trailing slash (e.g. from a misconfigured intermediate
+proxy), two of three plan requests fail:
 
 | Request | nginx | caddy |
 |---|---|---|
@@ -499,9 +560,8 @@ The channel is trying to open a pushed-update stream the static mirror
 does not serve. `push_enabled` is opt-*out* and defaults to `true`, and
 an unset `--stream-endpoint` is derived from the plan endpoint by
 stripping `/plan` and appending `/updates/stream`. Fix: set
-`--push-enabled false`. Convergence still happens -- the poll loop is
-the fallback and is all Tier 2 needs -- so this is noise rather than a
-stall, but it looks like a broken mirror.
+`--push-enabled false`. Convergence still happens via the poll loop, so this is noise rather
+than a stall, but it looks like a broken mirror.
 
 ### Fleet stalls at a stale sequence
 
@@ -518,9 +578,8 @@ Possible causes:
 
 - A corrupt blob already on the mirror. **Re-running the import does
   not repair it.** The writer skips any blob path that already exists
-  as a regular file, on filename alone -- it never compares contents,
-  and its own comment records that a corrupted pre-existing file is
-  caught by readers rather than by the writer. Recovery: delete the
+  as a regular file, on filename alone -- it never compares contents.
+  Recovery: delete the
   specific `blobs/sha256-<hex>` file named in the error, then re-run
   the same `op updates import --push-to` command, which will write it
   fresh. (Blobs are written via temp-file plus atomic rename, so an

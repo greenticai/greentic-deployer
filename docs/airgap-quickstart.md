@@ -192,8 +192,10 @@ greentic-deployer op updates config-set <ENV_ID> \
   --enabled true
 ```
 
-`--push-enabled false` is required: push defaults to on, and a static
-mirror cannot serve the pushed-update stream it would try to open.
+Set `--push-enabled false`: push defaults to on, and a static mirror
+cannot serve the pushed-update stream it would then try to open. The
+poll loop still converges without it, so this suppresses noise rather
+than fixing a breakage.
 
 The `--push-to` directory needs two URL rewrites (`/plan` and
 `/plan.sig`) and a dotfile-blocking rule. Verified nginx and Caddy
