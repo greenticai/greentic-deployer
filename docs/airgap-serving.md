@@ -107,6 +107,14 @@ hyphen before requesting.
 
 ## Web server configuration
 
+Both configs below listen on **8080**, matching the `mirror.lan:8080`
+endpoints used in the client examples. If you change one, change the
+other -- a mismatch leaves every machine polling a closed port, and the
+only symptom is that nothing ever converges. Running these in a
+container adds a second place to get it right: publish the port
+(`-p 8080:8080`) so the container's listener is reachable at the port
+the clients were told to use.
+
 ### nginx
 
 ```
@@ -142,7 +150,8 @@ http {
     sendfile      on;
 
     server {
-        listen 80;
+        # Must match the port in --plan-endpoint / --blob-base-url.
+        listen 8080;
         server_name _;
 
         root /srv/mirror;
@@ -218,7 +227,7 @@ http {
 	admin off
 }
 
-:80 {
+:8080 {
 	# --- security: deny dotfiles everywhere ---
 	# Must be first: blocks .push-lock and any dotfile
 	# before any other handler.
@@ -297,8 +306,12 @@ greentic-deployer op updates config-set <ENV_ID> \
   --enabled true
 ```
 
-`--push-enabled false` is **required** for a static mirror, and is easy to
-miss because it defaults to `true`. Push is opt-*out*: an enabled channel
+`--push-enabled false` is **strongly recommended** for a static mirror,
+and is easy to miss because it defaults to `true`. It is not required
+for correctness -- the poll loop is the fallback and converges on its
+own -- but without it the runtime generates continuous failed
+connection attempts that look exactly like a broken mirror. Push is
+opt-*out*: an enabled channel
 subscribes to a server-sent-event stream unless told not to. When
 `--stream-endpoint` is unset the runtime derives one by stripping the
 `/plan` suffix off the plan endpoint and appending `/updates/stream`, so
@@ -315,11 +328,16 @@ greentic-deployer op updates config-show <ENV_ID>
 ```
 
 The `resolved` block in the output shows the effective values after
-defaults are applied. For a Tier 2 mirror check two of them in
-particular: `resolved.push_enabled` must be `false`, and
-`resolved.stream_endpoint` must be absent. If the latter shows a
-`.../updates/stream` URL, push is still on and the runtime will keep
-trying to reach a stream the mirror does not serve.
+defaults are applied. For a Tier 2 mirror the one to check is
+`resolved.push_enabled`, which must be `false`.
+
+`resolved.stream_endpoint` will still show a derived
+`.../updates/stream` URL even when push is disabled -- the derivation
+only looks at the plan endpoint and does not consult `push_enabled`.
+That value is inert: the runtime gates streaming on `push_enabled`
+alone, so a populated `stream_endpoint` next to
+`resolved.push_enabled: false` is expected and is not a
+misconfiguration.
 
 ### Flag notes
 
@@ -342,8 +360,8 @@ trying to reach a stream the mirror does not serve.
   `on_update` reads the legacy `on_notify` mirror and stages instead of
   failing, so an old runtime silently degrades to `stage` rather than
   converging. Check the version floor below before relying on `apply`.
-- **`--push-enabled false`** -- required here; see above. Defaults to
-  `true`, which a static mirror cannot satisfy.
+- **`--push-enabled false`** -- strongly recommended here; see above.
+  Defaults to `true`, which a static mirror cannot satisfy.
 - **`--enabled true`** -- enables the poll loop.
 
 To clear a previously set blob mirror:
@@ -399,12 +417,30 @@ environments.
 
 ---
 
-## Version floor for binary convergence
+## Version floors
 
-Content-only plans (pack updates without binary self-update) converge
-on any poll-capable `greentic-start` version. No version floor applies.
+There are three distinct floors, and they are easy to conflate. Which
+one applies depends on how far you want the fleet to get without an
+operator at the keyboard.
 
-**Binary convergence** (plans that carry binary blobs fetched from the
+| Capability | Minimum `greentic-start` |
+|---|---|
+| Poll the mirror and **stage** a plan | any poll-capable version |
+| **Apply** content plans autonomously (`--on-notify apply`) | `v1.1.9` |
+| **Binary** convergence from the mirror | the C4 publish (below) |
+
+**Staging** works on any version that can poll. The plan is fetched,
+verified and staged; an operator then applies it per machine.
+
+**Autonomous content apply** requires `v1.1.9` or later, the first
+release that understands `on_update`. An older runtime reads the legacy
+`on_notify` mirror instead, which means it silently stages rather than
+failing -- so a fleet configured with `--on-notify apply` but running
+pre-`v1.1.9` binaries will sit waiting for a manual step with nothing in
+the logs to say why. Verify the runtime version before relying on
+`apply`.
+
+**Binary convergence** (plans carrying binary blobs fetched from the
 mirror) requires `greentic-start` at or above the C4 blob-mirror
 publish:
 
@@ -415,9 +451,9 @@ publish:
 | Dev Publish run ID | `30545101936` |
 
 Both versions are confirmed present on crates.io. A `greentic-start`
-older than this version will poll and stage content-only plans but
-**cannot fetch blobs from the mirror** -- it lacks the
-`fetch_blob_from_mirror` code path entirely.
+older than this will poll and stage content-only plans but **cannot
+fetch blobs from the mirror** -- it lacks the `fetch_blob_from_mirror`
+code path entirely.
 
 ---
 
@@ -480,9 +516,17 @@ set on `/plan/meta` and that no intermediary ignores it.
 The blob on the mirror does not match the SHA-256 in the signed plan.
 Possible causes:
 
-- Truncated write (import was interrupted before the blob write
-  completed). Re-run the same `op updates import --push-to` command;
-  it is idempotent for the same sequence and digest.
+- A corrupt blob already on the mirror. **Re-running the import does
+  not repair it.** The writer skips any blob path that already exists
+  as a regular file, on filename alone -- it never compares contents,
+  and its own comment records that a corrupted pre-existing file is
+  caught by readers rather than by the writer. Recovery: delete the
+  specific `blobs/sha256-<hex>` file named in the error, then re-run
+  the same `op updates import --push-to` command, which will write it
+  fresh. (Blobs are written via temp-file plus atomic rename, so an
+  interrupted import leaves the blob absent, not truncated -- a
+  mismatch points at corruption after the fact, e.g. filesystem damage
+  or an edit in place.)
 - A proxy applied transparent compression (`Content-Encoding: gzip`).
   The `greentic-start` client uses `reqwest` with only the `blocking`
   and `rustls` features -- no `gzip` or `deflate` feature -- so it
