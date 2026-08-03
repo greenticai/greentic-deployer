@@ -1354,6 +1354,13 @@ fn run_sorx(command: SorxCommand) -> Result<()> {
 fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
     use greentic_deployer::bundle_upload::{UploadOptions, from_url};
 
+    // Captured before `cmd.command` is moved into the async block below, so
+    // it is still available in the error arm to label the JSON envelope.
+    let op: &'static str = match &cmd.command {
+        BundleUploadSubcommand::Upload(_) => "upload",
+        BundleUploadSubcommand::RefreshUrl(_) => "refresh-url",
+    };
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1378,10 +1385,29 @@ fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
                 uploader.refresh_url(&args.object_ref, &opts).await
             }
         }
-    })?;
+    });
 
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    match result {
+        Ok(value) => {
+            println!("{}", serde_json::to_string(&value)?);
+            Ok(())
+        }
+        Err(err) => {
+            // Print the same JSON error envelope shape `op` uses, then exit
+            // directly so anyhow never gets a chance to re-render this error
+            // as plain `Error: …` text on stderr (which would double it up).
+            let envelope = serde_json::json!({
+                "op": op,
+                "noun": "bundle-upload",
+                "error": {
+                    "kind": err.message_key(),
+                    "message": err.to_string(),
+                }
+            });
+            eprintln!("{envelope}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_target_requirements(args: TargetRequirementsArgs) -> Result<()> {
