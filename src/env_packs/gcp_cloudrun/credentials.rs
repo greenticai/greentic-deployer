@@ -667,8 +667,13 @@ pub(crate) fn build_ambient_client() -> Result<Arc<dyn GcpValidatorClient>, GcpC
 
 /// The sentinel principal reported when ADC is not a legible service-account key
 /// (gcloud user creds / metadata server expose no principal to the SDK).
+///
+/// `pub(crate)` so callers that surface this email in an operator-facing error
+/// (`crate::bundle_upload::oci::OciBundleUploader::upload`) can detect the
+/// sentinel and substitute an actionable hint instead of naming a principal
+/// that is literally the string `(ADC principal)`.
 #[cfg(feature = "deploy-gcp-cloudrun")]
-const ADC_PRINCIPAL_UNKNOWN: &str = "(ADC principal)";
+pub(crate) const ADC_PRINCIPAL_UNKNOWN: &str = "(ADC principal)";
 
 #[cfg(feature = "deploy-gcp-cloudrun")]
 fn project_test_iam_url(project: &str) -> String {

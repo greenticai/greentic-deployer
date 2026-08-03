@@ -143,9 +143,15 @@ mod tests {
     #[test]
     fn accepts_an_oci_url_with_the_gcp_feature() {
         let result = from_url("oci://asia-southeast1-docker.pkg.dev/p/greentic/w:abc123");
+        #[cfg(feature = "deploy-gcp-cloudrun")]
         assert!(
             result.is_ok(),
             "oci:// must resolve to a backend: {result:?}"
         );
+        #[cfg(not(feature = "deploy-gcp-cloudrun"))]
+        assert!(matches!(
+            result.unwrap_err(),
+            BundleUploadError::FeatureNotEnabled { .. }
+        ));
     }
 }

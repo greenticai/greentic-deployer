@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use greentic_distributor_client::oci_distribution;
+use greentic_distributor_client::oci_distribution::errors::{OciDistributionError, OciErrorCode};
 use greentic_distributor_client::oci_packs::DefaultRegistryClient;
 use greentic_distributor_client::oci_push::{OciPushError, RegistryPusher, push_pack_with_client};
 
@@ -99,12 +99,16 @@ pub async fn push_bundle_with<P: RegistryPusher>(
     let pushed = push_pack_with_client(pusher, &target.reference, &bytes)
         .await
         .map_err(|e| classify_push_error(e, target, principal))?;
+    // Scheme-ful, matching every other backend's `object_ref` (e.g. S3's
+    // `s3://bucket/key`): `refresh-url` round-trips an `object_ref` through
+    // `dispatcher::from_url`, which requires the scheme to dispatch at all.
+    let object_ref = format!("oci://{}", pushed.reference);
     Ok(UploadedBundle {
-        url: format!("oci://{}", pushed.reference),
+        url: object_ref.clone(),
         digest: pushed.digest,
         // An OCI reference is not presigned; there is nothing to expire.
         expires_at: None,
-        object_ref: pushed.reference,
+        object_ref,
     })
 }
 
@@ -113,44 +117,78 @@ pub async fn push_bundle_with<P: RegistryPusher>(
 /// reclassifying an unrecognised failure into a friendlier one would hide it,
 /// which is the defect this epic keeps closing.
 ///
-/// A missing Artifact Registry repository answers with the OCI distribution
-/// spec's `NAME_UNKNOWN` code (conventionally HTTP 404). We deliberately never
-/// create the repository ourselves: that needs
+/// The PRIMARY path is `OciDistributionError::ServerError { code, .. }`:
+/// `oci-distribution` 0.11's push path (`Client::push`, via
+/// `extract_location_header`) returns `ServerError` for every unexpected HTTP
+/// status on the blob-session and manifest-PUT requests, 4xx included —
+/// `validate_registry_response`, the only place that builds `RegistryError`
+/// from an OCI-spec JSON envelope, is called solely from the pull/auth paths
+/// and is never reached by a push. So a real push failure carries a numeric
+/// `code`, not an envelope: 404 means the Artifact Registry repository does
+/// not exist, 403 means the authenticated principal was denied write.
+///
+/// The `RegistryError` envelope arm is kept as a SECONDARY path — some OCI
+/// clients and registries do still answer with the spec's `NAME_UNKNOWN` /
+/// `DENIED` codes — but it is not what this crate's push path actually
+/// produces today.
+///
+/// Both arms are additionally gated on `target` actually being a Google
+/// Artifact Registry reference (`OciTarget::gar_project_repository_location`
+/// returning `Some`): `OciTarget::parse` accepts any host, so a 403 against a
+/// non-GAR registry must not tell the operator to grant an Artifact Registry
+/// role that has nothing to do with the failure — that is exactly the
+/// reclassification of an unrecognised failure this function otherwise
+/// refuses to do.
+///
+/// We deliberately never create the repository ourselves: that needs
 /// `artifactregistry.repositories.create`, a far broader grant, and would
-/// make resources inside someone's project unasked. A denied write answers
-/// with `DENIED` (conventionally HTTP 403).
+/// make resources inside someone's project unasked.
 fn classify_push_error(
     err: OciPushError,
     target: &OciTarget,
     principal: &str,
 ) -> BundleUploadError {
-    if let OciPushError::Registry(oci_distribution::errors::OciDistributionError::RegistryError {
-        envelope,
-        ..
-    }) = &err
-    {
-        let codes = envelope.errors.iter().map(|e| &e.code);
-        for code in codes {
-            match code {
-                oci_distribution::errors::OciErrorCode::NameUnknown => {
-                    if let Some((project, repository, location)) =
-                        target.gar_project_repository_location()
-                    {
-                        return BundleUploadError::OciRepositoryMissing {
-                            repository,
-                            project,
-                            location,
-                        };
-                    }
-                }
-                oci_distribution::errors::OciErrorCode::Denied => {
-                    return BundleUploadError::OciPushDenied {
-                        principal: principal.to_string(),
-                    };
-                }
-                _ => {}
+    let gar = target.gar_project_repository_location();
+
+    match &err {
+        OciPushError::Registry(OciDistributionError::ServerError { code: 404, .. }) => {
+            if let Some((project, repository, location)) = gar {
+                return BundleUploadError::OciRepositoryMissing {
+                    repository,
+                    project,
+                    location,
+                };
             }
         }
+        OciPushError::Registry(OciDistributionError::ServerError { code: 403, .. })
+            if gar.is_some() =>
+        {
+            return BundleUploadError::OciPushDenied {
+                principal: principal.to_string(),
+            };
+        }
+        OciPushError::Registry(OciDistributionError::RegistryError { envelope, .. }) => {
+            for code in envelope.errors.iter().map(|e| &e.code) {
+                match code {
+                    OciErrorCode::NameUnknown => {
+                        if let Some((project, repository, location)) = gar.clone() {
+                            return BundleUploadError::OciRepositoryMissing {
+                                repository,
+                                project,
+                                location,
+                            };
+                        }
+                    }
+                    OciErrorCode::Denied if gar.is_some() => {
+                        return BundleUploadError::OciPushDenied {
+                            principal: principal.to_string(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
     BundleUploadError::Other(format!("push failed: {err}"))
 }
@@ -187,6 +225,16 @@ impl BundleUploader for OciBundleUploader {
         let identity = client.get_caller_identity().await.map_err(|e| {
             BundleUploadError::Other(format!("resolving the GCP caller identity: {e}"))
         })?;
+        // ADC often cannot expose a legible principal (gcloud user creds, the
+        // metadata server, or WIF all resolve to the sentinel), and naming a
+        // denied push after a literal "(ADC principal)" gives the operator
+        // nothing to act on. Substitute a pointer to how to find out instead.
+        let principal = if identity.email == credentials::ADC_PRINCIPAL_UNKNOWN {
+            "the current ADC identity (run `gcloud auth list` to see which account is active)"
+                .to_string()
+        } else {
+            identity.email
+        };
         // Minted per upload, never cached: Artifact Registry OAuth2 tokens are
         // short-lived, and `DefaultRegistryClient` freezes whatever credential
         // it is built with for its own lifetime, so a fresh client is built
@@ -196,7 +244,7 @@ impl BundleUploader for OciBundleUploader {
             .await
             .map_err(|e| BundleUploadError::Other(format!("minting a GAR access token: {e}")))?;
         let pusher = DefaultRegistryClient::with_basic_auth("oauth2accesstoken", token);
-        push_bundle_with(&pusher, &self.target, bundle_path, &identity.email).await
+        push_bundle_with(&pusher, &self.target, bundle_path, &principal).await
     }
 
     async fn refresh_url(
@@ -224,6 +272,7 @@ impl BundleUploader for OciBundleUploader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greentic_distributor_client::oci_distribution;
 
     #[test]
     fn a_gar_reference_is_parsed_into_its_parts() {
@@ -333,6 +382,14 @@ mod tests {
             outcome.url,
             "oci://r.example.test/p/greentic/worker-a:abc123"
         );
+        // Scheme-ful, matching `url`: `refresh-url` round-trips `object_ref`
+        // through `dispatcher::from_url`, which requires the `oci://` scheme
+        // to dispatch at all — a bare `host/path:tag` would fail closed there
+        // before `refresh_url` ever ran.
+        assert_eq!(
+            outcome.object_ref,
+            "oci://r.example.test/p/greentic/worker-a:abc123"
+        );
         // Pinned exact value, not just the `sha256:` prefix, so a regression
         // that hashed the wrong buffer (e.g. an empty or truncated read)
         // would be caught. Computed with:
@@ -345,5 +402,137 @@ mod tests {
             outcome.expires_at.is_none(),
             "an OCI reference is not presigned and cannot expire"
         );
+    }
+
+    fn gar_target() -> OciTarget {
+        OciTarget::parse("oci://asia-southeast1-docker.pkg.dev/my-proj/greentic/worker-a:abc123")
+            .unwrap()
+    }
+
+    fn non_gar_target() -> OciTarget {
+        OciTarget::parse("oci://r.example.test/p/greentic/worker-a:abc123").unwrap()
+    }
+
+    const PRINCIPAL: &str = "deployer@my-proj.iam.gserviceaccount.com";
+
+    fn server_error(code: u16) -> OciPushError {
+        OciPushError::Registry(OciDistributionError::ServerError {
+            code,
+            url: "https://asia-southeast1-docker.pkg.dev/v2/my-proj/greentic/worker-a/manifests/abc123".to_string(),
+            message: "test server error".to_string(),
+        })
+    }
+
+    fn registry_error(code: OciErrorCode) -> OciPushError {
+        OciPushError::Registry(OciDistributionError::RegistryError {
+            envelope: oci_distribution::errors::OciEnvelope {
+                errors: vec![oci_distribution::errors::OciError {
+                    code,
+                    message: "test registry error".to_string(),
+                    detail: serde_json::Value::Null,
+                }],
+            },
+            url: "https://asia-southeast1-docker.pkg.dev/v2/my-proj/greentic/worker-a/manifests/abc123".to_string(),
+        })
+    }
+
+    #[test]
+    fn gar_project_repository_location_decomposes_a_gar_reference() {
+        assert_eq!(
+            gar_target().gar_project_repository_location(),
+            Some((
+                "my-proj".to_string(),
+                "greentic".to_string(),
+                "asia-southeast1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn gar_project_repository_location_is_none_for_a_non_gar_host() {
+        assert_eq!(non_gar_target().gar_project_repository_location(), None);
+    }
+
+    /// FINDING 1: `oci-distribution` 0.11's push path never produces
+    /// `RegistryError` — it answers every unexpected status, 4xx included,
+    /// via `ServerError { code, .. }`. This is the mechanism a real push
+    /// failure actually uses.
+    #[test]
+    fn a_404_server_error_on_a_gar_host_names_the_gcloud_command() {
+        let err = classify_push_error(server_error(404), &gar_target(), PRINCIPAL);
+        match err {
+            BundleUploadError::OciRepositoryMissing {
+                repository,
+                project,
+                location,
+            } => {
+                assert_eq!(repository, "greentic");
+                assert_eq!(project, "my-proj");
+                assert_eq!(location, "asia-southeast1");
+            }
+            other => panic!("expected OciRepositoryMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_403_server_error_on_a_gar_host_names_the_principal() {
+        let err = classify_push_error(server_error(403), &gar_target(), PRINCIPAL);
+        match err {
+            BundleUploadError::OciPushDenied { principal } => {
+                assert_eq!(principal, PRINCIPAL);
+            }
+            other => panic!("expected OciPushDenied, got {other:?}"),
+        }
+    }
+
+    /// FINDING 3: `OciTarget::parse` accepts any host (Task 2's own tests use
+    /// `r.example.test` and `localhost:5000`), so a 403 against a registry
+    /// that is not Artifact Registry must not claim it is one.
+    #[test]
+    fn a_403_server_error_on_a_non_gar_host_stays_generic() {
+        let err = classify_push_error(server_error(403), &non_gar_target(), PRINCIPAL);
+        assert!(
+            matches!(err, BundleUploadError::Other(_)),
+            "a non-GAR denial must not name the Artifact Registry Writer role: {err:?}"
+        );
+    }
+
+    /// The mirror of the above for the repository-missing path.
+    #[test]
+    fn a_404_server_error_on_a_non_gar_host_stays_generic() {
+        let err = classify_push_error(server_error(404), &non_gar_target(), PRINCIPAL);
+        assert!(matches!(err, BundleUploadError::Other(_)), "{err:?}");
+    }
+
+    #[test]
+    fn an_unrecognised_server_error_stays_generic() {
+        let err = classify_push_error(server_error(500), &gar_target(), PRINCIPAL);
+        assert!(matches!(err, BundleUploadError::Other(_)), "{err:?}");
+    }
+
+    /// Secondary path: some clients/registries answer with the OCI-spec
+    /// envelope instead of a bare status. Kept working even though it is not
+    /// what this crate's push path produces today.
+    #[test]
+    fn a_name_unknown_envelope_code_on_a_gar_host_also_maps_to_repository_missing() {
+        let err = classify_push_error(
+            registry_error(OciErrorCode::NameUnknown),
+            &gar_target(),
+            PRINCIPAL,
+        );
+        assert!(
+            matches!(err, BundleUploadError::OciRepositoryMissing { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_denied_envelope_code_on_a_non_gar_host_stays_generic() {
+        let err = classify_push_error(
+            registry_error(OciErrorCode::Denied),
+            &non_gar_target(),
+            PRINCIPAL,
+        );
+        assert!(matches!(err, BundleUploadError::Other(_)), "{err:?}");
     }
 }
