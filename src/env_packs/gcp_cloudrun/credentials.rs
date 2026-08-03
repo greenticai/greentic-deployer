@@ -650,6 +650,19 @@ pub(crate) fn build_validator_client(
     Ok(Arc::new(RealGcpClient::from_bound(material)?))
 }
 
+/// Build the validator client for the ambient ADC principal — whatever
+/// credential chain is already active in the process environment
+/// (`GOOGLE_APPLICATION_CREDENTIALS`, gcloud user creds, or the metadata
+/// server) — rather than a specific binding's stored material.
+///
+/// Used by the `oci://` bundle-upload path (`crate::bundle_upload::oci`),
+/// which pushes to Google Artifact Registry on behalf of whoever is running
+/// `bundle-upload upload`, not a bound deployer identity.
+#[cfg(feature = "deploy-gcp-cloudrun")]
+pub(crate) fn build_ambient_client() -> Result<Arc<dyn GcpValidatorClient>, GcpClientError> {
+    Ok(Arc::new(RealGcpClient::resolve()?))
+}
+
 // ---- Pure REST helpers (unit-tested; no HTTP) ----
 
 /// The sentinel principal reported when ADC is not a legible service-account key

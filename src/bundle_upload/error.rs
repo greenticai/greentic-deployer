@@ -44,7 +44,7 @@ pub static AWS_CREDENTIALS_REFRESH_HELP: AwsCredentialsRefreshHelp = AwsCredenti
 #[derive(Debug, Error)]
 pub enum BundleUploadError {
     #[error(
-        "unsupported upload scheme '{0}'; expected one of: s3://, gs://, https://*.blob.core.windows.net/"
+        "unsupported upload scheme '{0}'; expected one of: s3://, gs://, oci://, https://*.blob.core.windows.net/"
     )]
     InvalidUrl(String),
 
@@ -89,6 +89,26 @@ pub enum BundleUploadError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The Artifact Registry repository does not exist. We deliberately do not
+    /// create it: that would need `artifactregistry.repositories.create`, a far
+    /// broader grant, and would make resources inside someone's project unasked.
+    #[error(
+        "Artifact Registry repository `{repository}` does not exist in project `{project}` \
+         ({location}). Create it once with:\n  gcloud artifacts repositories create {repository} \
+         --repository-format=docker --location={location} --project={project}"
+    )]
+    OciRepositoryMissing {
+        repository: String,
+        project: String,
+        location: String,
+    },
+    /// The service account authenticated but is not allowed to write.
+    #[error(
+        "`{principal}` is not allowed to push to this Artifact Registry repository. \
+         Grant it the Artifact Registry Writer role (roles/artifactregistry.writer)."
+    )]
+    OciPushDenied { principal: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -111,6 +131,8 @@ impl BundleUploadError {
             }
             Self::DigestMismatch { .. } => "bundle_upload.digest_mismatch",
             Self::Io(_) => "bundle_upload.io",
+            Self::OciRepositoryMissing { .. } => "bundle_upload.oci.repository_missing",
+            Self::OciPushDenied { .. } => "bundle_upload.oci.push_denied",
             Self::Other(_) => "bundle_upload.other",
         }
     }
@@ -184,6 +206,20 @@ mod tests {
             ),
             (BundleUploadError::Io(io_error), "bundle_upload.io"),
             (
+                BundleUploadError::OciRepositoryMissing {
+                    repository: "greentic".into(),
+                    project: "my-proj".into(),
+                    location: "asia-southeast1".into(),
+                },
+                "bundle_upload.oci.repository_missing",
+            ),
+            (
+                BundleUploadError::OciPushDenied {
+                    principal: "deployer@my-proj.iam.gserviceaccount.com".into(),
+                },
+                "bundle_upload.oci.push_denied",
+            ),
+            (
                 BundleUploadError::Other("misc".into()),
                 "bundle_upload.other",
             ),
@@ -193,6 +229,35 @@ mod tests {
             assert_eq!(err.message_key(), key);
             assert!(!err.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn a_missing_repository_names_the_gcloud_command_that_fixes_it() {
+        let err = BundleUploadError::OciRepositoryMissing {
+            repository: "greentic".to_string(),
+            project: "my-proj".to_string(),
+            location: "asia-southeast1".to_string(),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("gcloud artifacts repositories create"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("greentic"), "{rendered}");
+        assert!(rendered.contains("my-proj"), "{rendered}");
+    }
+
+    #[test]
+    fn a_denied_push_names_the_role_and_the_principal() {
+        let err = BundleUploadError::OciPushDenied {
+            principal: "deployer@my-proj.iam.gserviceaccount.com".to_string(),
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("Artifact Registry Writer"), "{rendered}");
+        assert!(
+            rendered.contains("deployer@my-proj.iam.gserviceaccount.com"),
+            "{rendered}"
+        );
     }
 
     #[test]
