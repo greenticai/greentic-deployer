@@ -1264,7 +1264,16 @@ fn main() -> Result<()> {
         TopLevelCommand::Aws(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Aws(command),
         ),
-        TopLevelCommand::BundleUpload(cmd) => run_bundle_upload(cmd),
+        TopLevelCommand::BundleUpload(cmd) => {
+            // run_bundle_upload already wrote the JSON error envelope to
+            // stderr; swallow the error here so anyhow doesn't re-render it
+            // as plain `Error: …` text and double up (same pattern as the
+            // `Op` arm below).
+            match run_bundle_upload(cmd) {
+                Ok(()) => Ok(()),
+                Err(_) => std::process::exit(1),
+            }
+        }
         TopLevelCommand::Azure(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Azure(command),
         ),
@@ -1354,6 +1363,13 @@ fn run_sorx(command: SorxCommand) -> Result<()> {
 fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
     use greentic_deployer::bundle_upload::{UploadOptions, from_url};
 
+    // Captured before `cmd.command` is moved into the async block below, so
+    // it is still available in the error arm to label the JSON envelope.
+    let op: &'static str = match &cmd.command {
+        BundleUploadSubcommand::Upload(_) => "upload",
+        BundleUploadSubcommand::RefreshUrl(_) => "refresh-url",
+    };
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1378,10 +1394,31 @@ fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
                 uploader.refresh_url(&args.object_ref, &opts).await
             }
         }
-    })?;
+    });
 
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    match result {
+        Ok(value) => {
+            println!("{}", serde_json::to_string(&value)?);
+            Ok(())
+        }
+        Err(err) => {
+            // Print the same JSON error envelope shape `op` uses, then return
+            // the error like an honest `Result`-returning function. The call
+            // site in `main()` swallows it so anyhow doesn't re-render it as
+            // plain `Error: …` text on stderr (which would double it up) —
+            // the same split `dispatch_op` / the `Op` arm use.
+            let envelope = serde_json::json!({
+                "op": op,
+                "noun": "bundle-upload",
+                "error": {
+                    "kind": err.message_key(),
+                    "message": err.to_string(),
+                }
+            });
+            eprintln!("{envelope}");
+            Err(err.into())
+        }
+    }
 }
 
 fn run_target_requirements(args: TargetRequirementsArgs) -> Result<()> {
