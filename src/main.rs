@@ -199,7 +199,7 @@ enum BundleUploadSubcommand {
 
 #[derive(Parser)]
 struct BundleUploadArgs {
-    /// Cloud storage target URL: s3://bucket/prefix/, gs://..., https://*.blob.core.windows.net/...
+    /// Cloud storage target URL: s3://bucket/prefix/, gs://..., oci://host/project/repo/image:tag, https://*.blob.core.windows.net/...
     #[arg(long)]
     target: String,
     /// Path to local .gtbundle file.
