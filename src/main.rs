@@ -1264,7 +1264,16 @@ fn main() -> Result<()> {
         TopLevelCommand::Aws(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Aws(command),
         ),
-        TopLevelCommand::BundleUpload(cmd) => run_bundle_upload(cmd),
+        TopLevelCommand::BundleUpload(cmd) => {
+            // run_bundle_upload already wrote the JSON error envelope to
+            // stderr; swallow the error here so anyhow doesn't re-render it
+            // as plain `Error: …` text and double up (same pattern as the
+            // `Op` arm below).
+            match run_bundle_upload(cmd) {
+                Ok(()) => Ok(()),
+                Err(_) => std::process::exit(1),
+            }
+        }
         TopLevelCommand::Azure(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Azure(command),
         ),
@@ -1393,9 +1402,11 @@ fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
             Ok(())
         }
         Err(err) => {
-            // Print the same JSON error envelope shape `op` uses, then exit
-            // directly so anyhow never gets a chance to re-render this error
-            // as plain `Error: …` text on stderr (which would double it up).
+            // Print the same JSON error envelope shape `op` uses, then return
+            // the error like an honest `Result`-returning function. The call
+            // site in `main()` swallows it so anyhow doesn't re-render it as
+            // plain `Error: …` text on stderr (which would double it up) —
+            // the same split `dispatch_op` / the `Op` arm use.
             let envelope = serde_json::json!({
                 "op": op,
                 "noun": "bundle-upload",
@@ -1405,7 +1416,7 @@ fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
                 }
             });
             eprintln!("{envelope}");
-            std::process::exit(1);
+            Err(err.into())
         }
     }
 }
