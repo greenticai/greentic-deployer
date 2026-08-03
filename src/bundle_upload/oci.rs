@@ -22,26 +22,38 @@ pub struct OciTarget {
 
 impl OciTarget {
     pub fn parse(url: &str) -> BundleUploadResult<Self> {
-        let rest = url.strip_prefix("oci://").ok_or_else(|| {
-            BundleUploadError::InvalidUrl(format!("expected an oci:// target, got `{url}`"))
-        })?;
+        let rest = url
+            .strip_prefix("oci://")
+            .ok_or_else(|| BundleUploadError::InvalidUrl(url.to_string()))?;
         let registry = rest
             .split('/')
             .next()
             .filter(|host| !host.is_empty())
             .ok_or_else(|| {
                 BundleUploadError::InvalidUrl(format!(
-                    "oci:// target has no registry host: `{url}`"
+                    "{url} (missing a registry host after oci://)"
                 ))
             })?
             .to_string();
+        // A digest reference (`@sha256:...`) must be rejected, not accepted as
+        // a "tagged" reference: a registry resolves `@sha256:...` against the
+        // *manifest* digest, not the content digest `push_bundle_with` returns
+        // in `UploadedBundle::digest` — pinning by digest here would silently
+        // pin the wrong value. See the doc on `push_bundle_with` below.
+        if rest.contains('@') {
+            return Err(BundleUploadError::InvalidUrl(format!(
+                "{url} (a tag is required, not a digest — an oci:// digest pin (`@sha256:...`) \
+                 would resolve against the registry manifest digest, not the bundle's content \
+                 digest, e.g. `…/worker:abc123`)"
+            )));
+        }
         // A tag is required: the epic derives it from the bundle's content
         // digest, and defaulting to `latest` would let two deploys disagree
         // about what one reference means.
         let path_after_host = &rest[registry.len()..];
         if !path_after_host.contains(':') {
             return Err(BundleUploadError::InvalidUrl(format!(
-                "oci:// target needs an explicit tag, e.g. `…/worker:abc123`: `{url}`"
+                "{url} (missing an explicit tag, e.g. `…/worker:abc123`)"
             )));
         }
         Ok(Self {
@@ -94,7 +106,10 @@ pub async fn push_bundle_with<P: RegistryPusher>(
     principal: &str,
 ) -> BundleUploadResult<UploadedBundle> {
     let bytes = std::fs::read(bundle).map_err(|e| {
-        BundleUploadError::InvalidUrl(format!("cannot read bundle {}: {e}", bundle.display()))
+        BundleUploadError::Io(std::io::Error::new(
+            e.kind(),
+            format!("cannot read bundle {}: {e}", bundle.display()),
+        ))
     })?;
     let pushed = push_pack_with_client(pusher, &target.reference, &bytes)
         .await
@@ -214,37 +229,47 @@ impl BundleUploader for OciBundleUploader {
         bundle_path: &Path,
         // Nothing about an OCI push is presigned — a GAR reference has no
         // expiry to control — so `presign_expires_secs` does not apply here.
-        // Bound to `_opts` rather than dropped from the signature so a reader
-        // does not wonder whether expiry handling was forgotten.
+        // The trait requires this parameter; it is unused (`_opts`), not
+        // dropped, so a reader does not wonder whether expiry handling was
+        // forgotten.
         _opts: &UploadOptions,
     ) -> BundleUploadResult<UploadedBundle> {
         let client = credentials::build_ambient_client()
             .map_err(|e| BundleUploadError::Other(format!("resolving GCP credentials: {e}")))?;
-        // Only needed to name who was denied if the push fails with 403 — the
-        // push itself authenticates with the access token below, not this.
-        let identity = client.get_caller_identity().await.map_err(|e| {
-            BundleUploadError::Other(format!("resolving the GCP caller identity: {e}"))
-        })?;
-        // ADC often cannot expose a legible principal (gcloud user creds, the
-        // metadata server, or WIF all resolve to the sentinel), and naming a
-        // denied push after a literal "(ADC principal)" gives the operator
-        // nothing to act on. Substitute a pointer to how to find out instead.
-        let principal = if identity.email == credentials::ADC_PRINCIPAL_UNKNOWN {
-            "the current ADC identity (run `gcloud auth list` to see which account is active)"
-                .to_string()
-        } else {
-            identity.email
-        };
         // Minted per upload, never cached: Artifact Registry OAuth2 tokens are
         // short-lived, and `DefaultRegistryClient` freezes whatever credential
         // it is built with for its own lifetime, so a fresh client is built
-        // per push rather than reused across pushes.
+        // per push rather than reused across pushes. This is the only ADC
+        // round-trip on the success path: the caller identity is resolved
+        // below only if the push actually comes back denied, since it is
+        // used only to name who was denied and would otherwise be a second,
+        // wasted round-trip (`get_caller_identity` re-proves the credential
+        // via its own `auth_headers` call) on every push.
         let token = client
             .access_token()
             .await
             .map_err(|e| BundleUploadError::Other(format!("minting a GAR access token: {e}")))?;
         let pusher = DefaultRegistryClient::with_basic_auth("oauth2accesstoken", token);
-        push_bundle_with(&pusher, &self.target, bundle_path, &principal).await
+        match push_bundle_with(&pusher, &self.target, bundle_path, "").await {
+            Err(BundleUploadError::OciPushDenied { .. }) => {
+                let identity = client.get_caller_identity().await.map_err(|e| {
+                    BundleUploadError::Other(format!("resolving the GCP caller identity: {e}"))
+                })?;
+                // ADC often cannot expose a legible principal (gcloud user
+                // creds, the metadata server, or WIF all resolve to the
+                // sentinel), and naming a denied push after a literal "(ADC
+                // principal)" gives the operator nothing to act on.
+                // Substitute a pointer to how to find out instead.
+                let principal = if identity.email == credentials::ADC_PRINCIPAL_UNKNOWN {
+                    "the current ADC identity (run `gcloud auth list` to see which account is active)"
+                        .to_string()
+                } else {
+                    identity.email
+                };
+                Err(BundleUploadError::OciPushDenied { principal })
+            }
+            other => other,
+        }
     }
 
     async fn refresh_url(
@@ -254,13 +279,13 @@ impl BundleUploader for OciBundleUploader {
         // nothing for `presign_expires_secs` to control here either.
         _opts: &UploadOptions,
     ) -> BundleUploadResult<UploadedBundle> {
-        // An OCI reference cannot expire, so returning the same reference
-        // unchanged is the correct answer here, not a stub — there is nothing
-        // to re-issue. The digest IS recoverable, but only via a network
-        // round-trip (re-pulling the manifest to recompute the content
-        // digest), which this call does not perform; fabricating a digest
-        // instead would let a wrong value fail closed at deploy time in
-        // another repo rather than failing honestly here.
+        // `bundle-upload refresh-url oci://…` always fails — deliberately,
+        // not as a missing stub. An OCI reference cannot expire, so there is
+        // no fresh reference to re-issue. The digest IS recoverable, but only
+        // via a network round-trip (re-pulling the manifest to recompute the
+        // content digest), which this call does not perform; fabricating a
+        // digest instead would let a wrong value fail closed at deploy time
+        // in another repo rather than failing honestly here.
         Err(BundleUploadError::Other(format!(
             "refreshing oci:// reference `{object_ref}` would require a network round-trip to \
              recover its content digest, which is not implemented; the reference itself does not \
@@ -329,6 +354,23 @@ mod tests {
         let target = OciTarget::parse("oci://localhost:5000/x/y:tag").expect("valid reference");
         assert_eq!(target.registry, "localhost:5000");
         assert_eq!(target.reference, "localhost:5000/x/y:tag");
+    }
+
+    #[test]
+    fn a_digest_reference_is_rejected_even_though_it_contains_a_colon() {
+        // `img@sha256:abc...` satisfies a bare `path_after_host.contains(':')`
+        // check, so without an explicit `@` rejection it would pass as
+        // "tagged". A registry resolves `@sha256:...` against the *manifest*
+        // digest, not the content digest `push_bundle_with` returns — pinning
+        // by digest here would silently pin the wrong value.
+        let err = OciTarget::parse(
+            "oci://asia-southeast1-docker.pkg.dev/my-proj/greentic/worker-a@sha256:\
+             6ce6c48d3210a2ab08af08fcc0e09d571dddf0132235724e93a37c008631847",
+        )
+        .unwrap_err();
+        let rendered = format!("{err}");
+        assert!(rendered.contains("tag"), "{rendered}");
+        assert!(rendered.contains("digest"), "{rendered}");
     }
 
     use std::sync::Mutex;

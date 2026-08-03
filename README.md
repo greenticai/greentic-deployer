@@ -578,10 +578,41 @@ greentic-deployer bundle-upload refresh-url \
   --object-ref s3://my-bundle-bucket/path/abc123.gtbundle
 ```
 
+`oci://` targets push the bundle to an OCI registry (Google Artifact Registry)
+instead of object storage, authenticating with Application Default
+Credentials. A tag is required — an untagged reference or a digest reference
+(`@sha256:...`) is rejected, since a registry resolves `@sha256:...` against
+the manifest digest, not the bundle's content digest returned below:
+
+```bash
+greentic-deployer bundle-upload upload \
+  --target oci://asia-southeast1-docker.pkg.dev/my-project/greentic/worker-a:abc123 \
+  --bundle ./dist/bundle-warmed-0.5.18.gtbundle
+```
+
+JSON output:
+
+```json
+{
+  "url": "oci://asia-southeast1-docker.pkg.dev/my-project/greentic/worker-a:abc123",
+  "digest": "sha256:abc...",
+  "expires_at": null,
+  "object_ref": "oci://asia-southeast1-docker.pkg.dev/my-project/greentic/worker-a:abc123"
+}
+```
+
+`expires_at` is always `null` for `oci://` — an OCI reference is not
+presigned and does not expire. `bundle-upload refresh-url` on an `oci://`
+reference always fails: there is no fresh reference to re-issue, and
+recomputing the digest would require an extra registry round-trip this
+command does not perform.
+
 Cargo features:
 
 - `bundle-upload-aws` — default-on. S3 implementation.
 - `bundle-upload-gcp` — off. GCS stub.
 - `bundle-upload-azure` — off. Azure Blob stub.
+- `deploy-gcp-cloudrun` — default-on. `oci://` implementation (pushes to
+  Google Artifact Registry).
 
 Design + plan: `docs/superpowers/specs/2026-05-07-gtc-bundle-upload-flag-design.md`
