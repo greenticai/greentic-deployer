@@ -196,25 +196,7 @@ version = ">=1.2.0-dev, <1.3.0-0"
 
 [dependencies.greentic-distributor-client]
 version = ">=1.2.0-dev, <1.3.0-0"
-# MERGE BLOCKER: `pack-push` does not exist on any published version of
-# greentic-distributor-client yet — it only exists on an unmerged branch. A
-# plain checkout of this repo (no override) cannot resolve dependencies at
-# all, including `cargo build --no-default-features`, until that crate
-# publishes a release carrying `pack-push`. There is no Cargo.toml-only
-# workaround: moving this into `deploy-gcp-cloudrun`'s feature list as
-# `greentic-distributor-client/pack-push` fails identically, because Cargo
-# validates `crate/feature` references structurally at lock-resolution time
-# regardless of whether the enclosing feature is active.
-# Local override to build/test in the meantime:
-#   cargo --config 'patch.crates-io.greentic-distributor-client.path="<path-to-oci-push-branch-checkout>"' <cmd>
-# Do NOT merge this branch until greentic-distributor-client publishes `pack-push`
-# AND, in the same PR, someone runs `cargo update -p greentic-distributor-client`
-# and commits the resulting Cargo.lock — publishing alone does not unblock this:
-# Cargo.lock currently pins greentic-distributor-client 1.2.0-dev.30555630870,
-# which predates `pack-push`, and this branch deliberately leaves the lockfile
-# untouched. This is this repo's own stated rule (see CLAUDE.md: "cargo update
-# once per repo per session, on the first Rust-touching PR only, and the
-# lockfile lands in the same PR").
+# `pack-push` is what the oci:// bundle-upload backend needs.
 features = ["pack-push"]
 
 [dependencies.greentic-secrets-lib]
