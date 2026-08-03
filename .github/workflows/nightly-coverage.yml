@@ -51,21 +51,32 @@ jobs:
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install coverage toolchain
+        # Without GITHUB_TOKEN, binstall hits api.github.com anonymously and is
+        # rate-limited per runner IP. A 403 does not fail binstall: it silently
+        # falls back to building from source with `cargo install` (no --locked),
+        # which cargo-nextest rejects via a deliberate compile_error!. That burns
+        # ~11 minutes and exits 70 looking like a Rust break. The token avoids the
+        # 403; --disable-strategies compile makes any remaining fallback fail fast.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # rust-cache restores ~/.cargo/.crates.toml but not ~/.cargo/bin,
           # so binstall may say "already installed" while the binary is gone.
           if ! command -v cargo-llvm-cov >/dev/null; then
-            cargo binstall -y --force cargo-llvm-cov
+            cargo binstall -y --force --disable-strategies compile cargo-llvm-cov
           fi
           if ! command -v cargo-nextest >/dev/null; then
-            cargo binstall -y --force cargo-nextest
+            cargo binstall -y --force --disable-strategies compile cargo-nextest
           fi
           command -v cargo-llvm-cov
           command -v cargo-nextest
 
       - name: Install greentic-dev
+        # Same anonymous-rate-limit trap as the coverage toolchain step above.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cargo binstall -y --force greentic-dev
+          cargo binstall -y --force --disable-strategies compile greentic-dev
           command -v greentic-dev
           greentic-dev --version
 
