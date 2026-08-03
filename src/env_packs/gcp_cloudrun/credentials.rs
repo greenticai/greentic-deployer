@@ -161,6 +161,13 @@ pub trait GcpValidatorClient: std::fmt::Debug + Send + Sync {
         sa_resource: &'a str,
         permissions: &'a [&'a str],
     ) -> Result<Vec<String>, GcpClientError>;
+
+    /// Mint an OAuth2 access token for the resolved credentials.
+    ///
+    /// Artifact Registry authenticates over the OCI protocol with HTTP Basic,
+    /// username `oauth2accesstoken` and this token as the password. The token is
+    /// short-lived, so callers must mint one per push rather than caching it.
+    async fn access_token(&self) -> Result<String, GcpClientError>;
 }
 
 /// GCP Cloud Run deployer credentials handler.
@@ -621,6 +628,26 @@ impl GcpValidatorClient for RealGcpClient {
         self.post_test_iam(&sa_test_iam_url(sa_resource), permissions)
             .await
     }
+
+    async fn access_token(&self) -> Result<String, GcpClientError> {
+        let headers = self.auth_headers().await?;
+        let raw = headers
+            .get(http::header::AUTHORIZATION)
+            .ok_or_else(|| {
+                GcpClientError::Transport("ADC headers carried no authorization".to_string())
+            })?
+            .to_str()
+            .map_err(|e| {
+                GcpClientError::Transport(format!("authorization header not UTF-8: {e}"))
+            })?;
+        raw.strip_prefix("Bearer ")
+            .map(str::to_string)
+            .ok_or_else(|| {
+                GcpClientError::Transport(
+                    "ADC authorization header was not a Bearer token".to_string(),
+                )
+            })
+    }
 }
 
 /// Build the validator client the connected `op credentials requirements` path
@@ -797,6 +824,10 @@ mod tests {
                 .unwrap()
                 .take()
                 .expect("sa permissions scripted once")
+        }
+
+        async fn access_token(&self) -> Result<String, GcpClientError> {
+            Ok("mock-access-token".to_string())
         }
     }
 
@@ -1072,6 +1103,16 @@ mod tests {
         for perm in VALIDATED_GCP_PERMISSIONS {
             assert!(tf.content.contains(&format!("\"{perm}\"")));
         }
+    }
+
+    #[tokio::test]
+    async fn mock_client_yields_a_token_for_registry_auth() {
+        let client = MockGcpClient::new(Ok(identity()), Ok(all_granted()));
+        let token = client.access_token().await.expect("mock mints a token");
+        assert!(
+            !token.is_empty(),
+            "an empty token would authenticate as anonymous"
+        );
     }
 
     #[test]
