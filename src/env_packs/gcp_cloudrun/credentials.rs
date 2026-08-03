@@ -631,22 +631,7 @@ impl GcpValidatorClient for RealGcpClient {
 
     async fn access_token(&self) -> Result<String, GcpClientError> {
         let headers = self.auth_headers().await?;
-        let raw = headers
-            .get(http::header::AUTHORIZATION)
-            .ok_or_else(|| {
-                GcpClientError::Transport("ADC headers carried no authorization".to_string())
-            })?
-            .to_str()
-            .map_err(|e| {
-                GcpClientError::Transport(format!("authorization header not UTF-8: {e}"))
-            })?;
-        raw.strip_prefix("Bearer ")
-            .map(str::to_string)
-            .ok_or_else(|| {
-                GcpClientError::Transport(
-                    "ADC authorization header was not a Bearer token".to_string(),
-                )
-            })
+        extract_bearer_token(&headers)
     }
 }
 
@@ -705,6 +690,34 @@ fn parse_test_iam_response(body: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extract the OAuth2 bearer token from ADC's `authorization` header, as reused
+/// by [`RealGcpClient::access_token`]. Pure so the malformed-input paths
+/// (header absent, header not UTF-8, header present but not `Bearer `-prefixed,
+/// or a `Bearer ` prefix with an empty token) are unit-tested without a live
+/// credential.
+#[cfg(feature = "deploy-gcp-cloudrun")]
+fn extract_bearer_token(headers: &http::HeaderMap) -> Result<String, GcpClientError> {
+    let raw = headers
+        .get(http::header::AUTHORIZATION)
+        .ok_or_else(|| {
+            GcpClientError::Transport("ADC headers carried no authorization".to_string())
+        })?
+        .to_str()
+        .map_err(|e| GcpClientError::Transport(format!("authorization header not UTF-8: {e}")))?;
+    let token = raw.strip_prefix("Bearer ").ok_or_else(|| {
+        GcpClientError::Transport("ADC authorization header was not a Bearer token".to_string())
+    })?;
+    if token.is_empty() {
+        // An empty token would authenticate as anonymous against the registry —
+        // fail here with a clear reason instead of surfacing a confusing 401/403
+        // from Artifact Registry three calls later.
+        return Err(GcpClientError::Transport(
+            "ADC authorization header carried an empty Bearer token".to_string(),
+        ));
+    }
+    Ok(token.to_string())
 }
 
 /// Resolve the ADC caller identity for display + project targeting. Reads the
@@ -1176,5 +1189,65 @@ mod tests {
             parse_sa_key_identity(&serde_json::json!({ "type": "authorized_user" }));
         assert_eq!(email, ADC_PRINCIPAL_UNKNOWN);
         assert!(project.is_none());
+    }
+
+    #[cfg(feature = "deploy-gcp-cloudrun")]
+    #[test]
+    fn extract_bearer_token_reads_the_token_from_a_well_formed_header() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer some-token"),
+        );
+        assert_eq!(extract_bearer_token(&headers).unwrap(), "some-token");
+    }
+
+    #[cfg(feature = "deploy-gcp-cloudrun")]
+    #[test]
+    fn extract_bearer_token_errors_when_authorization_header_is_missing() {
+        let headers = http::HeaderMap::new();
+        let err = extract_bearer_token(&headers).expect_err("missing header must error");
+        assert!(matches!(err, GcpClientError::Transport(ref m) if m.contains("no authorization")));
+    }
+
+    #[cfg(feature = "deploy-gcp-cloudrun")]
+    #[test]
+    fn extract_bearer_token_errors_without_the_bearer_prefix() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Basic some-token"),
+        );
+        let err = extract_bearer_token(&headers).expect_err("non-Bearer header must error");
+        assert!(
+            matches!(err, GcpClientError::Transport(ref m) if m.contains("not a Bearer token"))
+        );
+    }
+
+    #[cfg(feature = "deploy-gcp-cloudrun")]
+    #[test]
+    fn extract_bearer_token_errors_on_non_utf8_header_value() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_bytes(&[0xff]).expect("raw bytes are a valid HeaderValue"),
+        );
+        let err = extract_bearer_token(&headers).expect_err("non-UTF-8 header must error");
+        assert!(matches!(err, GcpClientError::Transport(ref m) if m.contains("not UTF-8")));
+    }
+
+    #[cfg(feature = "deploy-gcp-cloudrun")]
+    #[test]
+    fn extract_bearer_token_rejects_an_empty_token() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer "),
+        );
+        let err = extract_bearer_token(&headers).expect_err("empty token must error");
+        assert!(
+            matches!(err, GcpClientError::Transport(ref m) if m.contains("empty")),
+            "an empty token would authenticate as anonymous: {err:?}"
+        );
     }
 }
