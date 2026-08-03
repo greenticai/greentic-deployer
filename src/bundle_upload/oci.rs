@@ -125,6 +125,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_registry_host_colon_port_is_not_mistaken_for_a_tag_separator() {
+        // The tag search must start after the registry host, not from byte 0
+        // of the whole reference — a bare `rest.contains(':')` would treat a
+        // registry port (`localhost:5000`) as satisfying the tag requirement
+        // even when the image path after it has none.
+        let err = OciTarget::parse("oci://localhost:5000/x/y").unwrap_err();
+        assert!(
+            format!("{err}").contains("tag"),
+            "a host with a port but no image tag must still be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn a_tag_after_a_registry_host_colon_port_is_accepted() {
+        let target = OciTarget::parse("oci://localhost:5000/x/y:tag").expect("valid reference");
+        assert_eq!(target.registry, "localhost:5000");
+        assert_eq!(target.reference, "localhost:5000/x/y:tag");
+    }
+
     use std::sync::Mutex;
 
     /// Records what would have been pushed, so the upload path is testable
@@ -175,10 +195,13 @@ mod tests {
             outcome.url,
             "oci://r.example.test/p/greentic/worker-a:abc123"
         );
-        assert!(
-            outcome.digest.starts_with("sha256:"),
-            "digest must be the sha256:<hex> content digest: {}",
-            outcome.digest
+        // Pinned exact value, not just the `sha256:` prefix, so a regression
+        // that hashed the wrong buffer (e.g. an empty or truncated read)
+        // would be caught. Computed with:
+        //   printf 'hsqs\x00\x01\x02\x03payload' | sha256sum
+        assert_eq!(
+            outcome.digest,
+            "sha256:6ce6c48d3210a2ab08af08fcc0e09d571dddf0132235724e93a37c008631847e"
         );
         assert!(
             outcome.expires_at.is_none(),
