@@ -63,7 +63,7 @@ fn provider(err: EcsTargetError) -> DeployerError {
 /// compiled deployer module and is parsed by [`AwsEcsParams::from_answers`];
 /// the feature-gated `real_target` re-exports it and consumes it at
 /// `create_task_set`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FargateLaunchConfig {
     /// IAM role the ECS agent assumes to pull the image + write logs.
     pub execution_role_arn: String,
@@ -85,7 +85,145 @@ pub struct FargateLaunchConfig {
     pub container_name: String,
     /// Port the container listens on / the target group forwards to.
     pub container_port: i32,
+    /// Operator-supplied environment variables projected onto the app
+    /// container, from the `container_env` answer. Sorted by name at parse
+    /// time so the rendered task definition is deterministic (ECS registers a
+    /// new task-definition revision per warm; a reordered environment array
+    /// would make every re-register look like a change).
+    ///
+    /// **Values are secret-bearing by assumption** — this is the escape hatch
+    /// operators reach for when a setting has no dedicated answer, and broker
+    /// URLs, connection strings and API keys all arrive through it. Nothing
+    /// may render a value: [`FargateLaunchConfig`]'s [`std::fmt::Debug`] prints
+    /// names only, and no [`AwsEcsParamsError`] variant carries one.
+    pub environment: Vec<(String, String)>,
+    /// Extra containers placed in the same task definition as the app, from
+    /// the `sidecars` answer. Empty for the single-container default. The app
+    /// container is always registered first — see
+    /// [`SidecarContainer`] for what the surface deliberately omits.
+    pub sidecars: Vec<SidecarContainer>,
 }
+
+/// Renders `environment` / `env` pairs as their NAMES only. A launch config
+/// that carried a broker URL with an embedded password would otherwise print
+/// it in full anywhere a `{:?}` reaches — `RealEcsTarget` derives `Debug` and
+/// holds one, and `AwsEcsParams` holds one too. Names are kept because
+/// "which variables are set" is the diagnostic question; "what they are set
+/// to" never is.
+fn fmt_env_names(f: &mut std::fmt::Formatter<'_>, env: &[(String, String)]) -> std::fmt::Result {
+    f.debug_list().entries(env.iter().map(|(k, _)| k)).finish()
+}
+
+/// Wrapper so [`fmt_env_names`] can be handed to `debug_struct().field(..)`,
+/// which takes a `&dyn Debug` rather than a closure.
+struct EnvNames<'a>(&'a [(String, String)]);
+
+impl std::fmt::Debug for EnvNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt_env_names(f, self.0)
+    }
+}
+
+impl std::fmt::Debug for FargateLaunchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FargateLaunchConfig")
+            .field("execution_role_arn", &self.execution_role_arn)
+            .field("task_role_arn", &self.task_role_arn)
+            .field("subnets", &self.subnets)
+            .field("security_groups", &self.security_groups)
+            .field("assign_public_ip", &self.assign_public_ip)
+            .field("cpu", &self.cpu)
+            .field("memory", &self.memory)
+            .field("container_name", &self.container_name)
+            .field("container_port", &self.container_port)
+            // Names only — see `fmt_env_names`.
+            .field("environment", &EnvNames(&self.environment))
+            .field("sidecars", &self.sidecars)
+            .finish()
+    }
+}
+
+/// One extra container placed beside the app in the same task definition, so a
+/// small dependency (a broker, a metrics shipper) can run in the task and be
+/// reached by the app on `127.0.0.1` — Fargate bills the task's reservation,
+/// not the container count, so a sidecar on a task with headroom costs nothing.
+///
+/// **Deliberately small.** No health check, no `dependsOn` ordering, no volume
+/// mounts, no `secret://` valueFrom, and no CPU share. Each is a real need for
+/// some workload; none is needed to run a broker beside the app, which is the
+/// case this exists for. Adding one later is additive, whereas shipping five
+/// knobs nobody exercises is a surface to keep working forever.
+///
+/// `essential` is absent for a different reason — it is not a deferred knob but
+/// a decision. A sidecar is always non-essential, because ECS stops the WHOLE
+/// task when an essential container exits: an essential broker could take the
+/// app down with it, and would do so through the blue/green rollout, where the
+/// task set never stabilizes and the warm fails on a timeout naming the app.
+/// The rendering side states the same rule at the point it is applied
+/// (`real_target::sidecar_def`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SidecarContainer {
+    /// Container name inside the task definition. Must be unique across the
+    /// task and must not collide with
+    /// [`FargateLaunchConfig::container_name`] — the load balancer routes by
+    /// container name, so a collision would make the routing target ambiguous.
+    pub name: String,
+    /// Image the sidecar runs. Unlike the app image (which the deployer builds
+    /// per revision from `ecr_repository_prefix` + the revision ULID), this is
+    /// pinned by the operator and identical across revisions.
+    pub image: String,
+    /// Port the sidecar listens on, if any. Under `awsvpc` every container in
+    /// the task shares one ENI, so this is what the app reaches on
+    /// `127.0.0.1:<port>`. `None` for a sidecar that opens no socket.
+    pub port: Option<i32>,
+    /// Soft memory limit in MiB (ECS `memoryReservation`). `None` leaves the
+    /// sidecar sharing the task reservation without a floor.
+    pub memory_reservation_mib: Option<i32>,
+    /// Environment variables for THIS container only. Same parse rules,
+    /// reserved names and redaction as
+    /// [`FargateLaunchConfig::environment`].
+    pub environment: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for SidecarContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SidecarContainer")
+            .field("name", &self.name)
+            .field("image", &self.image)
+            .field("port", &self.port)
+            .field("memory_reservation_mib", &self.memory_reservation_mib)
+            // Names only — see `fmt_env_names`.
+            .field("environment", &EnvNames(&self.environment))
+            .finish()
+    }
+}
+
+/// Environment-variable names the DEPLOYER owns on the task's containers, and
+/// which `container_env` / a sidecar's `env` therefore may not set.
+///
+/// These carry the deployment's identity: which environment, which deployment,
+/// which revision, which bundle. Their values are minted per warm from the
+/// revision the deployer is placing, so an operator-supplied value is not a
+/// preference that could be honored — it is a statement about identity that is
+/// either redundant or false.
+///
+/// **Reserved before rendered, deliberately.** The AWS-ECS container definition
+/// projects none of these today (its Cloud Run and K8s siblings both do, via
+/// their `runtime_boot_env`; ECS has no equivalent yet). Reserving now costs an
+/// operator nothing — nobody can be relying on a variable the runtime does not
+/// read — whereas reserving later means the day the boot env lands, a manifest
+/// that pinned `GREENTIC_REVISION_ID` starts being silently overwritten, in
+/// production, having worked until then. Refusing at parse time is the only
+/// point where that is cheap.
+pub const DEPLOYER_MANAGED_ENV_KEYS: &[&str] = &[
+    "GREENTIC_BUNDLE_DIGEST",
+    "GREENTIC_BUNDLE_ID",
+    "GREENTIC_DEPLOYMENT_ID",
+    "GREENTIC_ENV",
+    "GREENTIC_ENV_ID",
+    "GREENTIC_REVISION_ID",
+    "GREENTIC_SEED_DIR",
+];
 
 /// Resolved scope for the AWS-ECS verbs, built from the binding's wizard
 /// answers (`None` → sandbox defaults). Holds the non-secret identifiers the
@@ -143,6 +281,233 @@ pub enum AwsEcsParamsError {
     Invalid { key: String, detail: String },
     #[error("launch config is incomplete: `{field}` is required")]
     MissingLaunchField { field: &'static str },
+    /// The whole `container_env` / `sidecars[].env` answer was not a mapping.
+    #[error("answer `{key}` must be a JSON object of `NAME: value` pairs")]
+    EnvNotAnObject { key: String },
+    /// One entry's value was not a string. Names only — see
+    /// [`FargateLaunchConfig::environment`] on why no variant carries a value.
+    #[error("environment variable `{name}` in answer `{key}` must be a string value")]
+    EnvValueNotAString { key: String, name: String },
+    /// One entry's name is not a legal environment-variable identifier.
+    #[error(
+        "environment variable name `{name}` in answer `{key}` is not a valid identifier \
+         (letters, digits and `_`, not starting with a digit)"
+    )]
+    EnvNameInvalid { key: String, name: String },
+    /// One entry's name is in [`DEPLOYER_MANAGED_ENV_KEYS`].
+    #[error(
+        "environment variable `{name}` in answer `{key}` is managed by the deployer and cannot \
+         be set from a binding answer — it carries the deployment's identity, which the deployer \
+         mints per revision. Remove it; every other name is yours."
+    )]
+    EnvNameReserved { key: String, name: String },
+    /// The `sidecars` answer was not an array of objects.
+    #[error("answer `sidecars` must be a JSON array of objects")]
+    SidecarsNotAnArray,
+    /// A sidecar omitted a field with no sensible default.
+    #[error("sidecar `{name}` is missing required field `{field}`")]
+    SidecarMissingField { name: String, field: &'static str },
+    /// A sidecar field was present but the wrong JSON type / shape.
+    #[error("sidecar `{name}` field `{field}` is invalid: {detail}")]
+    SidecarInvalid {
+        name: String,
+        field: &'static str,
+        detail: String,
+    },
+    /// Two sidecars, or a sidecar and the app container, share a name. ECS
+    /// keys the load-balancer binding on the container name, so a duplicate
+    /// makes the routing target ambiguous rather than merely untidy.
+    #[error(
+        "container name `{name}` is used twice in the task definition (a sidecar collides with \
+         the app container or with another sidecar); container names must be unique"
+    )]
+    DuplicateContainerName { name: String },
+}
+
+/// True for a POSIX-shell-legal environment variable name. Deliberately
+/// stricter than what ECS itself accepts: a name outside this set is far more
+/// likely to be a mis-typed answer (a stray quote, a `KEY=VALUE` string pasted
+/// as the name) than a real variable the workload reads.
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Parse a `{NAME: value}` environment mapping (the `container_env` answer, or
+/// a sidecar's `env`) into sorted name/value pairs.
+///
+/// `key` names the answer being parsed and appears in every error; no error
+/// carries a VALUE. Sorted because the rendered ECS `environment` array is
+/// compared on re-register, and because a `serde_json::Map` iterated in
+/// insertion order would make the task definition depend on how the operator
+/// happened to type their YAML.
+fn parse_env_map(key: &str, value: &Value) -> Result<Vec<(String, String)>, AwsEcsParamsError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| AwsEcsParamsError::EnvNotAnObject {
+            key: key.to_string(),
+        })?;
+    let mut out = Vec::with_capacity(obj.len());
+    for (name, raw) in obj {
+        if !valid_env_name(name) {
+            return Err(AwsEcsParamsError::EnvNameInvalid {
+                key: key.to_string(),
+                name: name.clone(),
+            });
+        }
+        if DEPLOYER_MANAGED_ENV_KEYS.contains(&name.as_str()) {
+            return Err(AwsEcsParamsError::EnvNameReserved {
+                key: key.to_string(),
+                name: name.clone(),
+            });
+        }
+        // Only strings. A number or bool would have an obvious rendering
+        // (`8080`, `true`), but accepting them means an operator's YAML
+        // `value: 08` silently becomes `8`, and `value: no` silently becomes
+        // `false` — the classic YAML foot-guns, landing in a live container.
+        let v = raw
+            .as_str()
+            .ok_or_else(|| AwsEcsParamsError::EnvValueNotAString {
+                key: key.to_string(),
+                name: name.clone(),
+            })?;
+        out.push((name.clone(), v.to_string()));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Read an optional sidecar integer field, bounded by `range`.
+fn sidecar_int(
+    name: &str,
+    field: &'static str,
+    value: &Value,
+    range: std::ops::RangeInclusive<i64>,
+) -> Result<Option<i32>, AwsEcsParamsError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let invalid = |detail: String| AwsEcsParamsError::SidecarInvalid {
+        name: name.to_string(),
+        field,
+        detail,
+    };
+    // Accept the JSON number and the string form: a manifest hand-written in
+    // YAML quotes numbers as often as not, and the sibling answers
+    // (`container_port`, `cpu`) are string-typed for exactly that reason.
+    let n: i64 = match value {
+        Value::Number(n) => n
+            .as_i64()
+            .ok_or_else(|| invalid(format!("`{n}` is not an integer")))?,
+        Value::String(s) => s
+            .parse()
+            .map_err(|_| invalid(format!("`{s}` is not an integer")))?,
+        other => return Err(invalid(format!("expected an integer, got {other}"))),
+    };
+    if !range.contains(&n) {
+        return Err(invalid(format!(
+            "{n} is outside {}..={}",
+            range.start(),
+            range.end()
+        )));
+    }
+    i32::try_from(n)
+        .map(Some)
+        .map_err(|_| invalid(format!("{n} does not fit in an i32")))
+}
+
+/// Parse the `sidecars` answer: an array of `{name, image, port?,
+/// memory_reservation_mib?, env?}` objects. Name uniqueness (including against
+/// the app container) is enforced later, in [`LaunchFields::build`], where the
+/// app container's name is resolved — it may come from `container_name` or
+/// from that answer's default, and only `build` knows which.
+fn parse_sidecars(value: &Value) -> Result<Vec<SidecarContainer>, AwsEcsParamsError> {
+    let items = value
+        .as_array()
+        .ok_or(AwsEcsParamsError::SidecarsNotAnArray)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let obj = item
+            .as_object()
+            .ok_or(AwsEcsParamsError::SidecarsNotAnArray)?;
+        // Read the name first so every later error can name the sidecar.
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or(AwsEcsParamsError::SidecarMissingField {
+                name: "<unnamed>".to_string(),
+                field: "name",
+            })?
+            .to_string();
+        if !valid_container_name(&name) {
+            return Err(AwsEcsParamsError::SidecarInvalid {
+                name: name.clone(),
+                field: "name",
+                detail: "must be 1..=255 characters of letters, digits, `_` or `-`".to_string(),
+            });
+        }
+        let image = obj
+            .get("image")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AwsEcsParamsError::SidecarMissingField {
+                name: name.clone(),
+                field: "image",
+            })?
+            .to_string();
+        let port = match obj.get("port") {
+            Some(v) => sidecar_int(&name, "port", v, 1..=65535)?,
+            None => None,
+        };
+        let memory_reservation_mib = match obj.get("memory_reservation_mib") {
+            Some(v) => sidecar_int(&name, "memory_reservation_mib", v, 1..=i64::from(i32::MAX))?,
+            None => None,
+        };
+        let environment = match obj.get("env") {
+            Some(Value::Null) | None => Vec::new(),
+            Some(v) => parse_env_map(&format!("sidecars[{name}].env"), v)?,
+        };
+        for field in obj.keys() {
+            // Deny-by-default inside the sidecar object too: the enclosing
+            // answers loop rejects unknown top-level keys, and a typo'd
+            // `immage:` would otherwise be dropped in silence.
+            if !matches!(
+                field.as_str(),
+                "name" | "image" | "port" | "memory_reservation_mib" | "env"
+            ) {
+                return Err(AwsEcsParamsError::SidecarInvalid {
+                    name: name.clone(),
+                    field: "<unknown>",
+                    detail: format!("unknown field `{field}`"),
+                });
+            }
+        }
+        out.push(SidecarContainer {
+            name,
+            image,
+            port,
+            memory_reservation_mib,
+            environment,
+        });
+    }
+    Ok(out)
+}
+
+/// Container-name shape ECS accepts, mirroring the `container_name` answer's
+/// wizard constraint.
+fn valid_container_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> {
@@ -269,6 +634,8 @@ struct LaunchFields {
     memory: Option<String>,
     container_name: Option<String>,
     container_port: Option<i32>,
+    environment: Option<Vec<(String, String)>>,
+    sidecars: Option<Vec<SidecarContainer>>,
 }
 
 impl LaunchFields {
@@ -296,6 +663,23 @@ impl LaunchFields {
                 field: "security_groups",
             },
         )?;
+        let container_name = self.container_name.unwrap_or_else(|| "worker".to_string());
+        let sidecars = self.sidecars.unwrap_or_default();
+        // Every container in the task must have a distinct name — the app's
+        // included. ECS binds the load balancer by container name, so a
+        // duplicate is not cosmetic: it makes "which container does the target
+        // group forward to" unanswerable. Checked here rather than in
+        // `parse_sidecars` because only `build` knows the app container's
+        // resolved name (the answer may have been omitted and defaulted).
+        let mut seen = vec![container_name.as_str()];
+        for sidecar in &sidecars {
+            if seen.contains(&sidecar.name.as_str()) {
+                return Err(AwsEcsParamsError::DuplicateContainerName {
+                    name: sidecar.name.clone(),
+                });
+            }
+            seen.push(&sidecar.name);
+        }
         Ok(Some(FargateLaunchConfig {
             execution_role_arn,
             task_role_arn: self.task_role_arn,
@@ -304,8 +688,10 @@ impl LaunchFields {
             assign_public_ip: self.assign_public_ip.unwrap_or(false),
             cpu: self.cpu.unwrap_or_else(|| "256".to_string()),
             memory: self.memory.unwrap_or_else(|| "512".to_string()),
-            container_name: self.container_name.unwrap_or_else(|| "worker".to_string()),
+            container_name,
             container_port: self.container_port.unwrap_or(8080),
+            environment: self.environment.unwrap_or_default(),
+            sidecars,
         }))
     }
 }
@@ -338,6 +724,17 @@ impl AwsEcsParams {
     /// reads it); `aws_profile` is validated as a string and accepted so a full
     /// binding's answers deserialize, but is consumed by the SDK client builder
     /// in a later slice, not by these verbs.
+    ///
+    /// `container_env` (a `{NAME: value}` mapping) and `sidecars` (an array of
+    /// container objects) are the two STRUCTURED answers — every other key is a
+    /// string, matching what the wizard form can collect. They are structured
+    /// because no string encoding of them is safe: the delimiter this pack uses
+    /// for its other multi-valued answers is a comma, and a comma is an
+    /// ordinary character inside a broker URL list or a connection string, so a
+    /// CSV `container_env` would silently split exactly the values it exists to
+    /// carry. `oci_insecure_registries` in the K8s pack sets the precedent for a
+    /// structured answer whose wizard form is a string; here only the structured
+    /// form exists, and the wizard spec says so rather than offering a lossy one.
     ///
     /// The Fargate launch-config keys (`execution_role_arn`, `subnets`, …) and
     /// the `target_group_arns` pool are parsed here too — every known key has
@@ -385,6 +782,8 @@ impl AwsEcsParams {
                 "memory" => launch.memory = Some(answer_string(key, value)?),
                 "container_name" => launch.container_name = Some(answer_string(key, value)?),
                 "container_port" => launch.container_port = Some(parse_port(key, value)?),
+                "container_env" => launch.environment = Some(parse_env_map(key, value)?),
+                "sidecars" => launch.sidecars = Some(parse_sidecars(value)?),
                 "target_group_arns" => {
                     params.target_group_pool = parse_target_group_pool(key, value)?
                 }
@@ -1158,6 +1557,308 @@ mod tests {
         assert_eq!(launch.container_name, "worker");
         assert_eq!(launch.container_port, 9090);
         assert_eq!(params.target_group_pool, ["tg-blue", "tg-green"]);
+        // Absent `container_env` / `sidecars` mean "none", not "invalid".
+        assert!(launch.environment.is_empty());
+        assert!(launch.sidecars.is_empty());
+    }
+
+    // ---- `container_env` passthrough -----------------------------------
+
+    /// The minimum launch set, so a `container_env` test does not have to
+    /// restate the Fargate scaffolding.
+    fn launch_answers(extra: serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "subnets": "subnet-aaaa",
+            "security_groups": "sg-1111",
+        });
+        let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), extra.as_object()) else {
+            panic!("launch_answers takes JSON objects");
+        };
+        for (k, v) in extra_obj {
+            base_obj.insert(k.clone(), v.clone());
+        }
+        base
+    }
+
+    fn launch_from(answers: &serde_json::Value) -> FargateLaunchConfig {
+        let env = build_fixture_env();
+        AwsEcsParams::from_answers(&env, Some(answers))
+            .expect("answers parse")
+            .launch
+            .expect("complete launch set parses to Some")
+    }
+
+    /// The unblocking case: an operator-supplied variable with no dedicated
+    /// answer reaches the launch config, and a value containing commas — a
+    /// multi-endpoint broker URL — survives intact, which no comma-delimited
+    /// encoding of this answer could promise.
+    #[test]
+    fn container_env_carries_operator_variables_including_comma_bearing_values() {
+        let launch = launch_from(&launch_answers(serde_json::json!({
+            "container_env": {
+                "RUST_LOG": "info",
+                "GREENTIC_EVENTS_NATS_URL": "nats://a.example:4222,nats://b.example:4222",
+            },
+        })));
+        assert_eq!(
+            launch.environment,
+            [
+                (
+                    "GREENTIC_EVENTS_NATS_URL".to_string(),
+                    "nats://a.example:4222,nats://b.example:4222".to_string()
+                ),
+                ("RUST_LOG".to_string(), "info".to_string()),
+            ],
+            "pairs are carried verbatim and sorted by name"
+        );
+    }
+
+    /// Sorting is by NAME, independent of the order the operator wrote them:
+    /// a re-register whose only difference is YAML ordering must not look like
+    /// a configuration change.
+    #[test]
+    fn container_env_is_sorted_by_name_not_by_authoring_order() {
+        let a = launch_from(&launch_answers(serde_json::json!({
+            "container_env": {"ZULU": "1", "ALPHA": "2"},
+        })));
+        let b = launch_from(&launch_answers(serde_json::json!({
+            "container_env": {"ALPHA": "2", "ZULU": "1"},
+        })));
+        assert_eq!(a.environment, b.environment);
+        assert_eq!(
+            a.environment.first().map(|(k, _)| k.as_str()),
+            Some("ALPHA")
+        );
+    }
+
+    /// The collision rule: a deployer-managed name is REFUSED, at parse time,
+    /// before any AWS call. Not last-wins (which would let a binding answer
+    /// misstate the revision the task is serving) and not first-wins (which
+    /// would drop the operator's value in silence — the very failure this
+    /// answer exists to end).
+    #[test]
+    fn container_env_refuses_a_deployer_managed_name() {
+        let env = build_fixture_env();
+        for name in DEPLOYER_MANAGED_ENV_KEYS {
+            let answers = launch_answers(serde_json::json!({
+                "container_env": {(*name).to_string(): "operator-supplied"},
+            }));
+            let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+            assert!(
+                matches!(&err, AwsEcsParamsError::EnvNameReserved { name: n, .. } if n == name),
+                "`{name}` must be refused, got {err:?}"
+            );
+        }
+    }
+
+    /// A name the deployer does not manage is accepted even when it shares the
+    /// `GREENTIC_` prefix. Reserving the prefix wholesale would have been
+    /// simpler and would have blocked `GREENTIC_EVENTS_NATS_URL`, the variable
+    /// this whole answer was added to deliver.
+    #[test]
+    fn container_env_reserves_names_not_the_greentic_prefix() {
+        let launch = launch_from(&launch_answers(serde_json::json!({
+            "container_env": {"GREENTIC_EVENTS_NATS_URL": "nats://127.0.0.1:4222"},
+        })));
+        assert_eq!(launch.environment.len(), 1);
+    }
+
+    #[test]
+    fn container_env_rejects_non_object_non_string_and_malformed_names() {
+        let env = build_fixture_env();
+        let cases: Vec<(serde_json::Value, &str)> = vec![
+            (serde_json::json!("A=1"), "a bare string is not a mapping"),
+            (serde_json::json!(["A=1"]), "an array is not a mapping"),
+        ];
+        for (value, why) in cases {
+            let answers = launch_answers(serde_json::json!({ "container_env": value }));
+            let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+            assert!(
+                matches!(err, AwsEcsParamsError::EnvNotAnObject { .. }),
+                "{why}"
+            );
+        }
+
+        let answers = launch_answers(serde_json::json!({"container_env": {"PORT": 8080}}));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(
+            matches!(&err, AwsEcsParamsError::EnvValueNotAString { name, .. } if name == "PORT"),
+            "a YAML number must be refused rather than stringified, got {err:?}"
+        );
+
+        let answers = launch_answers(serde_json::json!({"container_env": {"2FA": "x"}}));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(
+            matches!(&err, AwsEcsParamsError::EnvNameInvalid { name, .. } if name == "2FA"),
+            "got {err:?}"
+        );
+    }
+
+    /// Values are secret-bearing by assumption, so no rendered string may
+    /// carry one: not the `Display` of any error, and not the `Debug` of the
+    /// launch config (which `RealEcsTarget` holds and derives `Debug` over).
+    #[test]
+    fn no_rendered_string_carries_an_environment_value() {
+        const SECRET: &str = "sk-live-must-never-be-rendered";
+        let env = build_fixture_env();
+
+        // Every error path that can see a value.
+        let cases = [
+            serde_json::json!({"GREENTIC_REVISION_ID": SECRET}),
+            serde_json::json!({"2FA": SECRET}),
+        ];
+        for value in cases {
+            let answers = launch_answers(serde_json::json!({ "container_env": value }));
+            let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+            assert!(
+                !err.to_string().contains(SECRET) && !format!("{err:?}").contains(SECRET),
+                "error rendered the value: {err}"
+            );
+        }
+
+        // And the happy path's Debug — names survive, values do not.
+        let launch = launch_from(&launch_answers(serde_json::json!({
+            "container_env": {"BROKER_URL": SECRET},
+            "sidecars": [{"name": "broker", "image": "nats:2", "env": {"PASSWORD": SECRET}}],
+        })));
+        let rendered = format!("{launch:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "Debug rendered a value: {rendered}"
+        );
+        assert!(
+            rendered.contains("BROKER_URL") && rendered.contains("PASSWORD"),
+            "Debug must keep NAMES — they are the diagnostic half: {rendered}"
+        );
+        // The same object nested inside `AwsEcsParams`, which derives Debug.
+        let params = AwsEcsParams::from_answers(
+            &env,
+            Some(&launch_answers(
+                serde_json::json!({"container_env": {"BROKER_URL": SECRET}}),
+            )),
+        )
+        .expect("answers parse");
+        assert!(!format!("{params:?}").contains(SECRET));
+    }
+
+    // ---- sidecars ------------------------------------------------------
+
+    #[test]
+    fn sidecars_parse_with_port_memory_and_their_own_env() {
+        let launch = launch_from(&launch_answers(serde_json::json!({
+            "sidecars": [{
+                "name": "nats",
+                "image": "public.ecr.aws/nats/nats:2.10",
+                "port": "4222",
+                "memory_reservation_mib": 128,
+                "env": {"NATS_DEBUG": "false"},
+            }],
+        })));
+        let sidecar = launch.sidecars.first().expect("one sidecar");
+        assert_eq!(sidecar.name, "nats");
+        assert_eq!(sidecar.image, "public.ecr.aws/nats/nats:2.10");
+        assert_eq!(sidecar.port, Some(4222));
+        assert_eq!(sidecar.memory_reservation_mib, Some(128));
+        assert_eq!(
+            sidecar.environment,
+            [("NATS_DEBUG".to_string(), "false".to_string())]
+        );
+    }
+
+    /// A sidecar sharing the app container's name makes the load-balancer
+    /// binding ambiguous, so it is refused — including when the app container
+    /// took its name from the answer's default rather than from the answers.
+    #[test]
+    fn sidecar_name_may_not_collide_with_the_app_container_or_another_sidecar() {
+        let env = build_fixture_env();
+
+        let answers = launch_answers(serde_json::json!({
+            "sidecars": [{"name": "worker", "image": "nats:2"}],
+        }));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(
+            matches!(&err, AwsEcsParamsError::DuplicateContainerName { name } if name == "worker"),
+            "the DEFAULTED app container name must still collide, got {err:?}"
+        );
+
+        let answers = launch_answers(serde_json::json!({
+            "container_name": "app",
+            "sidecars": [{"name": "app", "image": "nats:2"}],
+        }));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::DuplicateContainerName { .. }
+        ));
+
+        let answers = launch_answers(serde_json::json!({
+            "sidecars": [
+                {"name": "nats", "image": "nats:2"},
+                {"name": "nats", "image": "nats:2"},
+            ],
+        }));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(
+            matches!(&err, AwsEcsParamsError::DuplicateContainerName { name } if name == "nats")
+        );
+    }
+
+    #[test]
+    fn sidecars_reject_missing_fields_unknown_fields_and_bad_shapes() {
+        let env = build_fixture_env();
+        let bad: Vec<(serde_json::Value, &str)> = vec![
+            (serde_json::json!({"image": "nats:2"}), "name"),
+            (serde_json::json!({"name": "nats"}), "image"),
+        ];
+        for (sidecar, field) in bad {
+            let answers = launch_answers(serde_json::json!({ "sidecars": [sidecar] }));
+            let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+            assert!(
+                matches!(&err, AwsEcsParamsError::SidecarMissingField { field: f, .. } if *f == field),
+                "expected missing `{field}`, got {err:?}"
+            );
+        }
+
+        // Deny-by-default inside the object, matching the top-level answers loop.
+        let answers = launch_answers(serde_json::json!({
+            "sidecars": [{"name": "nats", "image": "nats:2", "immage": "typo"}],
+        }));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(
+            matches!(&err, AwsEcsParamsError::SidecarInvalid { detail, .. }
+                if detail.contains("immage")),
+            "got {err:?}"
+        );
+
+        let answers = launch_answers(serde_json::json!({
+            "sidecars": [{"name": "nats", "image": "nats:2", "port": 70000}],
+        }));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(
+            matches!(&err, AwsEcsParamsError::SidecarInvalid { field, .. } if *field == "port"),
+            "got {err:?}"
+        );
+
+        let answers = launch_answers(serde_json::json!({"sidecars": {"name": "nats"}}));
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(err, AwsEcsParamsError::SidecarsNotAnArray));
+    }
+
+    /// `container_env` / `sidecars` are launch-config fields, so supplying one
+    /// alone hits the same all-or-nothing rule as `cpu` alone: the incomplete
+    /// launch set is an error, never a half-config.
+    #[test]
+    fn container_env_alone_is_an_incomplete_launch_config() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"container_env": {"RUST_LOG": "info"}});
+        let err = AwsEcsParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(matches!(
+            err,
+            AwsEcsParamsError::MissingLaunchField {
+                field: "execution_role_arn"
+            }
+        ));
     }
 
     #[test]

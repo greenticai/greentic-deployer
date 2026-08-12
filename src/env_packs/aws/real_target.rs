@@ -116,8 +116,8 @@ use aws_sdk_ecs::operation::describe_task_sets::DescribeTaskSetsOutput;
 use aws_sdk_ecs::operation::register_task_definition::RegisterTaskDefinitionOutput;
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition, DeploymentController,
-    DeploymentControllerType, LoadBalancer, NetworkConfiguration, NetworkMode, PortMapping, Scale,
-    ScaleUnit, StabilityStatus, TaskSet,
+    DeploymentControllerType, KeyValuePair, LoadBalancer, NetworkConfiguration, NetworkMode,
+    PortMapping, Scale, ScaleUnit, StabilityStatus, TaskSet,
 };
 use aws_sdk_elasticloadbalancingv2::operation::describe_target_groups::DescribeTargetGroupsOutput;
 use aws_sdk_elasticloadbalancingv2::types::{
@@ -134,7 +134,7 @@ use super::deploy_target::{
 // lives in the always-compiled deployer module; re-exported here to keep the
 // `real_target::FargateLaunchConfig` public path stable.
 use super::credentials::AssumedSession;
-pub use super::deployer::FargateLaunchConfig;
+pub use super::deployer::{FargateLaunchConfig, SidecarContainer};
 
 /// Production [`EcsDeployTarget`]: ECS task sets + ELBv2 weighted forward
 /// actions, region-pinned at construction.
@@ -435,7 +435,7 @@ impl EcsDeployTarget for RealEcsTarget {
             .memory(&self.launch.memory)
             .execution_role_arn(&self.launch.execution_role_arn)
             .set_task_role_arn(self.launch.task_role_arn.clone())
-            .container_definitions(container_def(&self.launch, &spec.image))
+            .set_container_definitions(Some(container_defs(&self.launch, &spec.image)))
             .send()
             .await
             .map_err(|e| api("register_task_definition", e))?;
@@ -748,8 +748,9 @@ fn active_service_exists(out: &DescribeServicesOutput, name: &str) -> bool {
     })
 }
 
-/// The container definition for a revision: the single essential container
-/// running the revision's image, exposing the launch config's container port.
+/// The app container definition for a revision: the essential container
+/// running the revision's image, exposing the launch config's container port,
+/// carrying the binding's `container_env` variables.
 fn container_def(launch: &FargateLaunchConfig, image: &str) -> ContainerDefinition {
     ContainerDefinition::builder()
         .name(&launch.container_name)
@@ -760,7 +761,59 @@ fn container_def(launch: &FargateLaunchConfig, image: &str) -> ContainerDefiniti
                 .container_port(launch.container_port)
                 .build(),
         )
+        .set_environment(env_pairs(&launch.environment))
         .build()
+}
+
+/// One sidecar's container definition.
+///
+/// **Never essential.** ECS stops the whole task when an essential container
+/// exits, so an essential sidecar would give a crash-looping broker the power
+/// to take the app down with it — and to do so through the blue/green rollout,
+/// where the task set never stabilizes and the warm fails on a timeout that
+/// names the app. A non-essential sidecar that dies leaves a degraded task
+/// running, which is the lesser failure and the visible one (the app's own
+/// connection errors say what broke).
+fn sidecar_def(sidecar: &SidecarContainer) -> ContainerDefinition {
+    let mut builder = ContainerDefinition::builder()
+        .name(&sidecar.name)
+        .image(&sidecar.image)
+        .essential(false)
+        .set_memory_reservation(sidecar.memory_reservation_mib)
+        .set_environment(env_pairs(&sidecar.environment));
+    if let Some(port) = sidecar.port {
+        builder = builder.port_mappings(PortMapping::builder().container_port(port).build());
+    }
+    builder.build()
+}
+
+/// Map name/value pairs to ECS `KeyValuePair`s, or `None` when empty.
+///
+/// `None` rather than `Some(vec![])` so a binding with no `container_env`
+/// registers a task definition byte-identical to the one it registered before
+/// this feature existed — an empty `environment` array is a diff against
+/// history for no behavioural reason.
+fn env_pairs(env: &[(String, String)]) -> Option<Vec<KeyValuePair>> {
+    if env.is_empty() {
+        return None;
+    }
+    Some(
+        env.iter()
+            .map(|(name, value)| KeyValuePair::builder().name(name).value(value).build())
+            .collect(),
+    )
+}
+
+/// Every container in a revision's task definition, app FIRST.
+///
+/// Order is load-bearing for humans, not for ECS: `describe-task-definition`,
+/// the console and `ecs execute-command`'s default all lead with
+/// `containerDefinitions[0]`, so putting a broker there would make every
+/// operator's first look land on the wrong container.
+fn container_defs(launch: &FargateLaunchConfig, image: &str) -> Vec<ContainerDefinition> {
+    let mut defs = vec![container_def(launch, image)];
+    defs.extend(launch.sidecars.iter().map(sidecar_def));
+    defs
 }
 
 /// The awsvpc network configuration for the task set's Fargate ENIs.
@@ -1193,6 +1246,8 @@ mod tests {
             memory: "512".to_string(),
             container_name: "worker".to_string(),
             container_port: 8080,
+            environment: Vec::new(),
+            sidecars: Vec::new(),
         }
     }
 
@@ -1251,6 +1306,111 @@ mod tests {
         assert_eq!(cd.essential(), Some(true));
         assert_eq!(cd.port_mappings().len(), 1);
         assert_eq!(cd.port_mappings()[0].container_port(), Some(8080));
+        assert!(
+            cd.environment().is_empty(),
+            "a binding with no container_env must register the same definition it always did"
+        );
+    }
+
+    /// The end of the chain the `container_env` answer exists for: a pair the
+    /// operator wrote reaches the rendered ECS container definition.
+    #[test]
+    fn container_def_projects_container_env_onto_the_app_container() {
+        let mut launch = launch();
+        launch.environment = vec![
+            (
+                "GREENTIC_EVENTS_NATS_URL".to_string(),
+                "nats://127.0.0.1:4222".to_string(),
+            ),
+            ("RUST_LOG".to_string(), "info".to_string()),
+        ];
+        let cd = container_def(&launch, "registry/img:rev-rev1");
+        let rendered: Vec<(&str, &str)> = cd
+            .environment()
+            .iter()
+            .map(|kv| {
+                (
+                    kv.name().unwrap_or_default(),
+                    kv.value().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                ("GREENTIC_EVENTS_NATS_URL", "nats://127.0.0.1:4222"),
+                ("RUST_LOG", "info"),
+            ]
+        );
+    }
+
+    fn sidecar() -> SidecarContainer {
+        SidecarContainer {
+            name: "nats".to_string(),
+            image: "public.ecr.aws/nats/nats:2.10".to_string(),
+            port: Some(4222),
+            memory_reservation_mib: Some(128),
+            environment: vec![("NATS_DEBUG".to_string(), "false".to_string())],
+        }
+    }
+
+    /// Both containers ride one task definition, app FIRST — the position
+    /// every console view and `describe-task-definition` reader leads with.
+    #[test]
+    fn container_defs_carry_the_app_first_then_each_sidecar() {
+        let mut launch = launch();
+        launch.sidecars = vec![sidecar()];
+        let defs = container_defs(&launch, "registry/img:rev-rev1");
+        let names: Vec<&str> = defs.iter().map(|d| d.name().unwrap_or_default()).collect();
+        assert_eq!(names, ["worker", "nats"]);
+        assert_eq!(defs[0].image(), Some("registry/img:rev-rev1"));
+        assert_eq!(defs[0].essential(), Some(true));
+    }
+
+    /// A sidecar is never essential: ECS stops the whole task when an
+    /// essential container exits, so an essential broker could take the app
+    /// down with it (and fail the warm on a stabilization timeout naming the
+    /// app, not the broker).
+    #[test]
+    fn sidecar_def_is_never_essential_and_carries_its_port_memory_and_env() {
+        let cd = sidecar_def(&sidecar());
+        assert_eq!(cd.essential(), Some(false));
+        assert_eq!(cd.image(), Some("public.ecr.aws/nats/nats:2.10"));
+        assert_eq!(cd.memory_reservation(), Some(128));
+        assert_eq!(cd.port_mappings().len(), 1);
+        assert_eq!(cd.port_mappings()[0].container_port(), Some(4222));
+        assert_eq!(cd.environment().len(), 1);
+        assert_eq!(cd.environment()[0].name(), Some("NATS_DEBUG"));
+
+        let portless = SidecarContainer {
+            port: None,
+            memory_reservation_mib: None,
+            environment: Vec::new(),
+            ..sidecar()
+        };
+        let cd = sidecar_def(&portless);
+        assert!(cd.port_mappings().is_empty());
+        assert!(cd.environment().is_empty());
+        assert_eq!(cd.memory_reservation(), None);
+    }
+
+    /// `RealEcsTarget` derives `Debug` and holds the launch config, so this is
+    /// the reachable path by which an environment value could be printed.
+    #[test]
+    fn real_target_debug_cannot_render_an_environment_value() {
+        const SECRET: &str = "sk-live-must-never-be-rendered";
+        let mut launch = launch();
+        launch.environment = vec![("BROKER_URL".to_string(), SECRET.to_string())];
+        launch.sidecars = vec![SidecarContainer {
+            environment: vec![("PASSWORD".to_string(), SECRET.to_string())],
+            ..sidecar()
+        }];
+        let rendered = format!("{launch:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "the launch config Debug rendered a value: {rendered}"
+        );
+        assert!(rendered.contains("BROKER_URL") && rendered.contains("PASSWORD"));
     }
 
     #[test]
