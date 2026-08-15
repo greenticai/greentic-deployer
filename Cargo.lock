@@ -2739,9 +2739,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.31667317846"
+version = "1.2.0-dev.31769735778"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "554dc580e0b9a50153ed69ab2123ca1fcf980787c66b44711f632c9f29028c03"
+checksum = "ca306d0a1ea4c9963cd08df7ef0f618c155c5db20cc9daacbbe235e86b11e720"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2773,9 +2773,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.31667317846"
+version = "1.2.0-dev.31769735778"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcd0549209ab196acff960025528a56b62a2e2797128928902e21e38bf41edd0"
+checksum = "64475f9f1159a9d93e70e6fc8584ee3f116d39b728aec56f647e13c8a5955560"
 dependencies = [
  "backhand",
  "serde",
@@ -2916,9 +2916,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.2.0-dev.31667121447"
+version = "1.2.0-dev.31769723111"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "771340f4fbab3e9421339e9c842920cf9819f0684f5691a6518203926d4885ff"
+checksum = "aac7e091d059433ade0821532ee769b84f1eea1d7da85c97d26a3f2bcfae9f04"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3051,9 +3051,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-api"
-version = "1.2.0-dev.31667677391"
+version = "1.2.0-dev.31770187054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3083dbeee289ce58309184d903880eda28f9003abddc8a5a08d5cbec7c1368"
+checksum = "2ac6a4f84af672f75f5889e200cee477d16b79c126223e0d79090f6fbf523812"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3062,9 +3062,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-core"
-version = "1.2.0-dev.31667677391"
+version = "1.2.0-dev.31770187054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9709defb52261446420a39b9c6f7830d39f6d1abcb92b3a5669d9e2b1773e56"
+checksum = "1cf231a0a196c82253c4b8740418fd5523fa535b38a0479aec25f45f01b145ef"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3090,9 +3090,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-lib"
-version = "1.2.0-dev.31667677391"
+version = "1.2.0-dev.31770187054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3bdfd11098ac131d32667ab6a9b07026211e448f1ba4ea1038cffe1e526c2cc"
+checksum = "b5c92ef918674b2bc9c5fe2305c812293366211bcef468b0944064209d00472d"
 dependencies = [
  "async-trait",
  "greentic-secrets-api",
@@ -3105,9 +3105,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-dev"
-version = "1.2.0-dev.31667677391"
+version = "1.2.0-dev.31770187054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccbc8ab796313c14c55033cb758e0828fe411b11564c2bd758e25b9da4b73f87"
+checksum = "d8b15e08cf9371aa1b0e48717e437e503dcbc9402ac8bd7375cc6cbf8a77fc1f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3123,9 +3123,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-vault-kv"
-version = "1.2.0-dev.31667677391"
+version = "1.2.0-dev.31770187054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85c6bd6cb090072958c363fd471f61b0cb2cff566c41672f4697bce49b46abee"
+checksum = "a99b48c6fedfe3bd3bc23aa753b794483b27e61622dfb4e76706696b1c53122a"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3138,9 +3138,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-spec"
-version = "1.2.0-dev.31667677391"
+version = "1.2.0-dev.31770187054"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9777205178d437fc68cbf211fb4fe200b7a83cb0b2da608f34685abdc7a213a"
+checksum = "88be002df612578e1747e0235fd10d4c5387d515440f81e8206d6b77516f1a98"
 dependencies = [
  "async-trait",
  "greentic-types",
@@ -7801,7 +7801,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
