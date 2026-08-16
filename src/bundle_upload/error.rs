@@ -109,6 +109,19 @@ pub enum BundleUploadError {
     )]
     OciPushDenied { principal: String },
 
+    /// The environment is declared offline and the caller did not override.
+    ///
+    /// Refused before any provider client is built. An upload has no local
+    /// form — the target is always remote — so unlike a deploy, the connection
+    /// kind alone decides; there is no "pack or distributor was requested"
+    /// condition to check.
+    #[error(
+        "connection is Offline but uploading to `{target}` requires network access; \
+         pass --allow-remote-in-offline to override (an in-network registry or bucket \
+         may still be reachable)"
+    )]
+    OfflineDisallowed { target: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -133,6 +146,7 @@ impl BundleUploadError {
             Self::Io(_) => "bundle_upload.io",
             Self::OciRepositoryMissing { .. } => "bundle_upload.oci.repository_missing",
             Self::OciPushDenied { .. } => "bundle_upload.oci.push_denied",
+            Self::OfflineDisallowed { .. } => "bundle_upload.offline_disallowed",
             Self::Other(_) => "bundle_upload.other",
         }
     }
@@ -218,6 +232,12 @@ mod tests {
                     principal: "deployer@my-proj.iam.gserviceaccount.com".into(),
                 },
                 "bundle_upload.oci.push_denied",
+            ),
+            (
+                BundleUploadError::OfflineDisallowed {
+                    target: "oci://r.example.test/p/repo/w:abc".into(),
+                },
+                "bundle_upload.offline_disallowed",
             ),
             (
                 BundleUploadError::Other("misc".into()),

@@ -208,6 +208,16 @@ struct BundleUploadArgs {
     /// Presigned URL expiry in seconds (S3 hard-caps at 604800).
     #[arg(long, default_value_t = 604800)]
     presign_expires: u64,
+    /// Config file declaring `[environment] connection`. When it says
+    /// `offline`, the upload is refused before any network call — this verb
+    /// had no way to be told that, so an air-gapped caller could only find out
+    /// by waiting for a connection to time out.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Upload anyway on an offline environment. "Offline" means no internet,
+    /// so a reachable in-network registry or bucket is a real case.
+    #[arg(long)]
+    allow_remote_in_offline: bool,
 }
 
 #[derive(Parser)]
@@ -218,6 +228,13 @@ struct BundleRefreshArgs {
     /// Presigned URL expiry in seconds.
     #[arg(long, default_value_t = 604800)]
     presign_expires: u64,
+    /// See `BundleUploadArgs::config`. Re-issuing a presigned URL is a call to
+    /// the same provider, so it is gated the same way.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// See `BundleUploadArgs::allow_remote_in_offline`.
+    #[arg(long)]
+    allow_remote_in_offline: bool,
 }
 
 #[derive(Parser)]
@@ -1383,18 +1400,55 @@ fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
         },
     };
 
-    let result = runtime.block_on(async {
-        match cmd.command {
-            BundleUploadSubcommand::Upload(args) => {
-                let uploader = from_url(&args.target)?;
-                uploader.upload(&args.bundle, &opts).await
+    // Checked BEFORE the runtime does any work: an operator who declared the
+    // environment offline gets an answer that names the cause, instead of the
+    // provider client's DNS or TCP failure — which reads as "the registry is
+    // down" and sends them off to check credentials and targets.
+    let offline_check =
+        {
+            use greentic_deployer::bundle_upload::BundleUploadError;
+            use greentic_types::ConnectionKind;
+
+            let (connection_path, target, allow) = match &cmd.command {
+                BundleUploadSubcommand::Upload(args) => (
+                    args.config.as_ref(),
+                    args.target.as_str(),
+                    args.allow_remote_in_offline,
+                ),
+                BundleUploadSubcommand::RefreshUrl(args) => (
+                    args.config.as_ref(),
+                    args.object_ref.as_str(),
+                    args.allow_remote_in_offline,
+                ),
+            };
+            match greentic_deployer::config::resolve_connection(connection_path) {
+                // An unreadable or malformed --config is surfaced rather than
+                // ignored: silently treating it as "online" would be the same
+                // failure this flag exists to prevent.
+                Err(err) => Some(BundleUploadError::Other(err.to_string())),
+                Ok(connection) => (matches!(connection, Some(ConnectionKind::Offline)) && !allow)
+                    .then(|| BundleUploadError::OfflineDisallowed {
+                        target: target.to_string(),
+                    }),
             }
-            BundleUploadSubcommand::RefreshUrl(args) => {
-                let uploader = from_url(&args.object_ref)?;
-                uploader.refresh_url(&args.object_ref, &opts).await
+        };
+
+    let result = if let Some(err) = offline_check {
+        Err(err)
+    } else {
+        runtime.block_on(async {
+            match cmd.command {
+                BundleUploadSubcommand::Upload(args) => {
+                    let uploader = from_url(&args.target)?;
+                    uploader.upload(&args.bundle, &opts).await
+                }
+                BundleUploadSubcommand::RefreshUrl(args) => {
+                    let uploader = from_url(&args.object_ref)?;
+                    uploader.refresh_url(&args.object_ref, &opts).await
+                }
             }
-        }
-    });
+        })
+    };
 
     match result {
         Ok(value) => {
