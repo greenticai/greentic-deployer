@@ -370,6 +370,25 @@ fn env_id_to_string(env_id: Option<String>) -> String {
     env_id.unwrap_or_else(|| "dev".to_string())
 }
 
+/// Resolve only `environment.connection`, for commands that have no pack,
+/// provider or tenant and therefore cannot build a [`DeployerRequest`].
+///
+/// `bundle-upload` is the case this exists for: it takes a target URL and a
+/// local file, so `DeployerConfig::resolve` does not apply — but an operator
+/// who declared the environment offline still means it, and uploading to a
+/// registry or a cloud bucket is egress by definition. Without this, that verb
+/// was the one remote operation no config could reach.
+pub fn resolve_connection(config_path: Option<&PathBuf>) -> Result<Option<ConnectionKind>> {
+    let mut resolver = ConfigResolver::new();
+    if let Some(layer) = load_explicit_config(config_path)? {
+        resolver = resolver.with_cli_overrides(layer);
+    }
+    let resolved = resolver
+        .load()
+        .map_err(|err| DeployerError::Config(err.to_string()))?;
+    Ok(resolved.config.environment.connection)
+}
+
 fn validate_offline_policy(
     connection: Option<&ConnectionKind>,
     pack_ref: &Option<PackRef>,
