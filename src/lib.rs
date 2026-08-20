@@ -17,6 +17,7 @@ pub mod cli;
 pub mod config;
 pub mod contract;
 pub mod credentials;
+pub mod crypto;
 pub mod defaults;
 pub mod deployment;
 pub mod desktop;

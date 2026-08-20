@@ -70,7 +70,7 @@ creds-gcp = []
 # binaries ship a live Cloud Run deploy path. The seam / fake / verbs from the
 # scaffold stay SDK-free under `creds-gcp`, so `--no-default-features --features
 # creds-gcp` still builds without any google-cloud-* dep.
-deploy-gcp-cloudrun = [
+deploy-gcp-cloudrun = ["dep:rustls", 
     "creds-gcp",
     "dep:google-cloud-run-v2",
     "dep:google-cloud-secretmanager-v1",
