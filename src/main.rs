@@ -1271,6 +1271,11 @@ fn default_packs_dir() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Before anything opens a TLS connection. Both `ring` and `aws-lc-rs` are
+    // linked, so rustls refuses to pick one on its own and the first handshake
+    // panics — previously on every GCP path, because the only installer sat
+    // inside the Kubernetes client.
+    greentic_deployer::crypto::install_default_crypto_provider();
     let cli = Cli::parse();
     match cli.command {
         TopLevelCommand::TargetRequirements(args) => run_target_requirements(args),
