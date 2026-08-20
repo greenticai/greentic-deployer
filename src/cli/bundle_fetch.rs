@@ -80,7 +80,18 @@ fn fetch_oci_to_cache(oci_ref: &str) -> Result<PathBuf, OpError> {
                 offline: false,
                 ..PackFetchOptions::default()
             };
-            let fetcher: OciPackFetcher<DefaultRegistryClient> = OciPackFetcher::new(opts);
+            // Google Artifact Registry authenticates PULLS as well as pushes,
+            // and the default client pulls anonymously — so a bundle this same
+            // binary had just pushed came back `Not authorized`, reported as a
+            // missing input rather than as a credential problem. Mint the same
+            // short-lived OAuth token the push path uses, for AR hosts only:
+            // every other registry keeps the anonymous client, which is what
+            // public packs need.
+            let fetcher: OciPackFetcher<DefaultRegistryClient> =
+                match artifact_registry_client(&rt, oci_ref) {
+                    Some(client) => OciPackFetcher::with_client(client, opts),
+                    None => OciPackFetcher::new(opts),
+                };
             rt.block_on(fetcher.fetch_pack_to_cache(oci_ref))
                 .map(|resolved| resolved.path)
                 .map_err(|source| OpError::Fetch(format!("oci pull `{oci_ref}`: {source}")))
@@ -90,6 +101,53 @@ fn fetch_oci_to_cache(oci_ref: &str) -> Result<PathBuf, OpError> {
             Err(_) => Err(OpError::Fetch("oci fetch thread panicked".to_string())),
         }
     })
+}
+
+/// Host suffix that identifies a Google Artifact Registry reference.
+const ARTIFACT_REGISTRY_SUFFIX: &str = "-docker.pkg.dev";
+
+/// An authenticated registry client for a Google Artifact Registry reference,
+/// or `None` for any other host.
+///
+/// Returns `None` rather than an error when the credential cannot be resolved:
+/// the caller then falls back to the anonymous client and the registry reports
+/// the denial itself. Failing here instead would turn "this deployment has no
+/// GCP credential" into a fetch error on references that never needed one.
+#[cfg(feature = "creds-gcp")]
+fn artifact_registry_client(
+    rt: &tokio::runtime::Runtime,
+    oci_ref: &str,
+) -> Option<DefaultRegistryClient> {
+    let host = oci_ref
+        .trim_start_matches(OCI_SCHEME)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if !host.ends_with(ARTIFACT_REGISTRY_SUFFIX) {
+        return None;
+    }
+    // Both halves run INSIDE the runtime. `build_ambient_client` reaches
+    // `google-cloud-auth`, which `tokio::spawn`s a token-refresh task in its
+    // constructor — calling it outside a runtime context panics there rather
+    // than returning an error, and the panic surfaces only as "oci fetch
+    // thread panicked".
+    rt.block_on(async {
+        let client = crate::env_packs::gcp_cloudrun::credentials::build_ambient_client().ok()?;
+        let token = client.access_token().await.ok()?;
+        Some(DefaultRegistryClient::with_basic_auth(
+            "oauth2accesstoken",
+            token,
+        ))
+    })
+}
+
+/// Without the GCP credential stack there is nothing to authenticate with.
+#[cfg(not(feature = "creds-gcp"))]
+fn artifact_registry_client(
+    _rt: &tokio::runtime::Runtime,
+    _oci_ref: &str,
+) -> Option<DefaultRegistryClient> {
+    None
 }
 
 #[cfg(test)]
