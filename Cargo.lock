@@ -2766,9 +2766,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.32253045841"
+version = "1.2.0-dev.32334657980"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34e497707f8787b36f97c98b1b451d015fc5cfb7bf63140f258b8006fdc59eae"
+checksum = "ea5e6ee061e4b9f09782792444ce8a37898feeb9390e3e08ae868711eec273b1"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2800,9 +2800,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.32253045841"
+version = "1.2.0-dev.32334657980"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a7535b6fde9c4440171f17aada66f73c65b9aca750b799eb2d032d916738f8d"
+checksum = "f9c85bae23581190d8df3c8fdd6f5af655274c55f45b4a301ad3b16ff35f2f44"
 dependencies = [
  "backhand",
  "serde",
@@ -3078,9 +3078,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-api"
-version = "1.2.0-dev.32252878598"
+version = "1.2.0-dev.32335104542"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "309fb7d69b277d463a8ecda20a69a3a51527740cc08c8e272216bf06c94c0dde"
+checksum = "a10243d94b1f1158fd8abdc44026b99e654e14ad9999d87aa464ce66f8542540"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3089,9 +3089,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-core"
-version = "1.2.0-dev.32252878598"
+version = "1.2.0-dev.32335104542"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffa620a2b04e3843748c460919cbbce01e856debaa0777bfd01ee71f0cd2343a"
+checksum = "b5e593357dd537b835b37556478a4101def2e4ea71a38d523d913d1e694b6f05"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3117,9 +3117,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-lib"
-version = "1.2.0-dev.32252878598"
+version = "1.2.0-dev.32335104542"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8666a7ee4f5cc44c7d84f272076de7e9e30adba00775c3807644b5df07eb588c"
+checksum = "5b263e0bd016d0bb64db6a65deed6771329d3977d851b595e4913aeaca67d0a9"
 dependencies = [
  "async-trait",
  "greentic-secrets-api",
@@ -3132,9 +3132,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-dev"
-version = "1.2.0-dev.32252878598"
+version = "1.2.0-dev.32335104542"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffb921168f351d8c8843622879a98f8f9e885f64720cabb3a50c4bfbc854a688"
+checksum = "5ca98d618a0a01ee33b3c8293290cd55a349e453b5e0d93123939e7affddc9fb"
 dependencies = [
  "async-trait",
  "base64",
@@ -3150,9 +3150,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-vault-kv"
-version = "1.2.0-dev.32252878598"
+version = "1.2.0-dev.32335104542"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "279cebd040bcb8527aa6dbb7abe53ecb23e5c0455248537643d729db6f8b8801"
+checksum = "01cc847effbf8281d959d832723711c20930c69864d744cd55557a0e30646306"
 dependencies = [
  "anyhow",
  "base64",
@@ -3165,9 +3165,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-spec"
-version = "1.2.0-dev.32252878598"
+version = "1.2.0-dev.32335104542"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e221b74a3d69531b002673d5975524d3c2c654bc6171219b60c0a9dabe92b9"
+checksum = "50a6f7df73b84f476148589339c856f98e84f3a41d0bff0c66a444618ffb3330"
 dependencies = [
  "async-trait",
  "greentic-types",
@@ -3266,9 +3266,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "1.2.0-dev.32253996870"
+version = "1.2.0-dev.32336377169"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68432d8316c665e00c5c68d478d8f63a2952b9e415f0480b802b8dbaa79e5615"
+checksum = "d7206c9b063f74bb2fa222fd24d8ecf7d0528940bd4b5dfc84ee4f4b889f4b84"
 dependencies = [
  "chrono",
  "flate2",
@@ -7887,7 +7887,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
