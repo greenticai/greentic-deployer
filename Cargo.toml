@@ -106,7 +106,7 @@ greentic-config-types = ">=1.1.0-0, <1.2.0-0"
 # transitively through this version, so it must exclude dev-lane publishes.
 # The pin must move with every deploy-spec version bump; that coupling is
 # deliberate.
-greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "=0.2.6" }
+greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = "=1.3.0-research.2" }
 greentic-operator-trust = { path = "crates/greentic-operator-trust", version = "0.2" }
 # did:web resolution for `trust-root add-did`. Default features only: `cli` and
 # `testing` would drag clap/tokio/rand in for no runtime benefit.
