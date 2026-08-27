@@ -201,6 +201,13 @@ pub fn add(
             .add_bundle(
                 &env_id,
                 StoreAddBundlePayload {
+                    // No `--pack-name` flag yet: this CLI cannot name a
+                    // pack distinct from `bundle_id`, so a unit added here
+                    // keeps the pre-field meaning. Wiring the flag touches
+                    // the clap args, the audit target shape and the HTTP
+                    // store, and is deliberately left out of this
+                    // schema-only change.
+                    pack_name: None,
                     bundle_id,
                     customer_id,
                     revenue_share,
@@ -291,6 +298,13 @@ pub fn update(
             .update_bundle(
                 &env_id,
                 StoreUpdateBundlePayload {
+                    // No `--pack-name` flag yet: this CLI cannot name a
+                    // pack distinct from `bundle_id`, so a unit added here
+                    // keeps the pre-field meaning. Wiring the flag touches
+                    // the clap args, the audit target shape and the HTTP
+                    // store, and is deliberately left out of this
+                    // schema-only change.
+                    pack_name: None,
                     deployment_id,
                     status: payload.status,
                     route_binding: new_route_binding,

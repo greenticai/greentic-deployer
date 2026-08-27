@@ -110,6 +110,10 @@ pub enum BundleError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddBundlePayload {
     pub bundle_id: BundleId,
+    /// The pack this deployment ships. `None` means the same as
+    /// `bundle_id` — see [`BundleDeployment::pack_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_name: Option<String>,
     pub customer_id: CustomerId,
     pub revenue_share: Vec<RevenueShareEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +131,11 @@ pub struct AddBundlePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateBundlePayload {
     pub deployment_id: DeploymentId,
+    /// Re-point the deployment at a different pack. `None` leaves it
+    /// unchanged — it does NOT reset it to the `bundle_id` default, since
+    /// every other field here is skip-on-`None` too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<BundleDeploymentStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +219,7 @@ pub fn add_bundle(
         deployment_id,
         env_id: env.environment_id.clone(),
         bundle_id: payload.bundle_id,
+        pack_name: payload.pack_name,
         customer_id: payload.customer_id,
         status: BundleDeploymentStatus::Active,
         current_revisions: Vec::new(),
@@ -238,6 +248,7 @@ pub fn update_bundle(
 ) -> Result<BundleUpdateApplied, BundleError> {
     let UpdateBundlePayload {
         deployment_id,
+        pack_name,
         status,
         route_binding,
         revenue_share,
@@ -256,6 +267,9 @@ pub fn update_bundle(
     }
     if let Some(rb) = route_binding {
         env.bundles[index].route_binding = rb;
+    }
+    if let Some(name) = pack_name {
+        env.bundles[index].pack_name = Some(name);
     }
     if let Some(overrides) = config_overrides {
         env.bundles[index].config_overrides = overrides;
@@ -374,6 +388,7 @@ mod tests {
 
     fn add_payload(bundle: &str, customer: &str) -> AddBundlePayload {
         AddBundlePayload {
+            pack_name: None,
             bundle_id: BundleId::new(bundle),
             customer_id: CustomerId::new(customer),
             revenue_share: shares(),
@@ -495,6 +510,7 @@ mod tests {
         let applied = update_bundle(
             &mut env,
             UpdateBundlePayload {
+                pack_name: None,
                 deployment_id: did,
                 status: Some(BundleDeploymentStatus::Paused),
                 route_binding: None,
@@ -520,6 +536,7 @@ mod tests {
         let applied = update_bundle(
             &mut env,
             UpdateBundlePayload {
+                pack_name: None,
                 deployment_id: did,
                 status: Some(BundleDeploymentStatus::Paused),
                 route_binding: None,
@@ -538,6 +555,7 @@ mod tests {
         let err = update_bundle(
             &mut env,
             UpdateBundlePayload {
+                pack_name: None,
                 deployment_id: did,
                 status: None,
                 route_binding: None,
@@ -639,6 +657,7 @@ mod tests {
     fn update_payload_wire_encoding_is_pinned() {
         let did = DeploymentId::new();
         let payload = UpdateBundlePayload {
+            pack_name: None,
             deployment_id: did,
             status: Some(BundleDeploymentStatus::Paused),
             route_binding: None,
@@ -673,5 +692,87 @@ mod tests {
         );
         let decoded: RemoveBundleOutcome = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn add_bundle_carries_the_pack_name_through() {
+        let mut env = minimal_env();
+        let mut payload = add_payload("checkout-a", "cust-1");
+        payload.pack_name = Some("checkout".to_string());
+        let idx = add_bundle(&mut env, payload, DeploymentId::new(), fixed_now())
+            .expect("fresh pair deploys");
+        assert_eq!(env.bundles[idx].pack_name.as_deref(), Some("checkout"));
+    }
+
+    /// Two deployments of ONE pack under different ids — the case a single
+    /// `bundle_id` could not express, and the reason this field exists.
+    #[test]
+    fn one_pack_deploys_twice_under_different_bundle_ids() {
+        let mut env = minimal_env();
+        for id in ["checkout-a", "checkout-b"] {
+            let mut payload = add_payload(id, "cust-1");
+            payload.pack_name = Some("checkout".to_string());
+            add_bundle(&mut env, payload, DeploymentId::new(), fixed_now())
+                .expect("a second id is a second deployment, not a duplicate");
+        }
+        assert_eq!(env.bundles.len(), 2);
+        assert!(
+            env.bundles
+                .iter()
+                .all(|b| b.pack_name.as_deref() == Some("checkout"))
+        );
+    }
+
+    #[test]
+    fn update_bundle_repoints_the_pack_and_none_leaves_it_alone() {
+        let mut env = minimal_env();
+        let did = DeploymentId::new();
+        let mut payload = add_payload("acme", "cust-1");
+        payload.pack_name = Some("before".to_string());
+        add_bundle(&mut env, payload, did, fixed_now()).expect("deploys");
+
+        update_bundle(
+            &mut env,
+            UpdateBundlePayload {
+                deployment_id: did,
+                pack_name: Some("after".to_string()),
+                status: None,
+                route_binding: None,
+                revenue_share: None,
+                config_overrides: None,
+            },
+        )
+        .expect("patch applies");
+        assert_eq!(env.bundles[0].pack_name.as_deref(), Some("after"));
+
+        // `None` skips the field, exactly like every other patch field here.
+        // It must NOT reset the pack to the `bundle_id` default.
+        update_bundle(
+            &mut env,
+            UpdateBundlePayload {
+                deployment_id: did,
+                pack_name: None,
+                status: Some(BundleDeploymentStatus::Paused),
+                route_binding: None,
+                revenue_share: None,
+                config_overrides: None,
+            },
+        )
+        .expect("patch applies");
+        assert_eq!(env.bundles[0].pack_name.as_deref(), Some("after"));
+    }
+
+    /// The migration property: an environment written before this field
+    /// existed decodes with `None`, which every reader must treat as "the
+    /// pack is named by `bundle_id`". No rewrite, no backfill.
+    #[test]
+    fn a_payload_written_before_this_field_decodes_to_none() {
+        let decoded: AddBundlePayload = serde_json::from_value(serde_json::json!({
+            "bundle_id": "acme",
+            "customer_id": "cust-1",
+            "revenue_share": [],
+        }))
+        .unwrap();
+        assert!(decoded.pack_name.is_none());
     }
 }

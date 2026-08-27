@@ -94,6 +94,23 @@ pub struct BundleDeployment {
     pub deployment_id: DeploymentId,
     pub env_id: EnvId,
     pub bundle_id: BundleId,
+    /// Which `.gtpack` this deployment ships, when that differs from
+    /// [`Self::bundle_id`].
+    ///
+    /// The two are separate facts. `bundle_id` names the DEPLOYMENT: it is
+    /// the environment-unique key `add_bundle` refuses duplicates on, chosen
+    /// when the unit is added. The pack is what gets built and shipped, and
+    /// several deployments may legitimately ship the SAME pack under
+    /// different ids and route prefixes — which is precisely what
+    /// `op deploy --bundle-id` exists for. Carrying both in one field made
+    /// that supported case impossible to express: a second unit needs a
+    /// second `bundle_id`, and a second `bundle_id` named no pack.
+    ///
+    /// `None` means "the same as `bundle_id`" — exactly what every
+    /// deployment written before this field existed meant implicitly, so
+    /// stored environments need no migration and no rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_name: Option<String>,
     pub customer_id: CustomerId,
     pub status: BundleDeploymentStatus,
     /// Subset of `Environment.revisions` for this deployment.
