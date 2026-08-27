@@ -773,6 +773,7 @@ mod tests {
     fn deployed_bundle(env: &mut Environment, bundle: &str) -> BundleId {
         let bundle_id = BundleId::new(bundle);
         env.bundles.push(BundleDeployment {
+            pack_name: None,
             schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
             deployment_id: crate::ids::DeploymentId::new(),
             env_id: env_id(),

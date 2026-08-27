@@ -72,6 +72,7 @@ async fn seed_deployment(backend: &SqliteEnvironmentStore, id: &EnvId) -> Deploy
     let mut env = loaded.value;
     let deployment_id = DeploymentId::new();
     env.bundles.push(BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id,
         env_id: id.clone(),
@@ -527,6 +528,7 @@ async fn remote_env_lifecycle_end_to_end() {
             .add_bundle(
                 &id,
                 AddBundlePayload {
+                    pack_name: None,
                     bundle_id: BundleId::new("e2e-bundle"),
                     customer_id: CustomerId::new("cust-e2e"),
                     revenue_share: vec![RevenueShareEntry {
@@ -553,6 +555,7 @@ async fn remote_env_lifecycle_end_to_end() {
             .add_bundle(
                 &id,
                 AddBundlePayload {
+                    pack_name: None,
                     bundle_id: BundleId::new("e2e-bundle"),
                     customer_id: CustomerId::new("cust-e2e"),
                     revenue_share: vec![RevenueShareEntry {
@@ -576,6 +579,7 @@ async fn remote_env_lifecycle_end_to_end() {
             .update_bundle(
                 &id,
                 UpdateBundlePayload {
+                    pack_name: None,
                     deployment_id: added_bundle.deployment_id,
                     status: Some(BundleDeploymentStatus::Paused),
                     route_binding: None,
@@ -612,6 +616,7 @@ async fn remote_env_lifecycle_end_to_end() {
             .add_bundle(
                 &id,
                 AddBundlePayload {
+                    pack_name: None,
                     bundle_id: BundleId::new("e2e-msg-bundle"),
                     customer_id: CustomerId::new("cust-e2e"),
                     revenue_share: vec![RevenueShareEntry {

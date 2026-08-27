@@ -125,6 +125,7 @@ pub fn make_revision(
 /// Build a `BundleDeployment` for the env.
 pub fn make_bundle_deployment(env_id: &str, bundle_id: &str) -> BundleDeployment {
     BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id: DeploymentId::new(),
         env_id: EnvId::try_from(env_id).expect("test env_id"),

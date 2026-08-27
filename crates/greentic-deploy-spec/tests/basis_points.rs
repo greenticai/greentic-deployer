@@ -76,6 +76,7 @@ fn traffic_split_rejects_summed_overflow_when_entries_are_in_range() {
 
 fn deployment(shares: &[u32]) -> BundleDeployment {
     BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id: DeploymentId::new(),
         env_id: EnvId::from_str("local").unwrap(),

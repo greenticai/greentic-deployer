@@ -2304,6 +2304,7 @@ mod tests {
         let result = store.add_bundle(
             &env_id(),
             AddBundlePayload {
+                pack_name: None,
                 bundle_id: BundleId::new("fast2flow"),
                 customer_id: greentic_deploy_spec::CustomerId::new("local-dev"),
                 revenue_share: Vec::new(),
@@ -2323,6 +2324,7 @@ mod tests {
         let result = store.update_bundle(
             &env_id(),
             UpdateBundlePayload {
+                pack_name: None,
                 deployment_id: DeploymentId::new(),
                 status: Some(greentic_deploy_spec::BundleDeploymentStatus::Active),
                 route_binding: None,
