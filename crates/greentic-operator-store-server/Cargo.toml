@@ -12,7 +12,7 @@ greentic-deploy-spec = { path = "../greentic-deploy-spec", version = ">=0.2.3, <
 greentic-operator-trust = { path = "../greentic-operator-trust", version = "0.2" }
 axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-fs4 = "0.13"
+fs4 = "1.1"
 clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
