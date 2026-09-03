@@ -104,6 +104,14 @@ const STAGE_INIT_IMAGE: &str = "busybox:1.36.1";
 /// closing the K8s "no runtime secrets" gap without a cloud secret-store.
 pub const DEV_SECRETS_SECRET_NAME: &str = "gtc-dev-secrets";
 
+/// Name of the Secret carrying the operator's `oci_password` answer for an
+/// authenticated `oci://` bundle pull. Env-level (one per namespace, not
+/// per-revision) — the worker and router pods both reference its `password`
+/// key via `valueFrom.secretKeyRef`, so the value never appears in a plain
+/// pod-spec env value a `get deployment` reader could see. Rendered only when
+/// [`K8sParams::oci_password`] is set.
+pub const OCI_CREDENTIALS_SECRET_NAME: &str = "gtc-oci-credentials";
+
 /// Read-only mount of the dev-store Secret the staging init container copies from.
 const DEV_SECRETS_SRC: &str = "/etc/greentic/dev-secrets";
 
@@ -216,6 +224,28 @@ pub struct K8sParams {
     /// bundles from over plain HTTP. From the `oci_insecure_registries` answer;
     /// rendered as `GREENTIC_OCI_INSECURE_REGISTRIES`. Empty → HTTPS only.
     pub oci_insecure_registries: Vec<String>,
+    /// Registry username for an authenticated `oci://` bundle pull. From the
+    /// `oci_username` answer; rendered as a plain `OCI_USERNAME` pod env var —
+    /// usernames are not secret material. `None` unless the operator supplied
+    /// one; [`K8sParams::from_answers`] rejects a request that sets this
+    /// without [`Self::oci_password`] (and vice versa), since a lone
+    /// credential half is almost always an operator mistake rather than a
+    /// deliberate setting.
+    pub oci_username: Option<String>,
+    /// Registry password for an authenticated `oci://` bundle pull. From the
+    /// `oci_password` answer. Unlike `oci_username` this is real secret
+    /// material: it is never rendered as a plain pod env value. It is instead
+    /// carried into the cluster as the [`OCI_CREDENTIALS_SECRET_NAME`] Secret
+    /// (an env-level object, like [`DEV_SECRETS_SECRET_NAME`]) and the worker
+    /// / router pods reference it via `valueFrom.secretKeyRef` — so reading a
+    /// rendered Deployment (`kubectl get deployment -o yaml`) never exposes
+    /// the value, only readers with `get secret` in the namespace can. The
+    /// reference is `optional: true`: a single-revision `warm_revision` /
+    /// `archive_revision` call never applies this env-level Secret (only the
+    /// full `reconcile` does, mirroring the dev-store Secret), so a worker
+    /// warmed in isolation before the first full reconcile boots without the
+    /// credential rather than failing pod admission.
+    pub oci_password: Option<String>,
     /// Base64 of the env's local dev-store, set at reconcile time so the
     /// rendered [`DEV_SECRETS_SECRET_NAME`] Secret carries the operator's
     /// secrets. `None` on the pure preview path (`op env render`) and for the
@@ -242,6 +272,8 @@ impl K8sParams {
             router_replicas: 2,
             tunnel: TunnelMode::Off,
             oci_insecure_registries: Vec::new(),
+            oci_username: None,
+            oci_password: None,
             dev_secrets_data: None,
             secrets_backend: SecretsBackend::DevStore,
         }
@@ -266,6 +298,10 @@ impl K8sParams {
     /// - `kubeconfig_context`: silently accepted and ignored (client-
     ///   targeting knob, not a manifest knob — consumed by
     ///   [`kube_client::connect`](super::kube_client::connect)).
+    /// - `oci_username` / `oci_password`: either both set (non-blank) or both
+    ///   left blank/absent — one without the other is rejected as `Err`,
+    ///   since supplying half a credential pair is almost certainly a mistake
+    ///   rather than an intentional answer.
     /// - Any other key → `Err` (fail closed on wizard version skew or
     ///   typos).
     pub fn from_answers(
@@ -289,6 +325,8 @@ impl K8sParams {
             "router_replicas",
             "tunnel",
             "oci_insecure_registries",
+            "oci_username",
+            "oci_password",
         ];
         for key in obj.keys() {
             if !KNOWN_KEYS.contains(&key.as_str()) {
@@ -390,12 +428,24 @@ impl K8sParams {
 
         // kubeconfig_context: silently accepted and ignored.
 
+        let oci_username = answer_string(obj, "oci_username");
+        let oci_password = answer_string(obj, "oci_password");
+        if oci_username.is_some() != oci_password.is_some() {
+            return Err(
+                "oci_username and oci_password must both be set, or both left blank — \
+                 supplying only one is almost certainly a mistake"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
             namespace,
             runtime_image,
             router_replicas,
             tunnel,
             oci_insecure_registries,
+            oci_username,
+            oci_password,
             // Reconcile injects the dev-store bytes after this pure parse (it
             // owns the filesystem read); the preview path leaves it unset.
             dev_secrets_data: defaults.dev_secrets_data,
@@ -795,7 +845,20 @@ const RAYON_THREADS: &str = "4";
 /// runtime's `127.0.0.1` default would make every probe fail); `HOME` roots
 /// the env store on the writable staging volume; `RAYON_NUM_THREADS` caps the
 /// bundle-unpack thread pool (see [`RAYON_THREADS`]).
-fn runtime_boot_env(env: &Environment, oci_insecure_registries: &[String]) -> Vec<Value> {
+///
+/// `OCI_USERNAME` / `OCI_PASSWORD` authenticate the boot-pull against a
+/// private registry: both roles do a `start --env` boot-pull of a routed
+/// `bundle_source_uri` (see [`env_has_pullable_routed_revision`]), so both
+/// need the credential, not just the worker. `greentic-setup`'s
+/// `registry_basic_auth_for_reference` and greentic-start's boot-pull read
+/// exactly these two names — matched verbatim here, or the whole chain is
+/// inert. `OCI_USERNAME` is a plain value (not secret material); `OCI_PASSWORD`
+/// is sourced from the [`OCI_CREDENTIALS_SECRET_NAME`] Secret via
+/// `valueFrom.secretKeyRef` (see [`K8sParams::oci_password`] for why), marked
+/// `optional` so a pod rendered without that env-level Secret having been
+/// applied yet (a single-revision `warm_revision` ahead of the first full
+/// `reconcile`) still boots — just without the credential.
+fn runtime_boot_env(env: &Environment, params: &K8sParams) -> Vec<Value> {
     let mut vars = vec![
         json!({"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()}),
         json!({"name": "HOME", "value": STAGE_HOME}),
@@ -804,10 +867,25 @@ fn runtime_boot_env(env: &Environment, oci_insecure_registries: &[String]) -> Ve
     ];
     // greentic-start honors this only on the digest-gated OCI boot-pull; emitting
     // it when unset would be a harmless no-op, but skip it to keep the pod spec lean.
-    if !oci_insecure_registries.is_empty() {
+    if !params.oci_insecure_registries.is_empty() {
         vars.push(json!({
             "name": "GREENTIC_OCI_INSECURE_REGISTRIES",
-            "value": oci_insecure_registries.join(","),
+            "value": params.oci_insecure_registries.join(","),
+        }));
+    }
+    if let Some(username) = &params.oci_username {
+        vars.push(json!({"name": "OCI_USERNAME", "value": username}));
+    }
+    if params.oci_password.is_some() {
+        vars.push(json!({
+            "name": "OCI_PASSWORD",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": OCI_CREDENTIALS_SECRET_NAME,
+                    "key": "password",
+                    "optional": true,
+                },
+            },
         }));
     }
     vars
@@ -881,7 +959,7 @@ pub fn render_worker_deployment(
     params: &K8sParams,
 ) -> Value {
     let labels = worker_selector_labels(env, revision);
-    let mut env_vars = runtime_boot_env(env, &params.oci_insecure_registries);
+    let mut env_vars = runtime_boot_env(env, params);
     env_vars.extend([
         json!({"name": "GREENTIC_REVISION_ID", "value": revision.revision_id.0.to_string()}),
         json!({"name": "GREENTIC_DEPLOYMENT_ID", "value": revision.deployment_id.0.to_string()}),
@@ -1082,7 +1160,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
-                        "env": Value::Array(runtime_boot_env(env, &params.oci_insecure_registries)),
+                        "env": Value::Array(runtime_boot_env(env, params)),
                         "volumeMounts": runtime_volume_mounts(),
                         "readinessProbe": {
                             "httpGet": {"path": "/healthz", "port": SERVE_PORT},
@@ -1202,6 +1280,30 @@ fn render_dev_secrets_secret(env: &Environment, params: &K8sParams) -> Value {
             "labels": common_labels(env, "dev-secrets"),
         },
         "data": Value::Object(data),
+    })
+}
+
+/// The `oci_password` answer, delivered into the cluster as a Secret so
+/// neither the worker nor the router pod spec carries it as a plain value —
+/// only a caller with `get secret` in the namespace (a narrower grant than
+/// `get deployment`) can read it back. Uses `stringData` (server-side
+/// base64-encoded) since, unlike [`K8sParams::dev_secrets_data`], the answer
+/// arrives as plain text, never pre-encoded. Only rendered when
+/// [`K8sParams::oci_password`] is set — [`render_environment_manifests`]
+/// gates the call.
+fn render_oci_credentials_secret(env: &Environment, params: &K8sParams) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": OCI_CREDENTIALS_SECRET_NAME,
+            "namespace": params.namespace,
+            "labels": common_labels(env, "oci-credentials"),
+        },
+        "stringData": {
+            "password": params.oci_password.clone().unwrap_or_default(),
+        },
     })
 }
 
@@ -1385,6 +1487,13 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
         SecretsBackend::Vault(_) => {
             manifests.push(render_worker_service_account(env, params));
         }
+    }
+    // The `oci_password` credential Secret, appended after the DevStore/Vault
+    // object so both env-level secret objects share the "last, never pruned"
+    // placement — orthogonal to the `SecretsBackend` choice above (a
+    // registry credential is unrelated to how `secret://` refs resolve).
+    if params.oci_password.is_some() {
+        manifests.push(render_oci_credentials_secret(env, params));
     }
     manifests
 }
@@ -1618,6 +1727,143 @@ mod tests {
                 "the HTTPS-only default must not emit the insecure-registries var"
             );
         }
+    }
+
+    #[test]
+    fn oci_credentials_render_into_worker_and_router_pods() {
+        let (env, mut params) = fixture();
+        params.oci_username = Some("registry-user".to_string());
+        params.oci_password = Some("hunter2".to_string());
+
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            let envs = d["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            let username = envs
+                .iter()
+                .find(|e| e["name"] == "OCI_USERNAME")
+                .expect("OCI_USERNAME is rendered on both pods");
+            assert_eq!(
+                username["value"], "registry-user",
+                "the username is a plain value, not secret material"
+            );
+            let password = envs
+                .iter()
+                .find(|e| e["name"] == "OCI_PASSWORD")
+                .expect("OCI_PASSWORD is rendered on both pods");
+            // The password must never appear as a plain `value` — only as a
+            // reference into the credentials Secret.
+            assert!(
+                password.get("value").is_none(),
+                "OCI_PASSWORD must not carry a plain value"
+            );
+            assert_eq!(
+                password["valueFrom"]["secretKeyRef"]["name"],
+                OCI_CREDENTIALS_SECRET_NAME
+            );
+            assert_eq!(password["valueFrom"]["secretKeyRef"]["key"], "password");
+            assert_eq!(
+                password["valueFrom"]["secretKeyRef"]["optional"], true,
+                "a pod rendered before the env-level Secret exists must still boot"
+            );
+        }
+    }
+
+    #[test]
+    fn no_oci_credentials_env_vars_by_default() {
+        let (env, params) = fixture();
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            let envs = d["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            assert!(
+                !envs.iter().any(|e| e["name"] == "OCI_USERNAME"),
+                "no oci_username answer must not emit OCI_USERNAME"
+            );
+            assert!(
+                !envs.iter().any(|e| e["name"] == "OCI_PASSWORD"),
+                "no oci_password answer must not emit OCI_PASSWORD"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_credentials_secret_rendered_only_when_password_is_set() {
+        let (env, params) = fixture();
+        // Default params: no oci_password → no Secret in the env-level set.
+        let env_level = render_environment_manifests(&env, &params);
+        assert!(
+            !env_level
+                .iter()
+                .any(|o| o["metadata"]["name"] == OCI_CREDENTIALS_SECRET_NAME),
+            "the oci-credentials Secret must not render without an oci_password"
+        );
+
+        let mut with_creds = params.clone();
+        with_creds.oci_username = Some("registry-user".to_string());
+        with_creds.oci_password = Some("hunter2".to_string());
+        let env_level = render_environment_manifests(&env, &with_creds);
+        let secret = env_level
+            .iter()
+            .find(|o| o["metadata"]["name"] == OCI_CREDENTIALS_SECRET_NAME)
+            .expect("the oci-credentials Secret renders once oci_password is set");
+        assert_eq!(secret["kind"], "Secret");
+        assert_eq!(secret["metadata"]["namespace"], json!(with_creds.namespace));
+        assert_eq!(secret["stringData"]["password"], "hunter2");
+        // The Secret must never carry the username or any other identifying
+        // field beyond the password itself.
+        assert!(secret["stringData"]["username"].is_null());
+    }
+
+    #[test]
+    fn from_answers_oci_credentials_pair_accepted() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "oci_username": "registry-user",
+            "oci_password": "hunter2",
+        });
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.oci_username.as_deref(), Some("registry-user"));
+        assert_eq!(params.oci_password.as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn from_answers_oci_credentials_absent_is_fine() {
+        let env = build_fixture_env();
+        let params = K8sParams::from_answers(&env, Some(&serde_json::json!({}))).unwrap();
+        assert_eq!(params.oci_username, None);
+        assert_eq!(params.oci_password, None);
+    }
+
+    #[test]
+    fn from_answers_oci_username_without_password_rejected() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"oci_username": "registry-user"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("oci_username and oci_password"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_oci_password_without_username_rejected() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"oci_password": "hunter2"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("oci_username and oci_password"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_oci_credentials_unknown_key_still_rejected() {
+        // The new keys must not have widened KNOWN_KEYS into accept-everything.
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"oci_usernam": "typo"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("oci_usernam"), "got: {err}");
     }
 
     #[test]
