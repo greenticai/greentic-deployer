@@ -313,7 +313,7 @@ features = ["ring"]
 # talk to — v1_33 types are forward-compatible with newer servers and
 # cover everything the deployer touches (all stable since well before
 # 1.31). Bump only when a newer-only API field is needed.
-version = "0.27"
+version = "0.28"
 optional = true
 features = [
     "v1_33",
