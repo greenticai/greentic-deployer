@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 
 [dependencies.sqlx]
-version = "0.8"
+version = "0.9"
 default-features = false
 features = [
     "runtime-tokio",
