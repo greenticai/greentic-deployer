@@ -54,6 +54,40 @@ pub(crate) const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
 pub(crate) const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
 pub(crate) const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secrets.env";
 
+/// The pack segment whose keys are owned by greentic-designer-admin rather
+/// than by an environment: stored VERBATIM, under the `default` env segment.
+///
+/// Mirrors greentic-start's reader carve-out (`src/secrets_client.rs`,
+/// `canonicalize_dev_store_secret_uri`) exactly. The two must agree: a writer
+/// that normalizes a key the reader does not — or files it under a different
+/// env segment — stores a credential nothing ever looks up, and the failure
+/// surfaces only as an ordinary MCP node error.
+const MCP_CATEGORY: &str = "mcp";
+
+/// Env segment every `mcp` key is written under, matching
+/// `greentic_aw_runtime::mcp_secrets::MCP_ENV_SEGMENT`.
+const MCP_ENV_SEGMENT: &str = "default";
+
+/// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) names the `mcp`
+/// category. Keyed on the PACK position, never a substring: a tenant or a
+/// secret merely called `mcp` is an ordinary key.
+fn is_mcp_rel_path(rel_path: &str) -> bool {
+    rel_path.split('/').nth(2) == Some(MCP_CATEGORY)
+}
+
+/// The dev store's native key for `rel_path` in `env_id`.
+///
+/// THE one derivation, shared by [`put_env_secret`], [`get_env_secret`] and
+/// [`dev_store_has`] so a write, the read that checks it and the presence
+/// probe `env apply` gates on cannot land on different keys.
+pub(super) fn dev_store_key(env_id: &EnvId, rel_path: &str) -> String {
+    if is_mcp_rel_path(rel_path) {
+        format!("secrets://{MCP_ENV_SEGMENT}/{rel_path}")
+    } else {
+        format!("secrets://{}/{rel_path}", env_id.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsListPayload {
     pub environment_id: String,
@@ -284,7 +318,7 @@ pub(super) fn put_env_secret(
 ) -> Result<(String, Value), OpError> {
     if kind_path == DEV_STORE_KIND_PATH {
         validate_dev_store_secret_path(rel_path)?;
-        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let store_uri = dev_store_key(env_id, rel_path);
         let dev_path = resolve_dev_store_path(
             &store.env_dir(env_id)?,
             std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
@@ -297,7 +331,7 @@ pub(super) fn put_env_secret(
     } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
         // Same ref shape as the dev store; the difference is the backend.
         validate_dev_store_secret_path(rel_path)?;
-        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let store_uri = dev_store_key(env_id, rel_path);
         let vault_addr = vault_seed_put(store, env, &store_uri, value)?;
         Ok((store_uri, json!({"vault_addr": vault_addr})))
     } else {
@@ -322,7 +356,7 @@ pub(super) fn get_env_secret(
 ) -> Result<(Option<String>, String, Value), OpError> {
     if kind_path == DEV_STORE_KIND_PATH {
         validate_dev_store_secret_path(rel_path)?;
-        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let store_uri = dev_store_key(env_id, rel_path);
         let dev_path = resolve_dev_store_path(
             &store.env_dir(env_id)?,
             std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
@@ -341,7 +375,7 @@ pub(super) fn get_env_secret(
         ))
     } else if kind_path == crate::defaults::VAULT_SECRETS_PATH {
         validate_dev_store_secret_path(rel_path)?;
-        let store_uri = format!("secrets://{}/{rel_path}", env_id.as_str());
+        let store_uri = dev_store_key(env_id, rel_path);
         let (value, vault_addr) = vault_seed_get(store, env, &store_uri)?;
         Ok((value, store_uri, json!({"vault_addr": vault_addr})))
     } else {
@@ -909,11 +943,9 @@ pub(super) fn dev_store_has(
     if !dev_path.exists() {
         return Ok(false);
     }
-    let uri = format!(
-        "secrets://{}/{}",
-        env_id.as_str(),
-        rel_path.trim_start_matches('/')
-    );
+    // Same derivation as the write (`put_env_secret`), or `env apply` probes a
+    // key nothing was stored at and re-prompts for a secret already held.
+    let uri = dev_store_key(env_id, rel_path.trim_start_matches('/'));
     dev_store_contains(&dev_path, &uri)
 }
 
@@ -1596,6 +1628,42 @@ mod tests {
         assert!(!is_canonical_secret_name("_leading"));
         assert!(!is_canonical_secret_name("trailing_"));
         assert!(!is_canonical_secret_name("double__underscore"));
+    }
+
+    #[test]
+    fn an_mcp_key_is_written_under_the_default_env_segment() {
+        // greentic-start reads `secrets://default/<tenant>/<team>/mcp/<id>`
+        // (`src/secrets_client.rs`, the MCP carve-out), and
+        // `greentic_aw_runtime::mcp_secrets::MCP_ENV_SEGMENT` pins `default`
+        // because that is what greentic-designer-admin writes. Keying an MCP
+        // secret by the environment id instead stores it where no lookup ever
+        // goes — silently, because an unresolved MCP credential surfaces only
+        // as an ordinary node error.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3"),
+            "secrets://default/acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3"
+        );
+    }
+
+    #[test]
+    fn every_other_category_keeps_the_environment_id() {
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "acme/_/messaging-telegram/bot_token"),
+            "secrets://local/acme/_/messaging-telegram/bot_token"
+        );
+    }
+
+    #[test]
+    fn the_category_is_the_third_segment_not_a_substring() {
+        // `mcp` anywhere but the pack position is an ordinary key. A tenant
+        // literally named `mcp` must not move every one of its secrets.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "mcp/_/messaging-telegram/bot_token"),
+            "secrets://local/mcp/_/messaging-telegram/bot_token"
+        );
     }
 
     #[test]
