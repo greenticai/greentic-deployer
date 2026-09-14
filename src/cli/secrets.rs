@@ -797,13 +797,25 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
              name without surrounding whitespace)"
         )));
     }
-    // The runtime reader canonicalizes the name segment before lookup
-    // (greentic-start `secret_name::canonical_secret_name`), so a
-    // non-canonical name would be written but never found. Reject
-    // instead of silently transforming — producer and consumer must
-    // share one derivation, and we share it by only accepting
-    // already-canonical input.
-    if !is_canonical_secret_name(name) {
+    // Outside the `mcp` category the runtime reader canonicalizes the name
+    // segment before lookup (greentic-start
+    // `secret_name::canonical_secret_name`), so a non-canonical name would be
+    // written but never found. Reject instead of silently transforming —
+    // producer and consumer must share one derivation, and we share it by
+    // only accepting already-canonical input.
+    //
+    // The `mcp` category is exempt, mirroring greentic-start's reader
+    // (`src/secrets_client.rs`, `canonicalize_dev_store_secret_uri`): admin
+    // keys an MCP server by its hyphenated UUID and the runtime reads it
+    // verbatim through `greentic_aw_runtime::mcp_secrets`. Normalizing here
+    // would rewrite the lookup to `…/mcp/ff308b9c_951a_…` and resolve nothing
+    // — silently, because a missing MCP credential is reported as an ordinary
+    // node error.
+    //
+    // The TEAM segment above is deliberately NOT exempt: the runtime
+    // canonicalizes the team either way, so a literal `default` is still a key
+    // nothing reads.
+    if !is_mcp_rel_path(rel_path) && !is_canonical_secret_name(name) {
         return Err(OpError::InvalidArgument(format!(
             "secret name `{name}` is not store-canonical: use lowercase \
              a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
@@ -1663,6 +1675,83 @@ mod tests {
         assert_eq!(
             dev_store_key(&env_id, "mcp/_/messaging-telegram/bot_token"),
             "secrets://local/mcp/_/messaging-telegram/bot_token"
+        );
+    }
+
+    #[test]
+    fn an_mcp_name_keeps_its_hyphenated_uuid() {
+        // greentic-designer-admin keys an MCP server by its hyphenated UUID
+        // and greentic-runner reads it verbatim. Canonicalizing turns the
+        // lookup into `…/mcp/ff308b9c_951a_…`, which resolves nothing.
+        validate_dev_store_secret_path("acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3")
+            .expect("an mcp name must reach the store byte-for-byte");
+    }
+
+    #[test]
+    fn a_non_mcp_name_is_still_rejected() {
+        let err = validate_dev_store_secret_path("acme/_/messaging-telegram/BOT-TOKEN")
+            .expect_err("non-mcp keys must still be normalized");
+        assert!(format!("{err}").contains("store-canonical"), "{err}");
+    }
+
+    #[test]
+    fn an_mcp_path_still_rejects_a_literal_default_team() {
+        // The carve-out covers the NAME and the env segment, never the team:
+        // the runtime reads the default team as `_`, so a literal `default`
+        // would be written under a key no lookup uses.
+        let err =
+            validate_dev_store_secret_path("acme/default/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3")
+                .expect_err("the team segment keeps its rule");
+        assert!(format!("{err}").contains("team segment"), "{err}");
+    }
+
+    #[test]
+    fn an_mcp_path_still_needs_four_segments() {
+        validate_dev_store_secret_path("acme/_/mcp")
+            .expect_err("shape is checked before the category");
+    }
+
+    #[test]
+    fn a_put_and_a_get_agree_on_an_mcp_key() {
+        // The write and the read must derive the same key. They were two
+        // independent `format!` calls; a carve-out applied to one of them
+        // would store a credential that `op secrets get` then reports as
+        // absent.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        let path = "acme/sales/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        let put_outcome = put(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsPutPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                value: "t0k".to_string(),
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+        let get_outcome = get(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsGetPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                reveal: true,
+            }),
+        )
+        .unwrap();
+
+        let put_uri = put_outcome.result.get("store_uri").and_then(|v| v.as_str());
+        assert_eq!(put_uri, Some(format!("secrets://default/{path}").as_str()));
+        assert_eq!(
+            put_uri,
+            get_outcome.result.get("store_uri").and_then(|v| v.as_str())
+        );
+        assert_eq!(
+            get_outcome.result.get("value").and_then(|v| v.as_str()),
+            Some("t0k")
         );
     }
 
