@@ -37,10 +37,11 @@ use serde_json::Value;
 use tokio::time::{Instant, sleep};
 
 use super::K8sDeployerHandler;
-use super::cluster::{K8sCluster, K8sClusterError, ObjectRef};
+use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, ServiceStatus};
 use super::manifests::{
-    DEV_SECRETS_SECRET_NAME, K8sParams, SecretsBackend, has_cluster_presence,
-    render_runtime_config_map, render_worker_manifests,
+    DEV_SECRETS_SECRET_NAME, K8sParams, ROUTER_NAME, SecretsBackend, ServiceType,
+    has_cluster_presence, render_router_service, render_runtime_config_map,
+    render_worker_manifests,
 };
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
@@ -277,7 +278,46 @@ impl K8sDeployerHandler {
                 }
             }
         }
-        Ok(ReconcileReport { applied, pruned })
+        let router_address = self.read_router_address(env, &params).await;
+        Ok(ReconcileReport {
+            applied,
+            pruned,
+            router_address,
+        })
+    }
+
+    /// Read the router Service back so the report can say where the env is
+    /// reachable. `None` for the default `ClusterIP` — there is no external
+    /// address to report, and skipping the read keeps the default path at
+    /// exactly the API calls it made before this existed.
+    ///
+    /// Never fails the reconcile: the convergence has already succeeded by the
+    /// time this runs, so a failed status read is downgraded to
+    /// [`RouterAddress::Unknown`] carrying the reason. The `ObjectRef` is built
+    /// from the same [`render_router_service`] the apply used, so the object
+    /// read is the object written.
+    async fn read_router_address(
+        &self,
+        env: &Environment,
+        params: &K8sParams,
+    ) -> Option<RouterAddress> {
+        if params.service_type == ServiceType::ClusterIp {
+            return None;
+        }
+        let service = match ObjectRef::from_manifest(&render_router_service(env, params)) {
+            Ok(object) => object,
+            Err(e) => {
+                return Some(RouterAddress::Unknown {
+                    reason: e.to_string(),
+                });
+            }
+        };
+        Some(match self.cluster.get_service_status(&service).await {
+            Ok(status) => RouterAddress::from_status(&status),
+            Err(e) => RouterAddress::Unknown {
+                reason: format!("could not read Service `{ROUTER_NAME}`: {e}"),
+            },
+        })
     }
 
     /// Converge, then optionally block until every applied Deployment has
@@ -325,6 +365,81 @@ impl K8sDeployerHandler {
     }
 }
 
+/// Where the env's router is reachable from outside the cluster, as the cluster
+/// itself reports it after the reconcile's apply.
+///
+/// Serializes as an internally-tagged object (`{"state": "...", ...}`) so every
+/// arm is a distinguishable answer rather than a string a caller has to guess
+/// the meaning of. The distinction that matters, and the reason this is not an
+/// `Option<String>`: a load balancer is provisioned ASYNCHRONOUSLY, so "no
+/// address yet, keep asking" and "no address will ever appear here" are
+/// routinely both true of the same env minutes apart, and an empty string
+/// cannot tell them apart. `ClusterIP` reports nothing at all — see
+/// [`ReconcileReport::router_address`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RouterAddress {
+    /// The API server allocated a node port. The host half is the operator's
+    /// to supply — any node's reachable IP — so only the port is reported;
+    /// this deployer does not list nodes and would have to guess which of a
+    /// node's addresses a caller can route to.
+    NodePort { node_port: i32 },
+    /// The cloud controller assigned an ingress. At least one of `hostname` /
+    /// `ip` is set (AWS-style load balancers return a hostname, GCP-style an
+    /// IP); both are carried rather than collapsed into one string so a caller
+    /// keeps whichever its own DNS or firewall config needs.
+    LoadBalancer {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ip: Option<String>,
+    },
+    /// The Service was accepted and no address is assigned YET. Expected for
+    /// the first seconds-to-minutes of a `LoadBalancer`; re-run `op env
+    /// reconcile` (or read the Service) rather than treating it as "none".
+    Pending,
+    /// The Service was applied but its status could not be read back. Reported
+    /// rather than raised, because the convergence itself SUCCEEDED — failing a
+    /// completed reconcile over a status read would tell an operator their
+    /// deploy failed when it did not. Reported rather than omitted, because
+    /// silently answering "no address" for a read that never happened is the
+    /// failure this whole report exists to end.
+    Unknown { reason: String },
+}
+
+impl RouterAddress {
+    /// Interpret a read-back [`ServiceStatus`] into one named state.
+    ///
+    /// `Pending` is the answer for every type whose address the cluster has not
+    /// assigned — including a `NodePort` with no allocated port, which is a
+    /// transient the API server closes on its own, not a permanent "none".
+    pub fn from_status(status: &ServiceStatus) -> Self {
+        match status.service_type.as_str() {
+            "NodePort" => match status.node_port {
+                Some(node_port) => Self::NodePort { node_port },
+                None => Self::Pending,
+            },
+            "LoadBalancer" => {
+                if status.ingress_hostname.is_some() || status.ingress_ip.is_some() {
+                    Self::LoadBalancer {
+                        hostname: status.ingress_hostname.clone(),
+                        ip: status.ingress_ip.clone(),
+                    }
+                } else {
+                    Self::Pending
+                }
+            }
+            // Includes `ClusterIP` and any type this build does not model: the
+            // caller only asks after selecting an externally-exposed type, so
+            // reaching here means the live object disagrees with what was
+            // applied. That is worth naming, not silently reporting as pending.
+            other => Self::Unknown {
+                reason: format!("router Service reports spec.type `{other}`"),
+            },
+        }
+    }
+}
+
 /// Outcome of [`K8sDeployerHandler::reconcile`].
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReconcileReport {
@@ -333,6 +448,18 @@ pub struct ReconcileReport {
     pub applied: Vec<ObjectRef>,
     /// Worker objects deleted for revisions without cluster presence.
     pub pruned: Vec<ObjectRef>,
+    /// Where the router is reachable from outside the cluster, when the env
+    /// asked to be ([`ServiceType::NodePort`] / [`ServiceType::LoadBalancer`]).
+    ///
+    /// `None` for the default [`ServiceType::ClusterIp`], and it is
+    /// skipped on the wire: an env that never answered `service_type` produces
+    /// a byte-identical reconcile report to the one it produced before this
+    /// field existed. `None` therefore means "no external address was asked
+    /// for" — never "asked for and not found", which is
+    /// [`RouterAddress::Pending`], nor "asked for and unreadable", which is
+    /// [`RouterAddress::Unknown`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_address: Option<RouterAddress>,
 }
 
 #[async_trait]
@@ -489,6 +616,14 @@ mod tests {
                 updated_replicas: 1,
                 available_replicas: available,
             })
+        }
+
+        async fn get_service_status(
+            &self,
+            _service: &ObjectRef,
+        ) -> Result<ServiceStatus, K8sClusterError> {
+            // These tests exercise only the readiness wait.
+            unreachable!("the rollout-wait tests never read a Service status")
         }
     }
 
@@ -769,6 +904,234 @@ mod tests {
             !cluster.objects().keys().any(|o| o.name == lingering),
             "reconcile prunes the now-absent revision's workers"
         );
+    }
+
+    /// A cluster fake that applies/deletes normally (delegating to the
+    /// in-memory store) but answers `get_service_status` from a script — the
+    /// allocated nodePort and the LB ingress are assigned by the API server and
+    /// the cloud controller, so nothing in an applied manifest can produce them.
+    #[derive(Debug)]
+    struct AddressedCluster {
+        inner: InMemoryCluster,
+        status: ServiceStatus,
+    }
+
+    #[async_trait]
+    impl K8sCluster for AddressedCluster {
+        async fn apply(&self, manifest: &Value) -> Result<(), K8sClusterError> {
+            self.inner.apply(manifest).await
+        }
+
+        async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError> {
+            self.inner.delete(object).await
+        }
+
+        async fn get_rollout_status(
+            &self,
+            deployment: &ObjectRef,
+        ) -> Result<RolloutStatus, K8sClusterError> {
+            self.inner.get_rollout_status(deployment).await
+        }
+
+        async fn get_service_status(
+            &self,
+            _service: &ObjectRef,
+        ) -> Result<ServiceStatus, K8sClusterError> {
+            Ok(self.status.clone())
+        }
+    }
+
+    /// A cluster fake whose status read always fails, for the
+    /// "convergence succeeded, the address read did not" path.
+    #[derive(Debug)]
+    struct UnreadableServiceCluster(InMemoryCluster);
+
+    #[async_trait]
+    impl K8sCluster for UnreadableServiceCluster {
+        async fn apply(&self, manifest: &Value) -> Result<(), K8sClusterError> {
+            self.0.apply(manifest).await
+        }
+
+        async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError> {
+            self.0.delete(object).await
+        }
+
+        async fn get_rollout_status(
+            &self,
+            deployment: &ObjectRef,
+        ) -> Result<RolloutStatus, K8sClusterError> {
+            self.0.get_rollout_status(deployment).await
+        }
+
+        async fn get_service_status(
+            &self,
+            _service: &ObjectRef,
+        ) -> Result<ServiceStatus, K8sClusterError> {
+            Err(K8sClusterError::Api("connection reset".to_string()))
+        }
+    }
+
+    fn service_type_answers(service_type: &str) -> Value {
+        serde_json::json!({"service_type": service_type})
+    }
+
+    #[test]
+    fn router_address_reads_an_allocated_node_port() {
+        let status = ServiceStatus {
+            service_type: "NodePort".to_string(),
+            node_port: Some(31234),
+            ..Default::default()
+        };
+        assert_eq!(
+            RouterAddress::from_status(&status),
+            RouterAddress::NodePort { node_port: 31234 }
+        );
+    }
+
+    #[test]
+    fn router_address_reads_both_load_balancer_ingress_shapes() {
+        // AWS-style load balancers assign a hostname, GCP-style an IP; both are
+        // carried through rather than collapsed into one string.
+        let hostname = ServiceStatus {
+            service_type: "LoadBalancer".to_string(),
+            ingress_hostname: Some("a1b2.elb.amazonaws.com".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            RouterAddress::from_status(&hostname),
+            RouterAddress::LoadBalancer {
+                hostname: Some("a1b2.elb.amazonaws.com".to_string()),
+                ip: None,
+            }
+        );
+        let ip = ServiceStatus {
+            service_type: "LoadBalancer".to_string(),
+            ingress_ip: Some("34.1.2.3".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            RouterAddress::from_status(&ip),
+            RouterAddress::LoadBalancer {
+                hostname: None,
+                ip: Some("34.1.2.3".to_string()),
+            }
+        );
+    }
+
+    /// The distinction the whole report exists for: an address that has not
+    /// been assigned YET must not read as an address that will never exist.
+    #[test]
+    fn router_address_reports_an_unassigned_address_as_pending() {
+        for service_type in ["LoadBalancer", "NodePort"] {
+            let status = ServiceStatus {
+                service_type: service_type.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                RouterAddress::from_status(&status),
+                RouterAddress::Pending,
+                "{service_type} with nothing assigned is pending"
+            );
+        }
+    }
+
+    /// Reaching here means the live object disagrees with the type that was
+    /// applied — worth naming rather than silently reporting as pending.
+    #[test]
+    fn router_address_names_an_unexposed_live_service() {
+        let status = ServiceStatus {
+            service_type: "ClusterIP".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            RouterAddress::from_status(&status),
+            RouterAddress::Unknown { .. }
+        ));
+    }
+
+    /// The default path must make no extra API call and add no wire field, so a
+    /// reconcile that never answered `service_type` is byte-identical to the
+    /// one it produced before this shipped.
+    #[tokio::test]
+    async fn reconcile_reports_no_router_address_by_default() {
+        let (handler, _cluster) = handler_with_fake();
+        let env = build_fixture_env();
+        let report = handler.reconcile(&env, None, true).await.unwrap();
+        assert_eq!(report.router_address, None);
+        let wire = serde_json::to_value(&report).unwrap();
+        assert!(
+            wire.get("router_address").is_none(),
+            "the default report carries no router_address key: {wire}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_the_routers_allocated_node_port() {
+        let cluster = Arc::new(AddressedCluster {
+            inner: InMemoryCluster::default(),
+            status: ServiceStatus {
+                service_type: "NodePort".to_string(),
+                node_port: Some(30987),
+                ..Default::default()
+            },
+        });
+        let handler = K8sDeployerHandler::with_cluster(cluster);
+        let env = build_fixture_env();
+        let report = handler
+            .reconcile(&env, Some(&service_type_answers("NodePort")), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.router_address,
+            Some(RouterAddress::NodePort { node_port: 30987 })
+        );
+    }
+
+    /// End-to-end through the in-memory fake, which applies the `LoadBalancer`
+    /// Service and provisions nothing — exactly the state of a real cluster for
+    /// the first seconds-to-minutes after the apply.
+    #[tokio::test]
+    async fn reconcile_reports_a_not_yet_provisioned_load_balancer_as_pending() {
+        let (handler, _cluster) = handler_with_fake();
+        let env = build_fixture_env();
+        let report = handler
+            .reconcile(&env, Some(&service_type_answers("LoadBalancer")), true)
+            .await
+            .unwrap();
+        assert_eq!(report.router_address, Some(RouterAddress::Pending));
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            wire.pointer("/router_address/state")
+                .and_then(Value::as_str),
+            Some("pending"),
+            "pending must be a distinguishable wire state: {wire}"
+        );
+    }
+
+    /// A failed status read must not fail a convergence that succeeded — and
+    /// must not be reported as "no address" either.
+    #[tokio::test]
+    async fn an_unreadable_router_service_is_reported_not_raised() {
+        let cluster = Arc::new(UnreadableServiceCluster(InMemoryCluster::default()));
+        let handler = K8sDeployerHandler::with_cluster(cluster);
+        let env = build_fixture_env();
+        let report = handler
+            .reconcile(&env, Some(&service_type_answers("LoadBalancer")), true)
+            .await
+            .expect("a failed address read must not fail the reconcile");
+        match report.router_address {
+            Some(RouterAddress::Unknown { reason }) => {
+                assert!(
+                    reason.contains(ROUTER_NAME),
+                    "reason names the object: {reason}"
+                );
+                assert!(
+                    reason.contains("connection reset"),
+                    "reason carries the cause: {reason}"
+                );
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
     }
 
     /// A Vault backend whose connection config matches the provider defaults.

@@ -34,13 +34,15 @@ use k8s_openapi::api::authentication::v1::{SelfSubjectReview, TokenRequest, Toke
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
-use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
+use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use kube::config::KubeConfigOptions;
 use serde_json::Value;
 
 use super::bootstrap::DEPLOYER_IDENTITY_BEARER_KEY;
-use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, manifest_field};
+use super::cluster::{
+    K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, ServiceStatus, manifest_field,
+};
 use super::credentials::{
     AccessDecision, ClusterIdentity, K8sBootstrapClient, K8sClientError, K8sOperation,
     K8sValidatorClient, MintedToken, OperationDecision,
@@ -335,6 +337,46 @@ impl K8sCluster for KubeCluster {
             replicas: status.and_then(|s| s.replicas).unwrap_or(0),
             updated_replicas: status.and_then(|s| s.updated_replicas).unwrap_or(0),
             available_replicas: status.and_then(|s| s.available_replicas).unwrap_or(0),
+        })
+    }
+
+    async fn get_service_status(
+        &self,
+        service: &ObjectRef,
+    ) -> Result<ServiceStatus, K8sClusterError> {
+        // Read through the typed core/v1 API so `.spec.ports[].nodePort` and
+        // `.status.loadBalancer` parse without a hand-written schema — the same
+        // reason `get_rollout_status` reads a typed Deployment.
+        let namespace = service.namespace.as_deref().unwrap_or_default();
+        let api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let svc = api.get(&service.name).await.map_err(map_cluster_error)?;
+        let spec = svc.spec.as_ref();
+        // The rendered Service declares exactly one port, named `http`. Prefer
+        // it by NAME and fall back to the first port, so an object an operator
+        // has since added a port to still reports the one Greentic serves on
+        // rather than whichever the API server happened to order first.
+        let port = spec.and_then(|s| {
+            s.ports.as_ref().and_then(|ports| {
+                ports
+                    .iter()
+                    .find(|p| p.name.as_deref() == Some("http"))
+                    .or_else(|| ports.first())
+            })
+        });
+        // `.status.loadBalancer.ingress` is empty until the cloud controller
+        // provisions the load balancer — that absence is a real state
+        // (`RouterAddress::Pending`), not a failure to read.
+        let ingress = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_ref())
+            .and_then(|ingress| ingress.first());
+        Ok(ServiceStatus {
+            service_type: spec.and_then(|s| s.type_.clone()).unwrap_or_default(),
+            node_port: port.and_then(|p| p.node_port),
+            ingress_hostname: ingress.and_then(|i| i.hostname.clone()),
+            ingress_ip: ingress.and_then(|i| i.ip.clone()),
         })
     }
 }

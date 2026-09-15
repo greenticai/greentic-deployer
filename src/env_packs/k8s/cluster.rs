@@ -170,6 +170,34 @@ impl RolloutStatus {
     }
 }
 
+/// What the API server reports about a Service's exposure, read back after the
+/// apply so the reconcile can tell the operator where the env is reachable.
+///
+/// The fields are the raw readback, not a verdict: the `NodePort` allocation
+/// and the `LoadBalancer` ingress are assigned by the API server and the cloud
+/// controller respectively, so neither is knowable from the manifest that was
+/// applied. Turning them into one named state is
+/// [`RouterAddress::from_status`](super::deployer::RouterAddress::from_status) —
+/// the same split as [`RolloutStatus`] and its `is_complete` policy, so the
+/// interpretation stays pure and unit-testable without a cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceStatus {
+    /// `.spec.type` as the API server recorded it. Read back rather than
+    /// assumed from the applied manifest: a Service that already existed under
+    /// a different type is reconciled by the apply, and reporting the type we
+    /// SENT would describe an object we had not confirmed.
+    pub service_type: String,
+    /// `.spec.ports[].nodePort` for the `http` port — allocated by the API
+    /// server for `NodePort` and `LoadBalancer`, absent for `ClusterIP`.
+    pub node_port: Option<i32>,
+    /// `.status.loadBalancer.ingress[0].hostname` — what AWS-style load
+    /// balancers assign. `None` while provisioning, and for non-LB types.
+    pub ingress_hostname: Option<String>,
+    /// `.status.loadBalancer.ingress[0].ip` — what GCP-style load balancers
+    /// assign. `None` while provisioning, and for non-LB types.
+    pub ingress_ip: Option<String>,
+}
+
 /// Declarative mutation surface against one cluster.
 ///
 /// ## Idempotency contract
@@ -196,6 +224,20 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
         &self,
         deployment: &ObjectRef,
     ) -> Result<RolloutStatus, K8sClusterError>;
+
+    /// Read a Service's [`ServiceStatus`] so the reconcile can report where the
+    /// env is reachable. Called only after [`apply`](Self::apply) has accepted
+    /// the Service, so the object is expected to exist.
+    ///
+    /// Needs no RBAC beyond what the deployer already holds: `services` `get`
+    /// is in
+    /// [`VALIDATED_K8S_OPERATIONS`](super::credentials::VALIDATED_K8S_OPERATIONS)
+    /// and in the Role the bootstrap rules pack mints, so an env bound before
+    /// this method existed can serve it with its existing credential.
+    async fn get_service_status(
+        &self,
+        service: &ObjectRef,
+    ) -> Result<ServiceStatus, K8sClusterError>;
 }
 
 /// The scaffold default: no client wired, every call fails honestly.
@@ -216,6 +258,13 @@ impl K8sCluster for UnconfiguredCluster {
         &self,
         _deployment: &ObjectRef,
     ) -> Result<RolloutStatus, K8sClusterError> {
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    async fn get_service_status(
+        &self,
+        _service: &ObjectRef,
+    ) -> Result<ServiceStatus, K8sClusterError> {
         Err(K8sClusterError::Unconfigured)
     }
 }
@@ -271,6 +320,35 @@ impl K8sCluster for InMemoryCluster {
             replicas: i32::MAX,
             updated_replicas: i32::MAX,
             available_replicas: i32::MAX,
+        })
+    }
+
+    async fn get_service_status(
+        &self,
+        service: &ObjectRef,
+    ) -> Result<ServiceStatus, K8sClusterError> {
+        let stored = self
+            .objects
+            .lock()
+            .expect("mutex not poisoned")
+            .get(service)
+            .cloned()
+            .ok_or_else(|| K8sClusterError::Api(format!("`{service}` not found")))?;
+        // The fake has no API server and no cloud controller, so it reports
+        // exactly what an apply would have persisted and nothing either of them
+        // would have assigned: no allocated nodePort, no LB ingress. A
+        // `LoadBalancer` therefore reads as PENDING here, which is the honest
+        // fake of a load balancer that has been requested and not yet
+        // provisioned — and the state a caller most needs to be able to see.
+        Ok(ServiceStatus {
+            service_type: stored
+                .pointer("/spec/type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            node_port: None,
+            ingress_hostname: None,
+            ingress_ip: None,
         })
     }
 }
@@ -415,6 +493,48 @@ mod tests {
             c.delete(&r).await.unwrap_err(),
             K8sClusterError::Unconfigured
         ));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_cluster_cannot_read_a_service_status() {
+        let c = UnconfiguredCluster;
+        let r = ObjectRef::from_manifest(&manifest()).unwrap();
+        assert!(matches!(
+            c.get_service_status(&r).await.unwrap_err(),
+            K8sClusterError::Unconfigured
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_memory_service_status_reports_the_applied_type_and_no_assigned_address() {
+        let c = InMemoryCluster::default();
+        let lb = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "svc-a", "namespace": "ns-a"},
+            "spec": {"type": "LoadBalancer"},
+        });
+        c.apply(&lb).await.unwrap();
+        let status = c
+            .get_service_status(&ObjectRef::from_manifest(&lb).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(status.service_type, "LoadBalancer");
+        // The fake has no cloud controller, so it assigns nothing — the honest
+        // fake of a load balancer that has been requested and not provisioned.
+        assert_eq!(status.node_port, None);
+        assert_eq!(status.ingress_hostname, None);
+        assert_eq!(status.ingress_ip, None);
+    }
+
+    #[tokio::test]
+    async fn in_memory_service_status_of_an_absent_object_is_an_error() {
+        // Never a default-shaped `ServiceStatus`: a Service that is not there
+        // and a Service with no address assigned are different answers, and
+        // only one of them means "keep waiting".
+        let c = InMemoryCluster::default();
+        let r = ObjectRef::from_manifest(&manifest()).unwrap();
+        assert!(c.get_service_status(&r).await.is_err());
     }
 
     #[tokio::test]

@@ -891,6 +891,14 @@ pub fn reconcile(
             "pruned_count": report.pruned.len(),
             "applied": report.applied,
             "pruned": report.pruned,
+            // Where the router is reachable from outside the cluster, for an
+            // env whose `service_type` answer asked to be exposed. Absent
+            // (`null`, dropped by `skip_serializing_if`) for the default
+            // `ClusterIP`, so a reconcile that never answered `service_type`
+            // emits exactly the fields it emitted before this shipped. A
+            // present value distinguishes an assigned address from one still
+            // being provisioned — see `RouterAddress`.
+            "router_address": report.router_address,
         }),
     ))
 }
