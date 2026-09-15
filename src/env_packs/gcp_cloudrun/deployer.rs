@@ -93,6 +93,40 @@ pub struct GcpCloudRunParams {
     /// When set, the image is pinned by digest (recommended — plan D3).
     pub runtime_image_digest: Option<String>,
     pub service_account: Option<String>,
+    /// The tenant the deployed workload resolves secrets under, projected as
+    /// `GREENTIC_TENANT` (see [`runtime_boot_env`]).
+    ///
+    /// **Not cosmetic identity.** greentic-start's `config.tenant` defaults to
+    /// `default`, and that value is a path SEGMENT of every `secrets://` URI the
+    /// workload builds: `secrets://{env}/{tenant}/{team}/…`. Nothing else in the
+    /// env-manifest overrides it, so a workload owned by tenant `aws` looked
+    /// under `default` and never found what the deploy had written. Measured
+    /// live on 2026-09-15, with the credential staged under the tenant `aws`:
+    ///
+    /// ```text
+    /// WASM secrets read MISS uri=secrets://default/default/_/mcp/ff308b9c-951a-…
+    /// ```
+    ///
+    /// Nothing was red at any layer — the deploy reported success, every flow
+    /// node reported ok, and the card rendered with every field blank. This
+    /// answer is therefore the difference between a credential being found and
+    /// being written somewhere nothing reads.
+    ///
+    /// `None` omits the variable entirely rather than emitting an empty one, so
+    /// an environment that sends no answer keeps today's boot env byte for byte
+    /// and greentic-start keeps its own default.
+    pub runtime_tenant: Option<String>,
+    /// The team the deployed workload resolves secrets under, projected as
+    /// `GREENTIC_TEAM` (see [`runtime_boot_env`]).
+    ///
+    /// The third segment of the same `secrets://{env}/{tenant}/{team}/…` URI as
+    /// [`Self::runtime_tenant`], and it fails the same silent way: greentic-
+    /// start's `config.team` also defaults to `default`, so a team-scoped
+    /// credential resolves to a path the runtime never reads, with no error at
+    /// any layer. See the doc on `runtime_tenant` for the measured MISS line.
+    ///
+    /// `None` omits the variable, leaving greentic-start's own default in force.
+    pub runtime_team: Option<String>,
     pub secret_prefix: String,
     pub cpu: String,
     pub memory: String,
@@ -119,6 +153,10 @@ impl GcpCloudRunParams {
             runtime_image_tag: DEFAULT_RUNTIME_IMAGE_TAG.to_string(),
             runtime_image_digest: None,
             service_account: None,
+            // Absent by default: greentic-start keeps its own `default`/`default`
+            // unless an environment explicitly answers otherwise.
+            runtime_tenant: None,
+            runtime_team: None,
             secret_prefix: format!("gtc-{env_id}"),
             cpu: "1".to_string(),
             memory: "512Mi".to_string(),
@@ -152,6 +190,8 @@ impl GcpCloudRunParams {
                     params.runtime_image_digest = optional_string(key, value)?
                 }
                 "service_account" => params.service_account = optional_string(key, value)?,
+                "runtime_tenant" => params.runtime_tenant = optional_string(key, value)?,
+                "runtime_team" => params.runtime_team = optional_string(key, value)?,
                 "secret_prefix" => params.secret_prefix = answer_string(key, value)?,
                 "cpu" => params.cpu = answer_string(key, value)?,
                 "memory" => params.memory = answer_string(key, value)?,
@@ -349,9 +389,21 @@ pub(crate) fn secret_conflict(name: &str, owner: &str, env_id: &str) -> Deployer
 /// and the revision-identity vars mirror the k8s pack-pull contract so the
 /// runtime knows which revision to serve. The bundle *source* URI is read from
 /// the seeded `environment.json`, not an env var, so none is set here.
-fn runtime_boot_env(env: &Environment, revision: &Revision) -> Vec<(String, String)> {
+///
+/// `GREENTIC_TENANT` / `GREENTIC_TEAM` are appended only when the binding
+/// answered them (see [`GcpCloudRunParams::runtime_tenant`]). They are the
+/// tenant and team segments of every `secrets://` URI the workload resolves, and
+/// they are **omitted rather than emitted empty** when absent: an environment
+/// that answers neither produces byte for byte the boot env it produced before
+/// these answers existed, so every already-deployed revision is unchanged and
+/// [`revision_intent`] fingerprints the same value it fingerprinted before.
+fn runtime_boot_env(
+    env: &Environment,
+    revision: &Revision,
+    params: &GcpCloudRunParams,
+) -> Vec<(String, String)> {
     let env_id = env.environment_id.as_str();
-    vec![
+    let mut vars = vec![
         ("GREENTIC_ENV".to_string(), env_id.to_string()),
         ("GREENTIC_ENV_ID".to_string(), env_id.to_string()),
         ("GREENTIC_SEED_DIR".to_string(), SEED_MOUNT_DIR.to_string()),
@@ -376,7 +428,14 @@ fn runtime_boot_env(env: &Environment, revision: &Revision) -> Vec<(String, Stri
             "GREENTIC_BUNDLE_DIGEST".to_string(),
             revision.bundle_digest.clone(),
         ),
-    ]
+    ];
+    if let Some(tenant) = &params.runtime_tenant {
+        vars.push(("GREENTIC_TENANT".to_string(), tenant.clone()));
+    }
+    if let Some(team) = &params.runtime_team {
+        vars.push(("GREENTIC_TEAM".to_string(), team.clone()));
+    }
+    vars
 }
 
 /// Deterministic Cloud Run revision name: `gtc-svc-{dep}-{rev}` (61 chars ≤ the
@@ -665,7 +724,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // versions, and a retry must not have to mint any to know what it wants.
         let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
         let secret_name = environment_secret_name(&params.secret_prefix);
-        let boot_env = runtime_boot_env(env, revision);
+        let boot_env = runtime_boot_env(env, revision, &params);
         let intent = revision_intent(
             &params.image_ref(),
             &runtime_service_account,
@@ -1856,7 +1915,8 @@ mod tests {
     fn runtime_boot_env_activates_seed_and_carries_revision_identity() {
         let env = build_fixture_env();
         let revision = &env.revisions[0];
-        let vars = runtime_boot_env(&env, revision);
+        let params = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
+        let vars = runtime_boot_env(&env, revision, &params);
         let get = |k: &str| {
             vars.iter()
                 .find(|(name, _)| name == k)
@@ -1889,6 +1949,150 @@ mod tests {
         assert!(get("GREENTIC_BUNDLE_SOURCE_URI").is_none());
     }
 
+    /// An environment answering neither key must produce the boot env it
+    /// produced before these answers existed — not an empty-valued pair. An
+    /// empty `GREENTIC_TENANT` would override greentic-start's own default with
+    /// the empty string, and any new var at all moves `revision_intent`'s
+    /// fingerprint, which would make every live revision read as a conflict.
+    #[test]
+    fn runtime_boot_env_omits_tenant_and_team_when_unanswered() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let params = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
+        assert_eq!(params.runtime_tenant, None);
+        assert_eq!(params.runtime_team, None);
+
+        let vars = runtime_boot_env(&env, revision, &params);
+        let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !names.contains(&"GREENTIC_TENANT"),
+            "an unanswered tenant must be absent, not empty: {names:?}"
+        );
+        assert!(
+            !names.contains(&"GREENTIC_TEAM"),
+            "an unanswered team must be absent, not empty: {names:?}"
+        );
+
+        // The exact set, in order, that predates this feature.
+        assert_eq!(
+            names,
+            vec![
+                "GREENTIC_ENV",
+                "GREENTIC_ENV_ID",
+                "GREENTIC_SEED_DIR",
+                "HOME",
+                "GREENTIC_GATEWAY_LISTEN_ADDR",
+                "GREENTIC_REVISION_ID",
+                "GREENTIC_DEPLOYMENT_ID",
+                "GREENTIC_BUNDLE_ID",
+                "GREENTIC_BUNDLE_DIGEST",
+            ]
+        );
+
+        // An answers object that omits both keys is the same as no answers at
+        // all — the designer sends a flat map, so "absent" is the common case.
+        let sparse = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"region": "us-central1"})),
+        )
+        .expect("sparse answers parse");
+        assert_eq!(
+            runtime_boot_env(&env, revision, &sparse),
+            vars,
+            "omitting the keys from a non-empty answers object changes nothing"
+        );
+    }
+
+    /// The whole point of the feature: the answered tenant and team become the
+    /// segments of every `secrets://{env}/{tenant}/{team}/…` URI the workload
+    /// resolves, instead of greentic-start's `default`/`default`.
+    #[test]
+    fn runtime_boot_env_projects_the_answered_tenant_and_team() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let params = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "aws", "runtime_team": "general"})),
+        )
+        .expect("tenant and team answers parse");
+        assert_eq!(params.runtime_tenant.as_deref(), Some("aws"));
+        assert_eq!(params.runtime_team.as_deref(), Some("general"));
+
+        let vars = runtime_boot_env(&env, revision, &params);
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("GREENTIC_TENANT"), Some("aws"));
+        assert_eq!(get("GREENTIC_TEAM"), Some("general"));
+
+        // Projecting them adds exactly two vars and disturbs nothing else.
+        let baseline = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
+        assert_eq!(
+            vars.len(),
+            runtime_boot_env(&env, revision, &baseline).len() + 2
+        );
+    }
+
+    /// Each key is independently optional: answering one must not force the
+    /// other, and an explicitly blank answer is `None` (via `optional_string`)
+    /// rather than an empty variable.
+    #[test]
+    fn runtime_tenant_and_team_are_independently_optional() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+
+        let tenant_only = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "aws"})),
+        )
+        .expect("tenant-only answers parse");
+        let tenant_only_vars = runtime_boot_env(&env, revision, &tenant_only);
+        let names: Vec<&str> = tenant_only_vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"GREENTIC_TENANT"));
+        assert!(!names.contains(&"GREENTIC_TEAM"));
+
+        let blank = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "  ", "runtime_team": ""})),
+        )
+        .expect("blank answers parse");
+        assert_eq!(blank.runtime_tenant, None);
+        assert_eq!(blank.runtime_team, None);
+        let blank_vars = runtime_boot_env(&env, revision, &blank);
+        let names: Vec<&str> = blank_vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !names.contains(&"GREENTIC_TENANT") && !names.contains(&"GREENTIC_TEAM"),
+            "a blank answer must omit the var, never emit an empty one: {names:?}"
+        );
+    }
+
+    /// `from_answers` is deny-by-default, which is why this change must land
+    /// before greentic-designer starts sending the keys: an older deployer
+    /// rejects the whole deploy on `UnknownKey`. Pin that both new keys are
+    /// accepted AND that the refusal still works for a genuinely unknown one.
+    #[test]
+    fn from_answers_accepts_the_runtime_identity_keys_and_still_rejects_unknown_ones() {
+        let env = build_fixture_env();
+
+        GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "aws", "runtime_team": "general"})),
+        )
+        .expect("both runtime identity keys are accepted");
+
+        let err = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenancy": "aws"})),
+        )
+        .expect_err("a genuinely unknown key is still refused");
+        assert!(
+            matches!(&err, GcpCloudRunParamsError::UnknownKey(k) if k == "runtime_tenancy"),
+            "expected UnknownKey(runtime_tenancy), got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn warm_threads_boot_env_onto_the_service() {
         let (handler, target) = handler_with_fake();
@@ -1900,10 +2104,11 @@ mod tests {
 
         // warm builds boot env once and projects it onto the upserted Service,
         // so the running container actually boots from the staged seed.
+        let params = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
         let recorded = target
             .service_env_for(revision.deployment_id)
             .expect("warm upserts the Service with boot env");
-        assert_eq!(recorded, runtime_boot_env(&env, revision));
+        assert_eq!(recorded, runtime_boot_env(&env, revision, &params));
         assert!(
             recorded
                 .iter()
