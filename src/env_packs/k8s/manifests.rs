@@ -14,7 +14,10 @@
 //!   topology-spread) receives all ingress for the env; the Gateway /
 //!   Ingress (Zain's choice, Q4) sends 100% of matching traffic to the
 //!   stable router Service. Provider-native revision weighting is
-//!   deferred to Phase E.
+//!   deferred to Phase E. No Ingress is rendered here — external
+//!   reachability is selected on the router Service's own `spec.type`
+//!   ([`ServiceType`]), which needs no ingress controller and no RBAC
+//!   beyond the `services` verbs the deployer already holds.
 //! - One **worker** Deployment + ClusterIP Service per revision, labeled
 //!   `greentic.ai/revision: <ULID>`. The router resolves the deployment,
 //!   applies the authoritative `TrafficSplit` from the runtime-config
@@ -209,6 +212,70 @@ pub struct VaultBackend {
     pub namespace: Option<String>,
 }
 
+/// How the env's stable router Service is exposed (deployer answer
+/// `service_type`), i.e. `Service.spec.type` on the object the rendered
+/// Gateway / Ingress would otherwise front.
+///
+/// The env-pack renders **no Ingress** — routing a hostname into the cluster is
+/// the operator's own decision (cert issuer, controller class, DNS), and one
+/// this deployer has no way to make correctly for an arbitrary cluster. That
+/// left the router reachable only from inside the cluster, so an operator had
+/// no address at all short of `kubectl port-forward`. Selecting the Service
+/// TYPE closes that without an Ingress and, deliberately, **without an RBAC
+/// migration**: `services` (get/create/patch/delete) is already in
+/// [`VALIDATED_K8S_OPERATIONS`](super::credentials::VALIDATED_K8S_OPERATIONS),
+/// so an env bootstrapped before this answer existed can adopt it with the
+/// credential it already holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServiceType {
+    /// In-cluster address only — the historical, and still default, shape.
+    #[default]
+    ClusterIp,
+    /// The API server allocates a port on every node; reachable at
+    /// `<any-node-ip>:<nodePort>`. The node IP half is the operator's to
+    /// supply, so the reconcile report carries the port alone.
+    NodePort,
+    /// The cloud provider provisions a load balancer and assigns an ingress
+    /// address. Provisioning is ASYNCHRONOUS — the address is routinely absent
+    /// for the first minutes after the apply, which is why
+    /// [`RouterAddress`](super::deployer::RouterAddress) reports a distinct
+    /// `pending` rather than an empty one.
+    LoadBalancer,
+}
+
+impl ServiceType {
+    /// The canonical Kubernetes spelling written to `Service.spec.type`.
+    pub fn as_k8s_str(self) -> &'static str {
+        match self {
+            Self::ClusterIp => "ClusterIP",
+            Self::NodePort => "NodePort",
+            Self::LoadBalancer => "LoadBalancer",
+        }
+    }
+
+    /// Parse the `service_type` wizard answer.
+    ///
+    /// Matching is ASCII-case-insensitive on the canonical Kubernetes names.
+    /// That is a normalization, not a fallback: `LoadBalancer` is a CamelCase
+    /// API enum typed by hand into a free-text wizard field, and rejecting
+    /// `loadbalancer` would fail a deploy over letter case while the operator's
+    /// intent is unambiguous. Anything the table does not name is an `Err` —
+    /// an unrecognised value must never quietly resolve to `ClusterIP`, which
+    /// is exactly the silent non-exposure this answer exists to end.
+    fn parse(raw: &str) -> Result<Self, String> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "clusterip" => Ok(Self::ClusterIp),
+            "nodeport" => Ok(Self::NodePort),
+            "loadbalancer" => Ok(Self::LoadBalancer),
+            _ => Err(format!(
+                "service_type `{raw}` is not valid (expected `ClusterIP`, \
+                 `NodePort` or `LoadBalancer`)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct K8sParams {
     /// Namespace every rendered object lands in. One namespace per
@@ -260,6 +327,18 @@ pub struct K8sParams {
     /// backend (it owns the binding-answers read, exactly like
     /// [`Self::dev_secrets_data`]).
     pub secrets_backend: SecretsBackend,
+    /// How the stable ROUTER Service is exposed. From the `service_type`
+    /// answer; [`ServiceType::ClusterIp`] (the pre-existing, hardcoded shape)
+    /// unless the operator selects otherwise.
+    ///
+    /// It governs the router Service ONLY. The per-revision worker Services
+    /// stay `ClusterIP` unconditionally and must: the router is the env's
+    /// single front door precisely because it is the thing that enforces the
+    /// authoritative `TrafficSplit` (see the module docs), so giving each
+    /// revision its own externally-reachable address would hand callers a way
+    /// to reach a revision the split routes 0% of traffic to — and, for
+    /// `LoadBalancer`, bill one load balancer per revision.
+    pub service_type: ServiceType,
 }
 
 impl K8sParams {
@@ -276,6 +355,7 @@ impl K8sParams {
             oci_password: None,
             dev_secrets_data: None,
             secrets_backend: SecretsBackend::DevStore,
+            service_type: ServiceType::ClusterIp,
         }
     }
 
@@ -298,6 +378,10 @@ impl K8sParams {
     /// - `kubeconfig_context`: silently accepted and ignored (client-
     ///   targeting knob, not a manifest knob — consumed by
     ///   [`kube_client::connect`](super::kube_client::connect)).
+    /// - `service_type`: `ClusterIP` (default) / `NodePort` / `LoadBalancer`,
+    ///   matched case-insensitively. `null` / empty-string → `ClusterIP`, so
+    ///   an env that never answers it renders exactly what it rendered before
+    ///   the answer existed. An unrecognised value is an `Err`.
     /// - `oci_username` / `oci_password`: either both set (non-blank) or both
     ///   left blank/absent — one without the other is rejected as `Err`,
     ///   since supplying half a credential pair is almost certainly a mistake
@@ -327,6 +411,7 @@ impl K8sParams {
             "oci_insecure_registries",
             "oci_username",
             "oci_password",
+            "service_type",
         ];
         for key in obj.keys() {
             if !KNOWN_KEYS.contains(&key.as_str()) {
@@ -397,6 +482,11 @@ impl K8sParams {
             None => defaults.tunnel,
         };
 
+        let service_type = match answer_string(obj, "service_type") {
+            Some(s) => ServiceType::parse(&s)?,
+            None => defaults.service_type,
+        };
+
         // Accepts a comma-separated string (the wizard form) or a JSON array of
         // strings (declarative env-manifest authors). Blank → no registries.
         let oci_insecure_registries = match obj.get("oci_insecure_registries") {
@@ -453,6 +543,7 @@ impl K8sParams {
             // binding, not the deployer wizard answers parsed here; the call
             // site overlays it (like `dev_secrets_data`).
             secrets_backend: defaults.secrets_backend,
+            service_type,
         })
     }
 }
@@ -1069,6 +1160,14 @@ pub fn render_worker_deployment(
 
 /// One revision's ClusterIP Service — the stable address the router
 /// dispatches that revision's traffic to.
+///
+/// Deliberately NOT driven by [`K8sParams::service_type`]: this Service is
+/// internal plumbing between the router and one revision, and the router is
+/// what enforces the authoritative `TrafficSplit`. An externally-reachable
+/// per-revision address would route around that split entirely (a caller could
+/// hit a revision weighted 0%), and under `LoadBalancer` would provision one
+/// load balancer per revision. External exposure is a property of the ENV, so
+/// it lands on the env's one front door: [`render_router_service`].
 pub fn render_worker_service(env: &Environment, revision: &Revision, params: &K8sParams) -> Value {
     json!({
         "apiVersion": "v1",
@@ -1176,7 +1275,14 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
 }
 
 /// The stable router Service — the single target the Gateway / Ingress
-/// routes 100% of the env's traffic to.
+/// routes 100% of the env's traffic to, and the one object whose
+/// `spec.type` the operator selects ([`K8sParams::service_type`]).
+///
+/// The default is `ClusterIP`, so an env with no `service_type` answer renders
+/// byte-for-byte what it rendered before the answer existed. `NodePort` /
+/// `LoadBalancer` are what give the env an address reachable from outside the
+/// cluster at all; the env-pack still renders no Ingress (see
+/// [`ServiceType`]).
 pub fn render_router_service(env: &Environment, params: &K8sParams) -> Value {
     let labels = common_labels(env, "router");
     json!({
@@ -1188,7 +1294,7 @@ pub fn render_router_service(env: &Environment, params: &K8sParams) -> Value {
             "labels": labels,
         },
         "spec": {
-            "type": "ClusterIP",
+            "type": params.service_type.as_k8s_str(),
             "selector": labels,
             "ports": [{"name": "http", "port": SERVE_PORT, "targetPort": SERVE_PORT}],
         },
@@ -1388,6 +1494,14 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
             "spec": {
                 "podSelector": {"matchLabels": router_labels},
                 "policyTypes": ["Ingress", "Egress"],
+                // No `from` selector: an ingress rule with ports only admits
+                // ANY source on that port. That is what makes an externally
+                // exposed router ([`K8sParams::service_type`]) actually
+                // reachable — narrowing this to in-cluster peers would leave a
+                // `NodePort` / `LoadBalancer` Service that resolves while the
+                // pod drops the packets, under a NetworkPolicy-enforcing CNI
+                // only. Pinned by
+                // `router_ingress_admits_traffic_from_outside_the_cluster`.
                 "ingress": [{"ports": [{"protocol": "TCP", "port": SERVE_PORT}]}],
                 "egress": [{
                     "to": [{"podSelector": {"matchLabels": worker_component}}],
@@ -2161,6 +2275,158 @@ mod tests {
     }
 
     // ---- from_answers + is_dns1123_label -----------------------------------
+
+    /// The regression pin the `service_type` answer is measured against: an env
+    /// that does not answer it must render the router Service EXACTLY as it did
+    /// before the answer existed. Written as a whole-object literal rather than
+    /// a `spec.type` probe on purpose — a field quietly added to the default
+    /// Service is the same silent change to existing deployments that this test
+    /// exists to catch.
+    #[test]
+    fn an_unanswered_service_type_renders_the_pre_existing_router_service() {
+        let (env, params) = fixture();
+        assert_eq!(params.service_type, ServiceType::ClusterIp, "the default");
+        let labels = common_labels(&env, "router");
+        assert_eq!(
+            render_router_service(&env, &params),
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": ROUTER_NAME,
+                    "namespace": params.namespace,
+                    "labels": labels,
+                },
+                "spec": {
+                    "type": "ClusterIP",
+                    "selector": labels,
+                    "ports": [{"name": "http", "port": SERVE_PORT, "targetPort": SERVE_PORT}],
+                },
+            })
+        );
+    }
+
+    /// The whole env-level set, not just the router: answering nothing must be
+    /// indistinguishable from answering the default explicitly, so an operator
+    /// who writes `ClusterIP` into a binding gets no surprise diff either.
+    #[test]
+    fn an_unanswered_service_type_matches_an_explicit_clusterip_answer() {
+        let (env, defaults) = fixture();
+        let explicit =
+            K8sParams::from_answers(&env, Some(&json!({"service_type": "ClusterIP"}))).unwrap();
+        assert_eq!(
+            render_environment_manifests(&env, &defaults),
+            render_environment_manifests(&env, &explicit)
+        );
+    }
+
+    #[test]
+    fn service_type_answer_selects_the_router_service_type() {
+        let (env, _) = fixture();
+        for (answer, expected) in [("NodePort", "NodePort"), ("LoadBalancer", "LoadBalancer")] {
+            let params =
+                K8sParams::from_answers(&env, Some(&json!({"service_type": answer}))).unwrap();
+            let svc = render_router_service(&env, &params);
+            assert_eq!(
+                svc.pointer("/spec/type").and_then(Value::as_str),
+                Some(expected),
+                "router Service type for answer `{answer}`"
+            );
+        }
+    }
+
+    /// Exposure is a property of the ENV, so it lands on the env's single front
+    /// door. Exposing a per-revision worker would hand callers an address that
+    /// routes around the router's `TrafficSplit` entirely — reaching a revision
+    /// weighted 0% — and, under `LoadBalancer`, bill one load balancer per
+    /// revision.
+    #[test]
+    fn an_exposed_env_still_renders_in_cluster_worker_services() {
+        let (env, mut params) = fixture();
+        let revision = env.revisions.first().expect("fixture has a revision");
+        for service_type in [ServiceType::NodePort, ServiceType::LoadBalancer] {
+            params.service_type = service_type;
+            let svc = render_worker_service(&env, revision, &params);
+            assert_eq!(
+                svc.pointer("/spec/type").and_then(Value::as_str),
+                Some("ClusterIP"),
+                "worker Service must stay in-cluster under {service_type:?}"
+            );
+        }
+    }
+
+    /// `LoadBalancer` is a CamelCase Kubernetes API enum typed by hand into a
+    /// free-text field; failing a deploy over letter case would be a worse
+    /// answer than normalizing one.
+    #[test]
+    fn from_answers_service_type_matching_is_case_insensitive() {
+        let (env, _) = fixture();
+        for (answer, expected) in [
+            ("clusterip", ServiceType::ClusterIp),
+            ("NODEPORT", ServiceType::NodePort),
+            ("loadbalancer", ServiceType::LoadBalancer),
+            (" LoadBalancer ", ServiceType::LoadBalancer),
+        ] {
+            let params =
+                K8sParams::from_answers(&env, Some(&json!({"service_type": answer}))).unwrap();
+            assert_eq!(params.service_type, expected, "answer `{answer}`");
+        }
+    }
+
+    /// An unrecognised value must never quietly resolve to `ClusterIP` — that
+    /// is exactly the silent non-exposure this answer exists to end.
+    #[test]
+    fn from_answers_unknown_service_type_rejected() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(&env, Some(&json!({"service_type": "Ingress"})))
+            .expect_err("an unmodelled Service type must be rejected");
+        assert!(err.contains("service_type"), "got {err}");
+        assert!(
+            err.contains("Ingress"),
+            "the error names the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn from_answers_blank_service_type_falls_back_to_clusterip() {
+        let (env, _) = fixture();
+        for blank in [json!(""), json!(null)] {
+            let params =
+                K8sParams::from_answers(&env, Some(&json!({"service_type": blank}))).unwrap();
+            assert_eq!(params.service_type, ServiceType::ClusterIp);
+        }
+    }
+
+    /// The other half of external exposure, and the half that fails silently:
+    /// a `NodePort` / `LoadBalancer` Service only reaches the pod if the
+    /// router's NetworkPolicy admits the traffic. An ingress rule carrying
+    /// ports and NO `from` selector admits any source; adding one would leave
+    /// the Service resolving while the pod drops the packets — and only under
+    /// a NetworkPolicy-enforcing CNI, so it would pass on a cluster without
+    /// one.
+    #[test]
+    fn router_ingress_admits_traffic_from_outside_the_cluster() {
+        let (env, mut params) = fixture();
+        params.service_type = ServiceType::LoadBalancer;
+        let policies = render_network_policies(&env, &params);
+        let router = policies
+            .iter()
+            .find(|p| p["metadata"]["name"] == "gtc-allow-router")
+            .expect("the router allow-policy is always rendered");
+        let rules = router["spec"]["ingress"]
+            .as_array()
+            .expect("the router policy carries ingress rules");
+        assert_eq!(rules.len(), 1);
+        assert!(
+            rules[0].get("from").is_none(),
+            "a `from` selector would make an exposed router unreachable: {}",
+            router["spec"]["ingress"]
+        );
+        assert_eq!(
+            rules[0]["ports"],
+            json!([{"protocol": "TCP", "port": SERVE_PORT}])
+        );
+    }
 
     #[test]
     fn from_answers_none_equals_for_env() {

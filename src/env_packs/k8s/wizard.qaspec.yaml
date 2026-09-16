@@ -104,3 +104,25 @@ questions:
       as `GREENTIC_OCI_INSECURE_REGISTRIES`; honored only on the
       digest-pinned OCI boot-pull path.
     required: false
+
+  - id: service_type
+    type: enum
+    title: Router service type
+    description: >-
+      How the environment's stable router Service is exposed. The env-pack
+      renders NO Ingress — routing a hostname in is the operator's own
+      decision (controller class, cert issuer, DNS) — so this answer is
+      what decides whether the environment has an address reachable from
+      outside the cluster at all. `ClusterIP` (the default, and the only
+      behaviour before this answer existed) is in-cluster only.
+      `NodePort` is reachable at `<any-node-ip>:<allocated-port>`.
+      `LoadBalancer` asks the cloud provider to provision one and assign an
+      address. It governs the ROUTER only: per-revision worker Services
+      stay in-cluster, because the router is what enforces the traffic
+      split. `op env reconcile` reports the resulting address, and reports
+      a load balancer still being provisioned as pending rather than as
+      absent. Needs no RBAC change — the deployer already holds the
+      `services` verbs.
+    required: false
+    default_value: "ClusterIP"
+    choices: ["ClusterIP", "NodePort", "LoadBalancer"]
