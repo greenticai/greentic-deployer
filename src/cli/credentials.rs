@@ -217,7 +217,12 @@ pub fn bootstrap(
     // deployer has no bind path. Built before the audit scope so the override
     // outlives the `run_bootstrap` call.
     let bind_creds: Option<Box<dyn DeployerCredentials>> = if bind_requested {
-        let creds = match admin_bind_k8s_credentials(store, &env_id, admin.profile())? {
+        let creds = match admin_bind_k8s_credentials(
+            store,
+            &env_id,
+            admin.profile(),
+            Some(admin.as_str()),
+        )? {
             Some(c) => Some(c),
             None => admin_bind_aws_credentials(store, &env_id, admin.profile())?,
         };
@@ -330,7 +335,23 @@ pub fn rotate(
     // non-K8s (render-only) deployer has nothing to rotate live. This only
     // constructs the connector (no connection yet), so it is cheap to run
     // before the `--if-needed` short-circuit.
-    let bind_creds = admin_bind_k8s_credentials(store, &env_id, &payload.admin_profile)?
+    // `None`, deliberately: rotate still authenticates from the AMBIENT
+    // kubeconfig, which is the behaviour bootstrap just moved away from.
+    //
+    // The material cannot be threaded here without moving
+    // `load_admin_credential` above this line, and its position is
+    // load-bearing — `--if-needed` documents that it "never loads admin
+    // material" when the token is not yet due, so hoisting the load would
+    // read the operator's file (or consume the inline string) on a path whose
+    // whole point is to do nothing. Closing this needs the connector to take
+    // the material lazily, at connect time, which is a larger change than the
+    // bug being fixed here warranted.
+    //
+    // Consequence, stated rather than left to be discovered: a rotate whose
+    // caller supplies `admin_material_*` has that material ignored exactly as
+    // bootstrap did, and fails the same way when there is no ambient
+    // kubeconfig.
+    let bind_creds = admin_bind_k8s_credentials(store, &env_id, &payload.admin_profile, None)?
         .ok_or_else(|| {
             OpError::Conflict(
                 "live rotation is only supported for K8s-bound environments this round; \
@@ -674,13 +695,16 @@ fn admin_bind_k8s_credentials(
     store: &LocalFsStore,
     env_id: &EnvId,
     admin_profile: &str,
+    admin_kubeconfig: Option<&str>,
 ) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
     use crate::cli::env::load_render_answers;
     use crate::env_packs::k8s::K8sDeployerHandler;
     use crate::env_packs::k8s::credentials::{
         K8sBootstrapClient, K8sBootstrapConnectFut, K8sBootstrapConnector, K8sDeployerCredentials,
     };
-    use crate::env_packs::k8s::kube_client::{KubeBootstrapClient, connect};
+    use crate::env_packs::k8s::kube_client::{
+        KubeBootstrapClient, connect, connect_with_kubeconfig,
+    };
     use crate::env_packs::k8s::manifests::K8sParams;
     use std::sync::Arc;
 
@@ -708,13 +732,32 @@ fn admin_bind_k8s_credentials(
         .namespace;
 
     let admin_context = admin_profile.to_string();
+    // The admin kubeconfig the CALLER supplied, when it supplied one. Cloned
+    // out of the zeroizing wrapper because the connector outlives this call;
+    // it is dropped with the connector and never written anywhere.
+    let admin_kubeconfig = admin_kubeconfig
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let connector: K8sBootstrapConnector = Arc::new(move || -> K8sBootstrapConnectFut {
         let admin_context = admin_context.clone();
+        let admin_kubeconfig = admin_kubeconfig.clone();
         Box::pin(async move {
             // Authenticate as the admin kubeconfig context (no bound token);
             // that identity must hold rights to create the SA/Role/
             // RoleBinding and call the TokenRequest subresource.
-            let client = connect(Some(&admin_context), None).await?;
+            //
+            // Prefer the SUPPLIED document. Falling through to the ambient
+            // chain is what this path did unconditionally, and it meant a
+            // caller that handed over a kubeconfig was authenticated from
+            // whatever happened to be in `~/.kube/config` instead. The
+            // fallback is kept for callers that supply no material at all —
+            // an operator at a terminal with a working ambient kubeconfig —
+            // so nothing that works today stops working.
+            let client = match admin_kubeconfig.as_deref() {
+                Some(yaml) => connect_with_kubeconfig(yaml, Some(&admin_context)).await?,
+                None => connect(Some(&admin_context), None).await?,
+            };
             Ok(Arc::new(KubeBootstrapClient::new(client)) as Arc<dyn K8sBootstrapClient>)
         })
     });
@@ -730,6 +773,7 @@ fn admin_bind_k8s_credentials(
     _store: &LocalFsStore,
     _env_id: &EnvId,
     _admin_profile: &str,
+    _admin_kubeconfig: Option<&str>,
 ) -> Result<Option<Box<dyn DeployerCredentials>>, OpError> {
     Err(OpError::Conflict(
         "`bind: true` requires a build with the `k8s-client` feature".to_string(),

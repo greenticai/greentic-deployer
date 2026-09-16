@@ -36,7 +36,7 @@ use k8s_openapi::api::authorization::v1::{
 };
 use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
-use kube::config::KubeConfigOptions;
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use serde_json::Value;
 
 use super::bootstrap::DEPLOYER_IDENTITY_BEARER_KEY;
@@ -70,6 +70,61 @@ pub const FIELD_MANAGER: &str = "greentic-deployer";
 /// All failures fold into [`K8sClientError::NoClusterAccess`] — the
 /// operator's fix path is the same regardless (fix kubeconfig / cluster
 /// access).
+/// Connect using a kubeconfig supplied BY VALUE, not the ambient chain.
+///
+/// # Why this exists
+///
+/// [`connect`] resolves through `Config::from_kubeconfig`, which reads
+/// `$KUBECONFIG` / `~/.kube/config` and looks the context up THERE. That is
+/// right for an operator at a terminal and wrong for `credentials bootstrap`,
+/// whose whole contract is that the caller HANDS IT the admin kubeconfig
+/// (`admin_material_inline` / `admin_material_path`).
+///
+/// Until this existed, the bootstrap path accepted that material, reported
+/// `admin_credential_consumed_at`, and then authenticated from the ambient
+/// chain anyway — so a caller with no ambient kubeconfig failed with
+/// "failed to load current context", and a caller whose ambient kubeconfig
+/// happened to contain a context of the same name silently succeeded against
+/// THAT cluster. Both were measured against this binary before the fix; the
+/// second is the one worth remembering, because it reports success.
+///
+/// `context` is looked up inside the SUPPLIED document. `None` uses that
+/// document's own `current-context`.
+pub async fn connect_with_kubeconfig(
+    kubeconfig_yaml: &str,
+    context: Option<&str>,
+) -> Result<kube::Client, K8sClientError> {
+    crate::crypto::install_default_crypto_provider();
+    let config = config_from_supplied_kubeconfig(kubeconfig_yaml, context).await?;
+    kube::Client::try_from(config).map_err(|e| K8sClientError::NoClusterAccess(e.to_string()))
+}
+
+/// The half of [`connect_with_kubeconfig`] that resolves a `Config` from the
+/// SUPPLIED document. Separated so it can be tested without a cluster: this
+/// performs no network I/O, and the property worth pinning — that the
+/// ambient chain is not consulted — is observable here as a resolved
+/// `cluster_url`.
+async fn config_from_supplied_kubeconfig(
+    kubeconfig_yaml: &str,
+    context: Option<&str>,
+) -> Result<kube::Config, K8sClientError> {
+    let doc = Kubeconfig::from_yaml(kubeconfig_yaml).map_err(|e| {
+        // Never quote the document: it carries client certificates and bearer
+        // tokens, and this string reaches the operator.
+        K8sClientError::NoClusterAccess(format!("supplied kubeconfig is not readable: {e}"))
+    })?;
+    let options = KubeConfigOptions {
+        context: context.map(str::to_string),
+        ..Default::default()
+    };
+    kube::Config::from_custom_kubeconfig(doc, &options)
+        .await
+        .map_err(|e| {
+            let named = context.unwrap_or("<current-context>");
+            K8sClientError::NoClusterAccess(format!("supplied kubeconfig, context `{named}`: {e}"))
+        })
+}
+
 pub async fn connect(
     kubeconfig_context: Option<&str>,
     bound_token: Option<&str>,
@@ -1525,5 +1580,102 @@ rules:
             respond
         );
         assert_eq!(result.expect("absent secret is Ok(None)"), None);
+    }
+}
+
+/// The supplied kubeconfig must be the one that authenticates — never the
+/// ambient chain.
+///
+/// These pin the pair that measured the bug: `credentials bootstrap` accepted
+/// `admin_material_inline`, reported `admin_credential_consumed_at`, and then
+/// resolved through `$KUBECONFIG` / `~/.kube/config` anyway. A caller with no
+/// ambient kubeconfig failed; a caller whose ambient kubeconfig happened to
+/// hold a same-named context silently authenticated against THAT cluster.
+///
+/// The regression guard is the FIRST test's URL assertion, not a test that
+/// manipulates `$KUBECONFIG` (this crate is `#![forbid(unsafe_code)]`, and
+/// `set_var` is unsafe on this edition). Reintroducing the ambient chain
+/// makes that assertion fail wherever no ambient kubeconfig resolves to the
+/// same cluster — which is every CI runner and every container.
+#[cfg(test)]
+mod supplied_kubeconfig_tests {
+    use super::*;
+
+    fn kubeconfig(context: &str, server: &str) -> String {
+        format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             clusters:\n\
+             - name: c\n  \
+               cluster:\n    \
+                 server: {server}\n\
+             contexts:\n\
+             - name: {context}\n  \
+               context:\n    \
+                 cluster: c\n    \
+                 user: u\n\
+             current-context: {context}\n\
+             users:\n\
+             - name: u\n  \
+               user:\n    \
+                 token: t\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn the_supplied_document_is_what_answers() {
+        let cfg = config_from_supplied_kubeconfig(
+            &kubeconfig("supplied", "https://supplied.example:6443"),
+            Some("supplied"),
+        )
+        .await
+        .expect("the supplied context resolves");
+        assert_eq!(
+            cfg.cluster_url.to_string(),
+            "https://supplied.example:6443/"
+        );
+    }
+
+    /// `None` means the supplied document's OWN `current-context`, not the
+    /// ambient one — the distinction a caller relies on when it hands over a
+    /// kubeconfig without naming a context.
+    #[tokio::test]
+    async fn no_context_uses_the_supplied_documents_own_current_context() {
+        let cfg = config_from_supplied_kubeconfig(
+            &kubeconfig("only-one", "https://supplied.example:6443"),
+            None,
+        )
+        .await
+        .expect("current-context resolves");
+        assert_eq!(
+            cfg.cluster_url.to_string(),
+            "https://supplied.example:6443/"
+        );
+    }
+
+    /// A context the supplied document does not define is refused. It must not
+    /// be searched for anywhere else.
+    #[tokio::test]
+    async fn a_context_absent_from_the_supplied_document_is_refused() {
+        let err = config_from_supplied_kubeconfig(
+            &kubeconfig("supplied", "https://supplied.example:6443"),
+            Some("somewhere-else"),
+        )
+        .await
+        .expect_err("an undefined context must not resolve");
+        assert!(err.to_string().contains("somewhere-else"), "{err}");
+    }
+
+    /// An unreadable document is refused, and the refusal never quotes it — a
+    /// kubeconfig carries client certificates and bearer tokens, and this
+    /// string reaches the operator.
+    #[tokio::test]
+    async fn an_unreadable_document_is_refused_without_quoting_it() {
+        let err = config_from_supplied_kubeconfig("NOT-A-KUBECONFIG: [", Some("any"))
+            .await
+            .expect_err("garbage must not resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("not readable"), "{msg}");
+        assert!(!msg.contains("NOT-A-KUBECONFIG"), "document leaked: {msg}");
     }
 }
