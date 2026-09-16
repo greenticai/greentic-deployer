@@ -258,7 +258,7 @@ fn bind_k8s_env_and_bootstrap_bound_sa(store: &Path) -> Value {
         serde_json::json!({
             "environment_id": ENV_ID,
             "admin_profile": admin_context,
-            "admin_material_inline": "ambient-kubeconfig",
+            "admin_material_inline": ambient_kubeconfig(),
             "bind": true,
         }),
     );
@@ -301,6 +301,23 @@ fn creds_token_env_key() -> String {
 }
 
 /// Run kubectl, asserting success, returning trimmed stdout.
+/// The ambient kubeconfig, as a self-contained document.
+///
+/// `credentials bootstrap` / `rotate` authenticate with the kubeconfig the
+/// CALLER hands them, so these tests must hand over a real one. They used to
+/// pass the literal string `"ambient-kubeconfig"` and rely on the material
+/// being ignored while the deployer resolved `$KUBECONFIG` itself — which was
+/// the bug: a caller that supplied a kubeconfig was authenticated against
+/// whatever the ambient chain happened to hold, and the call reported success.
+///
+/// `--flatten` is required, not cosmetic: it inlines the cert/key files a kind
+/// kubeconfig references by path, so the document stays valid once it is
+/// carried somewhere with no access to those paths — which is the whole point
+/// of supplying it by value.
+fn ambient_kubeconfig() -> String {
+    kubectl_ok(&["config", "view", "--raw", "--minify", "--flatten"])
+}
+
 fn kubectl_ok(args: &[&str]) -> String {
     let out = kubectl(args);
     assert!(
@@ -2434,7 +2451,7 @@ fn rotate_bound_sa(store: &Path, if_needed: bool) -> Value {
         serde_json::json!({
             "environment_id": ENV_ID,
             "admin_profile": admin_context,
-            "admin_material_inline": "ambient-kubeconfig",
+            "admin_material_inline": ambient_kubeconfig(),
             "if_needed": if_needed,
         }),
     );
