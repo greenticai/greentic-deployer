@@ -519,6 +519,9 @@ are **rejected** (fail closed on version skew).
 | `telemetry_env` | object (string values, exact-name allow-list) | *(unset)* | Plain telemetry env vars (`OTLP_ENDPOINT`, `OTEL_*`, `GREENTIC_TELEMETRY_*`, …) rendered into both the worker and the router pod, sorted, with `greentic.role=<worker\|router>` appended to `OTEL_RESOURCE_ATTRIBUTES`. No telemetry env at all, same as before this key existed, only when **neither** `telemetry_env` nor `telemetry_headers` is answered — answering either one on its own still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=<worker\|router>` to both pods. |
 | `telemetry_headers` | string | *(unset)* | The OTLP header credential (e.g. `authorization=Bearer …`). Never rendered as a literal — staged as a `gtc-telemetry-headers` Secret and referenced via `secretKeyRef` (`optional: true`) as `OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS`. The Secret is env-scoped and is never pruned when the answer is removed — clearing it only stops the pods referencing it, mirroring `gtc-oci-credentials`. Answering this alone (with `telemetry_env` unset) still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=<worker\|router>` to both pods — see `telemetry_env` above. |
 
+Transitional: `telemetry_env` / `telemetry_headers` carry telemetry until a
+telemetry slot binding exists; the contract may move there.
+
 ### Env-manifest (`greentic.env-manifest.v1`) — K8s-relevant fields
 
 | Field | Notes |

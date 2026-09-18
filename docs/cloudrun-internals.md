@@ -165,7 +165,8 @@ wrong.
 ### Intent is fingerprinted before staging
 
 `revision_intent(...)` hashes image, runtime SA, scaling, session affinity,
-secret name, and boot env **before** anything is staged. A warm is retried
+secret name, boot env, and the NAMES of secret-sourced env vars (never their
+version or value) **before** anything is staged. A warm is retried
 routinely (the CLI re-runs `op env up`; a previous attempt may have died
 mid-flight), and the trait requires the second call with the same input to
 succeed. Computing intent first means a retry knows what it wants **without
