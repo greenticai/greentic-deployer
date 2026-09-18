@@ -573,16 +573,27 @@ fn build_container(spec: &ServiceSpec) -> run::Container {
 }
 
 /// Project the spec's literal boot env vars onto the container (plan D6
-/// activation), preserving order so the rendered Service is deterministic.
+/// activation), preserving order so the rendered Service is deterministic —
+/// followed by env vars sourced from a pinned Secret Manager version (the
+/// telemetry header credential), which never carry a literal value.
 fn build_env_vars(spec: &ServiceSpec) -> Vec<run::EnvVar> {
-    spec.env
-        .iter()
-        .map(|(name, value)| {
-            run::EnvVar::new()
-                .set_name(name.clone())
-                .set_value(value.clone())
-        })
-        .collect()
+    let plain = spec.env.iter().map(|(name, value)| {
+        run::EnvVar::new()
+            .set_name(name.clone())
+            .set_value(value.clone())
+    });
+    let from_secret = spec.secret_env.iter().map(|s| {
+        run::EnvVar::new()
+            .set_name(s.name.clone())
+            .set_value_source(
+                run::EnvVarSource::new().set_secret_key_ref(
+                    run::SecretKeySelector::new()
+                        .set_secret(s.secret_name.clone())
+                        .set_version(s.version.clone()),
+                ),
+            )
+    });
+    plain.chain(from_secret).collect()
 }
 
 /// Scale-to-zero rendered explicitly (plan D5): `min_instance_count = 0`,
@@ -871,7 +882,7 @@ fn bytes_from(payload: &[u8]) -> bytes::Bytes {
 mod tests {
     use super::*;
     use crate::env_packs::gcp_cloudrun::deploy_target::{
-        ScalingSpec, SecretMount, SecretMountItem,
+        ScalingSpec, SecretEnvVar, SecretMount, SecretMountItem,
     };
 
     fn dep(seed: u128) -> DeploymentId {
@@ -903,6 +914,7 @@ mod tests {
             revision_intent: "test-intent".to_string(),
             secrets,
             env: Vec::new(),
+            secret_env: Vec::new(),
         }
     }
 
@@ -1093,6 +1105,25 @@ mod tests {
             ],
             "boot env is projected as ordered literal values (never value sources)"
         );
+    }
+
+    #[test]
+    fn secret_env_renders_as_a_version_pinned_secret_key_ref() {
+        let mut s = spec(vec![], vec![]);
+        s.secret_env = vec![SecretEnvVar {
+            name: "OTEL_EXPORTER_OTLP_HEADERS".into(),
+            secret_name: "gtc-e-environment".into(),
+            version: "7".into(),
+        }];
+        let vars = build_env_vars(&s);
+        let v = vars
+            .iter()
+            .find(|v| v.name == "OTEL_EXPORTER_OTLP_HEADERS")
+            .unwrap();
+        assert!(v.value().is_none(), "never a literal value");
+        let r = v.value_source().unwrap().secret_key_ref.as_ref().unwrap();
+        assert_eq!(r.secret, "gtc-e-environment");
+        assert_eq!(r.version, "7");
     }
 
     #[test]

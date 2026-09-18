@@ -1055,6 +1055,7 @@ impl GcpCloudRunDeployerHandler {
                 revision_intent: intent.to_string(),
                 secrets: secret_mounts.clone(),
                 env: boot_env.to_vec(),
+                secret_env: Vec::new(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
                 Ok(status) => break status.url,
