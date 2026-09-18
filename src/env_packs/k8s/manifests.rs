@@ -3321,4 +3321,84 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("`FOO`"), "{err}");
     }
+
+    /// One valid value per name in `telemetry::ALLOWED_ENV` (spec §4.3),
+    /// self-checked against the const so it cannot silently drift out of
+    /// sync with it (adding a 13th allowed name without updating this
+    /// fixture fails loudly here rather than testing a stale list).
+    fn all_allowed_telemetry_env() -> serde_json::Value {
+        let answer = serde_json::json!({
+            "TELEMETRY_EXPORT": "otlp-grpc",
+            "OTLP_ENDPOINT": "http://collector.internal:4317",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example.com:4318",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+            "OTEL_TRACES_SAMPLER_ARG": "0.1",
+            "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod",
+            "OTEL_SERVICE_NAME": "greentic-worker",
+            "GREENTIC_TELEMETRY_ENABLED": "1",
+            "GREENTIC_TELEMETRY_EXPORTER": "otlp",
+            "GREENTIC_TELEMETRY_ENDPOINT": "https://telemetry.example.com",
+            "GREENTIC_TELEMETRY_SAMPLING": "0.5",
+        });
+        let obj = answer.as_object().unwrap();
+        for name in crate::env_packs::telemetry::ALLOWED_ENV {
+            assert!(
+                obj.contains_key(*name),
+                "fixture missing allowed name {name}"
+            );
+        }
+        assert_eq!(
+            obj.len(),
+            crate::env_packs::telemetry::ALLOWED_ENV.len(),
+            "fixture must cover exactly ALLOWED_ENV — update both together"
+        );
+        answer
+    }
+
+    /// Every env var name rendered on a Deployment's single container is
+    /// unique — the allow-list, the boot env, and (for Vault) the secrets-
+    /// backend connection vars are three sources feeding one `env` array,
+    /// and a name shared by two of them would have the later one silently
+    /// shadow the earlier with no error at any layer.
+    fn assert_no_duplicate_container_env_names(d: &Value) {
+        let envs = container_env(d);
+        let mut names: Vec<&str> = envs.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate env var name rendered: {names:?}"
+        );
+    }
+
+    #[test]
+    fn allowed_names_and_devstore_boot_env_are_disjoint() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"telemetry_env": all_allowed_telemetry_env()});
+        let params = K8sParams::from_answers(&env, Some(&answers)).expect("all names are allowed");
+        assert_no_duplicate_container_env_names(&render_worker_deployment(
+            &env,
+            &env.revisions[0],
+            &params,
+        ));
+        assert_no_duplicate_container_env_names(&render_router_deployment(&env, &params));
+    }
+
+    #[test]
+    fn allowed_names_and_vault_boot_env_are_disjoint() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"telemetry_env": all_allowed_telemetry_env()});
+        let mut params =
+            K8sParams::from_answers(&env, Some(&answers)).expect("all names are allowed");
+        params.secrets_backend = SecretsBackend::Vault(vault_backend());
+        assert_no_duplicate_container_env_names(&render_worker_deployment(
+            &env,
+            &env.revisions[0],
+            &params,
+        ));
+        assert_no_duplicate_container_env_names(&render_router_deployment(&env, &params));
+    }
 }

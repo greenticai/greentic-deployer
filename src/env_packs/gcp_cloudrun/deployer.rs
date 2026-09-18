@@ -2444,4 +2444,64 @@ mod tests {
         .to_string();
         assert!(err.contains("`FOO`"), "{err}");
     }
+
+    /// One valid value per name in `telemetry::ALLOWED_ENV` (spec §4.3),
+    /// self-checked against the const so it cannot silently drift out of
+    /// sync with it.
+    fn all_allowed_telemetry_env() -> serde_json::Value {
+        let answer = serde_json::json!({
+            "TELEMETRY_EXPORT": "otlp-grpc",
+            "OTLP_ENDPOINT": "http://collector.internal:4317",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example.com:4318",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+            "OTEL_TRACES_SAMPLER_ARG": "0.1",
+            "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod",
+            "OTEL_SERVICE_NAME": "greentic-worker",
+            "GREENTIC_TELEMETRY_ENABLED": "1",
+            "GREENTIC_TELEMETRY_EXPORTER": "otlp",
+            "GREENTIC_TELEMETRY_ENDPOINT": "https://telemetry.example.com",
+            "GREENTIC_TELEMETRY_SAMPLING": "0.5",
+        });
+        let obj = answer.as_object().unwrap();
+        for name in crate::env_packs::telemetry::ALLOWED_ENV {
+            assert!(
+                obj.contains_key(*name),
+                "fixture missing allowed name {name}"
+            );
+        }
+        assert_eq!(
+            obj.len(),
+            crate::env_packs::telemetry::ALLOWED_ENV.len(),
+            "fixture must cover exactly ALLOWED_ENV — update both together"
+        );
+        answer
+    }
+
+    #[test]
+    fn allowed_names_and_cloud_run_boot_env_are_disjoint() {
+        // `runtime_tenant` / `runtime_team` answered too, so `GREENTIC_TENANT`
+        // / `GREENTIC_TEAM` are actually present in the boot env this checks
+        // against, not just the names always rendered.
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let mut answers = all_allowed_telemetry_env();
+        let full = serde_json::json!({
+            "runtime_tenant": "aws",
+            "runtime_team": "general",
+            "telemetry_env": answers.take(),
+        });
+        let params =
+            GcpCloudRunParams::from_answers(&env, Some(&full)).expect("all names are allowed");
+        let vars = runtime_boot_env(&env, revision, &params);
+        let mut names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate boot env name rendered: {names:?}"
+        );
+    }
 }
