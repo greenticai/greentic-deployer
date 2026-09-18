@@ -848,6 +848,26 @@ fn dev_secrets_content_hash(data: Option<&str>) -> String {
     hex
 }
 
+/// Content hash of the telemetry header credential — same format as
+/// [`dev_secrets_content_hash`] (a full sha256 hex digest of the value
+/// alone, so the annotation is never reversible to the credential in
+/// practice). Placed on BOTH the worker AND router pod templates: the
+/// header reaches a running pod only through `secretKeyRef`
+/// (`OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS`), which `greentic-start`
+/// resolves once at container start — so rotating only the
+/// `gtc-telemetry-headers` Secret's `stringData` does not reach a pod
+/// already running, and a changed hash here is what makes `reconcile` roll
+/// it, mirroring `greentic.ai/dev-store-hash` above.
+fn telemetry_headers_content_hash(headers: &str) -> String {
+    let digest = Sha256::digest(headers.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Init container that copies the dev-store Secret into the worker's writable
 /// HOME at the path greentic-start's dev-store backend reads
 /// (`$HOME/.greentic/environments/<env_id>/.greentic/dev/.dev.secrets.env`). The
@@ -1116,11 +1136,25 @@ pub fn render_worker_deployment(
     // operator rotates a credential. The preview path (`None`) omits the
     // annotation so `op env render` stays pure. `apply-revision` also
     // renders `None`, so the annotation is stable across verb paths.
+    //
+    // The telemetry header credential gets the same treatment: it is
+    // answer-derived rather than reconcile-materialized, so (unlike the
+    // dev-store hash) it is identical across the preview and apply paths —
+    // rendered whenever `telemetry_headers` was answered, omitted otherwise,
+    // so an environment with no header renders byte-identical to before this
+    // annotation existed.
     let mut pod_annotations = serde_json::Map::new();
     if uses_dev_secrets {
         let hash = dev_secrets_content_hash(params.dev_secrets_data.as_deref());
         pod_annotations.insert(
             "greentic.ai/dev-store-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    if let Some(headers) = params.telemetry.headers() {
+        let hash = telemetry_headers_content_hash(headers.expose());
+        pod_annotations.insert(
+            "greentic.ai/telemetry-headers-hash".to_string(),
             Value::String(hash),
         );
     }
@@ -1249,6 +1283,24 @@ pub(crate) fn has_cluster_presence(lifecycle: RevisionLifecycle) -> bool {
 /// authoritative for `TrafficSplit` enforcement in the Zain v1 pilot.
 pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value {
     let labels = common_labels(env, "router");
+    // Same rotation annotation as the worker pod template
+    // ([`render_worker_deployment`]) — the router references the SAME
+    // `gtc-telemetry-headers` Secret keys, so it must roll on the same
+    // rotation, and it stages no dev-store material so it never carries
+    // `greentic.ai/dev-store-hash`.
+    let mut pod_annotations = serde_json::Map::new();
+    if let Some(headers) = params.telemetry.headers() {
+        let hash = telemetry_headers_content_hash(headers.expose());
+        pod_annotations.insert(
+            "greentic.ai/telemetry-headers-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    let pod_metadata = if pod_annotations.is_empty() {
+        json!({"labels": labels})
+    } else {
+        json!({"labels": labels, "annotations": Value::Object(pod_annotations)})
+    };
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -1261,7 +1313,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
             "replicas": params.router_replicas,
             "selector": {"matchLabels": labels},
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": pod_metadata,
                 "spec": {
                     "securityContext": pod_security_context(),
                     "topologySpreadConstraints": [{
@@ -3146,6 +3198,71 @@ mod tests {
                 .iter()
                 .any(|m| m["metadata"]["name"] == TELEMETRY_HEADERS_SECRET_NAME)
         );
+    }
+
+    /// `greentic.ai/telemetry-headers-hash` annotation on a rendered pod
+    /// template, if any.
+    fn telemetry_headers_hash_annotation(d: &Value) -> Option<String> {
+        d["spec"]["template"]["metadata"]["annotations"]["greentic.ai/telemetry-headers-hash"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn rotating_the_telemetry_header_changes_the_pod_template_annotation_on_both_roles() {
+        // `secretKeyRef` env is resolved once at container start, so rotating
+        // only the Secret's `stringData` does not roll a pod already running.
+        // A pod-template annotation must change so `reconcile` rolls it —
+        // mirroring `greentic.ai/dev-store-hash`.
+        let env = build_fixture_env();
+        let one = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "authorization=Bearer one"})),
+        )
+        .expect("telemetry_headers answer parses");
+        let two = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "authorization=Bearer two"})),
+        )
+        .expect("telemetry_headers answer parses");
+
+        let worker_one = render_worker_deployment(&env, &env.revisions[0], &one);
+        let worker_two = render_worker_deployment(&env, &env.revisions[0], &two);
+        let router_one = render_router_deployment(&env, &one);
+        let router_two = render_router_deployment(&env, &two);
+
+        let worker_hash_one =
+            telemetry_headers_hash_annotation(&worker_one).expect("worker annotation rendered");
+        let worker_hash_two =
+            telemetry_headers_hash_annotation(&worker_two).expect("worker annotation rendered");
+        assert_ne!(
+            worker_hash_one, worker_hash_two,
+            "a header rotation must change the worker's pod-template annotation"
+        );
+
+        let router_hash_one =
+            telemetry_headers_hash_annotation(&router_one).expect("router annotation rendered");
+        let router_hash_two =
+            telemetry_headers_hash_annotation(&router_two).expect("router annotation rendered");
+        assert_ne!(
+            router_hash_one, router_hash_two,
+            "a header rotation must change the router's pod-template annotation"
+        );
+
+        // The hash is never the value itself.
+        for rendered in [&worker_one, &worker_two, &router_one, &router_two] {
+            let text = serde_json::to_string(rendered).unwrap();
+            assert!(!text.contains("Bearer one") && !text.contains("Bearer two"));
+        }
+    }
+
+    #[test]
+    fn no_telemetry_headers_render_no_rotation_annotation_on_either_role() {
+        let (env, params) = fixture();
+        let worker = render_worker_deployment(&env, &env.revisions[0], &params);
+        let router = render_router_deployment(&env, &params);
+        assert_eq!(telemetry_headers_hash_annotation(&worker), None);
+        assert_eq!(telemetry_headers_hash_annotation(&router), None);
     }
 
     #[test]
