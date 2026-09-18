@@ -616,3 +616,11 @@ Cargo features:
   Google Artifact Registry).
 
 Design + plan: `docs/superpowers/specs/2026-05-07-gtc-bundle-upload-flag-design.md`
+
+## Dev builds
+
+Every Dev Publish run on `develop` creates a GitHub prerelease tagged
+`v1.2.<run-id>` carrying prebuilt `greentic-deployer-dev` archives, which is what
+`gtc install --channel dev` installs. The binary inside reports that same
+`1.2.<run-id>` from `--version`, so any dev binary can be traced back to the
+release and the CI run that built it.
