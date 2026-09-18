@@ -421,8 +421,8 @@ impl K8sParams {
             "oci_username",
             "oci_password",
             "service_type",
-            "telemetry_env",
-            "telemetry_headers",
+            telemetry_answers::TELEMETRY_ENV_KEY,
+            telemetry_answers::TELEMETRY_HEADERS_KEY,
         ];
         for key in obj.keys() {
             if !KNOWN_KEYS.contains(&key.as_str()) {
