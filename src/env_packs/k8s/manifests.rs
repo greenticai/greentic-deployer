@@ -54,6 +54,10 @@ use sha2::{Digest, Sha256};
 
 use crate::environment::runtime_config::materialize_runtime_config;
 
+mod telemetry;
+use crate::env_packs::telemetry::{self as telemetry_answers, TelemetryAnswers};
+pub use telemetry::TELEMETRY_HEADERS_SECRET_NAME;
+
 /// Sandbox-default runtime image (S1). Tag-pinned for the sandbox only —
 /// production requires a digest-pinned ref supplied via the env-pack
 /// wizard (`runtime_image`).
@@ -339,6 +343,10 @@ pub struct K8sParams {
     /// to reach a revision the split routes 0% of traffic to — and, for
     /// `LoadBalancer`, bill one load balancer per revision.
     pub service_type: ServiceType,
+    /// Telemetry profile for worker + router pods. From the
+    /// `telemetry_env` / `telemetry_headers` answers; empty by default, which
+    /// renders exactly what was rendered before these answers existed.
+    pub telemetry: TelemetryAnswers,
 }
 
 impl K8sParams {
@@ -356,6 +364,7 @@ impl K8sParams {
             dev_secrets_data: None,
             secrets_backend: SecretsBackend::DevStore,
             service_type: ServiceType::ClusterIp,
+            telemetry: TelemetryAnswers::default(),
         }
     }
 
@@ -412,6 +421,8 @@ impl K8sParams {
             "oci_username",
             "oci_password",
             "service_type",
+            "telemetry_env",
+            "telemetry_headers",
         ];
         for key in obj.keys() {
             if !KNOWN_KEYS.contains(&key.as_str()) {
@@ -528,6 +539,12 @@ impl K8sParams {
             );
         }
 
+        let telemetry = telemetry_answers::parse(
+            obj.get(telemetry_answers::TELEMETRY_ENV_KEY),
+            obj.get(telemetry_answers::TELEMETRY_HEADERS_KEY),
+        )
+        .map_err(|e| e.to_string())?;
+
         Ok(Self {
             namespace,
             runtime_image,
@@ -544,6 +561,7 @@ impl K8sParams {
             // site overlays it (like `dev_secrets_data`).
             secrets_backend: defaults.secrets_backend,
             service_type,
+            telemetry,
         })
     }
 }
@@ -1057,6 +1075,7 @@ pub fn render_worker_deployment(
         json!({"name": "GREENTIC_BUNDLE_ID", "value": revision.bundle_id.as_str()}),
         json!({"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest}),
     ]);
+    env_vars.extend(telemetry::pod_env(params, "worker"));
 
     // How the worker resolves `secret://` refs at runtime. Worker-only either
     // way — the router never resolves secrets, mirroring the historical
@@ -1259,7 +1278,12 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
-                        "env": Value::Array(runtime_boot_env(env, params)),
+                        "env": Value::Array(
+                            runtime_boot_env(env, params)
+                                .into_iter()
+                                .chain(telemetry::pod_env(params, "router"))
+                                .collect(),
+                        ),
                         "volumeMounts": runtime_volume_mounts(),
                         "readinessProbe": {
                             "httpGet": {"path": "/healthz", "port": SERVE_PORT},
@@ -1546,7 +1570,10 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     let pullable = env_has_pullable_routed_revision(env);
     let worker_uses_vault = matches!(params.secrets_backend, SecretsBackend::Vault(_));
     for role in ["worker", "router"] {
-        let allow_all = pullable || (role == "worker" && worker_uses_vault);
+        // Telemetry: both roles export to an operator collector. A
+        // per-destination rule joins the hardening follow-up above.
+        let allow_all =
+            pullable || (role == "worker" && worker_uses_vault) || !params.telemetry.is_empty();
         let egress = if allow_all { json!([{}]) } else { json!([]) };
         policies.push(json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -1608,6 +1635,9 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
     // registry credential is unrelated to how `secret://` refs resolve).
     if params.oci_password.is_some() {
         manifests.push(render_oci_credentials_secret(env, params));
+    }
+    if let Some(secret) = telemetry::render_headers_secret(env, params) {
+        manifests.push(secret);
     }
     manifests
 }
@@ -3024,5 +3054,145 @@ mod tests {
         // secrets, so its egress stays denied (no pullable revision either).
         assert_eq!(egress("gtc-allow-worker-egress"), json!([{}]));
         assert_eq!(egress("gtc-allow-router-egress"), json!([]));
+    }
+
+    fn telemetry_params() -> (Environment, K8sParams) {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "telemetry_env": {
+                "TELEMETRY_EXPORT": "otlp-grpc",
+                "OTLP_ENDPOINT": "http://collector.observability:4317",
+                "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod"
+            },
+            "telemetry_headers": "authorization=Bearer s3cret"
+        });
+        let params =
+            K8sParams::from_answers(&env, Some(&answers)).expect("telemetry answers parse");
+        (env, params)
+    }
+
+    fn container_env(d: &Value) -> Vec<Value> {
+        d["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn telemetry_renders_into_worker_and_router_with_their_roles() {
+        let (env, params) = telemetry_params();
+        for (d, role) in [
+            (
+                render_worker_deployment(&env, &env.revisions[0], &params),
+                "worker",
+            ),
+            (render_router_deployment(&env, &params), "router"),
+        ] {
+            let envs = container_env(&d);
+            let get = |n: &str| envs.iter().find(|e| e["name"] == n).cloned();
+            assert_eq!(get("TELEMETRY_EXPORT").unwrap()["value"], "otlp-grpc");
+            assert_eq!(
+                get("OTEL_RESOURCE_ATTRIBUTES").unwrap()["value"],
+                format!("service.namespace=prod,greentic.role={role}")
+            );
+            for name in crate::env_packs::telemetry::HEADER_ENV_NAMES {
+                let h = get(name).unwrap_or_else(|| panic!("{name} rendered on {role}"));
+                assert!(
+                    h.get("value").is_none(),
+                    "{name} must never carry a plain value"
+                );
+                assert_eq!(
+                    h["valueFrom"]["secretKeyRef"]["name"],
+                    TELEMETRY_HEADERS_SECRET_NAME
+                );
+                assert_eq!(h["valueFrom"]["secretKeyRef"]["key"], "headers");
+                assert_eq!(h["valueFrom"]["secretKeyRef"]["optional"], true);
+            }
+            let rendered = serde_json::to_string(&d).unwrap();
+            assert!(
+                !rendered.contains("s3cret"),
+                "the credential must not reach a pod spec"
+            );
+            let mut names: Vec<&str> = envs.iter().map(|e| e["name"].as_str().unwrap()).collect();
+            let total = names.len();
+            names.sort();
+            names.dedup();
+            assert_eq!(
+                names.len(),
+                total,
+                "telemetry must not collide with a boot variable on {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_headers_secret_is_rendered_only_when_answered() {
+        let (env, params) = telemetry_params();
+        let set = render_environment_manifests(&env, &params);
+        let secret = set
+            .iter()
+            .find(|m| {
+                m["kind"] == "Secret" && m["metadata"]["name"] == TELEMETRY_HEADERS_SECRET_NAME
+            })
+            .expect("header Secret rendered");
+        assert_eq!(
+            secret["stringData"]["headers"],
+            "authorization=Bearer s3cret"
+        );
+
+        let (env, plain) = fixture();
+        assert!(
+            !render_environment_manifests(&env, &plain)
+                .iter()
+                .any(|m| m["metadata"]["name"] == TELEMETRY_HEADERS_SECRET_NAME)
+        );
+    }
+
+    #[test]
+    fn no_telemetry_answers_render_exactly_what_they_rendered_before() {
+        let (env, params) = fixture();
+        let with_empty = K8sParams::from_answers(&env, Some(&serde_json::json!({}))).unwrap();
+        assert_eq!(params, with_empty);
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            assert!(!container_env(&d).iter().any(|e| {
+                let n = e["name"].as_str().unwrap();
+                n.starts_with("OTEL")
+                    || n.starts_with("OTLP")
+                    || n.starts_with("TELEMETRY")
+                    || n.starts_with("GREENTIC_TELEMETRY")
+            }));
+        }
+    }
+
+    #[test]
+    fn telemetry_opens_egress_even_with_no_pullable_revision() {
+        let (mut env, params) = telemetry_params();
+        env.traffic_splits.clear();
+        let policies = render_network_policies(&env, &params);
+        for role in ["worker", "router"] {
+            let p = policies
+                .iter()
+                .find(|p| p["metadata"]["name"] == format!("gtc-allow-{role}-egress"))
+                .unwrap();
+            assert_eq!(
+                p["spec"]["egress"],
+                serde_json::json!([{}]),
+                "{role} must reach the collector"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_telemetry_answer_fails_the_parse_by_name() {
+        let env = build_fixture_env();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_env": {"FOO": "x"}})),
+        )
+        .unwrap_err();
+        assert!(err.contains("`FOO`"), "{err}");
     }
 }
