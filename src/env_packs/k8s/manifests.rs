@@ -1624,6 +1624,15 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     for role in ["worker", "router"] {
         // Telemetry: both roles export to an operator collector. A
         // per-destination rule joins the hardening follow-up above.
+        //
+        // `!params.telemetry.is_empty()` opens egress for a profile carrying
+        // ONLY `TELEMETRY_EXPORT=none` (no endpoint, no headers) — there is
+        // nowhere for that profile to export to, so the opening buys nothing.
+        // Accepted rather than special-cased: the designer does not send
+        // `telemetry_env` at all for a disabled profile (see the delivery
+        // spec), so this is not a shape `telemetry_env` is answered with in
+        // practice, and narrowing it here would need parsing the VALUE of an
+        // allow-listed key rather than just its presence.
         let allow_all =
             pullable || (role == "worker" && worker_uses_vault) || !params.telemetry.is_empty();
         let egress = if allow_all { json!([{}]) } else { json!([]) };
