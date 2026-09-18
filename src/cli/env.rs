@@ -1911,6 +1911,55 @@ pub fn apply_traffic(
     ))
 }
 
+/// The revisions a Cloud Run bring-up warms: per deployment, the ones its
+/// recorded traffic split names; for a deployment with no split yet, only its
+/// newest present revision.
+///
+/// It used to be every revision with cluster presence. A superseded revision
+/// stays `Ready` — `deploy` never drains it — so after a blue-green re-stage
+/// the bring-up re-warmed the OLD revision too, under the CURRENT deployer
+/// answers. When those answers had changed (a new `runtime_image_digest`,
+/// say), that warm met the old revision's intent label and failed with "stage
+/// a NEW revision" — after the new revision had already been staged. A revision
+/// that carries no traffic has nothing to warm for.
+pub(crate) fn cloudrun_revisions_to_warm(
+    env: &Environment,
+) -> Vec<&greentic_deploy_spec::Revision> {
+    use greentic_deploy_spec::{DeploymentId, Revision};
+    use std::collections::{BTreeMap, BTreeSet};
+    let present =
+        |r: &&Revision| crate::env_packs::k8s::manifests::has_cluster_presence(r.lifecycle);
+    let routed: BTreeSet<RevisionId> = env
+        .traffic_splits
+        .iter()
+        .flat_map(|s| s.entries.iter().map(|e| e.revision_id))
+        .collect();
+    let with_split: BTreeSet<DeploymentId> =
+        env.traffic_splits.iter().map(|s| s.deployment_id).collect();
+    let mut newest_unsplit: BTreeMap<DeploymentId, &Revision> = BTreeMap::new();
+    for revision in env.revisions.iter().filter(present) {
+        if with_split.contains(&revision.deployment_id) {
+            continue;
+        }
+        let slot = newest_unsplit
+            .entry(revision.deployment_id)
+            .or_insert(revision);
+        if revision.sequence > slot.sequence {
+            *slot = revision;
+        }
+    }
+    env.revisions
+        .iter()
+        .filter(present)
+        .filter(|r| {
+            routed.contains(&r.revision_id)
+                || newest_unsplit
+                    .get(&r.deployment_id)
+                    .is_some_and(|n| n.revision_id == r.revision_id)
+        })
+        .collect()
+}
+
 /// One-command Cloud Run bring-up for `op env up`.
 ///
 /// After the deployer-agnostic `env_apply::apply`, `op env up` calls this to
@@ -1921,7 +1970,8 @@ pub fn apply_traffic(
 /// free of Cloud-Run-specific knowledge.
 ///
 /// Cloud Run is imperative (no declarative cluster reconcile), so bring-up warms
-/// every present revision via the same `apply-revision` verb, then pushes each
+/// every revision that carries traffic ([`cloudrun_revisions_to_warm`]) via the
+/// same `apply-revision` verb, then pushes each
 /// recorded traffic split via `apply-traffic`. Ordering is warm-then-route so a
 /// split never references a revision whose Cloud Run revision does not yet exist.
 /// Archived revisions are left in place (they carry no traffic and cost nothing
@@ -1971,17 +2021,14 @@ pub(crate) fn cloudrun_env_up(
         }
     }
 
-    // 1. Warm every present revision (bring-up only — see the archival note in
-    //    the doc comment). Each Cloud Run warm returns its Service's `*.run.app`
+    // 1. Warm every revision that carries traffic (bring-up only — see the
+    //    archival note in the doc comment). Each Cloud Run warm returns its Service's `*.run.app`
     //    URL; a deployment's revisions share one Service, so endpoints are keyed
     //    by deployment rather than collapsed to a single last-wins URL.
     let mut warmed: Vec<String> = Vec::new();
     let mut endpoints: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    for revision in &env.revisions {
-        if !crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle) {
-            continue;
-        }
+    for revision in cloudrun_revisions_to_warm(&env) {
         let (_identity, service_name, url) = apply_revision_non_k8s(
             store,
             &env,

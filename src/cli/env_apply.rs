@@ -1391,6 +1391,15 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     } else {
         None
     };
+    // Set when an EXISTING Cloud Run deployer binding's answers change. A Cloud
+    // Run revision is immutable and carries its image, scaling and identity in
+    // its template, so new answers need a new revision — but a converged
+    // bundle plans no deploy, and the bring-up then re-warms the live revision
+    // under the new answers and fails on its intent label. So every existing
+    // deployment is re-staged below. Cloud Run only: K8s re-renders its worker
+    // in place from the current answers, and a re-stage there would leave one
+    // more permanent worker behind per answers edit.
+    let mut cloudrun_deployer_answers_changed = false;
     for mp in &ctx.manifest.packs {
         let existing = match &ctx.env {
             Some(e) => e.pack_for_slot(mp.slot),
@@ -1455,6 +1464,13 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     }
                     None => false,
                 };
+                if answers_ref_differs
+                    && mp.slot == CapabilitySlot::Deployer
+                    && greentic_deploy_spec::PackDescriptor::try_new(&mp.kind)
+                        .is_ok_and(|d| super::env::is_cloudrun_kind(&d))
+                {
+                    cloudrun_deployer_answers_changed = true;
+                }
                 if kind_differs || pack_ref_differs || answers_ref_differs {
                     let desired_hash = hash_json(&json!({
                         "slot": mp.slot.to_string(),
@@ -1620,14 +1636,20 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     .as_ref()
                     .is_some_and(|o| *o != dep.config_overrides);
 
-                if !converged {
+                let restage = !converged || cloudrun_deployer_answers_changed;
+                if restage {
                     let digests: Vec<String> = rb
                         .revisions
                         .iter()
                         .map(|r| format!("{}@{}", r.spec.name, short_digest(&r.digest)))
                         .collect();
+                    let why = if converged {
+                        "deployer answers changed"
+                    } else {
+                        "split not converged"
+                    };
                     let detail = format!(
-                        "split not converged → re-deploy {} revision(s) [{}]",
+                        "{why} → re-deploy {} revision(s) [{}]",
                         rb.revisions.len(),
                         digests.join(", ")
                     );
@@ -1652,7 +1674,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                             .clone()
                             .expect("binding_differs implies manifest binding")
                     }),
-                    config_overrides: (overrides_differ && converged)
+                    config_overrides: (overrides_differ && !restage)
                         .then(|| rb.spec.config_overrides.clone().expect("overrides_differ")),
                     revenue_share: revenue_share_differs(rb, dep).then(|| {
                         rb.spec
@@ -1674,7 +1696,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     steps.push(step);
                 }
 
-                if converged && !did_update {
+                if !restage && !did_update {
                     steps.push(ApplyStep::no_op(
                         ApplyStepKind::DeploySplit,
                         rb.spec.bundle_id.clone(),
@@ -1704,7 +1726,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     env,
                     dep.deployment_id,
                 );
-                let needs_deploy = !converged;
+                let needs_deploy = !converged || cloudrun_deployer_answers_changed;
                 let live = live_revision_digest(env, dep.deployment_id);
 
                 // Deploy FIRST when re-staging is needed (routing-metadata-
@@ -1713,7 +1735,12 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                 // binding/overrides update runs AFTER the deploy lands.
                 if needs_deploy {
                     // Fix 1: two arms — real live digest vs degenerate/missing.
-                    let detail = if live.is_some_and(digest_is_real) {
+                    let detail = if converged {
+                        format!(
+                            "deployer answers changed → new revision ({})",
+                            short_digest(&primary_digest())
+                        )
+                    } else if live.is_some_and(digest_is_real) {
                         format!(
                             "digest {} → {} (blue-green re-stage)",
                             live.map(short_digest).unwrap_or("none"),
@@ -4207,6 +4234,117 @@ mod tests {
             env.revisions.len(),
             revisions_before,
             "binding-only change must not stage a new revision"
+        );
+    }
+
+    /// A manifest binding the deployer slot to `kind` with inline `answers`,
+    /// plus one single-revision bundle.
+    fn deployer_answers_manifest(kind: &str, answers: Value) -> Value {
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "packs": [{
+                "slot": "deployer",
+                "kind": kind,
+                "pack_ref": "builtin",
+                "answers": answers
+            }],
+            "bundles": [{"bundle_id": "bot", "bundle_path": fixture()}]
+        })
+    }
+
+    #[test]
+    fn cloudrun_deployer_answers_change_restages_a_converged_deployment() {
+        // A Cloud Run revision is immutable. New deployer answers (here the
+        // runtime image pinned by digest) must plan a new revision even though
+        // the bundle digest is unchanged — otherwise the bring-up re-warms the
+        // live revision under the new answers and fails on its intent label.
+        let (dir, store) = seeded_store();
+        let kind = "greentic.deployer.gcp-cloudrun@1.0.0";
+        let v1 = json!({"project": "p", "region": "europe-west1"});
+        let manifest_path =
+            write_manifest(dir.path(), &deployer_answers_manifest(kind, v1.clone()));
+        run_apply(&store, &manifest_path).expect("first apply");
+
+        let unchanged = run_dry(&store, &manifest_path).expect("dry-run unchanged");
+        assert!(
+            step_actions(&unchanged.result)
+                .iter()
+                .all(|(kind, action)| kind != "deploy-bundle" || action == "no-op"),
+            "unchanged answers must stay a digest-match no-op: {:?}",
+            step_actions(&unchanged.result)
+        );
+
+        let mut v2 = v1;
+        v2["runtime_image_digest"] =
+            json!("sha256:15be7f3bc3e34594485f02db69c2531c98055902370090ed4361748dbfc4c992");
+        let manifest_path = write_manifest(dir.path(), &deployer_answers_manifest(kind, v2));
+        let plan = run_dry(&store, &manifest_path).expect("dry-run after answers change");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-pack-binding".to_string(), "update".to_string())),
+            "plan: {actions:?}"
+        );
+        assert!(
+            actions.contains(&("deploy-bundle".to_string(), "update".to_string())),
+            "changed Cloud Run answers must re-stage the bundle: {actions:?}"
+        );
+
+        let revisions_before = load_local(&store).revisions.len();
+        run_apply(&store, &manifest_path).expect("apply answers change");
+        assert_eq!(
+            load_local(&store).revisions.len(),
+            revisions_before + 1,
+            "the re-stage must stage a new revision"
+        );
+        // The superseded revision stays `Ready` (deploy never drains it). The
+        // bring-up must warm only the one that now carries traffic, or it
+        // re-warms the old revision under the new answers and fails.
+        let env = load_local(&store);
+        let live = live_revision_digest(&env, env.bundles[0].deployment_id).map(str::to_string);
+        let warmed = super::super::env::cloudrun_revisions_to_warm(&env);
+        assert_eq!(warmed.len(), 1, "only the routed revision is warmed");
+        let newest = env.revisions.iter().map(|r| r.sequence).max();
+        assert_eq!(Some(warmed[0].sequence), newest, "and it is the new one");
+        assert_eq!(Some(warmed[0].bundle_digest.clone()), live);
+        let again = run_dry(&store, &manifest_path).expect("dry-run after apply");
+        assert!(
+            step_actions(&again.result)
+                .iter()
+                .all(|(kind, action)| kind != "deploy-bundle" || action == "no-op"),
+            "the change is consumed once applied: {:?}",
+            step_actions(&again.result)
+        );
+    }
+
+    #[test]
+    fn non_cloudrun_deployer_answers_change_does_not_restage() {
+        // K8s re-renders its worker in place from the current answers; a
+        // re-stage there would leave a permanent extra worker per edit. The
+        // local deployer stands in for "any kind that is not Cloud Run".
+        let (dir, store) = seeded_store();
+        let kind = "greentic.deployer.local@1.0.0";
+        let manifest_path = write_manifest(
+            dir.path(),
+            &deployer_answers_manifest(kind, json!({"runtime_image": "img:v1"})),
+        );
+        run_apply(&store, &manifest_path).expect("first apply");
+
+        let manifest_path = write_manifest(
+            dir.path(),
+            &deployer_answers_manifest(kind, json!({"runtime_image": "img:v2"})),
+        );
+        let plan = run_dry(&store, &manifest_path).expect("dry-run");
+        let actions = step_actions(&plan.result);
+        assert!(
+            actions.contains(&("update-pack-binding".to_string(), "update".to_string())),
+            "plan: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|(kind, action)| kind != "deploy-bundle" || action == "no-op"),
+            "a non-Cloud-Run answers change must not re-stage: {actions:?}"
         );
     }
 
