@@ -16,6 +16,7 @@ pub mod local_process;
 pub mod registry;
 pub mod render;
 pub mod slot;
+pub mod telemetry;
 
 #[cfg(feature = "creds-aws")]
 pub use aws::{AwsDeployerCredentials, AwsEcsDeployerHandler, AwsValidatorClient};
