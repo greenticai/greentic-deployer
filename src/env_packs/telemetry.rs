@@ -23,7 +23,12 @@ pub const HEADER_ENV_NAMES: [&str; 2] = ["OTEL_EXPORTER_OTLP_HEADERS", "OTLP_HEA
 
 /// Exact names, never prefixes: `OTEL_` would also admit the header
 /// credentials and the certificate/key FILE paths.
-const ALLOWED_ENV: &[&str] = &[
+///
+/// `pub(crate)` so both targets' tests can assert this list stays disjoint
+/// from their own boot env (spec §4.3) — a name collision here would shadow
+/// a boot variable silently, since a later `env`/`env_vars.extend` entry
+/// wins with no error at any layer.
+pub(crate) const ALLOWED_ENV: &[&str] = &[
     "TELEMETRY_EXPORT",
     "OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -112,12 +117,18 @@ impl TelemetryAnswers {
         }
         let mut out = self.env.clone();
         let role_attr = format!("{ROLE_ATTRIBUTE}={role}");
+        // Hoisted out of the predicate so it is built once per call, not once
+        // per comma-separated entry.
+        let role_prefix = format!("{ROLE_ATTRIBUTE}=");
         let attrs = match out.remove(RESOURCE_ATTRIBUTES) {
             None => role_attr,
+            // `.trim()` each entry: a designer-supplied value with
+            // `", "` separators (`"a=b, greentic.role=x"`) must still be
+            // recognised as already carrying the role, not doubled.
             Some(existing)
                 if existing
                     .split(',')
-                    .any(|kv| kv.starts_with(&format!("{ROLE_ATTRIBUTE}="))) =>
+                    .any(|kv| kv.trim().starts_with(&role_prefix)) =>
             {
                 existing
             }
@@ -328,5 +339,19 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(attrs, "greentic.role=custom");
+    }
+
+    #[test]
+    fn a_designer_supplied_role_with_a_space_after_the_comma_is_not_duplicated() {
+        // `kv.starts_with(...)` without trimming would miss this and append a
+        // second `greentic.role=`.
+        let t = env(json!({"OTEL_RESOURCE_ATTRIBUTES": "a=b, greentic.role=x"})).unwrap();
+        let attrs = t
+            .env_for_role("worker")
+            .into_iter()
+            .find(|(k, _)| k == "OTEL_RESOURCE_ATTRIBUTES")
+            .unwrap()
+            .1;
+        assert_eq!(attrs, "a=b, greentic.role=x");
     }
 }
