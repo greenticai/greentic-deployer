@@ -54,6 +54,10 @@ use sha2::{Digest, Sha256};
 
 use crate::environment::runtime_config::materialize_runtime_config;
 
+mod telemetry;
+use crate::env_packs::telemetry::{self as telemetry_answers, TelemetryAnswers};
+pub use telemetry::TELEMETRY_HEADERS_SECRET_NAME;
+
 /// Sandbox-default runtime image (S1). Tag-pinned for the sandbox only —
 /// production requires a digest-pinned ref supplied via the env-pack
 /// wizard (`runtime_image`).
@@ -339,6 +343,10 @@ pub struct K8sParams {
     /// to reach a revision the split routes 0% of traffic to — and, for
     /// `LoadBalancer`, bill one load balancer per revision.
     pub service_type: ServiceType,
+    /// Telemetry profile for worker + router pods. From the
+    /// `telemetry_env` / `telemetry_headers` answers; empty by default, which
+    /// renders exactly what was rendered before these answers existed.
+    pub telemetry: TelemetryAnswers,
 }
 
 impl K8sParams {
@@ -356,6 +364,7 @@ impl K8sParams {
             dev_secrets_data: None,
             secrets_backend: SecretsBackend::DevStore,
             service_type: ServiceType::ClusterIp,
+            telemetry: TelemetryAnswers::default(),
         }
     }
 
@@ -412,6 +421,8 @@ impl K8sParams {
             "oci_username",
             "oci_password",
             "service_type",
+            telemetry_answers::TELEMETRY_ENV_KEY,
+            telemetry_answers::TELEMETRY_HEADERS_KEY,
         ];
         for key in obj.keys() {
             if !KNOWN_KEYS.contains(&key.as_str()) {
@@ -528,6 +539,12 @@ impl K8sParams {
             );
         }
 
+        let telemetry = telemetry_answers::parse(
+            obj.get(telemetry_answers::TELEMETRY_ENV_KEY),
+            obj.get(telemetry_answers::TELEMETRY_HEADERS_KEY),
+        )
+        .map_err(|e| e.to_string())?;
+
         Ok(Self {
             namespace,
             runtime_image,
@@ -544,6 +561,7 @@ impl K8sParams {
             // site overlays it (like `dev_secrets_data`).
             secrets_backend: defaults.secrets_backend,
             service_type,
+            telemetry,
         })
     }
 }
@@ -830,6 +848,26 @@ fn dev_secrets_content_hash(data: Option<&str>) -> String {
     hex
 }
 
+/// Content hash of the telemetry header credential — same format as
+/// [`dev_secrets_content_hash`] (a full sha256 hex digest of the value
+/// alone, so the annotation is never reversible to the credential in
+/// practice). Placed on BOTH the worker AND router pod templates: the
+/// header reaches a running pod only through `secretKeyRef`
+/// (`OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS`), which `greentic-start`
+/// resolves once at container start — so rotating only the
+/// `gtc-telemetry-headers` Secret's `stringData` does not reach a pod
+/// already running, and a changed hash here is what makes `reconcile` roll
+/// it, mirroring `greentic.ai/dev-store-hash` above.
+fn telemetry_headers_content_hash(headers: &str) -> String {
+    let digest = Sha256::digest(headers.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Init container that copies the dev-store Secret into the worker's writable
 /// HOME at the path greentic-start's dev-store backend reads
 /// (`$HOME/.greentic/environments/<env_id>/.greentic/dev/.dev.secrets.env`). The
@@ -1057,6 +1095,7 @@ pub fn render_worker_deployment(
         json!({"name": "GREENTIC_BUNDLE_ID", "value": revision.bundle_id.as_str()}),
         json!({"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest}),
     ]);
+    env_vars.extend(telemetry::pod_env(params, "worker"));
 
     // How the worker resolves `secret://` refs at runtime. Worker-only either
     // way — the router never resolves secrets, mirroring the historical
@@ -1097,11 +1136,25 @@ pub fn render_worker_deployment(
     // operator rotates a credential. The preview path (`None`) omits the
     // annotation so `op env render` stays pure. `apply-revision` also
     // renders `None`, so the annotation is stable across verb paths.
+    //
+    // The telemetry header credential gets the same treatment: it is
+    // answer-derived rather than reconcile-materialized, so (unlike the
+    // dev-store hash) it is identical across the preview and apply paths —
+    // rendered whenever `telemetry_headers` was answered, omitted otherwise,
+    // so an environment with no header renders byte-identical to before this
+    // annotation existed.
     let mut pod_annotations = serde_json::Map::new();
     if uses_dev_secrets {
         let hash = dev_secrets_content_hash(params.dev_secrets_data.as_deref());
         pod_annotations.insert(
             "greentic.ai/dev-store-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    if let Some(headers) = params.telemetry.headers() {
+        let hash = telemetry_headers_content_hash(headers.expose());
+        pod_annotations.insert(
+            "greentic.ai/telemetry-headers-hash".to_string(),
             Value::String(hash),
         );
     }
@@ -1230,6 +1283,24 @@ pub(crate) fn has_cluster_presence(lifecycle: RevisionLifecycle) -> bool {
 /// authoritative for `TrafficSplit` enforcement in the Zain v1 pilot.
 pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value {
     let labels = common_labels(env, "router");
+    // Same rotation annotation as the worker pod template
+    // ([`render_worker_deployment`]) — the router references the SAME
+    // `gtc-telemetry-headers` Secret keys, so it must roll on the same
+    // rotation, and it stages no dev-store material so it never carries
+    // `greentic.ai/dev-store-hash`.
+    let mut pod_annotations = serde_json::Map::new();
+    if let Some(headers) = params.telemetry.headers() {
+        let hash = telemetry_headers_content_hash(headers.expose());
+        pod_annotations.insert(
+            "greentic.ai/telemetry-headers-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    let pod_metadata = if pod_annotations.is_empty() {
+        json!({"labels": labels})
+    } else {
+        json!({"labels": labels, "annotations": Value::Object(pod_annotations)})
+    };
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -1242,7 +1313,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
             "replicas": params.router_replicas,
             "selector": {"matchLabels": labels},
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": pod_metadata,
                 "spec": {
                     "securityContext": pod_security_context(),
                     "topologySpreadConstraints": [{
@@ -1259,7 +1330,12 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
-                        "env": Value::Array(runtime_boot_env(env, params)),
+                        "env": Value::Array(
+                            runtime_boot_env(env, params)
+                                .into_iter()
+                                .chain(telemetry::pod_env(params, "router"))
+                                .collect(),
+                        ),
                         "volumeMounts": runtime_volume_mounts(),
                         "readinessProbe": {
                             "httpGet": {"path": "/healthz", "port": SERVE_PORT},
@@ -1546,7 +1622,19 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     let pullable = env_has_pullable_routed_revision(env);
     let worker_uses_vault = matches!(params.secrets_backend, SecretsBackend::Vault(_));
     for role in ["worker", "router"] {
-        let allow_all = pullable || (role == "worker" && worker_uses_vault);
+        // Telemetry: both roles export to an operator collector. A
+        // per-destination rule joins the hardening follow-up above.
+        //
+        // `!params.telemetry.is_empty()` opens egress for a profile carrying
+        // ONLY `TELEMETRY_EXPORT=none` (no endpoint, no headers) — there is
+        // nowhere for that profile to export to, so the opening buys nothing.
+        // Accepted rather than special-cased: the designer does not send
+        // `telemetry_env` at all for a disabled profile (see the delivery
+        // spec), so this is not a shape `telemetry_env` is answered with in
+        // practice, and narrowing it here would need parsing the VALUE of an
+        // allow-listed key rather than just its presence.
+        let allow_all =
+            pullable || (role == "worker" && worker_uses_vault) || !params.telemetry.is_empty();
         let egress = if allow_all { json!([{}]) } else { json!([]) };
         policies.push(json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -1608,6 +1696,9 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
     // registry credential is unrelated to how `secret://` refs resolve).
     if params.oci_password.is_some() {
         manifests.push(render_oci_credentials_secret(env, params));
+    }
+    if let Some(secret) = telemetry::render_headers_secret(env, params) {
+        manifests.push(secret);
     }
     manifests
 }
@@ -3024,5 +3115,290 @@ mod tests {
         // secrets, so its egress stays denied (no pullable revision either).
         assert_eq!(egress("gtc-allow-worker-egress"), json!([{}]));
         assert_eq!(egress("gtc-allow-router-egress"), json!([]));
+    }
+
+    fn telemetry_params() -> (Environment, K8sParams) {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "telemetry_env": {
+                "TELEMETRY_EXPORT": "otlp-grpc",
+                "OTLP_ENDPOINT": "http://collector.observability:4317",
+                "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod"
+            },
+            "telemetry_headers": "authorization=Bearer s3cret"
+        });
+        let params =
+            K8sParams::from_answers(&env, Some(&answers)).expect("telemetry answers parse");
+        (env, params)
+    }
+
+    fn container_env(d: &Value) -> Vec<Value> {
+        d["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn telemetry_renders_into_worker_and_router_with_their_roles() {
+        let (env, params) = telemetry_params();
+        for (d, role) in [
+            (
+                render_worker_deployment(&env, &env.revisions[0], &params),
+                "worker",
+            ),
+            (render_router_deployment(&env, &params), "router"),
+        ] {
+            let envs = container_env(&d);
+            let get = |n: &str| envs.iter().find(|e| e["name"] == n).cloned();
+            assert_eq!(get("TELEMETRY_EXPORT").unwrap()["value"], "otlp-grpc");
+            assert_eq!(
+                get("OTEL_RESOURCE_ATTRIBUTES").unwrap()["value"],
+                format!("service.namespace=prod,greentic.role={role}")
+            );
+            for name in crate::env_packs::telemetry::HEADER_ENV_NAMES {
+                let h = get(name).unwrap_or_else(|| panic!("{name} rendered on {role}"));
+                assert!(
+                    h.get("value").is_none(),
+                    "{name} must never carry a plain value"
+                );
+                assert_eq!(
+                    h["valueFrom"]["secretKeyRef"]["name"],
+                    TELEMETRY_HEADERS_SECRET_NAME
+                );
+                assert_eq!(h["valueFrom"]["secretKeyRef"]["key"], "headers");
+                assert_eq!(h["valueFrom"]["secretKeyRef"]["optional"], true);
+            }
+            let rendered = serde_json::to_string(&d).unwrap();
+            assert!(
+                !rendered.contains("s3cret"),
+                "the credential must not reach a pod spec"
+            );
+            let mut names: Vec<&str> = envs.iter().map(|e| e["name"].as_str().unwrap()).collect();
+            let total = names.len();
+            names.sort();
+            names.dedup();
+            assert_eq!(
+                names.len(),
+                total,
+                "telemetry must not collide with a boot variable on {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_headers_secret_is_rendered_only_when_answered() {
+        let (env, params) = telemetry_params();
+        let set = render_environment_manifests(&env, &params);
+        let secret = set
+            .iter()
+            .find(|m| {
+                m["kind"] == "Secret" && m["metadata"]["name"] == TELEMETRY_HEADERS_SECRET_NAME
+            })
+            .expect("header Secret rendered");
+        assert_eq!(
+            secret["stringData"]["headers"],
+            "authorization=Bearer s3cret"
+        );
+
+        let (env, plain) = fixture();
+        assert!(
+            !render_environment_manifests(&env, &plain)
+                .iter()
+                .any(|m| m["metadata"]["name"] == TELEMETRY_HEADERS_SECRET_NAME)
+        );
+    }
+
+    /// `greentic.ai/telemetry-headers-hash` annotation on a rendered pod
+    /// template, if any.
+    fn telemetry_headers_hash_annotation(d: &Value) -> Option<String> {
+        d["spec"]["template"]["metadata"]["annotations"]["greentic.ai/telemetry-headers-hash"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn rotating_the_telemetry_header_changes_the_pod_template_annotation_on_both_roles() {
+        // `secretKeyRef` env is resolved once at container start, so rotating
+        // only the Secret's `stringData` does not roll a pod already running.
+        // A pod-template annotation must change so `reconcile` rolls it —
+        // mirroring `greentic.ai/dev-store-hash`.
+        let env = build_fixture_env();
+        let one = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "authorization=Bearer one"})),
+        )
+        .expect("telemetry_headers answer parses");
+        let two = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "authorization=Bearer two"})),
+        )
+        .expect("telemetry_headers answer parses");
+
+        let worker_one = render_worker_deployment(&env, &env.revisions[0], &one);
+        let worker_two = render_worker_deployment(&env, &env.revisions[0], &two);
+        let router_one = render_router_deployment(&env, &one);
+        let router_two = render_router_deployment(&env, &two);
+
+        let worker_hash_one =
+            telemetry_headers_hash_annotation(&worker_one).expect("worker annotation rendered");
+        let worker_hash_two =
+            telemetry_headers_hash_annotation(&worker_two).expect("worker annotation rendered");
+        assert_ne!(
+            worker_hash_one, worker_hash_two,
+            "a header rotation must change the worker's pod-template annotation"
+        );
+
+        let router_hash_one =
+            telemetry_headers_hash_annotation(&router_one).expect("router annotation rendered");
+        let router_hash_two =
+            telemetry_headers_hash_annotation(&router_two).expect("router annotation rendered");
+        assert_ne!(
+            router_hash_one, router_hash_two,
+            "a header rotation must change the router's pod-template annotation"
+        );
+
+        // The hash is never the value itself.
+        for rendered in [&worker_one, &worker_two, &router_one, &router_two] {
+            let text = serde_json::to_string(rendered).unwrap();
+            assert!(!text.contains("Bearer one") && !text.contains("Bearer two"));
+        }
+    }
+
+    #[test]
+    fn no_telemetry_headers_render_no_rotation_annotation_on_either_role() {
+        let (env, params) = fixture();
+        let worker = render_worker_deployment(&env, &env.revisions[0], &params);
+        let router = render_router_deployment(&env, &params);
+        assert_eq!(telemetry_headers_hash_annotation(&worker), None);
+        assert_eq!(telemetry_headers_hash_annotation(&router), None);
+    }
+
+    #[test]
+    fn no_telemetry_answers_render_exactly_what_they_rendered_before() {
+        let (env, params) = fixture();
+        let with_empty = K8sParams::from_answers(&env, Some(&serde_json::json!({}))).unwrap();
+        assert_eq!(params, with_empty);
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            assert!(!container_env(&d).iter().any(|e| {
+                let n = e["name"].as_str().unwrap();
+                n.starts_with("OTEL")
+                    || n.starts_with("OTLP")
+                    || n.starts_with("TELEMETRY")
+                    || n.starts_with("GREENTIC_TELEMETRY")
+            }));
+        }
+    }
+
+    #[test]
+    fn telemetry_opens_egress_even_with_no_pullable_revision() {
+        let (mut env, params) = telemetry_params();
+        env.traffic_splits.clear();
+        let policies = render_network_policies(&env, &params);
+        for role in ["worker", "router"] {
+            let p = policies
+                .iter()
+                .find(|p| p["metadata"]["name"] == format!("gtc-allow-{role}-egress"))
+                .unwrap();
+            assert_eq!(
+                p["spec"]["egress"],
+                serde_json::json!([{}]),
+                "{role} must reach the collector"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_telemetry_answer_fails_the_parse_by_name() {
+        let env = build_fixture_env();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_env": {"FOO": "x"}})),
+        )
+        .unwrap_err();
+        assert!(err.contains("`FOO`"), "{err}");
+    }
+
+    /// One valid value per name in `telemetry::ALLOWED_ENV` (spec §4.3),
+    /// self-checked against the const so it cannot silently drift out of
+    /// sync with it (adding a 13th allowed name without updating this
+    /// fixture fails loudly here rather than testing a stale list).
+    fn all_allowed_telemetry_env() -> serde_json::Value {
+        let answer = serde_json::json!({
+            "TELEMETRY_EXPORT": "otlp-grpc",
+            "OTLP_ENDPOINT": "http://collector.internal:4317",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example.com:4318",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+            "OTEL_TRACES_SAMPLER_ARG": "0.1",
+            "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod",
+            "OTEL_SERVICE_NAME": "greentic-worker",
+            "GREENTIC_TELEMETRY_ENABLED": "1",
+            "GREENTIC_TELEMETRY_EXPORTER": "otlp",
+            "GREENTIC_TELEMETRY_ENDPOINT": "https://telemetry.example.com",
+            "GREENTIC_TELEMETRY_SAMPLING": "0.5",
+        });
+        let obj = answer.as_object().unwrap();
+        for name in crate::env_packs::telemetry::ALLOWED_ENV {
+            assert!(
+                obj.contains_key(*name),
+                "fixture missing allowed name {name}"
+            );
+        }
+        assert_eq!(
+            obj.len(),
+            crate::env_packs::telemetry::ALLOWED_ENV.len(),
+            "fixture must cover exactly ALLOWED_ENV — update both together"
+        );
+        answer
+    }
+
+    /// Every env var name rendered on a Deployment's single container is
+    /// unique — the allow-list, the boot env, and (for Vault) the secrets-
+    /// backend connection vars are three sources feeding one `env` array,
+    /// and a name shared by two of them would have the later one silently
+    /// shadow the earlier with no error at any layer.
+    fn assert_no_duplicate_container_env_names(d: &Value) {
+        let envs = container_env(d);
+        let mut names: Vec<&str> = envs.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate env var name rendered: {names:?}"
+        );
+    }
+
+    #[test]
+    fn allowed_names_and_devstore_boot_env_are_disjoint() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"telemetry_env": all_allowed_telemetry_env()});
+        let params = K8sParams::from_answers(&env, Some(&answers)).expect("all names are allowed");
+        assert_no_duplicate_container_env_names(&render_worker_deployment(
+            &env,
+            &env.revisions[0],
+            &params,
+        ));
+        assert_no_duplicate_container_env_names(&render_router_deployment(&env, &params));
+    }
+
+    #[test]
+    fn allowed_names_and_vault_boot_env_are_disjoint() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"telemetry_env": all_allowed_telemetry_env()});
+        let mut params =
+            K8sParams::from_answers(&env, Some(&answers)).expect("all names are allowed");
+        params.secrets_backend = SecretsBackend::Vault(vault_backend());
+        assert_no_duplicate_container_env_names(&render_worker_deployment(
+            &env,
+            &env.revisions[0],
+            &params,
+        ));
+        assert_no_duplicate_container_env_names(&render_router_deployment(&env, &params));
     }
 }

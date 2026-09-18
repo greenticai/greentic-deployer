@@ -113,6 +113,14 @@ pub struct SecretMountItem {
     pub rel_path: String,
 }
 
+/// A container env var whose value is one pinned Secret Manager version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretEnvVar {
+    pub name: String,
+    pub secret_name: String,
+    pub version: String,
+}
+
 /// Desired state of a Cloud Run Service + the one revision being created.
 ///
 /// Merges what ECS split across `ServiceSpec` + `TaskSetSpec` + the ALB
@@ -155,6 +163,9 @@ pub struct ServiceSpec {
     /// and the revision-identity vars tell the runtime which revision to serve.
     /// Order-preserving so the rendered Service is deterministic.
     pub env: Vec<(String, String)>,
+    /// Env vars sourced from a pinned Secret Manager version — the telemetry
+    /// header credential. Revision-scoped, like `secrets`. Never a value.
+    pub secret_env: Vec<SecretEnvVar>,
 }
 
 /// The subset of [`ServiceSpec`] Cloud Run renders into the **immutable**
@@ -175,6 +186,7 @@ struct RevisionTemplate {
     revision_intent: String,
     secrets: Vec<SecretMount>,
     env: Vec<(String, String)>,
+    secret_env: Vec<SecretEnvVar>,
 }
 
 impl RevisionTemplate {
@@ -194,6 +206,7 @@ impl RevisionTemplate {
             revision_intent,
             secrets,
             env,
+            secret_env,
             // Service-level or non-Service: mutable without a new revision.
             deployment_id: _,
             revision_id: _,
@@ -210,6 +223,7 @@ impl RevisionTemplate {
             revision_intent: revision_intent.clone(),
             secrets: secrets.clone(),
             env: env.clone(),
+            secret_env: secret_env.clone(),
         }
     }
 }
@@ -507,6 +521,9 @@ pub struct InMemoryCloudRun {
     /// Boot env vars each Service was upserted with, so tests can assert the
     /// deployer projects the seed-activation + identity vars onto the container.
     service_env: Mutex<BTreeMap<DeploymentId, Vec<(String, String)>>>,
+    /// Secret-sourced env vars each Service was upserted with, so tests can
+    /// assert the deployer projects the telemetry header credential.
+    service_secret_env: Mutex<BTreeMap<DeploymentId, Vec<SecretEnvVar>>>,
     /// Secret mounts each Service was upserted with, so tests can assert the
     /// deployer projects both seed files under one `/seed` volume.
     service_secrets: Mutex<BTreeMap<DeploymentId, Vec<SecretMount>>>,
@@ -620,6 +637,16 @@ impl InMemoryCloudRun {
             .cloned()
     }
 
+    /// Secret-sourced env vars the last upsert projected onto `deployment_id`'s
+    /// container.
+    pub fn service_secret_env_for(&self, deployment_id: DeploymentId) -> Option<Vec<SecretEnvVar>> {
+        self.service_secret_env
+            .lock()
+            .expect("service-secret-env mutex")
+            .get(&deployment_id)
+            .cloned()
+    }
+
     /// Secret mounts the last upsert projected onto `deployment_id`'s container.
     pub fn service_secrets_for(&self, deployment_id: DeploymentId) -> Option<Vec<SecretMount>> {
         self.service_secrets
@@ -703,6 +730,10 @@ impl CloudRunTarget for InMemoryCloudRun {
             .lock()
             .expect("service-env mutex")
             .insert(spec.deployment_id, spec.env.clone());
+        self.service_secret_env
+            .lock()
+            .expect("service-secret-env mutex")
+            .insert(spec.deployment_id, spec.secret_env.clone());
         self.service_secrets
             .lock()
             .expect("service-secrets mutex")
@@ -932,6 +963,7 @@ mod tests {
             revision_intent: "test-intent".to_string(),
             secrets: Vec::new(),
             env: Vec::new(),
+            secret_env: Vec::new(),
         }
     }
 
@@ -984,6 +1016,38 @@ mod tests {
         let read = t.get_service(&service_ref(d)).await.unwrap().unwrap();
         assert_eq!(read.etag, created.etag);
         assert!(read.url.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_fake_records_secret_env_and_treats_it_as_revision_scoped() {
+        let fake = InMemoryCloudRun::default();
+        let d = dep(1);
+        let mut svc_spec = spec(
+            d,
+            rev(1),
+            vec![TrafficTarget {
+                revision_id: rev(1),
+                percent: 100,
+            }],
+        );
+        svc_spec.secret_env = vec![SecretEnvVar {
+            name: "OTLP_HEADERS".into(),
+            secret_name: "gtc-e-environment".into(),
+            version: "3".into(),
+        }];
+        fake.upsert_service(&svc_spec, None).await.unwrap();
+        assert_eq!(
+            fake.service_secret_env_for(svc_spec.deployment_id).unwrap(),
+            svc_spec.secret_env
+        );
+
+        let mut other = svc_spec.clone();
+        other.secret_env[0].version = "4".into();
+        let etag = fake.services()[&svc_spec.deployment_id].etag.clone();
+        assert!(
+            fake.upsert_service(&other, Some(&etag)).await.is_err(),
+            "same revision name with different secret env is a different template (409)"
+        );
     }
 
     #[tokio::test]

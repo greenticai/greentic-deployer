@@ -39,11 +39,14 @@ use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
     WarmOutcome, enforce_split_invariants, require_revision,
 };
+use crate::env_packs::telemetry::{
+    self as telemetry_answers, HEADER_ENV_NAMES, TelemetryAnswerError, TelemetryAnswers,
+};
 
 use super::GcpCloudRunDeployerHandler;
 use super::deploy_target::{
-    AccessMode, CloudRunTargetError, EnsuredSecret, RevisionRef, ScalingSpec, SecretMount,
-    SecretMountItem, ServiceRef, ServiceSpec, TrafficTarget,
+    AccessMode, CloudRunTargetError, EnsuredSecret, RevisionRef, ScalingSpec, SecretEnvVar,
+    SecretMount, SecretMountItem, ServiceRef, ServiceSpec, TrafficTarget,
 };
 
 /// Default runtime image (plan D2/D3): the public GHCR distroless image Cloud
@@ -133,6 +136,9 @@ pub struct GcpCloudRunParams {
     pub max_instances: u32,
     pub min_instances: u32,
     pub concurrency: u32,
+    /// Telemetry profile (`telemetry_env` / `telemetry_headers`). Empty by
+    /// default, which leaves the boot env and the revision intent unchanged.
+    pub telemetry: TelemetryAnswers,
 }
 
 impl GcpCloudRunParams {
@@ -163,6 +169,7 @@ impl GcpCloudRunParams {
             max_instances: 1,
             min_instances: 0,
             concurrency: 80,
+            telemetry: TelemetryAnswers::default(),
         }
     }
 
@@ -179,6 +186,8 @@ impl GcpCloudRunParams {
         let obj = answers
             .as_object()
             .ok_or(GcpCloudRunParamsError::NotAnObject)?;
+        let mut telemetry_env = None;
+        let mut telemetry_headers = None;
         for (key, value) in obj {
             match key.as_str() {
                 "project" => params.project = answer_string(key, value)?,
@@ -198,9 +207,12 @@ impl GcpCloudRunParams {
                 "max_instances" => params.max_instances = parse_u32(key, value)?,
                 "min_instances" => params.min_instances = parse_u32(key, value)?,
                 "concurrency" => params.concurrency = parse_u32(key, value)?,
+                telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
+                telemetry_answers::TELEMETRY_HEADERS_KEY => telemetry_headers = Some(value),
                 other => return Err(GcpCloudRunParamsError::UnknownKey(other.to_string())),
             }
         }
+        params.telemetry = telemetry_answers::parse(telemetry_env, telemetry_headers)?;
         Ok(params)
     }
 
@@ -435,6 +447,10 @@ fn runtime_boot_env(
     if let Some(team) = &params.runtime_team {
         vars.push(("GREENTIC_TEAM".to_string(), team.clone()));
     }
+    // Telemetry: appended last and sorted, and empty unless answered — so an
+    // environment with no profile boots byte for byte as before and
+    // `revision_intent` fingerprints the same value.
+    vars.extend(params.telemetry.env_for_role("worker"));
     vars
 }
 
@@ -459,6 +475,8 @@ pub enum GcpCloudRunParamsError {
     UnknownKey(String),
     #[error("answer `{key}` is invalid: {detail}")]
     Invalid { key: String, detail: String },
+    #[error(transparent)]
+    Telemetry(#[from] TelemetryAnswerError),
 }
 
 fn answer_string(key: &str, value: &Value) -> Result<String, GcpCloudRunParamsError> {
@@ -563,7 +581,10 @@ fn find_revision(env: &Environment, revision_id: RevisionId) -> Option<&Revision
 ///   warm mints new ones, so folding them in would make a plain retry look like
 ///   a config change — the very thing this exists to rule out. The fingerprint
 ///   must also be computable BEFORE staging, which is what lets the probe skip
-///   staging entirely on a retry.
+///   staging entirely on a retry. `secret_env_names` follows the same rule: only
+///   the NAMES of secret-sourced env vars are hashed, never the version or the
+///   value — a header change is a deployer-answers change, which `op env apply`
+///   rolls into a NEW revision (#603), never a fingerprint mutation here.
 /// * **`access_mode`.** The invoker policy is a separate IAM resource, not part
 ///   of the revision, and the converge tail reapplies it on every warm. Folding
 ///   it in would demand a new revision to flip public/authenticated.
@@ -578,6 +599,7 @@ fn revision_intent(
     session_affinity: bool,
     secret_name: &str,
     boot_env: &[(String, String)],
+    secret_env_names: &[&str],
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -597,6 +619,14 @@ fn revision_intent(
     for (key, value) in boot_env {
         field(key.as_bytes());
         field(value.as_bytes());
+    }
+    // Names only, never version or value: versions are staging artifacts (see
+    // above) and the value is a credential. Absent → nothing hashed, so every
+    // existing revision keeps its fingerprint. A header change is a
+    // deployer-answers change, which `op env apply` rolls into a NEW revision.
+    for name in secret_env_names {
+        field(b"secret-env");
+        field(name.as_bytes());
     }
     hex::encode(&hasher.finalize()[..16])
 }
@@ -725,6 +755,14 @@ impl Deployer for GcpCloudRunDeployerHandler {
         let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
         let secret_name = environment_secret_name(&params.secret_prefix);
         let boot_env = runtime_boot_env(env, revision, &params);
+        // Only when the operator answered a header does the revision carry a
+        // secret-sourced env var at all — mirrors `HEADER_ENV_NAMES`'s own use
+        // in `create_revision` staging, below.
+        let secret_env_names: &[&str] = if params.telemetry.headers().is_some() {
+            &HEADER_ENV_NAMES
+        } else {
+            &[]
+        };
         let intent = revision_intent(
             &params.image_ref(),
             &runtime_service_account,
@@ -732,6 +770,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
             SESSION_AFFINITY,
             &secret_name,
             &boot_env,
+            secret_env_names,
         );
 
         // Create the revision only if it is not already there, then converge the
@@ -992,6 +1031,24 @@ impl GcpCloudRunDeployerHandler {
                 rel_path: DEV_STORE_RELATIVE.to_string(),
             });
         }
+        // The telemetry header credential: one more version of the SAME
+        // environment secret (so the accessor grant below already covers it),
+        // referenced as env — never a literal in the revision template.
+        let mut secret_env = Vec::new();
+        if let Some(headers) = params.telemetry.headers() {
+            let v = self
+                .target
+                .add_secret_version(secret_name, headers.expose().as_bytes())
+                .await
+                .map_err(provider)?;
+            for name in HEADER_ENV_NAMES {
+                secret_env.push(SecretEnvVar {
+                    name: name.to_string(),
+                    secret_name: secret_name.to_string(),
+                    version: v.version.clone(),
+                });
+            }
+        }
         // Grant the runtime SA read on the secret (covers every version) —
         // load-bearing: Cloud Run rejects a revision whose SA cannot read a
         // mounted version. Idempotent, so a re-warm is a no-op.
@@ -1055,6 +1112,7 @@ impl GcpCloudRunDeployerHandler {
                 revision_intent: intent.to_string(),
                 secrets: secret_mounts.clone(),
                 env: boot_env.to_vec(),
+                secret_env: secret_env.clone(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
                 Ok(status) => break status.url,
@@ -2244,6 +2302,206 @@ mod tests {
             target.inner.traffic_for(dep_a).unwrap().len(),
             2,
             "the 50/50 split lands after the retry"
+        );
+    }
+
+    fn telemetry_answers() -> serde_json::Value {
+        serde_json::json!({
+            "telemetry_env": {
+                "TELEMETRY_EXPORT": "otlp-grpc",
+                "OTLP_ENDPOINT": "https://otlp.example.com:4317"
+            },
+            "telemetry_headers": "authorization=Bearer s3cret"
+        })
+    }
+
+    #[tokio::test]
+    async fn warm_renders_telemetry_env_and_stages_the_header_as_a_secret_version() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r = env.revisions[0].revision_id;
+        let dep = env.bundles[0].deployment_id;
+        handler
+            .warm_revision(&env, r, Some(&telemetry_answers()))
+            .await
+            .unwrap();
+
+        let plain = target.service_env_for(dep).unwrap();
+        assert!(plain.contains(&("TELEMETRY_EXPORT".into(), "otlp-grpc".into())));
+        assert!(plain.contains(&(
+            "OTEL_RESOURCE_ATTRIBUTES".into(),
+            "greentic.role=worker".into()
+        )));
+        assert!(
+            !plain.iter().any(|(_, v)| v.contains("s3cret")),
+            "no credential in plain env"
+        );
+
+        let secret_env = target.service_secret_env_for(dep).unwrap();
+        let names: Vec<&str> = secret_env.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            crate::env_packs::telemetry::HEADER_ENV_NAMES.to_vec()
+        );
+        let secret_name = environment_secret_name(&GcpCloudRunParams::for_env(&env).secret_prefix);
+        assert!(secret_env.iter().all(|s| s.secret_name == secret_name));
+        let versions: std::collections::BTreeSet<&str> =
+            secret_env.iter().map(|s| s.version.as_str()).collect();
+        assert_eq!(versions.len(), 1, "both names reference ONE staged version");
+
+        let mut all: Vec<&str> = plain
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .chain(names.iter().copied())
+            .collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            n,
+            "telemetry must not collide with a boot variable"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_telemetry_answers_keep_the_intent_and_env_unchanged() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let plain = GcpCloudRunParams::for_env(&env);
+        let with_empty =
+            GcpCloudRunParams::from_answers(&env, Some(&serde_json::json!({}))).unwrap();
+        assert_eq!(
+            runtime_boot_env(&env, revision, &plain),
+            runtime_boot_env(&env, revision, &with_empty)
+        );
+
+        let intent = |p: &GcpCloudRunParams, names: &[&str]| {
+            revision_intent(
+                "img",
+                "sa",
+                &p.scaling(),
+                true,
+                "secret",
+                &runtime_boot_env(&env, revision, p),
+                names,
+            )
+        };
+        let baseline = intent(&plain, &[]);
+        let with_tel = GcpCloudRunParams::from_answers(&env, Some(&telemetry_answers())).unwrap();
+        assert_ne!(
+            baseline,
+            intent(&with_tel, &crate::env_packs::telemetry::HEADER_ENV_NAMES)
+        );
+    }
+
+    #[test]
+    fn the_intent_never_depends_on_the_header_value() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let a = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "k=one"})),
+        )
+        .unwrap();
+        let b = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "k=two"})),
+        )
+        .unwrap();
+        let names = crate::env_packs::telemetry::HEADER_ENV_NAMES;
+        assert_eq!(
+            revision_intent(
+                "img",
+                "sa",
+                &a.scaling(),
+                true,
+                "s",
+                &runtime_boot_env(&env, revision, &a),
+                &names
+            ),
+            revision_intent(
+                "img",
+                "sa",
+                &b.scaling(),
+                true,
+                "s",
+                &runtime_boot_env(&env, revision, &b),
+                &names
+            ),
+            "a header change rolls a new revision via #603, never via the intent"
+        );
+    }
+
+    #[test]
+    fn a_bad_telemetry_answer_is_a_params_error() {
+        let env = build_fixture_env();
+        let err = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_env": {"FOO": "x"}})),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`FOO`"), "{err}");
+    }
+
+    /// One valid value per name in `telemetry::ALLOWED_ENV` (spec §4.3),
+    /// self-checked against the const so it cannot silently drift out of
+    /// sync with it.
+    fn all_allowed_telemetry_env() -> serde_json::Value {
+        let answer = serde_json::json!({
+            "TELEMETRY_EXPORT": "otlp-grpc",
+            "OTLP_ENDPOINT": "http://collector.internal:4317",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example.com:4318",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+            "OTEL_TRACES_SAMPLER_ARG": "0.1",
+            "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod",
+            "OTEL_SERVICE_NAME": "greentic-worker",
+            "GREENTIC_TELEMETRY_ENABLED": "1",
+            "GREENTIC_TELEMETRY_EXPORTER": "otlp",
+            "GREENTIC_TELEMETRY_ENDPOINT": "https://telemetry.example.com",
+            "GREENTIC_TELEMETRY_SAMPLING": "0.5",
+        });
+        let obj = answer.as_object().unwrap();
+        for name in crate::env_packs::telemetry::ALLOWED_ENV {
+            assert!(
+                obj.contains_key(*name),
+                "fixture missing allowed name {name}"
+            );
+        }
+        assert_eq!(
+            obj.len(),
+            crate::env_packs::telemetry::ALLOWED_ENV.len(),
+            "fixture must cover exactly ALLOWED_ENV — update both together"
+        );
+        answer
+    }
+
+    #[test]
+    fn allowed_names_and_cloud_run_boot_env_are_disjoint() {
+        // `runtime_tenant` / `runtime_team` answered too, so `GREENTIC_TENANT`
+        // / `GREENTIC_TEAM` are actually present in the boot env this checks
+        // against, not just the names always rendered.
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let mut answers = all_allowed_telemetry_env();
+        let full = serde_json::json!({
+            "runtime_tenant": "aws",
+            "runtime_team": "general",
+            "telemetry_env": answers.take(),
+        });
+        let params =
+            GcpCloudRunParams::from_answers(&env, Some(&full)).expect("all names are allowed");
+        let vars = runtime_boot_env(&env, revision, &params);
+        let mut names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate boot env name rendered: {names:?}"
         );
     }
 }
