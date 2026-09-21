@@ -517,7 +517,9 @@ are **rejected** (fail closed on version skew).
 | `router_replicas` | int (string or number) | `2` | Router replica count. Must be **≥ 2** (HA). |
 | `tunnel` | `"off"` \| `"cloudflared"` | `off` | Worker public-exposure mode. `cloudflared` → worker spawns a quick tunnel (single-revision only). |
 | `oci_insecure_registries` | string[] (`host[:port]`) | `[]` | Registry authorities the worker/router may pull bundles from over plain HTTP. Rendered as `GREENTIC_OCI_INSECURE_REGISTRIES`. Empty → HTTPS only. |
-| `image_pull_secret` | string (RFC 1123 label) | *(unset)* | Name of a `kubernetes.io/dockerconfigjson` Secret to render (from the `oci_username` / `oci_password` credential) and reference as `imagePullSecrets` from every pod this pack renders — for a private runtime/init image or an authenticated air-gapped registry. Requires both `oci_username` and `oci_password` to also be set. Unset → no Secret, no `imagePullSecrets` key at all. |
+| `oci_username` | string | *(unset)* | Registry username for an authenticated `oci://` bundle pull — greentic-start's own in-process pull, NOT the kubelet's image pull (see `image_pull_secret` below for that). Rendered as a plain `OCI_USERNAME` pod env var; usernames are not treated as secret material. Must be set together with `oci_password`, or left unset — one without the other is rejected. |
+| `oci_password` | string | *(unset)* | Registry password for the same `oci://` bundle pull. Real secret material: never rendered as a plain pod env value — carried into the cluster as the `gtc-oci-credentials` Secret and referenced by the worker/router via `secretKeyRef`. Must be set together with `oci_username`, or left unset. The Secret is env-scoped and is **never pruned** when both answers are removed later — clearing them only stops the pods referencing it; the Secret itself stays in the namespace, mirroring `gtc-telemetry-headers` and `image_pull_secret` below. |
+| `image_pull_secret` | string (RFC 1123 label) | *(unset)* | Name of a `kubernetes.io/dockerconfigjson` Secret to render (from the `oci_username` / `oci_password` credential) and reference as `imagePullSecrets` from the worker and router pods — for a private runtime/init image or an authenticated air-gapped registry. Requires both `oci_username` and `oci_password` to also be set, and must not collide with the name of an object this pack already renders (`gtc-router`, `gtc-runtime-config`, `gtc-env-store`, `gtc-dev-secrets`, `gtc-oci-credentials`, `gtc-telemetry-headers`, `gtc-worker`) — a `Secret`'s `type` is immutable, so a colliding name applies once and then fails every later reconcile. Unset → no Secret, no `imagePullSecrets` key at all. **Never pruned**: removing the answer later drops `imagePullSecrets` from the worker/router pods on the next reconcile, but the Secret itself stays in the namespace indefinitely, still holding live registry credentials — env-level objects are not pruned by design ([§9](#9-known-gaps--production-caveats)). **The `auths` entry's host is derived, not answered**: one entry per distinct authority of `runtime_image` and `init_image` (Docker's own segment-before-`/` heuristic), falling back to the first `oci_insecure_registries` entry only when neither image names an authority, and to the literal `docker.io` when nothing does at all — getting this host right is what decides whether the credential authenticates anything (`pull_secret_registry_hosts` in `manifests.rs`). |
 | `telemetry_env` | object (string values, exact-name allow-list) | *(unset)* | Plain telemetry env vars (`OTLP_ENDPOINT`, `OTEL_*`, `GREENTIC_TELEMETRY_*`, …) rendered into both the worker and the router pod, sorted, with `greentic.role=<worker\|router>` appended to `OTEL_RESOURCE_ATTRIBUTES`. No telemetry env at all, same as before this key existed, only when **neither** `telemetry_env` nor `telemetry_headers` is answered — answering either one on its own still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=<worker\|router>` to both pods. |
 | `telemetry_headers` | string | *(unset)* | The OTLP header credential (e.g. `authorization=Bearer …`). Never rendered as a literal — staged as a `gtc-telemetry-headers` Secret and referenced via `secretKeyRef` (`optional: true`) as `OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS`. The Secret is env-scoped and is never pruned when the answer is removed — clearing it only stops the pods referencing it, mirroring `gtc-oci-credentials`. Answering this alone (with `telemetry_env` unset) still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=<worker\|router>` to both pods — see `telemetry_env` above. |
 
@@ -557,10 +559,19 @@ limitation with a workaround.
   rendered manifests carry no `imagePullSecrets` key — the demo image and
   bundle are public ghcr. Set `image_pull_secret` (with `oci_username` /
   `oci_password`) to render a `kubernetes.io/dockerconfigjson` Secret and
-  attach it to every worker/router/init container, for a private image or an
+  attach it to the worker and router pods (init containers included, since
+  `imagePullSecrets` applies per-pod), for a private image or an
   authenticated air-gapped registry.
 - **No `imagePullPolicy`.** Non-digest tags default to `IfNotPresent`; pin a
   digest for deterministic pulls.
+- **`warm_revision` applies worker manifests alone.** Adding `image_pull_secret`
+  (or any other env-level answer) and warming a revision before the next full
+  `reconcile` produces a worker referencing objects — the pull Secret included
+  — that were never applied to the cluster. This surfaces as a rollout
+  timeout on the worker Deployment, not as a missing-secret or missing-object
+  error, since the API server admits the Deployment and only the pod's own
+  `ImagePullBackOff`/mount failure reveals the real cause. Run `reconcile`
+  after changing an env-level answer, before warming a revision against it.
 - **Tunnel is single-revision.** Each worker pod spawns its own cloudflared
   tunnel, so a traffic split registers N competing webhooks. For multi-revision
   / production use BYO-Ingress with a stable `public_base_url`.

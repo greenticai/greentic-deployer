@@ -164,6 +164,30 @@ pub enum TunnelMode {
 /// (Phase E.4). One per namespace, env-level.
 pub const WORKER_SERVICE_ACCOUNT: &str = "gtc-worker";
 
+/// Fixed object names this pack renders into an environment's namespace,
+/// checked against the `image_pull_secret` answer
+/// ([`K8sParams::from_answers`]) so an operator can never name a NEW Secret
+/// the same as one of these. A `Secret`'s `type` is immutable, so a name
+/// collision with [`DEV_SECRETS_SECRET_NAME`] / [`OCI_CREDENTIALS_SECRET_NAME`]
+/// / [`TELEMETRY_HEADERS_SECRET_NAME`] (all `Opaque`) would apply cleanly the
+/// first time and fail the SECOND server-side apply of
+/// `kubernetes.io/dockerconfigjson` under the same name — an error naming
+/// neither this answer nor the reason. The non-Secret names
+/// ([`ROUTER_NAME`], [`RUNTIME_CONFIG_MAP_NAME`], [`ENV_STORE_CONFIG_MAP_NAME`],
+/// [`WORKER_SERVICE_ACCOUNT`]) would not hit that specific failure — different
+/// `kind`s may share a name in one namespace — but are refused too, since a
+/// Secret answering to the same name as this pack's own Deployment/ConfigMap/
+/// ServiceAccount is confusing for no operator benefit.
+const RESERVED_OBJECT_NAMES: &[&str] = &[
+    ROUTER_NAME,
+    RUNTIME_CONFIG_MAP_NAME,
+    ENV_STORE_CONFIG_MAP_NAME,
+    DEV_SECRETS_SECRET_NAME,
+    OCI_CREDENTIALS_SECRET_NAME,
+    TELEMETRY_HEADERS_SECRET_NAME,
+    WORKER_SERVICE_ACCOUNT,
+];
+
 // Vault provider defaults (mirror `greentic-secrets-provider-vault-kv`). The
 // worker pod emits a `VAULT_*` var only when its value differs from the
 // provider's default, keeping the rendered pod spec lean — an absent var and
@@ -357,15 +381,19 @@ pub struct K8sParams {
     pub telemetry: TelemetryAnswers,
     /// Name of a `kubernetes.io/dockerconfigjson` Secret to render (built
     /// from [`Self::oci_username`] / [`Self::oci_password`]) and reference as
-    /// `imagePullSecrets` from every pod this pack renders. From the
-    /// `image_pull_secret` answer; an air-gapped cluster's registry is
-    /// usually authenticated, and nothing else in this pack supplies the
-    /// KUBELET a credential to pull the worker/router/init image with —
-    /// [`Self::oci_username`] / [`Self::oci_password`] instead authenticate
-    /// greentic-start's own in-process `oci://` bundle pull, a different
-    /// consumer entirely. `None` → no Secret, no `imagePullSecrets` key at
-    /// all (never an empty array). Requires both [`Self::oci_username`] and
-    /// [`Self::oci_password`] to be set — enforced in [`Self::from_answers`].
+    /// `imagePullSecrets` from the worker and router pods this pack renders
+    /// — NOT every pod: the dev-mode Vault Deployment
+    /// ([`super::vault_infra`]) is also rendered by this pack and carries no
+    /// `imagePullSecrets` key at all. From the `image_pull_secret` answer;
+    /// an air-gapped cluster's registry is usually authenticated, and
+    /// nothing else in this pack supplies the KUBELET a credential to pull
+    /// the worker/router/init image with — [`Self::oci_username`] /
+    /// [`Self::oci_password`] instead authenticate greentic-start's own
+    /// in-process `oci://` bundle pull, a different consumer entirely.
+    /// `None` → no Secret, no `imagePullSecrets` key at all (never an empty
+    /// array). Requires both [`Self::oci_username`] and [`Self::oci_password`]
+    /// to be set, and must not collide with an object name this pack already
+    /// renders — both enforced in [`Self::from_answers`].
     pub image_pull_secret: Option<String>,
 }
 
@@ -565,6 +593,19 @@ impl K8sParams {
                 if !is_dns1123_label(&name) {
                     return Err(format!(
                         "image_pull_secret `{name}` is not a valid RFC 1123 label"
+                    ));
+                }
+                // A DNS-1123 label alone does not stop it colliding with a
+                // fixed name this pack already renders into the same
+                // namespace. A `Secret`'s `type` is immutable, so naming
+                // this one e.g. `gtc-oci-credentials` (Opaque) produces two
+                // Secrets sharing a name with different `type`s in one apply
+                // list — the second server-side apply is rejected with an
+                // error naming neither this answer nor the reason.
+                if RESERVED_OBJECT_NAMES.contains(&name.as_str()) {
+                    return Err(format!(
+                        "image_pull_secret `{name}` collides with an object this pack already \
+                         renders into the same namespace — choose a different name"
                     ));
                 }
                 // The check above already guarantees `oci_username` and
@@ -1563,41 +1604,77 @@ fn render_oci_credentials_secret(env: &Environment, params: &K8sParams) -> Value
     })
 }
 
-/// The registry host to key an image-pull Secret's `.dockerconfigjson`
-/// `auths` entry under. Kubernetes matches an `auths` key against the
-/// registry host it is actually pulling from — a credential keyed on the
-/// wrong host authenticates nothing and fails exactly like no credential at
-/// all, so getting this right is load-bearing, not cosmetic.
-///
-/// Preference order:
-/// 1. The FIRST entry of `oci_insecure_registries`, when set — the operator
-///    already told the pack which host it talks to, so that answer is more
-///    specific than anything derived from the image reference.
-/// 2. Otherwise, the host segment of [`K8sParams::runtime_image`]: everything
-///    before the first `/`, when the reference contains a `/` AT ALL and
-///    that first segment contains a `.` or a `:` (the same heuristic Docker
-///    itself uses to tell a registry authority from a bare repository path,
-///    e.g. `ghcr.io/greenticai/x` vs `library/busybox`). A reference with no
-///    `/` at all (e.g. `myapp:v1`) can never be `host[:port]/path` — it is a
-///    bare repository name with a tag, implicitly `docker.io/library/myapp`,
-///    so the `:` there is a tag separator, not a port separator, and must
-///    not be read as one.
-///    `None` when neither source yields a host — the caller then keys the
-///    Secret on an empty string, which authenticates nothing but still
-///    renders a structurally valid Secret rather than panicking.
-fn pull_secret_registry_host(params: &K8sParams) -> Option<String> {
-    if let Some(first) = params.oci_insecure_registries.first() {
-        return Some(first.clone());
-    }
-    let (first_segment, has_slash) = match params.runtime_image.split_once('/') {
+/// The registry host implied by a single image reference, using the same
+/// heuristic Docker itself uses to tell a registry authority from a bare
+/// repository path: everything before the first `/`, when the reference
+/// contains a `/` AT ALL and that first segment contains a `.` or a `:`
+/// (e.g. `ghcr.io/greenticai/x` vs `library/busybox`). A reference with no
+/// `/` at all (e.g. `myapp:v1`) can never be `host[:port]/path` — it is a
+/// bare repository name with a tag, implicitly `docker.io/library/myapp`, so
+/// the `:` there is a tag separator, not a port separator, and must not be
+/// read as one. `None` when the reference names no authority at all.
+fn image_registry_host(image: &str) -> Option<String> {
+    let (first_segment, has_slash) = match image.split_once('/') {
         Some((first, _)) => (first, true),
-        None => (params.runtime_image.as_str(), false),
+        None => (image, false),
     };
     if has_slash && (first_segment.contains('.') || first_segment.contains(':')) {
         Some(first_segment.to_string())
     } else {
         None
     }
+}
+
+/// The registry hosts to key an image-pull Secret's `.dockerconfigjson`
+/// `auths` map under. Kubernetes matches an `auths` key against the
+/// registry host it is actually pulling FROM — a credential keyed on the
+/// wrong host authenticates nothing and fails exactly like no credential at
+/// all, so getting this right is load-bearing, not cosmetic.
+///
+/// This Secret authenticates the KUBELET's image pull — [`K8sParams::runtime_image`]
+/// and [`K8sParams::init_image`] are the two images it ever pulls under this
+/// pack, so their own authorities are what must be keyed, one `auths` entry
+/// per DISTINCT authority (deduplicated, first-seen order: runtime then
+/// init). [`K8sParams::oci_insecure_registries`] is a DIFFERENT consumer's
+/// answer — it drives greentic-start's own in-process `oci://` bundle pull,
+/// not the kubelet — so it is consulted only as a FALLBACK, when neither
+/// image reference yields an authority at all: an operator who set it
+/// clearly named a registry the cluster talks to, and a Secret with zero
+/// `auths` entries would authenticate nothing while looking configured.
+/// Preferring it over the images (the pre-fix behaviour) silently mis-keyed
+/// the credential whenever the bundle registry and the image registry
+/// differ — e.g. an in-cluster plain-HTTP bundle mirror alongside images
+/// hosted on a separate HTTPS registry — and never keyed [`K8sParams::init_image`]
+/// at all, so a differently-hosted init image could never pull.
+///
+/// When NEITHER an image authority NOR `oci_insecure_registries` yields a
+/// host, this keys the literal `docker.io` — what a bare repository
+/// reference (no host segment at all, e.g. `myapp:v1` or `library/busybox`)
+/// actually implies. The alternative (refusing `image_pull_secret` outright
+/// in [`K8sParams::from_answers`] for this combination) was considered and
+/// rejected: a bare reference naming Docker Hub with an authenticated pull
+/// (a real, supported case — private Docker Hub repositories) is exactly
+/// what this answer exists to serve, and refusing it would make that case
+/// inexpressible. `docker.io` is never returned as an EMPTY string, unlike
+/// the pre-fix fallback (`unwrap_or_default()` on `None`), which rendered a
+/// structurally valid but unauthenticating `"auths": {"": {…}}`.
+fn pull_secret_registry_hosts(params: &K8sParams) -> Vec<String> {
+    const DOCKER_HUB_HOST: &str = "docker.io";
+    let mut hosts = Vec::new();
+    for image in [params.runtime_image.as_str(), params.init_image.as_str()] {
+        if let Some(host) = image_registry_host(image)
+            && !hosts.contains(&host)
+        {
+            hosts.push(host);
+        }
+    }
+    if hosts.is_empty() {
+        match params.oci_insecure_registries.first() {
+            Some(first) => hosts.push(first.clone()),
+            None => hosts.push(DOCKER_HUB_HOST.to_string()),
+        }
+    }
+    hosts
 }
 
 /// The image-pull Secret naming the operator's `image_pull_secret` answer —
@@ -1610,35 +1687,40 @@ fn pull_secret_registry_host(params: &K8sParams) -> Option<String> {
 /// starts — two different consumers, two different Secret shapes, sharing
 /// the same [`K8sParams::oci_username`] / [`K8sParams::oci_password`]
 /// credential. `from_answers` already refuses `image_pull_secret` without
-/// both, so both are guaranteed present by the time this renders;
-/// `unwrap_or_default` is defensive, not a silent fallback path any caller
-/// can reach. Carries `auth` (base64 `user:pass`) alongside the broken-out
-/// `username`/`password` fields — some registries (and some
-/// `imagePullSecrets` consumers) read only the combined `auth` key. Only
-/// rendered when [`K8sParams::image_pull_secret`] is set —
+/// both, so both are guaranteed present by the time this renders. Carries
+/// `auth` (base64 `user:pass`) alongside the broken-out `username`/`password`
+/// fields — some registries (and some `imagePullSecrets` consumers) read
+/// only the combined `auth` key. `auths` carries one entry per distinct
+/// authority [`pull_secret_registry_hosts`] resolves (see its doc comment
+/// for the preference order), all under the SAME credential — there is only
+/// one `oci_username`/`oci_password` pair to render, so a `runtime_image`
+/// and `init_image` hosted on different registries both get keyed with it.
+/// Only rendered when [`K8sParams::image_pull_secret`] is set —
 /// [`render_environment_manifests`] gates the call.
 fn render_image_pull_secret(env: &Environment, params: &K8sParams) -> Value {
     let name = params
         .image_pull_secret
         .as_deref()
         .expect("caller checks params.image_pull_secret.is_some() first");
-    let host = pull_secret_registry_host(params).unwrap_or_default();
     let username = params.oci_username.as_deref().unwrap_or_default();
     let password = params.oci_password.as_deref().unwrap_or_default();
     let auth = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
     };
-    let docker_config_json = serde_json::to_string(&json!({
-        "auths": {
-            host: {
+    let mut auths = serde_json::Map::new();
+    for host in pull_secret_registry_hosts(params) {
+        auths.insert(
+            host,
+            json!({
                 "username": username,
                 "password": password,
                 "auth": auth,
-            },
-        },
-    }))
-    .expect("a JSON object of strings always serializes");
+            }),
+        );
+    }
+    let docker_config_json = serde_json::to_string(&json!({ "auths": Value::Object(auths) }))
+        .expect("a JSON object of strings always serializes");
     json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -1945,6 +2027,35 @@ mod tests {
             !json.contains("\"image\":\"busybox:1.36.1\""),
             "no init container may keep the default once the answer is set"
         );
+    }
+
+    /// `render_environment_manifests` renders neither the worker Deployment
+    /// nor a secrets-bound env, so it never reaches
+    /// `stage_dev_secrets_init_container` — one of the two sites the
+    /// `init_image` answer changed. Reverting that site to the
+    /// `DEFAULT_INIT_IMAGE` constant kept the test above green, because it
+    /// never exercises this code path at all.
+    #[test]
+    fn init_image_answer_replaces_the_dev_secrets_staging_init_container_image_too() {
+        let env = secrets_env();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "init_image": "registry.client.local/greentic/busybox:1.36.1" })),
+        )
+        .expect("a known answer key is accepted");
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        let init = d["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        let names: Vec<&str> = init.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["stage-env-store", "stage-dev-secrets"]);
+        for container in init {
+            assert_eq!(
+                container["image"], "registry.client.local/greentic/busybox:1.36.1",
+                "{} must use the init_image answer, not the busybox default",
+                container["name"]
+            );
+        }
     }
 
     #[test]
@@ -2297,6 +2408,29 @@ mod tests {
         assert!(!json.contains("dockerconfigjson"));
     }
 
+    /// The env-level set (checked above) is not the only place
+    /// `imagePullSecrets` is injected — the per-revision worker Deployment
+    /// (rendered OUTSIDE `render_environment_manifests`) carries the other
+    /// site, and a substring check over the env-level JSON alone can never
+    /// see it. Structural (key-absence), matching
+    /// `an_unanswered_service_type_renders_the_pre_existing_router_service`'s
+    /// pattern of pinning the unanswered case explicitly rather than
+    /// inferring it from what the answered case does.
+    #[test]
+    fn no_pull_secret_answer_renders_the_worker_deployment_with_no_image_pull_secrets_key() {
+        let (env, params) = fixture();
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert!(
+            d["spec"]["template"]["spec"]
+                .as_object()
+                .unwrap()
+                .get("imagePullSecrets")
+                .is_none(),
+            "an absent image_pull_secret answer must render no imagePullSecrets key at all \
+             on the worker Deployment, not an empty array — same contract as the env-level set"
+        );
+    }
+
     #[test]
     fn the_pull_secret_is_rendered_before_the_workloads_that_reference_it() {
         let (env, _) = fixture();
@@ -2342,8 +2476,60 @@ mod tests {
         );
     }
 
+    /// Parses the rendered `image_pull_secret`'s `.dockerconfigjson` back out
+    /// of `render_environment_manifests`' output, for asserting on its
+    /// `auths` map. Panics if the Secret named `name` is missing.
+    fn pull_secret_auths(manifests: &[Value], name: &str) -> serde_json::Value {
+        let secret = manifests
+            .iter()
+            .find(|m| m["metadata"]["name"] == name)
+            .unwrap_or_else(|| panic!("no rendered object named `{name}`"));
+        let doc: serde_json::Value =
+            serde_json::from_str(secret["stringData"][".dockerconfigjson"].as_str().unwrap())
+                .unwrap();
+        doc["auths"].clone()
+    }
+
     #[test]
-    fn the_pull_secret_credential_is_the_registry_credential() {
+    fn the_pull_secret_credential_derives_its_host_from_the_runtime_image_when_no_insecure_registries_are_set()
+     {
+        // No `oci_insecure_registries` this time — the registry host must
+        // fall back to the `runtime_image`'s own authority
+        // (`ghcr.io/greenticai/greentic-start-distroless:develop` -> `ghcr.io`).
+        // `init_image` stays at its bare-repository default (`busybox:1.36.1`,
+        // no host), so `ghcr.io` is the only entry.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["ghcr.io"]
+        );
+        let auth = &auths["ghcr.io"];
+        assert_eq!(auth["username"], "robot");
+        assert_eq!(auth["password"], "s3cret");
+        assert_eq!(auth["auth"], "cm9ib3Q6czNjcmV0");
+    }
+
+    #[test]
+    fn the_pull_secret_prefers_the_image_authority_over_oci_insecure_registries() {
+        // The regression this exists to catch: `oci_insecure_registries`
+        // answers a DIFFERENT consumer (greentic-start's in-process `oci://`
+        // bundle pull) than this Secret (the kubelet's image pull). An
+        // in-cluster plain-HTTP bundle mirror alongside images hosted on a
+        // separate HTTPS registry must not leave the kubelet's credential
+        // keyed on the bundle mirror's host — `runtime_image`'s own
+        // authority (`ghcr.io`) wins, and the mirror is never keyed here at
+        // all (it authenticates a different pull entirely).
         let (env, _) = fixture();
         let params = K8sParams::from_answers(
             &env,
@@ -2356,28 +2542,29 @@ mod tests {
         )
         .unwrap();
         let manifests = render_environment_manifests(&env, &params);
-        let secret = manifests
-            .iter()
-            .find(|m| m["metadata"]["name"] == "gtc-registry")
-            .unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(secret["stringData"][".dockerconfigjson"].as_str().unwrap())
-                .unwrap();
-        let auth = &doc["auths"]["registry.client.local"];
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["ghcr.io"],
+            "the image's own authority must win; the bundle-pull registry is a different consumer"
+        );
+        let auth = &auths["ghcr.io"];
         assert_eq!(auth["username"], "robot");
         assert_eq!(auth["password"], "s3cret");
     }
 
     #[test]
-    fn the_pull_secret_credential_derives_its_host_from_the_runtime_image_when_no_insecure_registries_are_set()
-     {
-        // No `oci_insecure_registries` this time — the registry host must
-        // fall back to the `runtime_image`'s own authority
-        // (`ghcr.io/greenticai/greentic-start-distroless:develop` -> `ghcr.io`).
+    fn the_pull_secret_keys_one_auths_entry_per_distinct_image_authority() {
+        // `runtime_image` and `init_image` hosted on two different
+        // registries must BOTH be keyed — the pre-fix helper never keyed
+        // `init_image`'s authority at all, so a differently-hosted init
+        // image could never pull.
         let (env, _) = fixture();
         let params = K8sParams::from_answers(
             &env,
             Some(&serde_json::json!({
+                "runtime_image": "ghcr.io/greenticai/greentic-start-distroless:develop",
+                "init_image": "registry.client.local/greentic/busybox:1.36.1",
                 "image_pull_secret": "gtc-registry",
                 "oci_username": "robot",
                 "oci_password": "s3cret",
@@ -2385,27 +2572,57 @@ mod tests {
         )
         .unwrap();
         let manifests = render_environment_manifests(&env, &params);
-        let secret = manifests
-            .iter()
-            .find(|m| m["metadata"]["name"] == "gtc-registry")
-            .unwrap();
-        let doc: serde_json::Value =
-            serde_json::from_str(secret["stringData"][".dockerconfigjson"].as_str().unwrap())
-                .unwrap();
-        let auth = &doc["auths"]["ghcr.io"];
-        assert_eq!(auth["username"], "robot");
-        assert_eq!(auth["password"], "s3cret");
-        assert_eq!(auth["auth"], "cm9ib3Q6czNjcmV0");
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        let mut keys: Vec<&str> = auths
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["ghcr.io", "registry.client.local"]);
+        for host in ["ghcr.io", "registry.client.local"] {
+            assert_eq!(auths[host]["username"], "robot");
+            assert_eq!(auths[host]["password"], "s3cret");
+        }
     }
 
     #[test]
-    fn the_pull_secret_credential_keys_no_host_for_a_slash_free_runtime_image() {
+    fn the_pull_secret_falls_back_to_oci_insecure_registries_only_when_no_image_yields_a_host() {
+        // Both images are bare/slash-free (no authority); the only
+        // operator-supplied host signal is `oci_insecure_registries`, so it
+        // is used as the fallback — same host list documented in
+        // `pull_secret_registry_hosts`.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "runtime_image": "myapp:v1",
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+                "oci_insecure_registries": "registry.client.local",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["registry.client.local"]
+        );
+    }
+
+    #[test]
+    fn the_pull_secret_keys_docker_io_when_no_source_yields_a_host() {
         // "myapp:v1" has no `/` at all, so it can never be `host[:port]/path`
         // — it is a bare repository name with a tag (implicitly
-        // `docker.io/library/myapp:v1`). `split('/').next()` on a
-        // slash-free reference returns the whole string, and the old
-        // heuristic then mistook the `:v1` tag separator for a `host:port`
-        // separator and used `"myapp:v1"` itself as the registry host.
+        // `docker.io/library/myapp:v1`). `init_image` stays at its own
+        // bare-repository default and `oci_insecure_registries` is unset, so
+        // NEITHER source yields a host — the deliberate fallback is the
+        // literal `docker.io`, what a bare reference actually implies, never
+        // an empty-string key that would authenticate nothing while looking
+        // configured.
         let (env, _) = fixture();
         let params = K8sParams::from_answers(
             &env,
@@ -2417,16 +2634,24 @@ mod tests {
             })),
         )
         .unwrap();
-        assert_eq!(pull_secret_registry_host(&params), None);
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["docker.io"]
+        );
+        let auth = &auths["docker.io"];
+        assert_eq!(auth["username"], "robot");
+        assert_eq!(auth["password"], "s3cret");
     }
 
     #[test]
-    fn the_pull_secret_credential_keys_no_host_when_neither_source_yields_one() {
+    fn the_pull_secret_keys_docker_io_for_a_bare_repository_path_too() {
         // "library/busybox" has a `/` but its first segment contains
         // neither `.` nor `:` — a bare repository path, not a registry
-        // authority (Docker's own heuristic, restated in this function's
-        // doc comment). No `oci_insecure_registries` either, so neither
-        // source yields a host.
+        // authority (Docker's own heuristic, restated in
+        // `image_registry_host`'s doc comment). No `oci_insecure_registries`
+        // either, so neither source yields a host and the fallback applies.
         let (env, _) = fixture();
         let params = K8sParams::from_answers(
             &env,
@@ -2438,7 +2663,12 @@ mod tests {
             })),
         )
         .unwrap();
-        assert_eq!(pull_secret_registry_host(&params), None);
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["docker.io"]
+        );
     }
 
     #[test]
@@ -2484,6 +2714,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("image_pull_secret"), "{err}");
+    }
+
+    #[test]
+    fn image_pull_secret_rejects_a_name_reserved_by_the_pack_itself() {
+        // Naming the new Secret after an object this pack already renders
+        // into the same namespace is refused up front — a Secret's `type`
+        // is immutable, so an unguarded collision applies cleanly the first
+        // time and fails the SECOND server-side apply of a different `type`
+        // under the same name, with an error naming neither this answer nor
+        // the reason.
+        let (env, _) = fixture();
+        for reserved in [
+            ROUTER_NAME,
+            RUNTIME_CONFIG_MAP_NAME,
+            ENV_STORE_CONFIG_MAP_NAME,
+            DEV_SECRETS_SECRET_NAME,
+            OCI_CREDENTIALS_SECRET_NAME,
+            TELEMETRY_HEADERS_SECRET_NAME,
+            WORKER_SERVICE_ACCOUNT,
+        ] {
+            let err = K8sParams::from_answers(
+                &env,
+                Some(&serde_json::json!({
+                    "image_pull_secret": reserved,
+                    "oci_username": "robot",
+                    "oci_password": "s3cret",
+                })),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("image_pull_secret") && err.contains(reserved),
+                "expected a refusal naming `image_pull_secret` and `{reserved}`, got: {err}"
+            );
+        }
     }
 
     #[test]
