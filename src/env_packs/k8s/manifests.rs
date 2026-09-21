@@ -1574,9 +1574,14 @@ fn render_oci_credentials_secret(env: &Environment, params: &K8sParams) -> Value
 ///    already told the pack which host it talks to, so that answer is more
 ///    specific than anything derived from the image reference.
 /// 2. Otherwise, the host segment of [`K8sParams::runtime_image`]: everything
-///    before the first `/`, when that segment contains a `.` or a `:` (the
-///    same heuristic Docker itself uses to tell a registry authority from a
-///    bare repository path, e.g. `ghcr.io/greenticai/x` vs `library/busybox`).
+///    before the first `/`, when the reference contains a `/` AT ALL and
+///    that first segment contains a `.` or a `:` (the same heuristic Docker
+///    itself uses to tell a registry authority from a bare repository path,
+///    e.g. `ghcr.io/greenticai/x` vs `library/busybox`). A reference with no
+///    `/` at all (e.g. `myapp:v1`) can never be `host[:port]/path` — it is a
+///    bare repository name with a tag, implicitly `docker.io/library/myapp`,
+///    so the `:` there is a tag separator, not a port separator, and must
+///    not be read as one.
 ///    `None` when neither source yields a host — the caller then keys the
 ///    Secret on an empty string, which authenticates nothing but still
 ///    renders a structurally valid Secret rather than panicking.
@@ -1584,8 +1589,11 @@ fn pull_secret_registry_host(params: &K8sParams) -> Option<String> {
     if let Some(first) = params.oci_insecure_registries.first() {
         return Some(first.clone());
     }
-    let first_segment = params.runtime_image.split('/').next().unwrap_or("");
-    if first_segment.contains('.') || first_segment.contains(':') {
+    let (first_segment, has_slash) = match params.runtime_image.split_once('/') {
+        Some((first, _)) => (first, true),
+        None => (params.runtime_image.as_str(), false),
+    };
+    if has_slash && (first_segment.contains('.') || first_segment.contains(':')) {
         Some(first_segment.to_string())
     } else {
         None
@@ -2388,6 +2396,49 @@ mod tests {
         assert_eq!(auth["username"], "robot");
         assert_eq!(auth["password"], "s3cret");
         assert_eq!(auth["auth"], "cm9ib3Q6czNjcmV0");
+    }
+
+    #[test]
+    fn the_pull_secret_credential_keys_no_host_for_a_slash_free_runtime_image() {
+        // "myapp:v1" has no `/` at all, so it can never be `host[:port]/path`
+        // — it is a bare repository name with a tag (implicitly
+        // `docker.io/library/myapp:v1`). `split('/').next()` on a
+        // slash-free reference returns the whole string, and the old
+        // heuristic then mistook the `:v1` tag separator for a `host:port`
+        // separator and used `"myapp:v1"` itself as the registry host.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "runtime_image": "myapp:v1",
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        assert_eq!(pull_secret_registry_host(&params), None);
+    }
+
+    #[test]
+    fn the_pull_secret_credential_keys_no_host_when_neither_source_yields_one() {
+        // "library/busybox" has a `/` but its first segment contains
+        // neither `.` nor `:` — a bare repository path, not a registry
+        // authority (Docker's own heuristic, restated in this function's
+        // doc comment). No `oci_insecure_registries` either, so neither
+        // source yields a host.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "runtime_image": "library/busybox",
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        assert_eq!(pull_secret_registry_host(&params), None);
     }
 
     #[test]

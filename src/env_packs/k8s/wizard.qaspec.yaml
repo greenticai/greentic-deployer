@@ -81,6 +81,17 @@ questions:
     constraint:
       pattern: '^[a-z0-9.\-_/:@]+$'
 
+  - id: init_image
+    type: string
+    title: Init container image (optional)
+    description: >-
+      Container image for the pack's init containers. Leave blank for
+      the sandbox default (`busybox:1.36.1`). Same validation as
+      `runtime_image`; production deployments SHOULD pin a digest.
+    required: false
+    constraint:
+      pattern: '^[a-z0-9.\-_/:@]+$'
+
   - id: router_replicas
     type: string
     title: Router replicas (optional)
@@ -104,6 +115,23 @@ questions:
       as `GREENTIC_OCI_INSECURE_REGISTRIES`; honored only on the
       digest-pinned OCI boot-pull path.
     required: false
+
+  - id: image_pull_secret
+    type: string
+    title: Image-pull secret name (optional)
+    description: >-
+      Name of a `kubernetes.io/dockerconfigjson` Secret to render (from
+      the `oci_username` / `oci_password` credential) and reference as
+      `imagePullSecrets` from every pod this pack renders — for a
+      private runtime/init image or an air-gapped cluster's
+      authenticated registry. Leave blank (the default) to render no
+      pull secret and no `imagePullSecrets` key at all. Requires
+      `oci_username` AND `oci_password` to also be set — naming a
+      Secret with no credential would authenticate nothing.
+    required: false
+    constraint:
+      max_len: 63
+      pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
 
   - id: service_type
     type: enum
