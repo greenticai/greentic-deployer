@@ -355,6 +355,18 @@ pub struct K8sParams {
     /// `telemetry_env` / `telemetry_headers` answers; empty by default, which
     /// renders exactly what was rendered before these answers existed.
     pub telemetry: TelemetryAnswers,
+    /// Name of a `kubernetes.io/dockerconfigjson` Secret to render (built
+    /// from [`Self::oci_username`] / [`Self::oci_password`]) and reference as
+    /// `imagePullSecrets` from every pod this pack renders. From the
+    /// `image_pull_secret` answer; an air-gapped cluster's registry is
+    /// usually authenticated, and nothing else in this pack supplies the
+    /// KUBELET a credential to pull the worker/router/init image with —
+    /// [`Self::oci_username`] / [`Self::oci_password`] instead authenticate
+    /// greentic-start's own in-process `oci://` bundle pull, a different
+    /// consumer entirely. `None` → no Secret, no `imagePullSecrets` key at
+    /// all (never an empty array). Requires both [`Self::oci_username`] and
+    /// [`Self::oci_password`] to be set — enforced in [`Self::from_answers`].
+    pub image_pull_secret: Option<String>,
 }
 
 impl K8sParams {
@@ -374,6 +386,7 @@ impl K8sParams {
             secrets_backend: SecretsBackend::DevStore,
             service_type: ServiceType::ClusterIp,
             telemetry: TelemetryAnswers::default(),
+            image_pull_secret: None,
         }
     }
 
@@ -406,6 +419,11 @@ impl K8sParams {
     ///   left blank/absent — one without the other is rejected as `Err`,
     ///   since supplying half a credential pair is almost certainly a mistake
     ///   rather than an intentional answer.
+    /// - `image_pull_secret`: valid RFC 1123 label (same rule as
+    ///   `namespace` — it names a Secret). Requires BOTH `oci_username` AND
+    ///   `oci_password` to be set — a Secret named but given no credential
+    ///   would authenticate nothing, exactly like no `imagePullSecrets` at
+    ///   all, only silently.
     /// - Any other key → `Err` (fail closed on wizard version skew or
     ///   typos).
     pub fn from_answers(
@@ -433,6 +451,7 @@ impl K8sParams {
             "oci_username",
             "oci_password",
             "service_type",
+            "image_pull_secret",
             telemetry_answers::TELEMETRY_ENV_KEY,
             telemetry_answers::TELEMETRY_HEADERS_KEY,
         ];
@@ -541,6 +560,27 @@ impl K8sParams {
             );
         }
 
+        let image_pull_secret = match answer_string(obj, "image_pull_secret") {
+            Some(name) => {
+                if !is_dns1123_label(&name) {
+                    return Err(format!(
+                        "image_pull_secret `{name}` is not a valid RFC 1123 label"
+                    ));
+                }
+                // The check above already guarantees `oci_username` and
+                // `oci_password` agree on presence, so this is really "both
+                // set or both absent" collapsed to "both set" for this answer.
+                if oci_username.is_none() || oci_password.is_none() {
+                    return Err(
+                        "image_pull_secret requires both oci_username and oci_password to be set"
+                            .to_string(),
+                    );
+                }
+                Some(name)
+            }
+            None => defaults.image_pull_secret,
+        };
+
         let telemetry = telemetry_answers::parse(
             obj.get(telemetry_answers::TELEMETRY_ENV_KEY),
             obj.get(telemetry_answers::TELEMETRY_HEADERS_KEY),
@@ -565,6 +605,7 @@ impl K8sParams {
             secrets_backend: defaults.secrets_backend,
             service_type,
             telemetry,
+            image_pull_secret,
         })
     }
 }
@@ -1228,6 +1269,12 @@ pub fn render_worker_deployment(
     if let Some(sa) = service_account {
         deployment["spec"]["template"]["spec"]["serviceAccountName"] = Value::from(sa);
     }
+    // Omit the key entirely when unset — an empty `imagePullSecrets: []` is a
+    // different document from no key at all, and the "absent answer renders
+    // byte-identically to today" contract depends on that distinction.
+    if let Some(name) = &params.image_pull_secret {
+        deployment["spec"]["template"]["spec"]["imagePullSecrets"] = json!([{"name": name}]);
+    }
     deployment
 }
 
@@ -1321,7 +1368,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
     } else {
         json!({"labels": labels, "annotations": Value::Object(pod_annotations)})
     };
-    json!({
+    let mut deployment = json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {
@@ -1367,7 +1414,14 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                 },
             },
         },
-    })
+    });
+    // Omit the key entirely when unset — an empty `imagePullSecrets: []` is a
+    // different document from no key at all, and the "absent answer renders
+    // byte-identically to today" contract depends on that distinction.
+    if let Some(name) = &params.image_pull_secret {
+        deployment["spec"]["template"]["spec"]["imagePullSecrets"] = json!([{"name": name}]);
+    }
+    deployment
 }
 
 /// The stable router Service — the single target the Gateway / Ingress
@@ -1505,6 +1559,89 @@ fn render_oci_credentials_secret(env: &Environment, params: &K8sParams) -> Value
         },
         "stringData": {
             "password": params.oci_password.clone().unwrap_or_default(),
+        },
+    })
+}
+
+/// The registry host to key an image-pull Secret's `.dockerconfigjson`
+/// `auths` entry under. Kubernetes matches an `auths` key against the
+/// registry host it is actually pulling from — a credential keyed on the
+/// wrong host authenticates nothing and fails exactly like no credential at
+/// all, so getting this right is load-bearing, not cosmetic.
+///
+/// Preference order:
+/// 1. The FIRST entry of `oci_insecure_registries`, when set — the operator
+///    already told the pack which host it talks to, so that answer is more
+///    specific than anything derived from the image reference.
+/// 2. Otherwise, the host segment of [`K8sParams::runtime_image`]: everything
+///    before the first `/`, when that segment contains a `.` or a `:` (the
+///    same heuristic Docker itself uses to tell a registry authority from a
+///    bare repository path, e.g. `ghcr.io/greenticai/x` vs `library/busybox`).
+///    `None` when neither source yields a host — the caller then keys the
+///    Secret on an empty string, which authenticates nothing but still
+///    renders a structurally valid Secret rather than panicking.
+fn pull_secret_registry_host(params: &K8sParams) -> Option<String> {
+    if let Some(first) = params.oci_insecure_registries.first() {
+        return Some(first.clone());
+    }
+    let first_segment = params.runtime_image.split('/').next().unwrap_or("");
+    if first_segment.contains('.') || first_segment.contains(':') {
+        Some(first_segment.to_string())
+    } else {
+        None
+    }
+}
+
+/// The image-pull Secret naming the operator's `image_pull_secret` answer —
+/// a `kubernetes.io/dockerconfigjson` Secret the KUBELET reads to
+/// authenticate pulling the worker/router/init images from the client's own
+/// registry. Distinct from [`render_oci_credentials_secret`] just above:
+/// that Secret authenticates greentic-start's own in-process `oci://` bundle
+/// pull (an application-level HTTP call), while this one authenticates the
+/// image pull itself, which the kubelet performs before the container ever
+/// starts — two different consumers, two different Secret shapes, sharing
+/// the same [`K8sParams::oci_username`] / [`K8sParams::oci_password`]
+/// credential. `from_answers` already refuses `image_pull_secret` without
+/// both, so both are guaranteed present by the time this renders;
+/// `unwrap_or_default` is defensive, not a silent fallback path any caller
+/// can reach. Carries `auth` (base64 `user:pass`) alongside the broken-out
+/// `username`/`password` fields — some registries (and some
+/// `imagePullSecrets` consumers) read only the combined `auth` key. Only
+/// rendered when [`K8sParams::image_pull_secret`] is set —
+/// [`render_environment_manifests`] gates the call.
+fn render_image_pull_secret(env: &Environment, params: &K8sParams) -> Value {
+    let name = params
+        .image_pull_secret
+        .as_deref()
+        .expect("caller checks params.image_pull_secret.is_some() first");
+    let host = pull_secret_registry_host(params).unwrap_or_default();
+    let username = params.oci_username.as_deref().unwrap_or_default();
+    let password = params.oci_password.as_deref().unwrap_or_default();
+    let auth = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+    };
+    let docker_config_json = serde_json::to_string(&json!({
+        "auths": {
+            host: {
+                "username": username,
+                "password": password,
+                "auth": auth,
+            },
+        },
+    }))
+    .expect("a JSON object of strings always serializes");
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "kubernetes.io/dockerconfigjson",
+        "metadata": {
+            "name": name,
+            "namespace": params.namespace,
+            "labels": common_labels(env, "image-pull-secret"),
+        },
+        "stringData": {
+            ".dockerconfigjson": docker_config_json,
         },
     })
 }
@@ -1674,22 +1811,34 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     policies
 }
 
-/// Every environment-level object, in apply order: Namespace, env-store
-/// ConfigMap + runtime ConfigMap (the pods stage / mount them — must exist
-/// first), router Deployment + Service + PDB, NetworkPolicies. Per-revision
-/// worker objects are NOT included — they ride the revision lifecycle verbs.
-/// `gtc op env render` emits this set (plus present-revision workers)
-/// through the [`ManifestRenderer`](crate::env_packs::render::ManifestRenderer)
-/// impl in [`super::render`].
+/// Every environment-level object, in apply order: Namespace, the image-pull
+/// Secret (when `image_pull_secret` is set), env-store ConfigMap + runtime
+/// ConfigMap (the pods stage / mount them — must exist first), router
+/// Deployment + Service + PDB, NetworkPolicies. Per-revision worker objects
+/// are NOT included — they ride the revision lifecycle verbs. `gtc op env
+/// render` emits this set (plus present-revision workers) through the
+/// [`ManifestRenderer`](crate::env_packs::render::ManifestRenderer) impl in
+/// [`super::render`].
 pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Vec<Value> {
-    let mut manifests = vec![
-        render_namespace(env, params),
+    let mut manifests = vec![render_namespace(env, params)];
+    // The image-pull Secret is rendered here, immediately after the
+    // Namespace, NOT appended last like the env-level secrets below
+    // (dev-store / Vault SA / oci-credentials / telemetry-headers). Those are
+    // mounted/assumed by pods that retry on a transient miss; this one gates
+    // the image pull itself — a Deployment applied before its
+    // `imagePullSecrets` entry exists fails its very first pull with
+    // `ImagePullBackOff` on every fresh install, which no retry recovers from
+    // without the operator noticing the ordering bug.
+    if params.image_pull_secret.is_some() {
+        manifests.push(render_image_pull_secret(env, params));
+    }
+    manifests.extend([
         render_env_store_config_map(env, params),
         render_runtime_config_map(env, params),
         render_router_deployment(env, params),
         render_router_service(env, params),
         render_router_pdb(env, params),
-    ];
+    ]);
     manifests.extend(render_network_policies(env, params));
     // The env-level secrets object, last (never pruned; appended after the
     // NetworkPolicies so it never shifts the index-pinned env-level objects;
@@ -2128,6 +2277,162 @@ mod tests {
         let answers = serde_json::json!({"oci_usernam": "typo"});
         let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
         assert!(err.contains("oci_usernam"), "got: {err}");
+    }
+
+    // ---- image_pull_secret --------------------------------------------------
+
+    #[test]
+    fn no_pull_secret_answer_renders_exactly_as_before() {
+        let (env, params) = fixture();
+        let json = serde_json::to_string(&render_environment_manifests(&env, &params)).unwrap();
+        assert!(!json.contains("imagePullSecrets"));
+        assert!(!json.contains("dockerconfigjson"));
+    }
+
+    #[test]
+    fn the_pull_secret_is_rendered_before_the_workloads_that_reference_it() {
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+                "oci_insecure_registries": "registry.client.local"
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+
+        let secret_at = manifests
+            .iter()
+            .position(|m| m["kind"] == "Secret" && m["metadata"]["name"] == "gtc-registry")
+            .expect("the pull secret is rendered");
+        let deployment_at = manifests
+            .iter()
+            .position(|m| m["kind"] == "Deployment")
+            .expect("the router deployment is rendered");
+        assert!(
+            secret_at < deployment_at,
+            "a pod admitted before its pull secret exists fails its first pull"
+        );
+        assert_eq!(
+            manifests[secret_at]["type"],
+            "kubernetes.io/dockerconfigjson"
+        );
+        assert_eq!(
+            manifests[deployment_at]["spec"]["template"]["spec"]["imagePullSecrets"][0]["name"],
+            "gtc-registry"
+        );
+
+        // The per-revision worker Deployment is rendered outside
+        // `render_environment_manifests`; it must reference the same secret.
+        let worker = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert_eq!(
+            worker["spec"]["template"]["spec"]["imagePullSecrets"][0]["name"],
+            "gtc-registry"
+        );
+    }
+
+    #[test]
+    fn the_pull_secret_credential_is_the_registry_credential() {
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+                "oci_insecure_registries": "registry.client.local"
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let secret = manifests
+            .iter()
+            .find(|m| m["metadata"]["name"] == "gtc-registry")
+            .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(secret["stringData"][".dockerconfigjson"].as_str().unwrap())
+                .unwrap();
+        let auth = &doc["auths"]["registry.client.local"];
+        assert_eq!(auth["username"], "robot");
+        assert_eq!(auth["password"], "s3cret");
+    }
+
+    #[test]
+    fn the_pull_secret_credential_derives_its_host_from_the_runtime_image_when_no_insecure_registries_are_set()
+     {
+        // No `oci_insecure_registries` this time — the registry host must
+        // fall back to the `runtime_image`'s own authority
+        // (`ghcr.io/greenticai/greentic-start-distroless:develop` -> `ghcr.io`).
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let secret = manifests
+            .iter()
+            .find(|m| m["metadata"]["name"] == "gtc-registry")
+            .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(secret["stringData"][".dockerconfigjson"].as_str().unwrap())
+                .unwrap();
+        let auth = &doc["auths"]["ghcr.io"];
+        assert_eq!(auth["username"], "robot");
+        assert_eq!(auth["password"], "s3cret");
+        assert_eq!(auth["auth"], "cm9ib3Q6czNjcmV0");
+    }
+
+    #[test]
+    fn a_pull_secret_without_a_credential_is_refused() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "image_pull_secret": "gtc-registry" })),
+        )
+        .unwrap_err();
+        assert!(err.contains("image_pull_secret"), "{err}");
+    }
+
+    #[test]
+    fn a_pull_secret_with_only_half_a_credential_is_refused() {
+        // develop's pre-existing `oci_username`/`oci_password` invariant
+        // ("both or neither") fires FIRST here, before `image_pull_secret`'s
+        // own check is ever reached — so this refuses for the oci-pair
+        // reason, not the image_pull_secret-specific one. Still refused
+        // either way, which is the property this test protects.
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+            })),
+        )
+        .unwrap_err();
+        assert!(err.contains("oci_username and oci_password"), "{err}");
+    }
+
+    #[test]
+    fn image_pull_secret_rejects_an_invalid_dns1123_label() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "Not_A_Label",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap_err();
+        assert!(err.contains("image_pull_secret"), "{err}");
     }
 
     #[test]
