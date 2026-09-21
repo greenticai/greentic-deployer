@@ -54,25 +54,38 @@ pub(crate) const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
 pub(crate) const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
 pub(crate) const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secrets.env";
 
-/// The pack segment whose keys are owned by greentic-designer-admin rather
+/// Pack segments whose keys are owned by greentic-designer-admin rather
 /// than by an environment: stored VERBATIM, under the `default` env segment.
+/// `mcp` keys an MCP server by its hyphenated UUID; `a2a` keys an external
+/// A2A agent the same way (`agent_id` is a hyphenated UUID too). Both are
+/// written and read byte-for-byte because the admin mints the id and the
+/// runtime looks it up unmodified — canonicalising either would rewrite the
+/// hyphens to underscores and resolve nothing, silently, since a missing
+/// credential of either kind is reported as an ordinary node/tool error.
 ///
 /// Mirrors greentic-start's reader carve-out (`src/secrets_client.rs`,
 /// `canonicalize_dev_store_secret_uri`) exactly. The two must agree: a writer
 /// that normalizes a key the reader does not — or files it under a different
 /// env segment — stores a credential nothing ever looks up, and the failure
-/// surfaces only as an ordinary MCP node error.
+/// surfaces only as an ordinary MCP/A2A node error.
 const MCP_CATEGORY: &str = "mcp";
 
-/// Env segment every `mcp` key is written under, matching
+/// See [`MCP_CATEGORY`] — the same verbatim-storage rule applies to `a2a`.
+const A2A_CATEGORY: &str = "a2a";
+
+/// Env segment every `mcp`/`a2a` key is written under, matching
 /// `greentic_aw_runtime::mcp_secrets::MCP_ENV_SEGMENT`.
 const MCP_ENV_SEGMENT: &str = "default";
 
-/// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) names the `mcp`
-/// category. Keyed on the PACK position, never a substring: a tenant or a
-/// secret merely called `mcp` is an ordinary key.
-fn is_mcp_rel_path(rel_path: &str) -> bool {
-    rel_path.split('/').nth(2) == Some(MCP_CATEGORY)
+/// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) names a category
+/// whose secret name is stored verbatim (`mcp` or `a2a`). Keyed on the PACK
+/// position, never a substring: a tenant or a secret merely called `mcp` or
+/// `a2a` is an ordinary key.
+fn is_verbatim_category_rel_path(rel_path: &str) -> bool {
+    matches!(
+        rel_path.split('/').nth(2),
+        Some(MCP_CATEGORY | A2A_CATEGORY)
+    )
 }
 
 /// The dev store's native key for `rel_path` in `env_id`.
@@ -81,7 +94,7 @@ fn is_mcp_rel_path(rel_path: &str) -> bool {
 /// [`dev_store_has`] so a write, the read that checks it and the presence
 /// probe `env apply` gates on cannot land on different keys.
 pub(super) fn dev_store_key(env_id: &EnvId, rel_path: &str) -> String {
-    if is_mcp_rel_path(rel_path) {
+    if is_verbatim_category_rel_path(rel_path) {
         format!("secrets://{MCP_ENV_SEGMENT}/{rel_path}")
     } else {
         format!("secrets://{}/{rel_path}", env_id.as_str())
@@ -797,25 +810,26 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
              name without surrounding whitespace)"
         )));
     }
-    // Outside the `mcp` category the runtime reader canonicalizes the name
-    // segment before lookup (greentic-start
+    // Outside the `mcp`/`a2a` categories the runtime reader canonicalizes the
+    // name segment before lookup (greentic-start
     // `secret_name::canonical_secret_name`), so a non-canonical name would be
     // written but never found. Reject instead of silently transforming —
     // producer and consumer must share one derivation, and we share it by
     // only accepting already-canonical input.
     //
-    // The `mcp` category is exempt, mirroring greentic-start's reader
-    // (`src/secrets_client.rs`, `canonicalize_dev_store_secret_uri`): admin
-    // keys an MCP server by its hyphenated UUID and the runtime reads it
-    // verbatim through `greentic_aw_runtime::mcp_secrets`. Normalizing here
-    // would rewrite the lookup to `…/mcp/ff308b9c_951a_…` and resolve nothing
-    // — silently, because a missing MCP credential is reported as an ordinary
-    // node error.
+    // The `mcp` and `a2a` categories are exempt, mirroring greentic-start's
+    // reader (`src/secrets_client.rs`, `canonicalize_dev_store_secret_uri`):
+    // admin keys an MCP server, and an external A2A agent, by a hyphenated
+    // UUID, and the runtime reads each verbatim (`greentic_aw_runtime::
+    // mcp_secrets`, and the A2A equivalent). Normalizing here would rewrite
+    // the lookup to `…/mcp/ff308b9c_951a_…` (or `…/a2a/…`) and resolve
+    // nothing — silently, because a missing MCP/A2A credential is reported
+    // as an ordinary node/tool error.
     //
     // The TEAM segment above is deliberately NOT exempt: the runtime
     // canonicalizes the team either way, so a literal `default` is still a key
     // nothing reads.
-    if !is_mcp_rel_path(rel_path) && !is_canonical_secret_name(name) {
+    if !is_verbatim_category_rel_path(rel_path) && !is_canonical_secret_name(name) {
         return Err(OpError::InvalidArgument(format!(
             "secret name `{name}` is not store-canonical: use lowercase \
              a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
@@ -1839,6 +1853,100 @@ mod tests {
         let store = LocalFsStore::new(dir.path());
         store.save(&env_with_secrets()).unwrap();
         let path = "acme/sales/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        let put_outcome = put(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsPutPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                value: "t0k".to_string(),
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+        let get_outcome = get(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsGetPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                reveal: true,
+            }),
+        )
+        .unwrap();
+
+        let put_uri = put_outcome.result.get("store_uri").and_then(|v| v.as_str());
+        assert_eq!(put_uri, Some(format!("secrets://default/{path}").as_str()));
+        assert_eq!(
+            put_uri,
+            get_outcome.result.get("store_uri").and_then(|v| v.as_str())
+        );
+        assert_eq!(
+            get_outcome.result.get("value").and_then(|v| v.as_str()),
+            Some("t0k")
+        );
+    }
+
+    #[test]
+    fn an_a2a_key_is_written_under_the_default_env_segment() {
+        // greentic-start reads `secrets://default/<tenant>/<team>/a2a/<id>`
+        // (the same carve-out as MCP), and greentic-designer-admin writes it
+        // verbatim. Keying an a2a secret by the environment id instead stores
+        // it where no lookup ever goes.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3"),
+            "secrets://default/acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3"
+        );
+    }
+
+    #[test]
+    fn the_a2a_category_is_the_third_segment_not_a_substring() {
+        // `a2a` anywhere but the pack position is an ordinary key. A tenant
+        // literally named `a2a` must not move every one of its secrets.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "a2a/_/messaging-telegram/bot_token"),
+            "secrets://local/a2a/_/messaging-telegram/bot_token"
+        );
+    }
+
+    #[test]
+    fn an_a2a_name_keeps_its_hyphenated_uuid() {
+        // greentic-designer-admin keys an A2A agent by its hyphenated UUID
+        // and greentic-runner reads it verbatim. Canonicalizing turns the
+        // lookup into `…/a2a/ff308b9c_951a_…`, which resolves nothing.
+        validate_dev_store_secret_path("acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3")
+            .expect("an a2a name must reach the store byte-for-byte");
+    }
+
+    #[test]
+    fn an_a2a_path_still_rejects_a_literal_default_team() {
+        // The carve-out covers the NAME and the env segment, never the team:
+        // the runtime reads the default team as `_`, so a literal `default`
+        // would be written under a key no lookup uses.
+        let err =
+            validate_dev_store_secret_path("acme/default/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3")
+                .expect_err("the team segment keeps its rule");
+        assert!(format!("{err}").contains("team segment"), "{err}");
+    }
+
+    #[test]
+    fn an_a2a_path_still_needs_four_segments() {
+        validate_dev_store_secret_path("acme/_/a2a")
+            .expect_err("shape is checked before the category");
+    }
+
+    #[test]
+    fn a_put_and_a_get_agree_on_an_a2a_key() {
+        // The write and the read must derive the same key. They were two
+        // independent `format!` calls; a carve-out applied to one of them
+        // would store a credential that `op secrets get` then reports as
+        // absent.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        let path = "acme/sales/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
         let put_outcome = put(
             &store,
             &OpFlags::default(),
