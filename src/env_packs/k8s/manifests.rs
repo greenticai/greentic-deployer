@@ -49,7 +49,7 @@
 //! the spec's canonical ULID rendering.
 
 use greentic_deploy_spec::{CapabilitySlot, EnvId, Environment, Revision, RevisionLifecycle};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::environment::runtime_config::materialize_runtime_config;
@@ -102,7 +102,12 @@ pub const ENV_STORE_CONFIG_MAP_NAME: &str = "gtc-env-store";
 /// into the writable HOME volume — the runtime image is distroless (no shell).
 /// M1 scaffold: M2 replaces this with the distributor-pull init container that
 /// also stages the runtime-config and the revision's packs.
-const STAGE_INIT_IMAGE: &str = "busybox:1.36.1";
+///
+/// Image the init containers run. Overridable through the `init_image`
+/// answer, which an air-gapped cluster needs: this default is pulled from
+/// Docker Hub by the kubelet, which no setting on the caller's side can
+/// redirect.
+pub const DEFAULT_INIT_IMAGE: &str = "busybox:1.36.1";
 
 /// Name of the Secret carrying the env's local dev-store (the operator's
 /// `.dev.secrets.env`). Rendered only for envs that bind a secrets pack; the
@@ -287,6 +292,9 @@ pub struct K8sParams {
     pub namespace: String,
     /// Container image for router and worker pods.
     pub runtime_image: String,
+    /// Container image for the init containers. From the `init_image` answer;
+    /// [`DEFAULT_INIT_IMAGE`] when the operator named none.
+    pub init_image: String,
     /// Router replica count. Plan step 11 mandates ≥ 2 for HA.
     pub router_replicas: u32,
     /// Worker public-exposure mode. From the `tunnel` deployer answer.
@@ -356,6 +364,7 @@ impl K8sParams {
         Self {
             namespace: namespace_for_env(&env.environment_id),
             runtime_image: DEFAULT_RUNTIME_IMAGE.to_string(),
+            init_image: DEFAULT_INIT_IMAGE.to_string(),
             router_replicas: 2,
             tunnel: TunnelMode::Off,
             oci_insecure_registries: Vec::new(),
@@ -381,6 +390,8 @@ impl K8sParams {
     ///   provisioned). `null` / empty-string → default.
     /// - `runtime_image`: non-empty string matching `[a-z0-9.\-_/:@]+`.
     ///   `null` / empty-string → default.
+    /// - `init_image`: same validation as `runtime_image`. `null` /
+    ///   empty-string → default.
     /// - `router_replicas`: JSON string or number parsed to `u32`; must
     ///   be >= 2 (the router must stay HA). `null` / empty-string →
     ///   default.
@@ -415,6 +426,7 @@ impl K8sParams {
             "kubeconfig_context",
             "namespace",
             "runtime_image",
+            "init_image",
             "router_replicas",
             "tunnel",
             "oci_insecure_registries",
@@ -440,18 +452,8 @@ impl K8sParams {
             None => defaults.namespace,
         };
 
-        let runtime_image = match answer_string(obj, "runtime_image") {
-            Some(img) => {
-                if !img
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_/:@".contains(&b))
-                {
-                    return Err(format!("runtime_image `{img}` contains invalid characters"));
-                }
-                img
-            }
-            None => defaults.runtime_image,
-        };
+        let runtime_image = validated_image(obj, "runtime_image", defaults.runtime_image)?;
+        let init_image = validated_image(obj, "init_image", defaults.init_image)?;
 
         let router_replicas = match obj.get("router_replicas") {
             None | Some(serde_json::Value::Null) => defaults.router_replicas,
@@ -548,6 +550,7 @@ impl K8sParams {
         Ok(Self {
             namespace,
             runtime_image,
+            init_image,
             router_replicas,
             tunnel,
             oci_insecure_registries,
@@ -575,6 +578,23 @@ fn parse_insecure_registries(raw: &str) -> Vec<String> {
         .filter(|e| !e.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Both image answers accept the same character set; one function so the two
+/// answers cannot drift into disagreeing about what an image reference is.
+fn validated_image(obj: &Map<String, Value>, key: &str, default: String) -> Result<String, String> {
+    match answer_string(obj, key) {
+        Some(img) => {
+            if !img
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_/:@".contains(&b))
+            {
+                return Err(format!("{key} `{img}` contains invalid characters"));
+            }
+            Ok(img)
+        }
+        None => Ok(default),
+    }
 }
 
 /// Extract a non-empty string answer, treating JSON `null` and empty
@@ -874,7 +894,7 @@ fn telemetry_headers_content_hash(headers: &str) -> String {
 /// copy is guarded on the source existing, so an empty/absent Secret is a no-op
 /// rather than a boot failure; the dev-store is opened read-write under a flock
 /// at runtime, so it must land on the writable volume, not the read-only mount.
-fn stage_dev_secrets_init_container(env: &Environment) -> Value {
+fn stage_dev_secrets_init_container(env: &Environment, params: &K8sParams) -> Value {
     let dev_dir = format!(
         "{STAGE_HOME}/.greentic/environments/{}/.greentic/dev",
         env.environment_id.as_str()
@@ -882,7 +902,7 @@ fn stage_dev_secrets_init_container(env: &Environment) -> Value {
     let src = format!("{DEV_SECRETS_SRC}/.dev.secrets.env");
     json!({
         "name": "stage-dev-secrets",
-        "image": STAGE_INIT_IMAGE,
+        "image": params.init_image,
         "securityContext": container_security_context(),
         "command": [
             "sh",
@@ -1049,14 +1069,14 @@ fn runtime_pod_volumes() -> Vec<Value> {
 ///
 /// Assumes a simple (RFC 1123-ish) env id so the path segment matches the
 /// store's; the sandbox env ids the wizard accepts satisfy this.
-fn env_store_init_container(env: &Environment) -> Value {
+fn env_store_init_container(env: &Environment, params: &K8sParams) -> Value {
     let dst = format!(
         "{STAGE_HOME}/.greentic/environments/{}",
         env.environment_id.as_str()
     );
     json!({
         "name": "stage-env-store",
-        "image": STAGE_INIT_IMAGE,
+        "image": params.init_image,
         "securityContext": container_security_context(),
         "command": [
             "sh",
@@ -1110,7 +1130,7 @@ pub fn render_worker_deployment(
     //   connection env, and greentic-start resolves refs from Vault in-pod.
     //
     // Pure on `env` + `params` so reconcile and `apply-revision` agree.
-    let mut init_containers = vec![env_store_init_container(env)];
+    let mut init_containers = vec![env_store_init_container(env, params)];
     let mut volumes = runtime_pod_volumes();
     let mut service_account: Option<&str> = None;
     let uses_dev_secrets =
@@ -1118,7 +1138,7 @@ pub fn render_worker_deployment(
     match &params.secrets_backend {
         SecretsBackend::DevStore => {
             if uses_dev_secrets {
-                init_containers.push(stage_dev_secrets_init_container(env));
+                init_containers.push(stage_dev_secrets_init_container(env, params));
                 volumes.push(json!({
                     "name": DEV_SECRETS_VOLUME,
                     "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
@@ -1322,7 +1342,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "whenUnsatisfiable": "ScheduleAnyway",
                         "labelSelector": {"matchLabels": labels},
                     }],
-                    "initContainers": [env_store_init_container(env)],
+                    "initContainers": [env_store_init_container(env, params)],
                     "containers": [{
                         "name": "router",
                         "image": params.runtime_image,
@@ -1740,6 +1760,45 @@ mod tests {
         assert_eq!(params.namespace, format!("gtc-{}", env.environment_id));
         assert_eq!(params.runtime_image, DEFAULT_RUNTIME_IMAGE);
         assert_eq!(params.router_replicas, 2, "plan step 11: router HA ≥ 2");
+    }
+
+    #[test]
+    fn init_image_defaults_to_the_bundled_busybox() {
+        let (env, params) = fixture();
+        assert_eq!(params.init_image, "busybox:1.36.1");
+        let manifests = render_environment_manifests(&env, &params);
+        let json = serde_json::to_string(&manifests).unwrap();
+        assert!(json.contains("busybox:1.36.1"));
+    }
+
+    #[test]
+    fn init_image_answer_replaces_every_init_container_image() {
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "init_image": "registry.client.local/greentic/busybox:1.36.1" })),
+        )
+        .expect("a known answer key is accepted");
+        assert_eq!(
+            params.init_image,
+            "registry.client.local/greentic/busybox:1.36.1"
+        );
+        let json = serde_json::to_string(&render_environment_manifests(&env, &params)).unwrap();
+        assert!(
+            !json.contains("\"image\":\"busybox:1.36.1\""),
+            "no init container may keep the default once the answer is set"
+        );
+    }
+
+    #[test]
+    fn init_image_rejects_invalid_characters() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "init_image": "Registry.Client.Local/BusyBox" })),
+        )
+        .unwrap_err();
+        assert!(err.contains("init_image"), "{err}");
     }
 
     #[test]
