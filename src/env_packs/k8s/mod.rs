@@ -278,4 +278,32 @@ mod tests {
             serde_yaml_bw::from_str(yaml).expect("wizard.qaspec.yaml parses as FormSpec");
         assert_eq!(spec.id, "greentic.deployer.k8s.wizard");
     }
+
+    /// The wizard's own header states credential MATERIAL is never
+    /// collected here — which is why `oci_username`/`oci_password` have no
+    /// questions of their own. `image_pull_secret` is a KNOWN, accepted
+    /// `K8sParams::from_answers` key (declarative env manifests may still
+    /// set it directly), but `from_answers` hard-refuses it unless BOTH
+    /// `oci_username` AND `oci_password` are also set — answers the wizard
+    /// can never collect. A wizard question for it can therefore only ever
+    /// fail, naming two answers the operator was never asked for. `init_image`
+    /// has no such prerequisite and keeps its question.
+    #[test]
+    fn wizard_omits_image_pull_secret_but_keeps_init_image() {
+        let yaml = K8sDeployerHandler::default()
+            .wizard_qaspec_yaml()
+            .expect("k8s handler ships a wizard QASpec");
+        let spec: qa_spec::FormSpec =
+            serde_yaml_bw::from_str(yaml).expect("wizard.qaspec.yaml parses as FormSpec");
+        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"image_pull_secret"),
+            "image_pull_secret requires oci_username/oci_password, which this wizard never \
+             collects, so it can only ever fail — got questions: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"init_image"),
+            "init_image has no such prerequisite and must keep its question — got: {ids:?}"
+        );
+    }
 }

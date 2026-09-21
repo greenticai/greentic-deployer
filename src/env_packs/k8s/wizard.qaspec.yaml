@@ -116,23 +116,6 @@ questions:
       digest-pinned OCI boot-pull path.
     required: false
 
-  - id: image_pull_secret
-    type: string
-    title: Image-pull secret name (optional)
-    description: >-
-      Name of a `kubernetes.io/dockerconfigjson` Secret to render (from
-      the `oci_username` / `oci_password` credential) and reference as
-      `imagePullSecrets` from every pod this pack renders — for a
-      private runtime/init image or an air-gapped cluster's
-      authenticated registry. Leave blank (the default) to render no
-      pull secret and no `imagePullSecrets` key at all. Requires
-      `oci_username` AND `oci_password` to also be set — naming a
-      Secret with no credential would authenticate nothing.
-    required: false
-    constraint:
-      max_len: 63
-      pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
-
   - id: service_type
     type: enum
     title: Router service type
