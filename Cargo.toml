@@ -10,7 +10,7 @@ resolver = "2"
 
 [package]
 name = "greentic-deployer"
-version = "1.3.0-research.1"
+version = "1.2.0-dev.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic deployer runtime for plan construction and deployment-pack dispatch"
@@ -120,9 +120,9 @@ async-trait = "0.1"
 base64 = "0.22"
 ciborium = "0.2"
 fs4 = "0.13"
-greentic-bundle = ">=1.3.0-research.0, <1.4.0-0"
-greentic-config = ">=1.3.0-research.1, <1.4.0-0"
-greentic-config-types = ">=1.3.0-research.1, <1.4.0-0"
+greentic-bundle = ">=1.2.0-dev, <1.3.0-0"
+greentic-config = ">=1.2.0-dev, <1.3.0-0"
+greentic-config-types = ">=1.2.0-dev, <1.3.0-0"
 # API floor is 0.2.4 (pin currently at 0.2.6): `cli/updates.rs` uses
 # `greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT`, which 0.2.3 does not define.
 # The path dep masks this locally — it always resolves to the in-tree copy — so
@@ -144,15 +144,14 @@ greentic-config-types = ">=1.3.0-research.1, <1.4.0-0"
 # The floor still tracks main (never below it): 0.2.6 adds
 # `UpdateHostConfig::default_bundle` and `EnvironmentHostConfig::{new, ..}`.
 #
-# RESEARCH LINE (greentic-start#595): develop moved deploy-spec from 0.2.x onto
-# the 1.3 research line, because greentic-runner develop =-pins deploy-spec on
-# that line and `Environment` / `Revision` cross the runner boundary.
-# 1.3.0-research.3 is the first research build carrying develop's API above
-# (plus `blob_base_url`, `resolve_default_bundle`, `DefaultBundleReason`); the
-# published 1.3.0-research.1/.2 predate it. dev-publish stamps it
-# `1.3.0-research.<RUN_ID>`, which this range admits.
-greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = ">=1.3.0-research.3, <1.4.0-0" }
-greentic-operator-trust = { path = "crates/greentic-operator-trust", version = ">=1.3.0-research.1, <1.4.0-0" }
+# DEV LANE: deploy-spec rides the same `1.2.0-dev` lane as the rest of the
+# greentic-designer chain (moved back from the 1.3 research line of
+# greentic-start#595 on 2026-09-22). `Environment` / `Revision` cross the
+# runner boundary, so runner and this crate must share one lane. dev-publish
+# stamps it `1.2.0-dev.<RUN_ID>`, which this range admits. It carries
+# `blob_base_url`, `resolve_default_bundle` and `DefaultBundleReason`.
+greentic-deploy-spec = { path = "crates/greentic-deploy-spec", version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = ">=1.2.0-dev, <1.3.0-0" }
 # did:web resolution for `trust-root add-did`. Default features only: `cli` and
 # `testing` would drag clap/tokio/rand in for no runtime benefit.
 greentic-trust = "0.2"
@@ -182,7 +181,7 @@ libc = "0.2"
 # is a runtime dep now (it was dev-only for the C6 env-pack YAML round-trip
 # tests; the env-pack trait still carries raw YAML). Already in the runtime
 # graph via greentic-bundle -> greentic-qa-lib, so this adds no new crates.
-qa-spec = ">=1.3.0-research.1, <1.4.0-0"
+qa-spec = ">=1.2.0-dev, <1.3.0-0"
 
 [dependencies.clap]
 version = "4.5"
@@ -191,24 +190,25 @@ features = [
 ]
 
 [dependencies.greentic-telemetry]
-# Floor pinned to the C5.1 publish that exposes `RolloutEvent` +
-# `emit_rollout_event`. Lower versions in the same range satisfy
-# `>=1.1.0-dev` but lack the rollout module.
-version = ">=1.1.0, <1.3.0-0"
+# On the 1.2.0-dev lane with the rest of the chain: greentic-types 1.2.0-dev
+# requires telemetry `>=1.2.0-dev`, which a stable `>=1.1.0` range cannot
+# admit (a pre-release only matches a comparator on its own M.m.p).
+# 1.2.0-dev.28923800659 carries `RolloutEvent` + `emit_rollout_event`.
+version = ">=1.2.0-dev, <1.3.0-0"
 features = [
     "otlp",
 ]
 
 [dependencies.greentic-types]
-version = ">=1.3.0-research.1, <1.4.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [dependencies.greentic-distributor-client]
-version = ">=1.3.0-research.4, <1.4.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 # `pack-push` is what the oci:// bundle-upload backend needs.
 features = ["pack-push"]
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.3.0-research.3, <1.4.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 features = [
     "providers-dev",
     "providers-vault",
@@ -217,10 +217,10 @@ features = [
 [dependencies.greentic-secrets-provider-dev]
 # Direct dependency only for `DevBackend`'s typed, value-free key enumeration
 # (`op secrets list --prefix`, `op secrets delete --prefix`): `DevStore` exposes
-# put/get/copy_excluding and no listing. Resolves to the SAME git rev as
-# greentic-secrets-lib through the [patch.crates-io] block below, so it adds no
-# crate to the graph — it is already there transitively.
-version = ">=1.3.0-research.3, <1.4.0-0"
+# put/get/copy_excluding and no listing. Resolves to the same published build as
+# greentic-secrets-lib, so it adds no crate to the graph — it is already there
+# transitively.
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [dependencies.greentic-update]
 # LANE-PINNED: this range admits only dev-lane pre-releases (1.2.0-dev.N).
@@ -237,7 +237,7 @@ version = ">=1.3.0-research.3, <1.4.0-0"
 # 1.2.0-dev.30445743798, which lacks all three, so a downstream crate that
 # resolved it (greentic-operator did) failed with E0432 inside THIS crate's
 # source while this repo stayed green on its own path dep.
-version = ">=1.3.0-research.1, <1.4.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 features = [
     "binswap",
     "enroll",
@@ -457,7 +457,7 @@ tower-test = "0.4"
 http = "1"
 http-body-util = "0.1"
 # Re-declared to turn on `test_support` (shared keypair fixtures) for tests.
-greentic-operator-trust = { path = "crates/greentic-operator-trust", version = ">=1.3.0-research.1, <1.4.0-0", features = ["test-utils"] }
+greentic-operator-trust = { path = "crates/greentic-operator-trust", version = ">=1.2.0-dev, <1.3.0-0", features = ["test-utils"] }
 # Path-only (no version) on purpose: the server crate is `publish = false`,
 # and cargo strips versionless path dev-deps at publish time. Used by the
 # `store_server_e2e` test to drive the real `HttpEnvironmentStore` client
@@ -474,20 +474,4 @@ greentic-deploy-spec = { path = "crates/greentic-deploy-spec" }
 # E2E can derive the canonical store-key the bound-credential resolver reads,
 # and seed a ServiceAccount token via env var. Already in the lockfile via the
 # normal dep, so no resolution change.
-greentic-secrets-lib = ">=1.3.0-research.3, <1.4.0-0"
-
-# Research-line chain (greentic-start#595). crates.io publishing is locked
-# fleet-wide, so the research-line builds this crate needs exist only in git:
-# greentic-update 1.3.0-research.1, greentic-distributor-client
-# 1.3.0-research.4 and greentic-secrets 1.3.0-research.3 (develop's code on
-# the research line). greentic-secrets-spec is patched as well because
-# greentic-bundle and greentic-deploy-spec require it from crates.io; without
-# it the graph holds two secrets-spec copies. A patch section does not travel
-# into a published crate; every consumer carries the same patch at its root.
-# TO UNWIND once publishing is restored: delete this block, `cargo update`.
-[patch.crates-io]
-greentic-update = { git = "https://github.com/greenticai/greentic-update", rev = "b861042120efb1c7f56c0c53ab05f6155f86e1c9" }
-greentic-distributor-client = { git = "https://github.com/greenticai/greentic-distributor-client", rev = "d594bb896c9722f439bf3c0cb98a3b85afb9b540" }
-greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
-greentic-secrets-spec = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
-greentic-secrets-provider-dev = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
+greentic-secrets-lib = ">=1.2.0-dev, <1.3.0-0"
