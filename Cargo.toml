@@ -214,6 +214,14 @@ features = [
     "providers-vault",
 ]
 
+[dependencies.greentic-secrets-provider-dev]
+# Direct dependency only for `DevBackend`'s typed, value-free key enumeration
+# (`op secrets list --prefix`, `op secrets delete --prefix`): `DevStore` exposes
+# put/get/copy_excluding and no listing. Resolves to the SAME git rev as
+# greentic-secrets-lib through the [patch.crates-io] block below, so it adds no
+# crate to the graph — it is already there transitively.
+version = ">=1.3.0-research.3, <1.4.0-0"
+
 [dependencies.greentic-update]
 # LANE-PINNED: this range admits only dev-lane pre-releases (1.2.0-dev.N).
 # Cargo treats pre-release comparators as exact-major.minor.patch, so
@@ -482,3 +490,4 @@ greentic-update = { git = "https://github.com/greenticai/greentic-update", rev =
 greentic-distributor-client = { git = "https://github.com/greenticai/greentic-distributor-client", rev = "d594bb896c9722f439bf3c0cb98a3b85afb9b540" }
 greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
 greentic-secrets-spec = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
+greentic-secrets-provider-dev = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }

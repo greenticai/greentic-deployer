@@ -280,6 +280,7 @@ fn route_remote(
             SecretsVerb::Put => Err(not_supported("secrets put")),
             SecretsVerb::Get => Err(not_supported("secrets get")),
             SecretsVerb::Rotate => Err(not_supported("secrets rotate")),
+            SecretsVerb::Delete => Err(not_supported("secrets delete")),
         },
         // Update-channel enrollment writes to the env's local secrets backend
         // and talks to the external Cert-CA — not a remote-store operation.

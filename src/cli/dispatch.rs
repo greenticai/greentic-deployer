@@ -1273,12 +1273,27 @@ pub enum CredentialsVerb {
     Rotate,
 }
 
+/// `op secrets <verb>`. Every verb reads its payload from `--answers <file>`
+/// (JSON or YAML); `--schema` prints that payload's JSON Schema. Paths are
+/// `<tenant>/<team>/<pack>/<name>` under the env's secret namespace.
 #[derive(Subcommand, Debug)]
 pub enum SecretsVerb {
+    /// Show the env's secret namespace and bound backend. With `prefix`
+    /// (`<tenant>/<team>/<pack>/[<name-prefix>]`) also enumerate the stored
+    /// KEY NAMES under it (dev-store only). Values are never printed.
     List,
+    /// Write one secret value (`environment_id`, `path`, `value`).
     Put,
+    /// Read one secret back: presence by default, the value only with
+    /// `reveal: true`.
     Get,
+    /// Rotate one secret (not yet implemented for any backend).
     Rotate,
+    /// Remove one secret (`path`) or every secret under a `prefix` from the
+    /// env's dev store. The key is dropped from the store file entirely (no
+    /// tombstone, no residual ciphertext). Deleting a missing key succeeds
+    /// with `deleted: false`.
+    Delete,
 }
 
 #[derive(Args, Debug)]
@@ -1477,6 +1492,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 SecretsVerb::Put => "put",
                 SecretsVerb::Get => "get",
                 SecretsVerb::Rotate => "rotate",
+                SecretsVerb::Delete => "delete",
             },
         ),
         OpNoun::TrustRoot { verb } => (
@@ -1753,6 +1769,7 @@ fn dispatch_secrets(
         SecretsVerb::Put => super::secrets::put(store, flags, None)?,
         SecretsVerb::Get => super::secrets::get(store, flags, None)?,
         SecretsVerb::Rotate => super::secrets::rotate(store, flags, None)?,
+        SecretsVerb::Delete => super::secrets::delete(store, flags, None)?,
     };
     print_outcome(&outcome)
 }

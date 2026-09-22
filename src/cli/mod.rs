@@ -10,7 +10,7 @@
 //! - [`traffic`] — Traffic-split management (`set`, `show`, `rollback`)
 //! - [`config`] — Host/setup/runtime config inspection (`show`, `set`)
 //! - [`credentials`] — Credential modes (`requirements`, `bootstrap`, `rotate`)
-//! - [`secrets`] — Secrets management (`list`, `put`, `get`, `rotate`)
+//! - [`secrets`] — Secrets management (`list`, `put`, `get`, `rotate`, `delete`)
 //!
 //! Every command pair honors:
 //!
