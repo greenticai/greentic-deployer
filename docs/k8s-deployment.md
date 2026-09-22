@@ -280,7 +280,7 @@ Two secrets backends are supported. The env-manifest `packs[]` entry on the
 
 When an env binds the `greentic.secrets.dev-store@1.0.0` pack:
 
-1. `op env apply` (or `op secrets put`) writes secret values into the operator's
+1. `op env apply` (or `op secrets put`; `op secrets delete` removes one) writes secret values into the operator's
    **local dev-store** (`<store>/<env>/.greentic/dev/.dev.secrets.env`,
    AES-256-GCM per secret).
 2. At **reconcile** the deployer base64-encodes that dev-store file and renders

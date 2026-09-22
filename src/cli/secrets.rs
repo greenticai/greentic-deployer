@@ -1,4 +1,4 @@
-//! `gtc op secrets {list,put,get,rotate}` (`A3`).
+//! `gtc op secrets {list,put,get,rotate,delete}` (`A3`).
 //!
 //! Operates on the env's bound `Secrets` env-pack. The actual backend
 //! dispatch (AWS Secrets Manager, Azure Key Vault, dev-store, Vault, etc.)
@@ -15,7 +15,14 @@
 //! live backend — return `NotYetImplemented` and point at the gating PR
 //! (A9 — env-pack registry + handler dispatch).
 //! `list` returns the *namespace* keys the env owns (always `secret://<env>/...`)
-//! — no actual material is fetched.
+//! — no actual material is fetched. With a `prefix` it also enumerates the
+//! dev store's stored KEY NAMES under that prefix (never values).
+//!
+//! `delete` removes one key (`path`) or every key under a `prefix` from the dev
+//! store — dropped from the store file entirely, not tombstoned, because the
+//! env-packs ship that whole file into every workload (see
+//! `dev_store_keys`). Deleting a missing key is a success with
+//! `deleted: false`.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +37,12 @@ use crate::environment::{EnvFlock, EnvironmentStore, LocalFsStore};
 use super::{
     AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record, resolve_idempotency_key,
 };
+
+#[cfg(test)]
+mod delete_tests;
+mod dev_store_keys;
+
+use dev_store_keys::DevStorePrefix;
 
 const NOUN: &str = "secrets";
 
@@ -104,6 +117,12 @@ pub(super) fn dev_store_key(env_id: &EnvId, rel_path: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsListPayload {
     pub environment_id: String,
+    /// Optional `<tenant>/<team>/<pack>/[<name-prefix>]`. When set, the
+    /// outcome also carries `prefix` and `stored_keys` — the dev store's live
+    /// key NAMES under it (dev-store backend only). Absent keeps the output
+    /// byte-for-byte what it was before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +156,22 @@ pub struct SecretsGetPayload {
 pub struct SecretsRotatePayload {
     pub environment_id: String,
     pub path: String,
+}
+
+/// `op secrets delete` payload. Exactly one of `path` / `prefix`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsDeletePayload {
+    pub environment_id: String,
+    /// One key, `<tenant>/<team>/<pack>/<name>` — validated exactly like `put`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Every live key under `<tenant>/<team>/<pack>/[<name-prefix>]`, removed
+    /// in one atomic rewrite of the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Caller-supplied A8 §2 idempotency key; minted per invocation when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// `op secrets list`. Returns the env's secret-ref namespace plus the kind
@@ -175,18 +210,25 @@ pub fn list(
         // visibility into where bundle auth resolves.
         known_refs.push(format!("auth://{bs}"));
     }
-    Ok(OpOutcome::new(
-        NOUN,
-        "list",
-        json!({
-            "environment_id": env_id.as_str(),
-            "secrets_kind": secrets.kind.to_string(),
-            "namespace": format!("secret://{}/", env_id.as_str()),
-            "known_refs": known_refs,
-            "snapshot_at": Utc::now(),
-            "note": "Phase A: namespace + known-refs only; live backend enumeration lands in A9.",
-        }),
-    ))
+    let mut result = json!({
+        "environment_id": env_id.as_str(),
+        "secrets_kind": secrets.kind.to_string(),
+        "namespace": format!("secret://{}/", env_id.as_str()),
+        "known_refs": known_refs,
+        "snapshot_at": Utc::now(),
+        "note": "Phase A: namespace + known-refs only; live backend enumeration lands in A9.",
+    });
+    if let Some(raw_prefix) = payload.prefix.as_deref() {
+        let prefix = DevStorePrefix::parse(raw_prefix)?;
+        require_dev_store_kind(secrets, "list --prefix")?;
+        let dev_path = env_dev_store_path(store, &env_id)?;
+        let keys = dev_store_keys::list_keys(&dev_path, &env_id, &prefix)?;
+        result["prefix"] = Value::String(prefix.render());
+        result["store_path"] = Value::String(dev_path.display().to_string());
+        result["stored_keys"] = serde_json::to_value(keys)
+            .map_err(|e| OpError::InvalidArgument(format!("serializing stored keys: {e}")))?;
+    }
+    Ok(OpOutcome::new(NOUN, "list", result))
 }
 
 pub fn put(
@@ -311,6 +353,125 @@ pub fn rotate(
             "secret rotation depends on backend-specific rotate hooks; lands in A9".to_string(),
         ))
     })
+}
+
+/// `op secrets delete`. Removes one key (`path`) or every live key under a
+/// `prefix` from the env's dev store. Idempotent: a key that is not there is a
+/// success with `deleted: false`. Audited like [`put`]. Only the dev-store
+/// backend is supported; other kinds return `NotYetImplemented`.
+pub fn delete(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<SecretsDeletePayload>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "delete", delete_schema()));
+    }
+    let payload = resolve_payload::<SecretsDeletePayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key.clone())?;
+    let target = match (&payload.path, &payload.prefix) {
+        (Some(path), None) => json!({"path": path}),
+        (None, Some(prefix)) => json!({"prefix": prefix}),
+        _ => {
+            return Err(OpError::InvalidArgument(
+                "exactly one of `path` or `prefix` is required".to_string(),
+            ));
+        }
+    };
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "delete",
+        target,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
+    };
+    audit_and_record(store, ctx, |_committed| {
+        let env = store.load(&env_id)?;
+        let secrets = require_secrets_pack(&env, &env_id)?;
+        let result = match (&payload.path, &payload.prefix) {
+            (Some(path), None) => delete_one(store, &env_id, secrets, path)?,
+            (None, Some(prefix)) => delete_under_prefix(store, &env_id, secrets, prefix)?,
+            _ => {
+                return Err(OpError::InvalidArgument(
+                    "exactly one of `path` or `prefix` is required".to_string(),
+                ));
+            }
+        };
+        Ok((OpOutcome::new(NOUN, "delete", result), AuditGens::NONE))
+    })
+}
+
+fn delete_one(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    secrets: &EnvPackBinding,
+    path: &str,
+) -> Result<Value, OpError> {
+    let rel_path = path.trim_start_matches('/');
+    let secret_uri = format!("secret://{}/{rel_path}", env_id.as_str());
+    SecretRef::try_new(secret_uri.clone())
+        .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
+    require_dev_store_kind(secrets, "delete")?;
+    // Same validation as `put`/`get` — including the reservation of the
+    // deployer's own bound credential paths — and the same key derivation.
+    validate_dev_store_secret_path(rel_path)?;
+    let store_uri = dev_store_key(env_id, rel_path);
+    let dev_path = env_dev_store_path(store, env_id)?;
+    let deleted = dev_store_keys::delete_key(&dev_path, &store_uri)?;
+    Ok(json!({
+        "environment_id": env_id.as_str(),
+        "secret_ref": secret_uri,
+        "store_uri": store_uri,
+        "secrets_kind": secrets.kind.to_string(),
+        "store_path": dev_path.display().to_string(),
+        "deleted": deleted,
+    }))
+}
+
+fn delete_under_prefix(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    secrets: &EnvPackBinding,
+    raw_prefix: &str,
+) -> Result<Value, OpError> {
+    let prefix = DevStorePrefix::parse(raw_prefix)?;
+    require_dev_store_kind(secrets, "delete --prefix")?;
+    let dev_path = env_dev_store_path(store, env_id)?;
+    let removed = dev_store_keys::delete_prefix(&dev_path, env_id, &prefix)?;
+    let count = removed.len();
+    Ok(json!({
+        "environment_id": env_id.as_str(),
+        "prefix": prefix.render(),
+        "secrets_kind": secrets.kind.to_string(),
+        "store_path": dev_path.display().to_string(),
+        "deleted": count > 0,
+        "deleted_count": count,
+        "deleted_keys": serde_json::to_value(removed).map_err(|e| {
+            OpError::InvalidArgument(format!("serializing deleted keys: {e}"))
+        })?,
+    }))
+}
+
+/// Key enumeration and hard delete exist for the dev store only.
+fn require_dev_store_kind(secrets: &EnvPackBinding, verb: &str) -> Result<(), OpError> {
+    if secrets.kind.path() == DEV_STORE_KIND_PATH {
+        Ok(())
+    } else {
+        Err(OpError::NotYetImplemented(format!(
+            "`op secrets {verb}` supports the dev-store backend only; backend \
+             dispatch for `{}` lands in A9 (env-pack registry)",
+            secrets.kind
+        )))
+    }
+}
+
+/// The env's dev store file, resolved exactly as `put`/`get` resolve it.
+fn env_dev_store_path(store: &LocalFsStore, env_id: &EnvId) -> Result<PathBuf, OpError> {
+    Ok(resolve_dev_store_path(
+        &store.env_dir(env_id)?,
+        std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+    ))
 }
 
 // --- internals -----------------------------------------------------------
@@ -1164,7 +1325,10 @@ fn list_schema() -> Value {
         "type": "object",
         "required": ["environment_id"],
         "additionalProperties": false,
-        "properties": {"environment_id": {"type": "string"}}
+        "properties": {
+            "environment_id": {"type": "string"},
+            "prefix": {"type": ["string", "null"], "description": "Optional <tenant>/<team>/<pack>/[<name-prefix>]. When set, the outcome also lists `stored_keys` — the dev store's live key names under it (never values). Dev-store backend only."}
+        }
     })
 }
 
@@ -1195,6 +1359,23 @@ fn get_schema() -> Value {
             "environment_id": {"type": "string"},
             "path": {"type": "string"},
             "reveal": {"type": "boolean", "default": false, "description": "Include the decrypted value in the outcome. Default false — presence + metadata only."}
+        }
+    })
+}
+
+fn delete_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "SecretsDeletePayload",
+        "type": "object",
+        "required": ["environment_id"],
+        "oneOf": [{"required": ["path"]}, {"required": ["prefix"]}],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "path": {"type": "string", "description": "One key, <tenant>/<team>/<pack>/<name> — validated exactly like `put`. Deleting a missing key succeeds with `deleted: false`."},
+            "prefix": {"type": "string", "description": "Every live key under <tenant>/<team>/<pack>/[<name-prefix>], removed in one atomic rewrite. Refused when it covers the deployer's own bound credential."},
+            "idempotency_key": {"type": ["string", "null"], "description": "Caller-supplied idempotency key; minted per invocation when absent."}
         }
     })
 }
@@ -1314,6 +1495,7 @@ mod tests {
             &OpFlags::default(),
             Some(SecretsListPayload {
                 environment_id: "local".to_string(),
+                prefix: None,
             }),
         )
         .unwrap();
@@ -1337,6 +1519,7 @@ mod tests {
             &OpFlags::default(),
             Some(SecretsListPayload {
                 environment_id: "local".to_string(),
+                prefix: None,
             }),
         )
         .unwrap_err();

@@ -2901,6 +2901,7 @@ dependencies = [
  "greentic-operator-store-server",
  "greentic-operator-trust",
  "greentic-secrets-lib",
+ "greentic-secrets-provider-dev",
  "greentic-telemetry",
  "greentic-trust",
  "greentic-types",

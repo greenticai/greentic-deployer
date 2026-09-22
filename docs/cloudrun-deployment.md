@@ -366,6 +366,42 @@ The authoritative field list is the schema itself:
 greentic-deployer op env apply --schema
 ```
 
+### Listing and removing secrets (`op secrets list --prefix`, `op secrets delete`)
+
+Every `op secrets` verb reads its payload from `--answers <file>`; `--schema`
+prints the payload schema. `put` / `get` write and read one key. To see which
+keys a store holds, pass a `prefix` to `list`; it returns key **names** only —
+values are never printed:
+
+```bash
+# list.json: {"environment_id": "local", "prefix": "acme/_/mcp/"}
+greentic-deployer op --store-root ./state --answers list.json secrets list
+# result.stored_keys: [{"path": "acme/_/mcp/<id>.unit-a", "store_uri": "secrets://default/acme/_/mcp/<id>.unit-a"}]
+```
+
+`prefix` is `<tenant>/<team>/<pack>/[<name-prefix>]`: tenant, team and pack are
+exact (the pack segment never matches partially), the name may be a partial
+prefix. Without `prefix`, `list` output is unchanged.
+
+`delete` removes one key (`path`) or every key under a `prefix`:
+
+```bash
+# delete.json: {"environment_id": "local", "path": "acme/_/mcp/<id>.unit-a"}
+#          or: {"environment_id": "local", "prefix": "acme/_/mcp/"}
+greentic-deployer op --store-root ./state --answers delete.json secrets delete
+```
+
+- Deleting a key that is not there succeeds with `deleted: false`.
+- `path` is validated exactly like `put` (same shape rules, same `mcp` / `a2a`
+  verbatim-name carve-out, same refusal of the deployer's own credential paths);
+  a `prefix` that covers the deployer credential is refused and deletes nothing.
+- The key is dropped from the store file, not tombstoned: the whole file ships
+  into every workload of the environment, so a tombstone would keep the old
+  value's ciphertext in containers that must not hold it. The rewrite is
+  atomic (sanitized copy renamed over the store) and serialized with `put`.
+- Each delete is audited like `put`. Dev-store backend only; other secrets
+  backends answer `not-yet-implemented`.
+
 ### Secret ownership
 
 The seed secret is stamped with a `greentic-env` label identifying the owning
