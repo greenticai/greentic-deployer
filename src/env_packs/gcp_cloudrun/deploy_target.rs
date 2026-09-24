@@ -250,6 +250,20 @@ pub struct RevisionStatus {
     /// something other than this deployer). `None` is not "matches anything" —
     /// it is unverifiable, which the deployer treats as a conflict.
     pub intent: Option<String>,
+    /// Why Cloud Run says the revision is not ready: the message of every
+    /// condition that has not succeeded, `Ready` first (e.g. "The user-provided
+    /// container failed to start and listen on the port defined provided by
+    /// the PORT=8080 environment variable"). `None` for a ready revision, or
+    /// one whose conditions carry no message yet.
+    ///
+    /// Carried so a readiness timeout can say WHY. Without it the only error a
+    /// caller ever saw was "did not become ready within 300s" — true of an
+    /// image that will not pull, a container that crashes at boot and one that
+    /// is merely slow alike — while Cloud Run held the actual reason.
+    pub not_ready_reason: Option<String>,
+    /// The Cloud Console link to this revision's logs, when Cloud Run reports
+    /// one — where the container's own error lives.
+    pub log_uri: Option<String>,
 }
 
 /// Return of [`CloudRunTarget::add_secret_version`]: the immutable numeric
@@ -717,6 +731,8 @@ impl CloudRunTarget for InMemoryCloudRun {
                     ready: true,
                     active: true,
                     intent: Some(spec.revision_intent.clone()),
+                    not_ready_reason: None,
+                    log_uri: None,
                 },
                 template,
             ),

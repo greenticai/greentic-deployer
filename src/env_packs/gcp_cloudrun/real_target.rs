@@ -778,7 +778,32 @@ fn revision_status_from(rev: &run::Revision) -> RevisionStatus {
         // Absent for a revision this deployer did not stamp, which the caller
         // treats as unverifiable rather than as a match.
         intent: rev.labels.get(INTENT_LABEL_KEY).cloned(),
+        not_ready_reason: if ready {
+            None
+        } else {
+            not_ready_reason(&rev.conditions)
+        },
+        log_uri: Some(rev.log_uri.clone()).filter(|u| !u.trim().is_empty()),
     }
+}
+
+/// Every non-succeeded condition's message, `Ready` first, as
+/// `<type>: <message>` joined by `; `. `None` when no such condition says
+/// anything — an empty reason must read as "Cloud Run gave none", not as a
+/// blank the caller renders.
+fn not_ready_reason(conditions: &[run::Condition]) -> Option<String> {
+    let mut failing: Vec<&run::Condition> = conditions
+        .iter()
+        .filter(|c| {
+            c.state != run::condition::State::ConditionSucceeded && !c.message.trim().is_empty()
+        })
+        .collect();
+    failing.sort_by_key(|c| c.r#type != "Ready");
+    let parts: Vec<String> = failing
+        .iter()
+        .map(|c| format!("{}: {}", c.r#type, c.message.trim()))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// A Service is ready when its terminal condition (or a `Ready` condition) has
@@ -1344,6 +1369,58 @@ mod tests {
             locked.bindings.iter().any(|b| b.role == "roles/run.admin"),
             "unrelated bindings are preserved"
         );
+    }
+
+    /// The reason a readiness timeout now carries: Cloud Run's own words.
+    #[test]
+    fn a_failing_revision_reports_its_conditions_ready_first() {
+        let conditions = vec![
+            run::Condition::new()
+                .set_type("ContainerHealthy")
+                .set_state(run::condition::State::ConditionFailed)
+                .set_message("Container import failed"),
+            run::Condition::new()
+                .set_type("Ready")
+                .set_state(run::condition::State::ConditionFailed)
+                .set_message("The user-provided container failed to start"),
+            run::Condition::new()
+                .set_type("ResourcesAvailable")
+                .set_state(run::condition::State::ConditionSucceeded)
+                .set_message("ignored: succeeded"),
+        ];
+        assert_eq!(
+            not_ready_reason(&conditions).as_deref(),
+            Some(
+                "Ready: The user-provided container failed to start; \
+                 ContainerHealthy: Container import failed"
+            )
+        );
+    }
+
+    #[test]
+    fn no_reason_when_no_failing_condition_says_anything() {
+        assert_eq!(not_ready_reason(&[]), None);
+        let silent = vec![
+            run::Condition::new()
+                .set_type("Ready")
+                .set_state(run::condition::State::ConditionPending),
+        ];
+        assert_eq!(not_ready_reason(&silent), None);
+    }
+
+    #[test]
+    fn a_ready_revision_carries_no_reason_and_an_empty_log_uri_is_absent() {
+        let mut rev = run::Revision::new();
+        rev.conditions = vec![
+            run::Condition::new()
+                .set_type("Ready")
+                .set_state(run::condition::State::ConditionSucceeded)
+                .set_message("done"),
+        ];
+        let status = revision_status_from(&rev);
+        assert!(status.ready);
+        assert_eq!(status.not_ready_reason, None);
+        assert_eq!(status.log_uri, None);
     }
 
     #[test]
