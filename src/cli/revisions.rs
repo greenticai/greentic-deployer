@@ -273,23 +273,21 @@ pub fn stage(
                         revision_id,
                         &bundle_path,
                     )?;
-                    // Walk `staged.lock.packs` once: build both
-                    // `lock_derived_pack_list` (feeds `Revision.pack_list`
+                    // `lock_derived_pack_list` feeds `Revision.pack_list`
                     // so `Environment::validate`'s config-overrides
-                    // cross-ref has data) and the pinned-pack-id set for
-                    // `materialize_pack_configs` in one pass.
+                    // cross-ref has data.
                     let mut lock_derived_pack_list: Vec<PackListEntry> =
                         Vec::with_capacity(staged.lock.packs.len());
-                    let mut pinned_pack_ids: std::collections::HashSet<String> =
-                        std::collections::HashSet::with_capacity(staged.lock.packs.len());
                     for lp in &staged.lock.packs {
                         let pack_id = lp.pack_id.clone();
-                        pinned_pack_ids.insert(pack_id.as_str().to_string());
                         lock_derived_pack_list.push(PackListEntry::from_lock_primitives(
                             pack_id,
                             lp.digest.clone(),
                         ));
                     }
+                    // Stems AND manifest ids — see `pack_config_pack_ids`.
+                    let pinned_pack_ids =
+                        super::bundle_stage::pack_config_pack_ids(&env_dir, &staged.lock);
                     let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
                     // If pack-config materialization fails AFTER
                     // `stage_local_bundle` succeeded, drop the rev_dir
