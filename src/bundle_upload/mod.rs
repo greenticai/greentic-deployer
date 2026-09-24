@@ -23,6 +23,11 @@ pub mod azure;
 #[cfg(feature = "deploy-gcp-cloudrun")]
 pub mod oci;
 
+// The push transport `oci` uses. Split out because it is a whole client
+// configuration with its own reasoning, not a detail of the uploader.
+#[cfg(feature = "deploy-gcp-cloudrun")]
+pub mod oci_pusher;
+
 pub use dispatcher::from_url;
 pub use error::{BundleUploadError, BundleUploadResult};
 pub use types::{UploadOptions, UploadedBundle};

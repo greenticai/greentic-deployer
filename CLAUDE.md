@@ -127,6 +127,34 @@ Useful surfaces when you need ground truth rather than a guess:
   build identity lives only in the crates.io version. **A stale `-dev` binary is
   indistinguishable from a current one.** Re-binstall when behaviour surprises you.
 
+## `bundle-upload upload oci://…` pushes monolithically, and must keep doing so
+
+Artifact Registry accepts a blob-upload `POST` and the FIRST `PATCH`, hands back
+an upload location of a different shape (`/v2/<project>/<repo>/pkg/blobs/…`),
+and answers a SECOND `PATCH` with `405 Method Not Allowed` — that location is
+finished with `PUT` and takes no further chunk. `oci-client`'s default blob push
+is chunked at 4 MiB, so **every blob over 4 MiB failed and every smaller one
+succeeded**, with an error naming only a `405`. Nothing in the message mentions
+size, which is why the lane read as broken rather than as size-dependent; and
+because a `.gtbundle` under 4 MiB is common, it looked like it worked.
+
+`oci-client`'s own monolithic fallback does not rescue it: `push_blob` retries
+monolithically only on `SpecViolationError`, which `extract_location_header`
+raises solely for an unexpected *success* status. A clean `405` becomes
+`ServerError { code: 405 }` and is returned verbatim.
+
+`bundle_upload::oci_pusher::MonolithicRegistryPusher` is the fix — an
+`oci_client::Client` with `use_monolithic_push: true`, i.e. the spec's other
+blob-upload flow (`POST` then one `PUT`). It branches on nothing: no host
+sniffing, no `Location`-shape heuristic. **Do not swap this path back to
+`DefaultRegistryClient`** (which offers no way to set that flag from outside)
+without re-testing a bundle over 4 MiB against a real Artifact Registry.
+`oci_pusher`'s tests drive a stub that reproduces both AR behaviours, and one of
+them pins that `DefaultRegistryClient` still fails there.
+
+Verified live on 2026-09-24: an 8,572,928-byte bundle pushed to
+`asia-southeast1-docker.pkg.dev` and pulled back byte-identical.
+
 ## Testing without a cloud account
 
 Every deployer has a fake. Do not reach for a live account to test logic:
