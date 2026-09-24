@@ -34,6 +34,9 @@ pub const VAULT_NAME: &str = "vault";
 /// used as the NetworkPolicy ingress source selector.
 const WORKER_COMPONENT: &str = "worker";
 
+/// The router pod's component label. It resolves secrets as a worker does.
+const ROUTER_COMPONENT: &str = "router";
+
 /// The dev Vault's HTTP API port.
 const VAULT_PORT: u16 = 8200;
 
@@ -232,8 +235,15 @@ pub fn render_vault_network_policy(p: &VaultInfraParams) -> Value {
                     "namespaceSelector": {
                         "matchLabels": { "kubernetes.io/metadata.name": p.worker_namespace },
                     },
+                    // The router reads secrets too (each unit's ingress
+                    // credential, to admit an external caller), so it is admitted
+                    // beside the workers — see `manifests::secrets_wiring`.
                     "podSelector": {
-                        "matchLabels": { "app.kubernetes.io/component": WORKER_COMPONENT },
+                        "matchExpressions": [{
+                            "key": "app.kubernetes.io/component",
+                            "operator": "In",
+                            "values": [WORKER_COMPONENT, ROUTER_COMPONENT],
+                        }],
                     },
                 }],
                 "ports": [{ "protocol": "TCP", "port": VAULT_PORT }],
@@ -326,8 +336,9 @@ mod tests {
             "ingress `from` must not scope by the env-ownership label (too broad)"
         );
         assert_eq!(
-            from["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "worker",
-            "ingress `from` must still select the worker component"
+            from["podSelector"]["matchExpressions"][0]["values"],
+            json!(["worker", "router"]),
+            "ingress `from` must select the worker and router components"
         );
         assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], VAULT_PORT);
     }
@@ -401,10 +412,11 @@ mod tests {
             VAULT_NAME
         );
         let from = &np["spec"]["ingress"][0]["from"][0];
-        assert_eq!(
-            from["podSelector"]["matchLabels"]["app.kubernetes.io/component"],
-            "worker"
-        );
+        let selector = &from["podSelector"]["matchExpressions"][0];
+        assert_eq!(selector["key"], "app.kubernetes.io/component");
+        assert_eq!(selector["operator"], "In");
+        // The router reads secrets too — each unit's ingress credential.
+        assert_eq!(selector["values"], json!(["worker", "router"]));
         assert_eq!(np["spec"]["ingress"][0]["ports"][0]["port"], 8200);
     }
 

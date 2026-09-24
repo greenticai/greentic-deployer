@@ -1798,6 +1798,50 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
     ]);
 }
 
+/// Stage a bearer the router will accept for `e2e-bundle` and return it.
+///
+/// Worker-interop D7 (greentic-start): a non-loopback caller of the generic
+/// JSON ingress is admitted only with a bearer whose SHA-256 is listed in the
+/// unit's `secrets://<env>/<tenant>/_/ingress/<canonical bundle id>` document.
+/// That document reaches the pods through the dev-store secrets pack, so this
+/// binds the pack first. The deployment's tenant is not pinned by the M4 route
+/// binding, so — like the M5 Telegram seed — it is written under both tenants
+/// the runtime may resolve.
+fn stage_ingress_bearer(store: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let secpack = payload(
+        store,
+        "ingress-secpack.json",
+        serde_json::json!({
+            "environment_id": ENV_ID,
+            "slot": "secrets",
+            "kind": "greentic.secrets.dev-store@1.0.0",
+            "pack_ref": "greentic.secrets.dev-store",
+        }),
+    );
+    op(store, Some(&secpack), &["env-packs", "add"]);
+
+    let token = "gtw_e2e_m4_front_door";
+    let document = serde_json::json!({
+        "v": 1,
+        "credentials": [{"id": "e2e", "sha256": hex::encode(Sha256::digest(token.as_bytes()))}],
+    });
+    for tenant in ["default", "tenant-default"] {
+        let put = payload(
+            store,
+            "ingress-put.json",
+            serde_json::json!({
+                "environment_id": ENV_ID,
+                "path": format!("{tenant}/_/ingress/e2e_bundle"),
+                "value": document.to_string(),
+            }),
+        );
+        op(store, Some(&put), &["secrets", "put"]);
+    }
+    token.to_string()
+}
+
 /// Issue a genuinely EXTERNAL (non-loopback) request to the env's router and
 /// return `(http_2xx, response_body)`.
 ///
@@ -1825,10 +1869,16 @@ fn worker_executes_a_real_flow_over_workers_invoke() {
 /// print the numeric code on an error, so the outcome is reported coarsely (2xx
 /// vs not) via a log marker; on a non-2xx the returned body carries the client
 /// Job/pod/events for diagnosis.
-fn external_ingress_request(path: &str, body: &Value) -> (bool, String) {
+fn external_ingress_request(path: &str, body: &Value, bearer: Option<&str>) -> (bool, String) {
     let url =
         format!("http://{ROUTER_DEPLOY}.{NAMESPACE}.svc.cluster.local:{BUNDLE_SERVER_PORT}{path}");
     let body_json = serde_json::to_string(body).expect("serialize ingress body");
+    // The runtime refuses a non-loopback caller of the generic ingress that
+    // presents no staged bearer (greentic-start worker-interop D7), and this
+    // client is exactly such a caller.
+    let auth_header = bearer
+        .map(|token| format!(" --header='Authorization: Bearer {token}'"))
+        .unwrap_or_default();
 
     // Fresh client namespace + Job (idempotent across reruns under -test-threads=1).
     let _ = kubectl(&["create", "namespace", CLIENT_NS]);
@@ -1863,7 +1913,7 @@ spec:
             - |
               i=0
               while [ $i -lt 15 ]; do
-                if wget -q -T 6 -O /tmp/resp --header='Content-Type: application/json' --post-data='{body_json}' '{url}'; then
+                if wget -q -T 6 -O /tmp/resp --header='Content-Type: application/json'{auth_header} --post-data='{body_json}' '{url}'; then
                   echo '{INGRESS_OK_MARKER}'
                   cat /tmp/resp
                   exit 0
@@ -1960,6 +2010,31 @@ fn router_serves_an_external_request_to_a_real_component() {
 
     let worker = boot_worker_serving_bundle(store, &image, &templates_fixture_bundle());
 
+    // The front door admits an external caller only with a bearer the unit
+    // staged (worker-interop D7), and only a router holding the secret store
+    // can check one. Stage it, then re-reconcile so the router and the worker
+    // both roll onto the dev-store that now carries it.
+    let token = stage_ingress_bearer(store);
+    reconcile(store);
+    for deployment in [
+        format!("deployment/{worker}"),
+        format!("deployment/{ROUTER_DEPLOY}"),
+    ] {
+        let status = kubectl(&[
+            "rollout",
+            "status",
+            &deployment,
+            "-n",
+            NAMESPACE,
+            "--timeout=180s",
+        ]);
+        assert!(
+            status.status.success(),
+            "{deployment} must roll onto the staged dev-store: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
     // Shared by the two failure paths below (router-never-Ready and
     // request-failed-after-Ready); they are mutually exclusive, so this only ever
     // runs on the one that fires.
@@ -2002,7 +2077,8 @@ fn router_serves_an_external_request_to_a_real_component() {
     // route-bound path on the router Service. A 2xx means the route table
     // resolved `(host, path) → deployment → revision` and the flow ran; the body
     // carries the templates component's echo.
-    let (ok, body) = external_ingress_request("/e2e", &serde_json::json!({"text": "m4"}));
+    let (ok, body) =
+        external_ingress_request("/e2e", &serde_json::json!({"text": "m4"}), Some(&token));
     if !ok {
         // A non-2xx (or unreachable router) is opaque from busybox `wget`; dump
         // the router's own logs plus the standard worker/server diagnostics so CI
