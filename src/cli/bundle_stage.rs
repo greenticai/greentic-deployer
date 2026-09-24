@@ -213,12 +213,7 @@ fn materialize_into_rev_dir(
     //    are deterministic for a given (revision id, bundle), so they line up
     //    with what the revision already records — re-derive the files rather than
     //    trust the (absent) on-disk copies.
-    let pinned_pack_ids: HashSet<String> = staged
-        .lock
-        .packs
-        .iter()
-        .map(|p| p.pack_id.as_str().to_string())
-        .collect();
+    let pinned_pack_ids = pack_config_pack_ids(env_dir, &staged.lock);
     super::pack_config_stage::materialize_pack_configs(
         env_dir,
         rev_dir,
@@ -228,6 +223,41 @@ fn materialize_into_rev_dir(
         &pinned_pack_ids,
     )?;
     Ok(())
+}
+
+/// The pack ids a `pack-config-input` document may name for `lock`: every
+/// locked pack's lock id (its staged FILE STEM) and the `pack_id` its own
+/// `manifest.cbor` declares.
+///
+/// The two are routinely different strings. `greentic-bundle wizard apply`
+/// derives the staged file name from the pack REFERENCE, rewriting every
+/// non-alphanumeric byte to `-`, so a pack whose manifest says
+/// `pack.dw.support` is staged — and locked — as `pack-dw-support`.
+/// `greentic-setup` writes its `state/pack-configs/<pack_id>.json` under the
+/// MANIFEST id, and the runtime reads pack configs back by the manifest id too
+/// (runner-host keys `load_revision`'s maps on `pack.metadata().pack_id`).
+/// Checking membership against the stems alone therefore refused exactly the
+/// config the runtime would have used, for every pack whose id carries a `.`.
+///
+/// A pack whose manifest cannot be read contributes its stem only: the stem is
+/// what the lock already vouches for, and an unreadable manifest is not
+/// evidence of any other id.
+pub(crate) fn pack_config_pack_ids(env_dir: &Path, lock: &PackListLock) -> HashSet<String> {
+    let mut ids = HashSet::with_capacity(lock.packs.len() * 2);
+    for pack in &lock.packs {
+        ids.insert(pack.pack_id.as_str().to_string());
+        match crate::pack_introspect::read_manifest_from_gtpack(&env_dir.join(&pack.path)) {
+            Ok(manifest) => {
+                ids.insert(manifest.pack_id.as_str().to_string());
+            }
+            Err(err) => tracing::debug!(
+                pack = %pack.path.display(),
+                error = %err,
+                "locked pack has no readable manifest; its pack configs match by file stem only"
+            ),
+        }
+    }
+    ids
 }
 
 fn stage_into(
@@ -1197,5 +1227,131 @@ mod materialize_tests {
         let err = materialize_revision_from_bundle(&store, &env_id, bogus, &fixture_bundle())
             .unwrap_err();
         assert!(matches!(err, OpError::NotFound(_)), "got: {err}");
+    }
+
+    /// A zip `.gtpack` whose `manifest.cbor` declares `pack_id`, written at
+    /// `<env_dir>/<rel>` — the shape `greentic-pack` builds.
+    fn write_zip_gtpack(env_dir: &Path, rel: &str, pack_id: &str) {
+        use std::io::Write as _;
+        use std::str::FromStr as _;
+
+        let manifest = greentic_types::pack_manifest::PackManifest {
+            agents: Default::default(),
+            schema_version: "pack-v1".to_string(),
+            pack_id: greentic_types::PackId::from_str(pack_id).unwrap(),
+            name: None,
+            version: semver::Version::new(0, 1, 0),
+            kind: greentic_types::pack_manifest::PackKind::Application,
+            publisher: "greentic".to_string(),
+            secret_requirements: Vec::new(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            signatures: Default::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        let encoded = greentic_types::cbor::encode_pack_manifest(&manifest).unwrap();
+        let path = env_dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("manifest.cbor", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&encoded).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn lock_of(env_dir: &Path, rels: &[&str]) -> PackListLock {
+        PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: RevisionId::new(),
+            packs: rels
+                .iter()
+                .map(|rel| {
+                    let rel = Path::new(rel);
+                    LockedPack {
+                        pack_id: PackId::new(rel.file_stem().unwrap().to_str().unwrap()),
+                        path: rel.to_path_buf(),
+                        digest: sha256_file(&env_dir.join(rel)).unwrap(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// `greentic-bundle wizard apply` stages `pack.dw.support` as
+    /// `pack-dw-support.gtpack`, so the lock names it by that stem, while
+    /// `greentic-setup` (and the runtime) name it by its manifest id. Both
+    /// must be accepted.
+    #[test]
+    fn pack_config_ids_carry_the_stem_and_the_manifest_id() {
+        let env = tempdir().unwrap();
+        let rel = "revisions/r1/bundle/packs/pack-dw-support.gtpack";
+        write_zip_gtpack(env.path(), rel, "pack.dw.support");
+
+        let ids = pack_config_pack_ids(env.path(), &lock_of(env.path(), &[rel]));
+
+        assert!(ids.contains("pack-dw-support"), "{ids:?}");
+        assert!(ids.contains("pack.dw.support"), "{ids:?}");
+        assert_eq!(ids.len(), 2);
+    }
+
+    /// An unreadable manifest is not evidence of any other id: the pack is
+    /// still matched by the stem the lock vouches for, and nothing fails.
+    #[test]
+    fn a_pack_without_a_readable_manifest_is_matched_by_stem_only() {
+        let env = tempdir().unwrap();
+        let rel = "revisions/r1/bundle/packs/opaque.gtpack";
+        std::fs::create_dir_all(env.path().join("revisions/r1/bundle/packs")).unwrap();
+        std::fs::write(env.path().join(rel), b"not a pack").unwrap();
+
+        let ids = pack_config_pack_ids(env.path(), &lock_of(env.path(), &[rel]));
+
+        assert_eq!(ids, HashSet::from(["opaque".to_string()]));
+    }
+
+    /// The deploy this fixes: `greentic-setup` wrote
+    /// `state/pack-configs/pack.dw.support.json` for a pack locked as
+    /// `pack-dw-support`, and materialization refused it with "pack_id is not
+    /// in the bundle's pack-list.lock".
+    #[test]
+    fn a_config_written_under_the_manifest_id_materializes() {
+        let env = tempdir().unwrap();
+        let rev_dir = env.path().join("revisions/r1");
+        let rel = "revisions/r1/bundle/packs/pack-dw-support.gtpack";
+        write_zip_gtpack(env.path(), rel, "pack.dw.support");
+        let inputs = rev_dir.join("bundle/state/pack-configs");
+        std::fs::create_dir_all(&inputs).unwrap();
+        std::fs::write(
+            inputs.join("pack.dw.support.json"),
+            serde_json::json!({
+                "schema": "greentic.pack-config-input.v1",
+                "pack_id": "pack.dw.support",
+                "env_id": "local",
+                "bundle_id": "support",
+                "non_secret": {"greeting": "hi"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let pinned = pack_config_pack_ids(env.path(), &lock_of(env.path(), &[rel]));
+        let refs = super::super::pack_config_stage::materialize_pack_configs(
+            env.path(),
+            &rev_dir,
+            RevisionId::new(),
+            &EnvId::try_from("local").unwrap(),
+            &BundleId::new("support"),
+            &pinned,
+        )
+        .expect("a config named by the manifest id is accepted");
+
+        assert_eq!(
+            refs,
+            vec![PathBuf::from(
+                "revisions/r1/pack-configs/pack.dw.support.json"
+            )]
+        );
     }
 }
