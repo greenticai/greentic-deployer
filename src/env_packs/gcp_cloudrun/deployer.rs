@@ -698,20 +698,46 @@ async fn wait_for_revision_ready(
 ) -> Result<(), DeployerError> {
     let deadline = Instant::now() + timeout;
     loop {
-        match target.get_revision_status(revision).await {
+        let status = match target.get_revision_status(revision).await {
             Ok(status) if status.ready => return Ok(()),
-            Ok(_) => {}
+            Ok(status) => status,
             Err(e) => return Err(provider(e)),
-        }
+        };
         if Instant::now() >= deadline {
-            return Err(DeployerError::Provider(format!(
-                "Cloud Run revision `{}` did not become ready within {}s",
+            return Err(readiness_timeout(
                 revision.revision_id,
-                timeout.as_secs()
-            )));
+                timeout,
+                Some(&status),
+            ));
         }
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// The error a readiness timeout reports, carrying what Cloud Run last said.
+///
+/// "Did not become ready within 300s" alone is true of an image that will not
+/// pull, a container that crashes at boot and one that is merely slow, and it
+/// sent operators hunting through IAM for a crash in their own worker. Cloud
+/// Run knows which of those it is — the revision's failing conditions and a
+/// link to its logs — so the error says so. The leading sentence is kept
+/// verbatim: callers match on it.
+fn readiness_timeout(
+    revision_id: RevisionId,
+    timeout: Duration,
+    last: Option<&super::deploy_target::RevisionStatus>,
+) -> DeployerError {
+    let mut message = format!(
+        "Cloud Run revision `{revision_id}` did not become ready within {}s",
+        timeout.as_secs()
+    );
+    if let Some(reason) = last.and_then(|s| s.not_ready_reason.as_deref()) {
+        message.push_str(&format!(". Cloud Run reports: {reason}"));
+    }
+    if let Some(uri) = last.and_then(|s| s.log_uri.as_deref()) {
+        message.push_str(&format!(". Revision logs: {uri}"));
+    }
+    DeployerError::Provider(message)
 }
 
 #[async_trait]
@@ -1153,6 +1179,65 @@ impl GcpCloudRunDeployerHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn not_ready(reason: Option<&str>, log_uri: Option<&str>) -> RevisionStatus {
+        RevisionStatus {
+            ready: false,
+            active: false,
+            intent: None,
+            not_ready_reason: reason.map(str::to_string),
+            log_uri: log_uri.map(str::to_string),
+        }
+    }
+
+    /// The timeout carries Cloud Run's own reason and the log link, after the
+    /// unchanged leading sentence callers match on.
+    #[test]
+    fn a_readiness_timeout_says_what_cloud_run_reported() {
+        let id = RevisionId::new();
+        let last = not_ready(
+            Some("Ready: The user-provided container failed to start"),
+            Some("https://console.cloud.google.com/logs/viewer?x=1"),
+        );
+        let DeployerError::Provider(msg) =
+            readiness_timeout(id, Duration::from_secs(300), Some(&last))
+        else {
+            panic!("a readiness timeout is a provider error");
+        };
+        assert!(
+            msg.starts_with(&format!(
+                "Cloud Run revision `{id}` did not become ready within 300s"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Cloud Run reports: Ready: The user-provided container failed to start"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Revision logs: https://console.cloud.google.com/logs/viewer?x=1"),
+            "{msg}"
+        );
+    }
+
+    /// Nothing reported (never polled, or no message yet): the old sentence,
+    /// exactly — no dangling "Cloud Run reports:".
+    #[test]
+    fn a_readiness_timeout_with_nothing_reported_is_the_plain_sentence() {
+        let id = RevisionId::new();
+        for last in [None, Some(not_ready(None, None))] {
+            let DeployerError::Provider(msg) =
+                readiness_timeout(id, Duration::from_secs(300), last.as_ref())
+            else {
+                panic!("a readiness timeout is a provider error");
+            };
+            assert_eq!(
+                msg,
+                format!("Cloud Run revision `{id}` did not become ready within 300s")
+            );
+        }
+    }
+
     use std::sync::Arc;
 
     use greentic_deploy_spec::TrafficSplitEntry;
