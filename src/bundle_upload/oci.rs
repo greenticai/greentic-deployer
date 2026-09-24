@@ -3,10 +3,10 @@
 use std::path::Path;
 
 use greentic_distributor_client::oci_distribution::errors::{OciDistributionError, OciErrorCode};
-use greentic_distributor_client::oci_packs::DefaultRegistryClient;
 use greentic_distributor_client::oci_push::{OciPushError, RegistryPusher, push_pack_with_client};
 
 use crate::bundle_upload::error::{BundleUploadError, BundleUploadResult};
+use crate::bundle_upload::oci_pusher::MonolithicRegistryPusher;
 use crate::bundle_upload::types::{UploadOptions, UploadedBundle};
 use crate::bundle_upload::uploader::BundleUploader;
 use crate::env_packs::gcp_cloudrun::credentials;
@@ -237,19 +237,23 @@ impl BundleUploader for OciBundleUploader {
         let client = credentials::build_ambient_client()
             .map_err(|e| BundleUploadError::Other(format!("resolving GCP credentials: {e}")))?;
         // Minted per upload, never cached: Artifact Registry OAuth2 tokens are
-        // short-lived, and `DefaultRegistryClient` freezes whatever credential
-        // it is built with for its own lifetime, so a fresh client is built
-        // per push rather than reused across pushes. This is the only ADC
-        // round-trip on the success path: the caller identity is resolved
-        // below only if the push actually comes back denied, since it is
-        // used only to name who was denied and would otherwise be a second,
-        // wasted round-trip (`get_caller_identity` re-proves the credential
-        // via its own `auth_headers` call) on every push.
+        // short-lived, and the pusher freezes whatever credential it is built
+        // with for its own lifetime, so a fresh one is built per push rather
+        // than reused across pushes. This is the only ADC round-trip on the
+        // success path: the caller identity is resolved below only if the
+        // push actually comes back denied, since it is used only to name who
+        // was denied and would otherwise be a second, wasted round-trip
+        // (`get_caller_identity` re-proves the credential via its own
+        // `auth_headers` call) on every push.
         let token = client
             .access_token()
             .await
             .map_err(|e| BundleUploadError::Other(format!("minting a GAR access token: {e}")))?;
-        let pusher = DefaultRegistryClient::with_basic_auth("oauth2accesstoken", token);
+        // Deliberately NOT `DefaultRegistryClient`: it pushes blobs in 4 MiB
+        // chunks, which Artifact Registry refuses past the first chunk, so
+        // every bundle over 4 MiB failed with a bare `405`. See
+        // `MonolithicRegistryPusher`.
+        let pusher = MonolithicRegistryPusher::with_basic_auth("oauth2accesstoken", token);
         match push_bundle_with(&pusher, &self.target, bundle_path, "").await {
             Err(BundleUploadError::OciPushDenied { .. }) => {
                 let identity = client.get_caller_identity().await.map_err(|e| {
