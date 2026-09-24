@@ -101,13 +101,33 @@ fn is_verbatim_category_rel_path(rel_path: &str) -> bool {
     )
 }
 
+/// The `llm` category: an agent's LLM API key, keyed by the agent's
+/// `llm.credential_ref`.
+///
+/// greentic-runner reads it at `secrets://default/<tenant>/_/llm/<ref>`
+/// (`resolve_in_process_llm_key`) — the `default` env segment is hardcoded
+/// there, exactly as it is for `mcp`. Unlike `mcp`/`a2a` the NAME is not
+/// verbatim: greentic-start's reader carve-out covers only those two, so it
+/// canonicalizes an `llm` name before lookup, and the ordinary canonical-name
+/// validation below is what makes the write land on that same key. Only the
+/// env segment differs from an ordinary key, and it is the whole defect: keyed
+/// by the environment id, every staged LLM key sat one segment away from the
+/// read and the agent ran with no key at all.
+const LLM_CATEGORY: &str = "llm";
+
+/// Whether `rel_path` names the `llm` category (pack position only, like
+/// [`is_verbatim_category_rel_path`]).
+fn is_llm_category_rel_path(rel_path: &str) -> bool {
+    rel_path.split('/').nth(2) == Some(LLM_CATEGORY)
+}
+
 /// The dev store's native key for `rel_path` in `env_id`.
 ///
 /// THE one derivation, shared by [`put_env_secret`], [`get_env_secret`] and
 /// [`dev_store_has`] so a write, the read that checks it and the presence
 /// probe `env apply` gates on cannot land on different keys.
 pub(super) fn dev_store_key(env_id: &EnvId, rel_path: &str) -> String {
-    if is_verbatim_category_rel_path(rel_path) {
+    if is_verbatim_category_rel_path(rel_path) || is_llm_category_rel_path(rel_path) {
         format!("secrets://{MCP_ENV_SEGMENT}/{rel_path}")
     } else {
         format!("secrets://{}/{rel_path}", env_id.as_str())
@@ -1971,6 +1991,27 @@ mod tests {
             dev_store_key(&env_id, "acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3"),
             "secrets://default/acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3"
         );
+    }
+
+    #[test]
+    fn an_llm_key_is_written_under_the_default_env_segment() {
+        // greentic-runner reads an agent's LLM key at
+        // `secrets://default/<tenant>/_/llm/<credential_ref>`, and greentic-start
+        // canonicalizes that name before lookup (its carve-out is mcp/a2a
+        // only), so the canonical name under `default` is the key it hits.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "default/_/llm/ff308b9c_951a_40b8"),
+            "secrets://default/default/_/llm/ff308b9c_951a_40b8"
+        );
+    }
+
+    #[test]
+    fn an_llm_name_must_still_be_canonical() {
+        // Not a verbatim category: a hyphenated name would be stored where
+        // the canonicalizing reader never looks, so it is refused.
+        assert!(validate_dev_store_secret_path("default/_/llm/ff308b9c-951a").is_err());
+        assert!(validate_dev_store_secret_path("default/_/llm/ff308b9c_951a").is_ok());
     }
 
     #[test]
