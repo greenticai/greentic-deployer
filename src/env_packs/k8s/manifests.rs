@@ -1184,6 +1184,66 @@ fn env_store_init_container(env: &Environment, params: &K8sParams) -> Value {
 /// Readiness probes `/healthz` today; the per-revision
 /// `/healthz/<revision_id>` route is the acceptance-gate target once
 /// `greentic-start` serves it.
+/// How a runtime pod — the worker AND the router — resolves `secret://` refs.
+///
+/// - `DevStore`: stage the operator's dev-store into the pod's writable HOME
+///   (messaging bot tokens, webhook secrets, per-unit ingress credentials
+///   resolve there). The Secret volume is `optional` and the init copy is
+///   guarded on the file existing, so an env with no secrets yet boots cleanly.
+/// - `Vault`: no values cross into the cluster — the pod gets the Vault
+///   ServiceAccount identity ([`WORKER_SERVICE_ACCOUNT`]) plus `VAULT_*`
+///   connection env, and greentic-start resolves refs from Vault in-pod.
+///
+/// **The router needs this too, and did without it until greentic-start's
+/// worker-interop contract D7.** D7 makes the runtime refuse every
+/// non-loopback caller of the generic JSON ingress that presents no bearer
+/// listed in `secrets://<env>/<tenant>/_/ingress/<bundle>`. The router is the
+/// pod that serves external traffic, so a router with no secret store read that
+/// document as absent and answered `401` to EVERY external request — including
+/// one carrying the correct bearer. The router therefore holds the same store
+/// as the workers (the dev-store cannot be filtered by category: it ships
+/// whole).
+///
+/// Pure on `env` + `params` so reconcile and `apply-revision` agree.
+struct SecretsWiring {
+    init_container: Option<Value>,
+    volume: Option<Value>,
+    env: Vec<Value>,
+    service_account: Option<&'static str>,
+    uses_dev_secrets: bool,
+}
+
+fn secrets_wiring(env: &Environment, params: &K8sParams) -> SecretsWiring {
+    let uses_dev_secrets =
+        matches!(params.secrets_backend, SecretsBackend::DevStore) && env_uses_dev_secrets(env);
+    match &params.secrets_backend {
+        SecretsBackend::DevStore if uses_dev_secrets => SecretsWiring {
+            init_container: Some(stage_dev_secrets_init_container(env, params)),
+            volume: Some(json!({
+                "name": DEV_SECRETS_VOLUME,
+                "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
+            })),
+            env: Vec::new(),
+            service_account: None,
+            uses_dev_secrets,
+        },
+        SecretsBackend::DevStore => SecretsWiring {
+            init_container: None,
+            volume: None,
+            env: Vec::new(),
+            service_account: None,
+            uses_dev_secrets,
+        },
+        SecretsBackend::Vault(vault) => SecretsWiring {
+            init_container: None,
+            volume: None,
+            env: secrets_backend_env(vault),
+            service_account: Some(WORKER_SERVICE_ACCOUNT),
+            uses_dev_secrets,
+        },
+    }
+}
+
 pub fn render_worker_deployment(
     env: &Environment,
     revision: &Revision,
@@ -1199,39 +1259,16 @@ pub fn render_worker_deployment(
     ]);
     env_vars.extend(telemetry::pod_env(params, "worker"));
 
-    // How the worker resolves `secret://` refs at runtime. Worker-only either
-    // way — the router never resolves secrets, mirroring the historical
-    // dev-store staging.
-    //
-    // - `DevStore`: stage the operator's dev-store into the worker's writable
-    //   HOME (messaging bot tokens, webhook secrets resolve there). The Secret
-    //   volume is `optional` and the init copy is guarded on the file existing,
-    //   so an env with no secrets yet boots cleanly.
-    // - `Vault`: no values cross into the cluster — the pod gets the Vault
-    //   ServiceAccount identity ([`WORKER_SERVICE_ACCOUNT`]) plus `VAULT_*`
-    //   connection env, and greentic-start resolves refs from Vault in-pod.
-    //
-    // Pure on `env` + `params` so reconcile and `apply-revision` agree.
+    // How the worker resolves `secret://` refs at runtime — see
+    // [`secrets_wiring`], which the router shares.
+    let wiring = secrets_wiring(env, params);
     let mut init_containers = vec![env_store_init_container(env, params)];
+    init_containers.extend(wiring.init_container);
     let mut volumes = runtime_pod_volumes();
-    let mut service_account: Option<&str> = None;
-    let uses_dev_secrets =
-        matches!(params.secrets_backend, SecretsBackend::DevStore) && env_uses_dev_secrets(env);
-    match &params.secrets_backend {
-        SecretsBackend::DevStore => {
-            if uses_dev_secrets {
-                init_containers.push(stage_dev_secrets_init_container(env, params));
-                volumes.push(json!({
-                    "name": DEV_SECRETS_VOLUME,
-                    "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
-                }));
-            }
-        }
-        SecretsBackend::Vault(vault) => {
-            env_vars.extend(secrets_backend_env(vault));
-            service_account = Some(WORKER_SERVICE_ACCOUNT);
-        }
-    }
+    volumes.extend(wiring.volume);
+    env_vars.extend(wiring.env);
+    let service_account = wiring.service_account;
+    let uses_dev_secrets = wiring.uses_dev_secrets;
 
     // Pod-template annotations: when the env stages dev-store material, a
     // content hash triggers a rolling restart on `reconcile` whenever the
@@ -1391,12 +1428,23 @@ pub(crate) fn has_cluster_presence(lifecycle: RevisionLifecycle) -> bool {
 /// authoritative for `TrafficSplit` enforcement in the Zain v1 pilot.
 pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value {
     let labels = common_labels(env, "router");
-    // Same rotation annotation as the worker pod template
-    // ([`render_worker_deployment`]) — the router references the SAME
-    // `gtc-telemetry-headers` Secret keys, so it must roll on the same
-    // rotation, and it stages no dev-store material so it never carries
-    // `greentic.ai/dev-store-hash`.
+    // The router resolves secrets exactly as a worker does — it must read each
+    // unit's ingress credential to admit an external caller. See
+    // [`secrets_wiring`].
+    let wiring = secrets_wiring(env, params);
+    // Same rotation annotations as the worker pod template
+    // ([`render_worker_deployment`]): the router stages the SAME dev-store and
+    // references the SAME `gtc-telemetry-headers` Secret keys, so it must roll
+    // on the same rotations — a router still holding a rotated-out ingress
+    // credential keeps refusing the new one.
     let mut pod_annotations = serde_json::Map::new();
+    if wiring.uses_dev_secrets {
+        let hash = dev_secrets_content_hash(params.dev_secrets_data.as_deref());
+        pod_annotations.insert(
+            "greentic.ai/dev-store-hash".to_string(),
+            Value::String(hash),
+        );
+    }
     if let Some(headers) = params.telemetry.headers() {
         let hash = telemetry_headers_content_hash(headers.expose());
         pod_annotations.insert(
@@ -1430,7 +1478,11 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "whenUnsatisfiable": "ScheduleAnyway",
                         "labelSelector": {"matchLabels": labels},
                     }],
-                    "initContainers": [env_store_init_container(env, params)],
+                    "initContainers": Value::Array(
+                        std::iter::once(env_store_init_container(env, params))
+                            .chain(wiring.init_container)
+                            .collect(),
+                    ),
                     "containers": [{
                         "name": "router",
                         "image": params.runtime_image,
@@ -1442,6 +1494,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                             runtime_boot_env(env, params)
                                 .into_iter()
                                 .chain(telemetry::pod_env(params, "router"))
+                                .chain(wiring.env)
                                 .collect(),
                         ),
                         "volumeMounts": runtime_volume_mounts(),
@@ -1451,11 +1504,16 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                             "periodSeconds": 5,
                         },
                     }],
-                    "volumes": Value::Array(runtime_pod_volumes()),
+                    "volumes": Value::Array(
+                        runtime_pod_volumes().into_iter().chain(wiring.volume).collect(),
+                    ),
                 },
             },
         },
     });
+    if let Some(sa) = wiring.service_account {
+        deployment["spec"]["template"]["spec"]["serviceAccountName"] = Value::from(sa);
+    }
     // Omit the key entirely when unset — an empty `imagePullSecrets: []` is a
     // different document from no key at all, and the "absent answer renders
     // byte-identically to today" contract depends on that distinction.
@@ -1856,18 +1914,19 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     // the default-deny namespace. BOTH the worker AND the router boot
     // `start --env` and materialize routed bundle-sourced revisions, so BOTH
     // need egress to the bundle source while a routed revision is pullable;
-    // additionally the WORKER needs egress to Vault when it resolves secrets
-    // there (`SecretsBackend::Vault`) — the router never resolves secrets.
+    // additionally BOTH need egress to Vault when secrets resolve there
+    // (`SecretsBackend::Vault`): the router reads each unit's ingress
+    // credential to admit an external caller (see [`secrets_wiring`]).
     // Render one stable, env-scoped policy per role: allow-all egress when that
     // role has an opening (the pod fetches its own packs integrity-gated against
     // the revision's `bundle_digest`, and the Vault token exchange is the
-    // worker's own outbound call, so breadth is not a pack-injection vector — a
+    // pod's own outbound call, so breadth is not a pack-injection vector — a
     // per-destination allow-list is a tracked hardening follow-up); an empty
     // deny rule otherwise. Always rendered so reconcile converges allow→deny
     // without env-level pruning, closing the opening once the env stops pulling
     // or leaves Vault. DNS egress stays granted by `gtc-allow-dns` regardless.
     let pullable = env_has_pullable_routed_revision(env);
-    let worker_uses_vault = matches!(params.secrets_backend, SecretsBackend::Vault(_));
+    let uses_vault = matches!(params.secrets_backend, SecretsBackend::Vault(_));
     for role in ["worker", "router"] {
         // Telemetry: both roles export to an operator collector. A
         // per-destination rule joins the hardening follow-up above.
@@ -1880,8 +1939,7 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
         // spec), so this is not a shape `telemetry_env` is answered with in
         // practice, and narrowing it here would need parsing the VALUE of an
         // allow-listed key rather than just its presence.
-        let allow_all =
-            pullable || (role == "worker" && worker_uses_vault) || !params.telemetry.is_empty();
+        let allow_all = pullable || uses_vault || !params.telemetry.is_empty();
         let egress = if allow_all { json!([{}]) } else { json!([]) };
         policies.push(json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -3737,25 +3795,51 @@ mod tests {
     }
 
     #[test]
-    fn vault_router_has_no_secrets_identity() {
+    fn vault_router_resolves_secrets_like_a_worker() {
         let env = build_fixture_env();
         let params = vault_params(&env);
         let r = render_router_deployment(&env, &params);
-        // The router routes traffic; it never resolves `secret://`, so it gets
-        // neither the Vault identity nor the connection env.
-        assert!(
-            r["spec"]["template"]["spec"]
-                .get("serviceAccountName")
-                .is_none(),
-            "router must not carry the Vault ServiceAccount"
+        // Worker-interop D7: the router must read each unit's ingress
+        // credential to admit an external caller, so under Vault it carries the
+        // same identity and connection env as a worker. Without them every
+        // external request answered 401, a correct bearer included.
+        assert_eq!(
+            r["spec"]["template"]["spec"]["serviceAccountName"],
+            json!(WORKER_SERVICE_ACCOUNT),
+            "router must carry the Vault ServiceAccount"
         );
         let envs = r["spec"]["template"]["spec"]["containers"][0]["env"]
             .as_array()
             .unwrap();
-        assert!(
-            envs.iter()
-                .all(|e| e["name"] != "GREENTIC_SECRETS_BACKEND" && e["name"] != "VAULT_ADDR"),
-            "router carries no Vault connection env"
+        for name in ["GREENTIC_SECRETS_BACKEND", "VAULT_ADDR"] {
+            assert!(
+                envs.iter().any(|e| e["name"] == name),
+                "router carries {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_store_router_stages_the_same_store_as_the_worker() {
+        let env = secrets_env();
+        let params = K8sParams::for_env(&env);
+        let r = render_router_deployment(&env, &params);
+        let w = render_worker_deployment(&env, &env.revisions[0], &params);
+        let names = |d: &Value, key: &str| -> Vec<String> {
+            d["spec"]["template"]["spec"][key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(&r, "initContainers"), names(&w, "initContainers"));
+        assert!(names(&r, "volumes").contains(&DEV_SECRETS_VOLUME.to_string()));
+        // A rotated credential must roll the router too, or it keeps refusing
+        // the new ingress bearer.
+        assert_eq!(
+            r["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"],
+            w["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"],
         );
     }
 
@@ -3779,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn vault_opens_worker_egress_not_router() {
+    fn vault_opens_worker_and_router_egress() {
         let env = build_fixture_env();
         let params = vault_params(&env); // no pullable routed revision
         let policies = render_network_policies(&env, &params);
@@ -3790,10 +3874,10 @@ mod tests {
                 .map(|p| p["spec"]["egress"].clone())
                 .unwrap()
         };
-        // The worker needs egress to reach Vault; the router does not resolve
-        // secrets, so its egress stays denied (no pullable revision either).
+        // Both resolve secrets from Vault — the router reads each unit's
+        // ingress credential — so both need egress to reach it.
         assert_eq!(egress("gtc-allow-worker-egress"), json!([{}]));
-        assert_eq!(egress("gtc-allow-router-egress"), json!([]));
+        assert_eq!(egress("gtc-allow-router-egress"), json!([{}]));
     }
 
     fn telemetry_params() -> (Environment, K8sParams) {
