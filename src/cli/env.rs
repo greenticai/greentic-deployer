@@ -941,6 +941,11 @@ fn reconcile_result_json(
     if !report.sor_units.is_empty() {
         result["sor_units"] = json!(report.sor_units);
     }
+    // Stale SoR inputs outside their unit's own segment are never deleted;
+    // named here (paths only) so an operator can remove them by hand.
+    if !report.sor_skipped_input_refs.is_empty() {
+        result["sor_skipped_input_refs"] = json!(report.sor_skipped_input_refs);
+    }
     result
 }
 
@@ -5139,6 +5144,21 @@ mod tests {
         let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["ready", "service", "sor", "unit_id", "url"]);
+        assert!(with.get("sor_skipped_input_refs").is_none());
+
+        report.sor_skipped_input_refs = vec!["default/_/worker/api_token".into()];
+        let skipped = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert_eq!(
+            skipped["sor_skipped_input_refs"],
+            json!(["default/_/worker/api_token"]),
+            "a stale ref reconcile would not delete is named by path"
+        );
     }
 
     // -- reconcile ----------------------------------------------------------

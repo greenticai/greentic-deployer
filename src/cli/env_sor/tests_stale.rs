@@ -188,18 +188,104 @@ fn a_vault_env_can_retire_the_units_it_no_longer_declares() {
         transit_key: "greentic".to_string(),
         namespace: None,
     });
-    let prepared = prepare_with_override(
-        &store,
-        &env,
-        &ns("gtc-local"),
-        &vault,
-        Some("/elsewhere/.dev.secrets.env".into()),
-    )
-    .unwrap()
-    .expect("a retire phase");
+    let prepared = prepare_with_override(&store, &env, &ns("gtc-local"), &vault, None)
+        .unwrap()
+        .expect("a retire phase");
     assert_eq!(prepared.retired_units, vec![old]);
     // Every key is absent (the store has none of them): still Ok.
     StoreRoutePublisher::new(&store, &env)
         .retire(&prepared.retired_sors, &prepared.stale_input_refs)
         .unwrap();
+}
+
+/// A retire-only run deletes from a dev store too. Under
+/// `GREENTIC_DEV_SECRETS_PATH` those deletes would hit the override file while
+/// the seed ships the env's own store, so the old inputs would ship forever
+/// once the ledger narrows: refused, and nothing recorded or deleted.
+#[test]
+fn a_retire_only_run_still_refuses_a_dev_secrets_path_override() {
+    let (_d, store, env) = seeded_with(&["a"]);
+    let env_id = &env.environment_id;
+    let old = applied("a", "gtc-local");
+    store
+        .transact(env_id, |l| l.save_sor_ledger(std::slice::from_ref(&old)))
+        .unwrap();
+    set_sor_units(&store, env_id, &[]).unwrap();
+    let msg = prepare_with_override(
+        &store,
+        &env,
+        &ns("gtc-local"),
+        &SecretsBackend::DevStore,
+        Some("/elsewhere/.dev.secrets.env".into()),
+    )
+    .err()
+    .expect("refused")
+    .to_string();
+    assert!(msg.contains("GREENTIC_DEV_SECRETS_PATH"), "{msg}");
+    assert_eq!(store.load_sor_ledger(env_id).unwrap(), vec![old.clone()]);
+    for rel in &old.input_refs {
+        assert!(present(&store, &env, rel), "`{rel}` is untouched");
+    }
+}
+
+/// A ref recorded outside the unit's own `sor-<unit_id>/` segment (a typo'd
+/// ref naming an unrelated key) is never deleted — only reported by path.
+#[test]
+fn a_stale_ref_outside_the_units_own_segment_is_reported_not_deleted() {
+    let (_d, store, env) = seeded_with(&["a"]);
+    let env_id = &env.environment_id;
+    let foreign = "default/_/worker/api_token".to_string();
+    put_env_secret(
+        &store,
+        &env,
+        env_id,
+        DEV_STORE_KIND_PATH,
+        &foreign,
+        "keep-me",
+    )
+    .unwrap();
+    let mut old = applied("a", "gtc-local");
+    old.input_refs.push(foreign.clone());
+    // Another unit's segment is foreign too.
+    old.input_refs
+        .push("default/_/sor-other/answers".to_string());
+    store
+        .transact(env_id, |l| l.save_sor_ledger(std::slice::from_ref(&old)))
+        .unwrap();
+    set_sor_units(&store, env_id, &[]).unwrap();
+
+    let prepared = prepare_with_override(
+        &store,
+        &env,
+        &ns("gtc-local"),
+        &SecretsBackend::DevStore,
+        None,
+    )
+    .unwrap()
+    .expect("a retire phase");
+    assert!(!prepared.stale_input_refs.contains(&foreign));
+    assert_eq!(
+        prepared.skipped_input_refs,
+        vec!["default/_/sor-other/answers".to_string(), foreign.clone()]
+    );
+    StoreRoutePublisher::new(&store, &env)
+        .retire(&prepared.retired_sors, &prepared.stale_input_refs)
+        .unwrap();
+    assert!(
+        present(&store, &env, &foreign),
+        "a foreign key is never deleted"
+    );
+    assert!(!present(&store, &env, "default/_/sor-a/postgres_url"));
+}
+
+#[test]
+fn only_the_units_own_canonical_segment_is_owned() {
+    assert!(is_owned_by("a", "default/_/sor-a/postgres_url"));
+    assert!(is_owned_by("a", "acme/_/sor-a/answers"));
+    assert!(!is_owned_by("a", "default/_/sor-ab/answers"));
+    assert!(!is_owned_by("ab", "default/_/sor-a/answers"));
+    assert!(!is_owned_by("a", "default/ops/sor-a/answers"));
+    assert!(!is_owned_by("a", "default/_/worker/token"));
+    assert!(!is_owned_by("a", "default/_/sor-a"));
+    assert!(!is_owned_by("a", "default/_/sor-a/x/y"));
 }

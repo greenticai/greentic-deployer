@@ -355,6 +355,11 @@ fn up_result_json(
     if !report.sor_units.is_empty() {
         result["sor_units"] = json!(report.sor_units);
     }
+    // Stale SoR inputs outside their unit's own segment are never deleted;
+    // named here (paths only) so an operator can remove them by hand.
+    if !report.sor_skipped_input_refs.is_empty() {
+        result["sor_skipped_input_refs"] = json!(report.sor_skipped_input_refs);
+    }
     result
 }
 

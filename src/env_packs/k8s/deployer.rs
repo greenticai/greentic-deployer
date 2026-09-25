@@ -258,6 +258,7 @@ impl K8sDeployerHandler {
             pruned,
             router_address,
             sor_units: Vec::new(),
+            sor_skipped_input_refs: Vec::new(),
         })
     }
 
@@ -486,6 +487,11 @@ pub struct ReconcileReport {
     /// Available fails the reconcile instead.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sor_units: Vec<super::sor_reconcile::SorUnitStatus>,
+    /// Stale SoR input rel-paths reconcile did NOT delete because they lie
+    /// outside their unit's own `sor-<unit_id>/` segment. Paths only, never a
+    /// value; skipped on the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sor_skipped_input_refs: Vec<String>,
 }
 
 #[async_trait]

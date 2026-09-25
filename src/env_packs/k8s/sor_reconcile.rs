@@ -99,6 +99,9 @@ pub struct SorReconcile<'a> {
     /// Input rel-paths a retired or re-pointed unit used to read that no
     /// declared unit reads now: deleted from the store in step 4.
     pub stale_input_refs: &'a [String],
+    /// Stale input rel-paths outside their unit's own `sor-<unit_id>/`
+    /// segment: left in place and surfaced in the report by path only.
+    pub skipped_input_refs: &'a [String],
     pub publisher: &'a dyn SorRoutePublisher,
 }
 
@@ -302,6 +305,7 @@ impl K8sDeployerHandler {
             pruned,
             router_address,
             sor_units,
+            sor_skipped_input_refs: sor.skipped_input_refs.to_vec(),
         })
     }
 }
@@ -471,6 +475,7 @@ mod tests {
             retired_units: &[],
             retired_sors: &[],
             stale_input_refs: &[],
+            skipped_input_refs: &[],
             publisher: &publisher,
         };
         let report = handler
@@ -555,6 +560,7 @@ mod tests {
             retired_units: &[],
             retired_sors: &[],
             stale_input_refs: &[],
+            skipped_input_refs: &[],
             publisher: &publisher,
         };
         let err = handler
@@ -608,6 +614,7 @@ mod tests {
             retired_units: &retired,
             retired_sors: &retired_sors,
             stale_input_refs: &stale,
+            skipped_input_refs: &[],
             publisher: &publisher,
         };
         let report = handler
@@ -668,6 +675,7 @@ mod tests {
             retired_units: &[],
             retired_sors: &[],
             stale_input_refs: &[],
+            skipped_input_refs: &[],
             publisher: &publisher,
         };
         let report = handler
@@ -735,6 +743,7 @@ mod tests {
             retired_units: &[],
             retired_sors: &[],
             stale_input_refs: &[],
+            skipped_input_refs: &[],
             publisher: &publisher,
         };
         let err = handler
@@ -789,6 +798,7 @@ mod tests {
             retired_units: &retired,
             retired_sors: &retired_sors,
             stale_input_refs: &[],
+            skipped_input_refs: &[],
             publisher: &publisher,
         };
         handler

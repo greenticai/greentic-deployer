@@ -59,17 +59,45 @@ pub(crate) fn sor_input_uris(
 }
 
 /// Input rel-paths the ledger records that no declared unit reads any more —
-/// a retired unit's inputs, and the old target of a re-pointed `*_ref`.
-fn stale_input_refs(units: &[SorUnit], ledger: &[AppliedSorUnit]) -> Vec<String> {
+/// a retired unit's inputs, and the old target of a re-pointed `*_ref` —
+/// split into `(deletable, foreign)`.
+///
+/// Only a path under the recording unit's OWN segment
+/// (`<tenant>/_/sor-<unit_id>/<name>`) is deletable. Refs are recorded before
+/// any reconcile succeeds, so a typo'd ref naming an unrelated key must never
+/// cost that key: such a path is returned as foreign, to be reported by path
+/// and left in place. (It stays excluded from the seed while on record.)
+fn stale_input_refs(units: &[SorUnit], ledger: &[AppliedSorUnit]) -> (Vec<String>, Vec<String>) {
     let declared: BTreeSet<&str> = units.iter().flat_map(SorUnit::input_refs).collect();
-    ledger
-        .iter()
-        .flat_map(|a| a.input_refs.iter())
-        .filter(|rel| !declared.contains(rel.as_str()))
-        .cloned()
-        .collect::<BTreeSet<String>>()
-        .into_iter()
-        .collect()
+    let mut owned = BTreeSet::new();
+    let mut foreign = BTreeSet::new();
+    for entry in ledger {
+        for rel in &entry.input_refs {
+            if declared.contains(rel.as_str()) {
+                continue;
+            }
+            if is_owned_by(&entry.unit_id, rel) {
+                owned.insert(rel.clone());
+            } else {
+                foreign.insert(rel.clone());
+            }
+        }
+    }
+    // A path some OTHER entry owns is still deletable through that entry.
+    foreign.retain(|rel| !owned.contains(rel));
+    (owned.into_iter().collect(), foreign.into_iter().collect())
+}
+
+/// `<tenant>/_/sor-<unit_id>/<name>` — the canonical place of a unit's inputs.
+fn is_owned_by(unit_id: &str, rel: &str) -> bool {
+    let segments: Vec<&str> = rel.split('/').collect();
+    matches!(
+        segments.as_slice(),
+        [tenant, "_", unit_segment, name]
+            if !tenant.is_empty()
+                && !name.is_empty()
+                && unit_segment.strip_prefix("sor-") == Some(unit_id)
+    )
 }
 
 /// Everything reconcile needs for the SoR phase, resolved before any cluster
@@ -82,8 +110,11 @@ pub(crate) struct PreparedSor {
     /// SoR keys no declared unit claims any more: their route documents are
     /// deleted.
     pub(crate) retired_sors: Vec<String>,
-    /// Input rel-paths no declared unit reads any more: deleted from the store.
+    /// Input rel-paths no declared unit reads any more, under the recording
+    /// unit's own `sor-<unit_id>/` segment: deleted from the store.
     pub(crate) stale_input_refs: Vec<String>,
+    /// Stale refs OUTSIDE that segment: never deleted, reported by path.
+    pub(crate) skipped_input_refs: Vec<String>,
     /// What the ledger narrows to once the reconcile succeeds.
     desired: Vec<AppliedSorUnit>,
 }
@@ -98,6 +129,7 @@ impl PreparedSor {
             retired_units: &self.retired_units,
             retired_sors: &self.retired_sors,
             stale_input_refs: &self.stale_input_refs,
+            skipped_input_refs: &self.skipped_input_refs,
             publisher,
         }
     }
@@ -151,12 +183,17 @@ fn prepare_with_override(
         return Ok(None);
     }
     let namespace = namespace()?;
-    // Only DECLARED units need the dev store: a retire-only run on a Vault
-    // env must be able to prune what an earlier dev-store era left behind.
+    // Only DECLARED units need the dev-store backend: a retire-only run on a
+    // Vault env must be able to prune what an earlier dev-store era left.
     if !units.is_empty() {
         require_dev_store_backend(backend)?;
-        refuse_dev_secrets_path_override(dev_secrets_path_override)?;
     }
+    // The override refusal is unconditional for any SoR phase: even a
+    // retire-only run deletes from a dev store, and under the override those
+    // deletes would hit a different file than the one the seed ships from —
+    // the old inputs and route document would then ship forever once the
+    // ledger narrows.
+    refuse_dev_secrets_path_override(dev_secrets_path_override)?;
     let renders = resolve_sor_inputs(store, env, &units)?;
 
     let desired: Vec<AppliedSorUnit> = units
@@ -186,7 +223,7 @@ fn prepare_with_override(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let stale_input_refs = stale_input_refs(&units, &ledger);
+    let (stale_input_refs, skipped_input_refs) = stale_input_refs(&units, &ledger);
 
     // Widen: an entry for the same unit at the same place keeps every input
     // it was ever recorded with until a successful reconcile narrows it, so a
@@ -212,6 +249,7 @@ fn prepare_with_override(
         retired_units,
         retired_sors,
         stale_input_refs,
+        skipped_input_refs,
         desired,
     }))
 }
