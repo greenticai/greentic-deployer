@@ -1034,7 +1034,8 @@ fn staging_excluded_uris(env: &Environment) -> Vec<String> {
 /// Any control-plane material (`staging_excluded_uris`) is hard-excluded from
 /// the returned bytes via a filtered copy, so the staged seed cannot resolve the
 /// bound deployer credential even with the shared dev master key. The operator's
-/// on-disk store is never modified.
+/// on-disk store is never modified. Every declared SoR unit's inputs are
+/// excluded the same way (see `env_sor::sor_input_uris`).
 ///
 /// **Concurrency.** The exclusion is derived from a fresh env load and the
 /// dev-store is snapshotted inside a single `store.transact` critical section,
@@ -1061,7 +1062,11 @@ pub(crate) fn read_dev_secrets_bytes(
         let env = locked
             .load()
             .map_err(|e| OpError::Conflict(format!("reloading env for staging: {e}")))?;
-        let exclude = staging_excluded_uris(&env);
+        let mut exclude = staging_excluded_uris(&env);
+        let sor_units = locked
+            .load_sor_units()
+            .map_err(|e| OpError::Conflict(format!("reading SoR units for staging: {e}")))?;
+        exclude.extend(super::env_sor::sor_input_uris(env_id, &sor_units));
 
         // A dev-store file may not exist yet — guarded no-op (a missing file
         // stages nothing; the worker's staging init is then a no-op).
@@ -6314,6 +6319,50 @@ mod tests {
             excluded.iter().filter(|u| **u == uri).count(),
             1,
             "the same store URI must appear once, not once per source"
+        );
+    }
+
+    #[test]
+    fn the_worker_seed_excludes_every_sor_input_but_keeps_the_route_document() {
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let mut unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        unit.postgres_ca_ref = Some("default/_/sor-landlord/postgres_ca".into());
+        crate::cli::env_sor::set_sor_units(&store, &env_id, std::slice::from_ref(&unit)).unwrap();
+        let kind = crate::cli::secrets::DEV_STORE_KIND_PATH;
+        for rel in unit.input_refs() {
+            crate::cli::secrets::put_env_secret(&store, &env, &env_id, kind, rel, "SOR-INPUT")
+                .unwrap();
+        }
+        let route = "default/_/sorla/landlord-tenant-sor";
+        crate::cli::secrets::put_env_secret(&store, &env, &env_id, kind, route, "{\"url\":\"u\"}")
+            .unwrap();
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a seed");
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let read = |uri: &str| -> Result<Vec<u8>, ()> {
+            let dev = DevStore::with_path(staged_path.clone()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { dev.get(uri).await.map_err(|_| ()) })
+        };
+        for rel in unit.input_refs() {
+            let uri = crate::cli::secrets::dev_store_key(&env_id, rel);
+            assert!(read(&uri).is_err(), "`{rel}` must not reach any worker");
+        }
+        assert!(
+            read(&crate::cli::secrets::dev_store_key(&env_id, route)).is_ok(),
+            "the route document is exactly what the workers need"
         );
     }
 
