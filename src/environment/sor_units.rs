@@ -63,6 +63,20 @@ pub struct AppliedSorUnit {
     pub unit_id: String,
     pub sor: String,
     pub namespace: String,
+    /// Store rel-paths of the inputs this unit was reconciled with (never a
+    /// value). Recorded so that once the unit is retired, or one of its
+    /// `*_ref`s re-pointed, the OLD inputs are still kept out of the seed that
+    /// ships into routers and workers, and are deleted from the store. A
+    /// ledger written before this field reads as empty.
+    #[serde(default)]
+    pub input_refs: Vec<String>,
+}
+
+impl AppliedSorUnit {
+    /// The same unit at the same place, whatever inputs it was recorded with.
+    pub fn same_unit(&self, other: &Self) -> bool {
+        self.unit_id == other.unit_id && self.sor == other.sor && self.namespace == other.namespace
+    }
 }
 
 /// `<env_dir>/sor-units.json`.
@@ -138,6 +152,11 @@ mod tests {
             unit_id: "landlord".into(),
             sor: "landlord-tenant-sor".into(),
             namespace: "gtc-local".into(),
+            input_refs: landlord()
+                .input_refs()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         };
         store
             .transact(&env_id, |locked| {
@@ -154,5 +173,18 @@ mod tests {
         .unwrap();
         assert_eq!(raw["schema"], SOR_UNITS_V1);
         assert_eq!(raw["environment_id"], "local");
+    }
+
+    /// A ledger written before `input_refs` existed still loads, with no refs.
+    #[test]
+    fn a_ledger_without_input_refs_still_deserialises() {
+        let old = serde_json::json!({
+            "schema": SOR_LEDGER_V1,
+            "environment_id": "local",
+            "units": [{"unit_id": "landlord", "sor": "landlord-tenant-sor", "namespace": "gtc-local"}],
+        });
+        let doc: SorLedgerDoc = serde_json::from_value(old).expect("old ledger loads");
+        assert_eq!(doc.units.len(), 1);
+        assert!(doc.units[0].input_refs.is_empty());
     }
 }

@@ -35,15 +35,40 @@ pub(crate) fn set_sor_units(
         .map_err(OpError::from)
 }
 
-/// Store URIs of every declared unit's inputs. Stripped from the dev-store
-/// seed that ships into routers and workers: those are the SoR's own
-/// credentials (its database URL above all), and no flow or worker reads
-/// them — the worker needs only the route document.
-pub(crate) fn sor_input_uris(env_id: &EnvId, units: &[SorUnit]) -> Vec<String> {
-    units
+/// Store URIs stripped from the dev-store seed that ships into routers and
+/// workers: every input a declared unit reads, UNIONED with every input the
+/// applied ledger records. Those are the SoR's own credentials (its database
+/// URL above all), and no flow or worker reads them — the worker needs only
+/// the route document. The ledger half is what keeps a retired or re-pointed
+/// unit's old inputs out of the seed until reconcile has deleted them.
+pub(crate) fn sor_input_uris(
+    env_id: &EnvId,
+    units: &[SorUnit],
+    ledger: &[AppliedSorUnit],
+) -> Vec<String> {
+    let declared = units.iter().flat_map(SorUnit::input_refs);
+    let recorded = ledger
         .iter()
-        .flat_map(SorUnit::input_refs)
+        .flat_map(|a| a.input_refs.iter().map(String::as_str));
+    declared
+        .chain(recorded)
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
         .map(|rel| crate::cli::secrets::dev_store_key(env_id, rel))
+        .collect()
+}
+
+/// Input rel-paths the ledger records that no declared unit reads any more —
+/// a retired unit's inputs, and the old target of a re-pointed `*_ref`.
+fn stale_input_refs(units: &[SorUnit], ledger: &[AppliedSorUnit]) -> Vec<String> {
+    let declared: BTreeSet<&str> = units.iter().flat_map(SorUnit::input_refs).collect();
+    ledger
+        .iter()
+        .flat_map(|a| a.input_refs.iter())
+        .filter(|rel| !declared.contains(rel.as_str()))
+        .cloned()
+        .collect::<BTreeSet<String>>()
+        .into_iter()
         .collect()
 }
 
@@ -57,6 +82,8 @@ pub(crate) struct PreparedSor {
     /// SoR keys no declared unit claims any more: their route documents are
     /// deleted.
     pub(crate) retired_sors: Vec<String>,
+    /// Input rel-paths no declared unit reads any more: deleted from the store.
+    pub(crate) stale_input_refs: Vec<String>,
     /// What the ledger narrows to once the reconcile succeeds.
     desired: Vec<AppliedSorUnit>,
 }
@@ -70,13 +97,17 @@ impl PreparedSor {
             units: &self.units,
             retired_units: &self.retired_units,
             retired_sors: &self.retired_sors,
+            stale_input_refs: &self.stale_input_refs,
             publisher,
         }
     }
 }
 
 /// Resolve the SoR phase. `None` when nothing is declared and nothing was
-/// ever applied, so an env without SoR units reconciles exactly as before.
+/// ever applied, so an env without SoR units reconciles exactly as before —
+/// including how it fails: the deployer answers are parsed for the namespace
+/// only AFTER that early return, so an env with no SoR units never sees an
+/// answers error from here.
 ///
 /// Every refusal happens here, before the ledger or the cluster is touched —
 /// the backend and `GREENTIC_DEV_SECRETS_PATH` checks come before any input is
@@ -87,13 +118,18 @@ impl PreparedSor {
 pub(crate) fn prepare(
     store: &LocalFsStore,
     env: &Environment,
-    namespace: &str,
+    answers: Option<&serde_json::Value>,
     backend: &SecretsBackend,
 ) -> Result<Option<PreparedSor>, OpError> {
+    let namespace = || {
+        crate::env_packs::k8s::manifests::K8sParams::from_answers(env, answers)
+            .map(|p| p.namespace)
+            .map_err(|e| OpError::InvalidArgument(format!("invalid deployer answers: {e}")))
+    };
     prepare_with_override(
         store,
         env,
-        namespace,
+        &namespace,
         backend,
         std::env::var_os(crate::cli::secrets::DEV_SECRETS_PATH_ENV),
     )
@@ -104,7 +140,7 @@ pub(crate) fn prepare(
 fn prepare_with_override(
     store: &LocalFsStore,
     env: &Environment,
-    namespace: &str,
+    namespace: &dyn Fn() -> Result<String, OpError>,
     backend: &SecretsBackend,
     dev_secrets_path_override: Option<OsString>,
 ) -> Result<Option<PreparedSor>, OpError> {
@@ -114,8 +150,13 @@ fn prepare_with_override(
     if units.is_empty() && ledger.is_empty() {
         return Ok(None);
     }
-    require_dev_store_backend(backend)?;
-    refuse_dev_secrets_path_override(dev_secrets_path_override)?;
+    let namespace = namespace()?;
+    // Only DECLARED units need the dev store: a retire-only run on a Vault
+    // env must be able to prune what an earlier dev-store era left behind.
+    if !units.is_empty() {
+        require_dev_store_backend(backend)?;
+        refuse_dev_secrets_path_override(dev_secrets_path_override)?;
+    }
     let renders = resolve_sor_inputs(store, env, &units)?;
 
     let desired: Vec<AppliedSorUnit> = units
@@ -123,7 +164,8 @@ fn prepare_with_override(
         .map(|u| AppliedSorUnit {
             unit_id: u.unit_id.clone(),
             sor: u.sor.clone(),
-            namespace: namespace.to_string(),
+            namespace: namespace.clone(),
+            input_refs: u.input_refs().into_iter().map(str::to_string).collect(),
         })
         .collect();
     // Retired = applied somewhere no declared unit now lives (same id AND
@@ -144,11 +186,23 @@ fn prepare_with_override(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let stale_input_refs = stale_input_refs(&units, &ledger);
 
+    // Widen: an entry for the same unit at the same place keeps every input
+    // it was ever recorded with until a successful reconcile narrows it, so a
+    // re-pointed ref's OLD target stays excluded (and due for deletion) even
+    // if this reconcile dies first.
     let mut intent = ledger;
     for d in &desired {
-        if !intent.contains(d) {
-            intent.push(d.clone());
+        match intent.iter_mut().find(|a| a.same_unit(d)) {
+            Some(existing) => {
+                for rel in &d.input_refs {
+                    if !existing.input_refs.contains(rel) {
+                        existing.input_refs.push(rel.clone());
+                    }
+                }
+            }
+            None => intent.push(d.clone()),
         }
     }
     store.transact(env_id, |locked| locked.save_sor_ledger(&intent))?;
@@ -157,6 +211,7 @@ fn prepare_with_override(
         units: renders,
         retired_units,
         retired_sors,
+        stale_input_refs,
         desired,
     }))
 }
@@ -174,6 +229,9 @@ pub(crate) fn record_applied(
 }
 
 #[cfg(test)]
+mod tests_stale;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::secrets::{DEV_STORE_KIND_PATH, put_env_secret};
@@ -183,7 +241,7 @@ mod tests {
     use crate::environment::sor_units::AppliedSorUnit;
     use greentic_deploy_spec::CapabilitySlot;
 
-    fn seeded_with(unit_ids: &[&str]) -> (tempfile::TempDir, LocalFsStore, Environment) {
+    pub(super) fn seeded_with(unit_ids: &[&str]) -> (tempfile::TempDir, LocalFsStore, Environment) {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let mut env = make_env("local");
@@ -221,21 +279,35 @@ mod tests {
         (dir, store, env)
     }
 
-    fn applied(id: &str, ns: &str) -> AppliedSorUnit {
+    pub(super) fn applied(id: &str, ns: &str) -> AppliedSorUnit {
         AppliedSorUnit {
             unit_id: id.into(),
             sor: format!("{id}-sor"),
             namespace: ns.into(),
+            input_refs: ["answers", "postgres_url", "shared_secret"]
+                .iter()
+                .map(|n| format!("default/_/sor-{id}/{n}"))
+                .collect(),
         }
+    }
+
+    pub(super) fn ns(namespace: &'static str) -> impl Fn() -> Result<String, OpError> {
+        move || Ok(namespace.to_string())
     }
 
     #[test]
     fn nothing_declared_and_nothing_recorded_means_no_sor_phase() {
         let (_d, store, env) = seeded_with(&[]);
         assert!(
-            prepare_with_override(&store, &env, "gtc-local", &SecretsBackend::DevStore, None)
-                .unwrap()
-                .is_none()
+            prepare_with_override(
+                &store,
+                &env,
+                &ns("gtc-local"),
+                &SecretsBackend::DevStore,
+                None
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -247,10 +319,15 @@ mod tests {
                 l.save_sor_ledger(&[applied("a", "gtc-local")])
             })
             .unwrap();
-        let prepared =
-            prepare_with_override(&store, &env, "gtc-local", &SecretsBackend::DevStore, None)
-                .unwrap()
-                .unwrap();
+        let prepared = prepare_with_override(
+            &store,
+            &env,
+            &ns("gtc-local"),
+            &SecretsBackend::DevStore,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             store.load_sor_ledger(&env.environment_id).unwrap(),
             vec![applied("a", "gtc-local"), applied("b", "gtc-local")],
@@ -273,10 +350,15 @@ mod tests {
                 l.save_sor_ledger(&[applied("b", "gtc-old")])
             })
             .unwrap();
-        let prepared =
-            prepare_with_override(&store, &env, "gtc-new", &SecretsBackend::DevStore, None)
-                .unwrap()
-                .unwrap();
+        let prepared = prepare_with_override(
+            &store,
+            &env,
+            &ns("gtc-new"),
+            &SecretsBackend::DevStore,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(prepared.retired_units, vec![applied("b", "gtc-old")]);
         assert!(
             prepared.retired_sors.is_empty(),
@@ -294,8 +376,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            prepare_with_override(&store, &env, "gtc-local", &SecretsBackend::DevStore, None)
-                .is_err()
+            prepare_with_override(
+                &store,
+                &env,
+                &ns("gtc-local"),
+                &SecretsBackend::DevStore,
+                None
+            )
+            .is_err()
         );
         assert!(
             store
@@ -322,7 +410,7 @@ mod tests {
         let msg = prepare_with_override(
             &store,
             &env,
-            "gtc-local",
+            &ns("gtc-local"),
             &SecretsBackend::DevStore,
             Some("/elsewhere/.dev.secrets.env".into()),
         )
@@ -357,7 +445,7 @@ mod tests {
             transit_key: "greentic".to_string(),
             namespace: None,
         });
-        let msg = prepare_with_override(&store, &env, "gtc-local", &vault, None)
+        let msg = prepare_with_override(&store, &env, &ns("gtc-local"), &vault, None)
             .err()
             .expect("refused")
             .to_string();

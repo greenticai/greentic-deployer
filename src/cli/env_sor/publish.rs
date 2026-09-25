@@ -1,5 +1,6 @@
 //! The store side of the SoR reconcile's step 4: writing each route document
-//! (contract C1) through the same dev-store writer `op secrets put` uses.
+//! (contract C1) through the same dev-store writer `op secrets put` uses, and
+//! deleting what retired or re-pointed units leave behind.
 
 use greentic_deploy_spec::Environment;
 
@@ -32,6 +33,7 @@ impl<'a> StoreRoutePublisher<'a> {
         &self,
         routes: &[RouteDocument],
         retired_sors: &[String],
+        stale_input_refs: &[String],
     ) -> Result<Option<String>, OpError> {
         let env_id = &self.env.environment_id;
         for route in routes {
@@ -51,12 +53,27 @@ impl<'a> StoreRoutePublisher<'a> {
                 )?;
             }
         }
-        for sor in retired_sors {
-            delete_env_secret(self.store, env_id, &route_rel_path(sor))?;
-        }
+        self.retire_inner(retired_sors, stale_input_refs)?;
         // Whenever the store file exists this is `Some`, whether or not
         // anything above changed: `None` would ship an EMPTY seed.
         crate::cli::env::read_dev_secrets_b64(self.store, env_id)
+    }
+
+    /// Delete retired route documents and stale SoR inputs. An absent key
+    /// (or an absent store file) is `Ok`; nothing is ever written.
+    fn retire_inner(
+        &self,
+        retired_sors: &[String],
+        stale_input_refs: &[String],
+    ) -> Result<(), OpError> {
+        let env_id = &self.env.environment_id;
+        for sor in retired_sors {
+            delete_env_secret(self.store, env_id, &route_rel_path(sor))?;
+        }
+        for rel in stale_input_refs {
+            delete_env_secret(self.store, env_id, rel)?;
+        }
+        Ok(())
     }
 }
 
@@ -65,9 +82,15 @@ impl SorRoutePublisher for StoreRoutePublisher<'_> {
         &self,
         routes: &[RouteDocument],
         retired_sors: &[String],
+        stale_input_refs: &[String],
     ) -> Result<Option<String>, String> {
         // The store verbs' errors name paths and URIs, never a value.
-        self.publish_inner(routes, retired_sors)
+        self.publish_inner(routes, retired_sors, stale_input_refs)
+            .map_err(|e| e.to_string())
+    }
+
+    fn retire(&self, retired_sors: &[String], stale_input_refs: &[String]) -> Result<(), String> {
+        self.retire_inner(retired_sors, stale_input_refs)
             .map_err(|e| e.to_string())
     }
 }
@@ -125,7 +148,7 @@ mod tests {
         let (_d, store, env) = seeded();
         let publisher = StoreRoutePublisher::new(&store, &env);
         let seed = publisher
-            .publish(&[doc("landlord-tenant-sor", "t1")], &[])
+            .publish(&[doc("landlord-tenant-sor", "t1")], &[], &[])
             .unwrap();
         assert!(seed.is_some(), "the refreshed seed is what the workers get");
         assert_eq!(
@@ -146,11 +169,11 @@ mod tests {
         let (_d, store, env) = seeded();
         let publisher = StoreRoutePublisher::new(&store, &env);
         publisher
-            .publish(&[doc("landlord-tenant-sor", "t1")], &[])
+            .publish(&[doc("landlord-tenant-sor", "t1")], &[], &[])
             .unwrap();
         let before = store_bytes(&store, &env);
         publisher
-            .publish(&[doc("landlord-tenant-sor", "t1")], &[])
+            .publish(&[doc("landlord-tenant-sor", "t1")], &[], &[])
             .unwrap();
         assert_eq!(
             before,
@@ -158,7 +181,7 @@ mod tests {
             "a rewrite re-encrypts, changes the seed hash and rolls every worker"
         );
         publisher
-            .publish(&[doc("landlord-tenant-sor", "t2")], &[])
+            .publish(&[doc("landlord-tenant-sor", "t2")], &[], &[])
             .unwrap();
         assert_ne!(before, store_bytes(&store, &env));
     }
@@ -168,10 +191,14 @@ mod tests {
         let (_d, store, env) = seeded();
         let publisher = StoreRoutePublisher::new(&store, &env);
         publisher
-            .publish(&[doc("landlord-tenant-sor", "t1")], &[])
+            .publish(&[doc("landlord-tenant-sor", "t1")], &[], &[])
             .unwrap();
         publisher
-            .publish(&[], &["landlord-tenant-sor".into(), "never-written".into()])
+            .publish(
+                &[],
+                &["landlord-tenant-sor".into(), "never-written".into()],
+                &[],
+            )
             .unwrap();
         assert!(stored(&store, &env, "landlord-tenant-sor").is_none());
     }
@@ -183,21 +210,21 @@ mod tests {
         let (_d, store, env) = seeded();
         let publisher = StoreRoutePublisher::new(&store, &env);
         assert!(
-            publisher.publish(&[], &[]).unwrap().is_none(),
+            publisher.publish(&[], &[], &[]).unwrap().is_none(),
             "no store file yet"
         );
         publisher
-            .publish(&[doc("landlord-tenant-sor", "t1")], &[])
+            .publish(&[doc("landlord-tenant-sor", "t1")], &[], &[])
             .unwrap();
         let unchanged = publisher
-            .publish(&[doc("landlord-tenant-sor", "t1")], &[])
+            .publish(&[doc("landlord-tenant-sor", "t1")], &[], &[])
             .unwrap();
         let expected = crate::cli::env::read_dev_secrets_b64(&store, &env.environment_id)
             .unwrap()
             .expect("a store file exists");
         assert_eq!(unchanged.as_deref(), Some(expected.as_str()));
         assert!(
-            publisher.publish(&[], &[]).unwrap().is_some(),
+            publisher.publish(&[], &[], &[]).unwrap().is_some(),
             "nothing to publish still returns the existing seed"
         );
     }
@@ -209,7 +236,7 @@ mod tests {
         // An unwritable sor key is refused by path validation; the error names
         // the path, never the document.
         let err = publisher
-            .publish(&[doc("Bad/Sor", "TOKEN-SECRET")], &[])
+            .publish(&[doc("Bad/Sor", "TOKEN-SECRET")], &[], &[])
             .unwrap_err();
         assert!(!err.contains("TOKEN-SECRET"), "{err}");
     }

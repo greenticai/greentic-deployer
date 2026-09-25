@@ -868,11 +868,9 @@ pub fn reconcile(
     // SoR units (SoRLa storage phase 3): resolved, and refused if unworkable,
     // before any cluster call; their route documents are written
     // mid-reconcile, after the SoRs are Available and before any worker rolls.
-    let namespace =
-        crate::env_packs::k8s::manifests::K8sParams::from_answers(&env, answers.as_ref())
-            .map_err(|e| OpError::InvalidArgument(format!("invalid deployer answers: {e}")))?
-            .namespace;
-    let prepared = super::env_sor::prepare(store, &env, &namespace, &secrets_backend)?;
+    // An env with no SoR units never parses the answers here, so it fails
+    // exactly where and how it did before SoR units existed.
+    let prepared = super::env_sor::prepare(store, &env, answers.as_ref(), &secrets_backend)?;
     // The publisher exists only when there is a SoR phase to publish for.
     let publisher = prepared
         .as_ref()
@@ -1079,8 +1077,9 @@ fn staging_excluded_uris(env: &Environment) -> Vec<String> {
 /// Any control-plane material (`staging_excluded_uris`) is hard-excluded from
 /// the returned bytes via a filtered copy, so the staged seed cannot resolve the
 /// bound deployer credential even with the shared dev master key. The operator's
-/// on-disk store is never modified. Every declared SoR unit's inputs are
-/// excluded the same way (see `env_sor::sor_input_uris`).
+/// on-disk store is never modified. Every SoR input — each declared unit's,
+/// and each one the applied ledger records for a retired or re-pointed unit —
+/// is excluded the same way (see `env_sor::sor_input_uris`).
 ///
 /// **Concurrency.** The exclusion is derived from a fresh env load and the
 /// dev-store is snapshotted inside a single `store.transact` critical section,
@@ -1111,7 +1110,14 @@ pub(crate) fn read_dev_secrets_bytes(
         let sor_units = locked
             .load_sor_units()
             .map_err(|e| OpError::Conflict(format!("reading SoR units for staging: {e}")))?;
-        exclude.extend(super::env_sor::sor_input_uris(env_id, &sor_units));
+        let sor_ledger = locked
+            .load_sor_ledger()
+            .map_err(|e| OpError::Conflict(format!("reading the SoR ledger for staging: {e}")))?;
+        exclude.extend(super::env_sor::sor_input_uris(
+            env_id,
+            &sor_units,
+            &sor_ledger,
+        ));
 
         // A dev-store file may not exist yet — guarded no-op (a missing file
         // stages nothing; the worker's staging init is then a no-op).
@@ -5766,6 +5772,60 @@ mod tests {
         match err {
             OpError::Conflict(msg) => assert!(msg.contains("bound to deployer"), "{msg}"),
             other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
+    }
+
+    /// An env with no SoR units must fail on bad deployer answers exactly as it
+    /// did before SoR units existed: through the cluster path as a `Conflict`,
+    /// never the SoR preparation's `invalid-argument`. With a SoR unit
+    /// declared, the namespace IS resolved up front and the answers refused.
+    #[test]
+    fn reconcile_without_sor_units_keeps_the_pre_sor_answers_error() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        binding.answers_ref = Some(PathBuf::from("env-packs/deployer/answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        let env_dir = store.env_dir(&env.environment_id).unwrap();
+        std::fs::create_dir_all(env_dir.join("env-packs/deployer")).unwrap();
+        // An invalid namespace, and a kubeconfig context that cannot exist, so
+        // the cluster path fails without any network call.
+        std::fs::write(
+            env_dir.join("env-packs/deployer/answers.json"),
+            r#"{"namespace": "NOT_A_DNS_LABEL", "kubeconfig_context": "no-such-context-sor-f2"}"#,
+        )
+        .unwrap();
+
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match &err {
+            OpError::Conflict(msg) => assert!(!msg.contains("invalid deployer answers"), "{msg}"),
+            other => panic!("expected the pre-SoR Conflict, got {other:?}"),
+        }
+
+        let unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        crate::cli::env_sor::set_sor_units(&store, &env.environment_id, &[unit]).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match &err {
+            OpError::InvalidArgument(msg) => {
+                assert!(msg.contains("invalid deployer answers"), "{msg}")
+            }
+            other => panic!("expected invalid-argument with a SoR unit, got {other:?}"),
         }
     }
 

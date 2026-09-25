@@ -1166,6 +1166,10 @@ impl<'a> Locked<'a> {
         self.store.save_sor_units_locked(&self.env_id, units)
     }
 
+    pub fn load_sor_ledger(&self) -> Result<Vec<AppliedSorUnit>, StoreError> {
+        self.store.load_sor_ledger(&self.env_id)
+    }
+
     pub fn save_sor_ledger(&self, units: &[AppliedSorUnit]) -> Result<(), StoreError> {
         self.store.save_sor_ledger_locked(&self.env_id, units)
     }

@@ -6,8 +6,10 @@
 //! 2. the SoR NetworkPolicies and each unit's Secret, Deployment and Service;
 //! 3. wait for every SoR Deployment to be Available — a SoR that does not
 //!    come up fails the reconcile before any flow or worker changes;
-//! 4. write each route document into the env's store (bare name only, C1)
-//!    and delete the documents of retired SoRs;
+//! 4. write each route document into the env's store (bare name only, C1),
+//!    delete the documents of retired SoRs, and delete the store keys of any
+//!    input a retired or re-pointed unit used to read (on a Vault env, which
+//!    cannot declare units, only the deletes run);
 //! 5. the WHOLE desired state rendered from the refreshed dev-store seed, so
 //!    the router and every worker roll onto a seed that holds the documents;
 //! 6. prune: absent revisions, retired SoR units (in the namespace they were
@@ -68,9 +70,8 @@ pub struct RouteDocument {
 /// The store side of step 4. Implemented by the CLI (which owns the store);
 /// errors are operator prose and must never contain a value.
 pub trait SorRoutePublisher: Send + Sync {
-    /// Write every route document (bare name), delete the documents of
-    /// `retired_sors`, and return the env's dev-store seed as it stands after
-    /// both (base64).
+    /// Write every route document (bare name), then [`Self::retire`], and
+    /// return the env's dev-store seed as it stands after both (base64).
     ///
     /// `None` means "there is no store file" and renders an EMPTY dev-store
     /// Secret — it never means "nothing changed". An implementation that
@@ -79,7 +80,13 @@ pub trait SorRoutePublisher: Send + Sync {
         &self,
         routes: &[RouteDocument],
         retired_sors: &[String],
+        stale_input_refs: &[String],
     ) -> Result<Option<String>, String>;
+
+    /// Delete the route documents of `retired_sors` and the store keys named
+    /// by `stale_input_refs` (rel-paths no declared unit reads any more). A
+    /// key that is already absent is not an error. Writes nothing.
+    fn retire(&self, retired_sors: &[String], stale_input_refs: &[String]) -> Result<(), String>;
 }
 
 /// Everything the SoR reconcile needs beyond the env and its answers.
@@ -89,6 +96,9 @@ pub struct SorReconcile<'a> {
     pub retired_units: &'a [AppliedSorUnit],
     /// SoR keys no declared unit claims any more.
     pub retired_sors: &'a [String],
+    /// Input rel-paths a retired or re-pointed unit used to read that no
+    /// declared unit reads now: deleted from the store in step 4.
+    pub stale_input_refs: &'a [String],
     pub publisher: &'a dyn SorRoutePublisher,
 }
 
@@ -213,8 +223,8 @@ impl K8sDeployerHandler {
                     other => other.to_string(),
                 };
                 DeployerError::Provider(format!(
-                    "SoR unit `{}` did not become Available, so no flow or worker was \
-                     changed: {reason}",
+                    "SoR unit `{}` did not become Available, so no router or worker \
+                     Deployment was rolled: {reason}",
                     render.unit.unit_id
                 ))
             })?;
@@ -229,12 +239,24 @@ impl K8sDeployerHandler {
                 value: route_document(&r.unit, &r.inputs, &params.namespace),
             })
             .collect();
-        let fresh_seed = sor
-            .publisher
-            .publish(&routes, sor.retired_sors)
-            .map_err(|e| {
-                DeployerError::Provider(format!("writing the SoR route documents: {e}"))
-            })?;
+        let fresh_seed = if matches!(self.secrets_backend, SecretsBackend::Vault(_)) {
+            // Retire-only (units on Vault were refused above): nothing to
+            // write into a dev store, and no refreshed seed to ship. The
+            // deletes still run so a retired unit's inputs do not linger;
+            // absent keys are fine.
+            sor.publisher
+                .retire(sor.retired_sors, sor.stale_input_refs)
+                .map_err(|e| {
+                    DeployerError::Provider(format!("retiring the SoR store entries: {e}"))
+                })?;
+            self.dev_secrets_data.clone()
+        } else {
+            sor.publisher
+                .publish(&routes, sor.retired_sors, sor.stale_input_refs)
+                .map_err(|e| {
+                    DeployerError::Provider(format!("writing the SoR route documents: {e}"))
+                })?
+        };
 
         // 5. the whole desired state, from the refreshed seed.
         let desired = self
@@ -303,8 +325,9 @@ mod tests {
     use crate::env_packs::k8s::manifests::{DEV_SECRETS_SECRET_NAME, K8sParams};
 
     type Log = Arc<Mutex<Vec<String>>>;
-    /// One `publish` call: `(sor, route document)` pairs, then the retired SoRs.
-    type PublishCall = (Vec<(String, String)>, Vec<String>);
+    /// One `publish` call: `(sor, route document)` pairs, the retired SoRs,
+    /// then the stale input refs.
+    type PublishCall = (Vec<(String, String)>, Vec<String>, Vec<String>);
 
     /// Records every apply/delete in order; Deployments named in `never_ready`
     /// never report an available replica.
@@ -370,6 +393,7 @@ mod tests {
             &self,
             routes: &[RouteDocument],
             retired: &[String],
+            stale: &[String],
         ) -> Result<Option<String>, String> {
             self.log.lock().unwrap().push("publish".into());
             self.calls.lock().unwrap().push((
@@ -378,8 +402,18 @@ mod tests {
                     .map(|r| (r.sor.clone(), r.value.expose().to_string()))
                     .collect(),
                 retired.to_vec(),
+                stale.to_vec(),
             ));
             Ok(self.fresh.clone())
+        }
+
+        fn retire(&self, retired: &[String], stale: &[String]) -> Result<(), String> {
+            self.log.lock().unwrap().push("retire".into());
+            self.calls
+                .lock()
+                .unwrap()
+                .push((Vec::new(), retired.to_vec(), stale.to_vec()));
+            Ok(())
         }
     }
 
@@ -436,6 +470,7 @@ mod tests {
             units: &units,
             retired_units: &[],
             retired_sors: &[],
+            stale_input_refs: &[],
             publisher: &publisher,
         };
         let report = handler
@@ -519,6 +554,7 @@ mod tests {
             units: &units,
             retired_units: &[],
             retired_sors: &[],
+            stale_input_refs: &[],
             publisher: &publisher,
         };
         let err = handler
@@ -563,12 +599,15 @@ mod tests {
             unit_id: "landlord".into(),
             sor: "landlord-tenant-sor".into(),
             namespace: "gtc-old".into(),
+            input_refs: vec!["default/_/sor-landlord/postgres_url".into()],
         }];
         let retired_sors = ["landlord-tenant-sor".to_string()];
+        let stale = ["default/_/sor-landlord/postgres_url".to_string()];
         let sor = SorReconcile {
             units: &[],
             retired_units: &retired,
             retired_sors: &retired_sors,
+            stale_input_refs: &stale,
             publisher: &publisher,
         };
         let report = handler
@@ -600,6 +639,11 @@ mod tests {
             publisher.calls.lock().unwrap()[0].1,
             vec!["landlord-tenant-sor".to_string()]
         );
+        assert_eq!(
+            publisher.calls.lock().unwrap()[0].2,
+            stale.to_vec(),
+            "a retired unit's inputs are deleted from the store"
+        );
         assert!(report.sor_units.is_empty());
         assert!(
             !cluster
@@ -623,6 +667,7 @@ mod tests {
             units: &units,
             retired_units: &[],
             retired_sors: &[],
+            stale_input_refs: &[],
             publisher: &publisher,
         };
         let report = handler
@@ -689,6 +734,7 @@ mod tests {
             units: &units,
             retired_units: &[],
             retired_sors: &[],
+            stale_input_refs: &[],
             publisher: &publisher,
         };
         let err = handler
@@ -707,5 +753,58 @@ mod tests {
             log.lock().unwrap().is_empty(),
             "no cluster call and no publish"
         );
+    }
+
+    /// Retiring units on a Vault env must not wedge it: no dev-store write,
+    /// the objects are pruned, and the handler's own seed ships unchanged.
+    #[tokio::test]
+    async fn a_vault_env_retiring_its_units_prunes_them_without_publishing() {
+        let (_h, cluster, publisher, log) = fixture(&[]);
+        let handler = K8sDeployerHandler::with_cluster_and_dev_secrets(
+            cluster.clone(),
+            Some("c3RhbGU=".into()),
+        )
+        .with_secrets_backend(crate::env_packs::k8s::manifests::SecretsBackend::Vault(
+            crate::env_packs::k8s::manifests::VaultBackend {
+                addr: "http://vault.vault.svc:8200".to_string(),
+                k8s_role: "greentic-worker".to_string(),
+                kv_mount: "secret".to_string(),
+                kv_prefix: "greentic".to_string(),
+                auth_mount: "kubernetes".to_string(),
+                transit_mount: "transit".to_string(),
+                transit_key: "greentic".to_string(),
+                namespace: None,
+            },
+        ));
+        let env = env_with_dev_store();
+        let retired = [AppliedSorUnit {
+            unit_id: "landlord".into(),
+            sor: "landlord-tenant-sor".into(),
+            namespace: "gtc-old".into(),
+            input_refs: vec![],
+        }];
+        let retired_sors = ["landlord-tenant-sor".to_string()];
+        let sor = SorReconcile {
+            units: &[],
+            retired_units: &retired,
+            retired_sors: &retired_sors,
+            stale_input_refs: &[],
+            publisher: &publisher,
+        };
+        handler
+            .reconcile_with_sor_timed(
+                &env,
+                None,
+                true,
+                &sor,
+                Duration::from_secs(10),
+                Duration::from_millis(1),
+            )
+            .await
+            .expect("a retire-only reconcile on Vault succeeds");
+        let log = log.lock().unwrap().clone();
+        assert!(!log.iter().any(|e| e == "publish"), "{log:?}");
+        assert!(log.iter().any(|e| e == "retire"), "{log:?}");
+        assert!(log.contains(&"delete Deployment/gtc-sor-landlord".to_string()));
     }
 }
