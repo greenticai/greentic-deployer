@@ -5,3 +5,21 @@
 mod validate;
 
 pub(crate) use validate::validate_sor_units;
+
+use greentic_deploy_spec::EnvId;
+
+use crate::cli::OpError;
+use crate::environment::LocalFsStore;
+use crate::environment::sor_units::SorUnit;
+
+/// Record the declared SoR units (`<env_dir>/sor-units.json`) under the env
+/// flock. Called by the `set-sor-units` apply step.
+pub(crate) fn set_sor_units(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    units: &[SorUnit],
+) -> Result<(), OpError> {
+    store
+        .transact(env_id, |locked| locked.save_sor_units(units))
+        .map_err(OpError::from)
+}

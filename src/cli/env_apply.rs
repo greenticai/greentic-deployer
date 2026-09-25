@@ -161,6 +161,7 @@ enum ApplyStepKind {
     SetWelcomeFlow,
     TrustDid,
     ConfigureUpdates,
+    SetSorUnits,
 }
 
 impl ApplyStepKind {
@@ -182,6 +183,7 @@ impl ApplyStepKind {
             ApplyStepKind::SetWelcomeFlow => "set-welcome-flow",
             ApplyStepKind::TrustDid => "trust-did",
             ApplyStepKind::ConfigureUpdates => "configure-updates",
+            ApplyStepKind::SetSorUnits => "set-sor-units",
         }
     }
 }
@@ -261,6 +263,8 @@ enum StepOp {
     /// so the manifest path and the imperative verb share one validator, one
     /// locked read-modify-write, and one audit record.
     ConfigureUpdates(Box<UpdateConfigSetPayload>),
+    /// Record the declared `sor_units[]` into `<env_dir>/sor-units.json`.
+    SetSorUnits(Vec<super::env_manifest::ManifestSorUnit>),
     AddPackBinding(Box<EnvPackBindingPayload>),
     UpdatePackBinding(Box<EnvPackBindingPayload>),
     AddExtension(Box<ExtensionBindingPayload>),
@@ -2043,6 +2047,11 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
         }
     }
 
+    // SoR units: recorded for `op env reconcile`, which deploys them first.
+    if let Some(units) = &ctx.manifest.sor_units {
+        steps.push(sor_units_step(store, ctx, units)?);
+    }
+
     // Update-channel subscription, last: an environment only starts polling for
     // updates once everything else it declares has converged. A failed bundle
     // deploy therefore leaves the env unsubscribed rather than subscribed to a
@@ -2052,6 +2061,45 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     }
 
     Ok(steps)
+}
+
+/// Diff the declared SoR units against `<env_dir>/sor-units.json`. The whole
+/// list is the unit of change: order-sensitive equality, so a reordered list
+/// is an update (harmless) rather than a missed change.
+fn sor_units_step(
+    store: &LocalFsStore,
+    ctx: &ApplyContext,
+    units: &[super::env_manifest::ManifestSorUnit],
+) -> Result<ApplyStep, OpError> {
+    let key = ctx.env_id.as_str().to_string();
+    let current = store.load_sor_units(&ctx.env_id)?;
+    if current.as_slice() == units {
+        return Ok(ApplyStep::no_op(
+            ApplyStepKind::SetSorUnits,
+            key,
+            "sor units unchanged",
+        ));
+    }
+    let names: Vec<&str> = units.iter().map(|u| u.unit_id.as_str()).collect();
+    let detail = format!("{} SoR unit(s): [{}]", units.len(), names.join(", "));
+    let ikey = derive_idempotency_key(
+        &ctx.env_id,
+        ApplyStepKind::SetSorUnits.label(),
+        &key,
+        &hash_json(&json!(units)),
+    );
+    Ok(ApplyStep {
+        kind: ApplyStepKind::SetSorUnits,
+        key,
+        action: if current.is_empty() {
+            ApplyAction::Create
+        } else {
+            ApplyAction::Update
+        },
+        detail,
+        idempotency_key: Some(ikey),
+        op: StepOp::SetSorUnits(units.to_vec()),
+    })
 }
 
 /// The `updates` block's steps, in the order they must execute.
@@ -2354,6 +2402,7 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
                 super::updates::config_set(store, &exec_flags, Some((**payload).clone()))
                     .map(|_| ())
             }
+            StepOp::SetSorUnits(units) => super::env_sor::set_sor_units(store, &ctx.env_id, units),
             StepOp::AddPackBinding(payload) => {
                 let payload = stage_binding_answers(store, ctx, (**payload).clone())?;
                 super::env_packs::add(store, &exec_flags, Some(payload)).map(|_| ())
@@ -2565,6 +2614,13 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                     env.host_config.gui_enabled
                 ));
             }
+        }
+    }
+
+    if let Some(units) = &ctx.manifest.sor_units {
+        checked += 1;
+        if store.load_sor_units(&ctx.env_id)?.as_slice() != units.as_slice() {
+            failures.push("sor_units in sor-units.json differ from the manifest".to_string());
         }
     }
 
@@ -3724,6 +3780,99 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn sor_manifest(units: Option<Value>) -> Value {
+        let mut doc = json!({"schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"}});
+        if let Some(units) = units {
+            doc["sor_units"] = units;
+        }
+        doc
+    }
+
+    fn landlord_unit_json() -> Value {
+        json!({
+            "unit_id": "landlord",
+            "sor": "landlord-tenant-sor",
+            "pack_ref": format!("oci://reg.example/greentic/sor-landlord:t1@sha256:{}", "c".repeat(64)),
+            "image": "ghcr.io/greenticai/greentic-sorx:0.2.36114419551",
+            "tenant_id": "acme",
+            "answers_ref": "default/_/sor-landlord/answers",
+            "postgres_url_ref": "default/_/sor-landlord/postgres_url",
+            "shared_secret_ref": "default/_/sor-landlord/shared_secret"
+        })
+    }
+
+    fn recorded_unit_ids(store: &LocalFsStore) -> Vec<String> {
+        store
+            .load_sor_units(&EnvId::try_from("local").unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|u| u.unit_id)
+            .collect()
+    }
+
+    #[test]
+    fn sor_units_are_recorded_and_reapply_is_a_noop() {
+        let (dir, store) = seeded_store();
+        let path = write_manifest(
+            dir.path(),
+            &sor_manifest(Some(json!([landlord_unit_json()]))),
+        );
+        let outcome = run_apply(&store, &path).expect("apply");
+        assert!(
+            step_actions(&outcome.result).contains(&("set-sor-units".into(), "create".into())),
+            "{:?}",
+            step_actions(&outcome.result)
+        );
+        assert_eq!(recorded_unit_ids(&store), vec!["landlord".to_string()]);
+
+        let again = run_apply(&store, &path).expect("re-apply");
+        assert!(step_actions(&again.result).contains(&("set-sor-units".into(), "no-op".into())));
+    }
+
+    #[test]
+    fn absent_sor_units_leave_the_recorded_set_untouched() {
+        let (dir, store) = seeded_store();
+        let with = write_manifest(
+            dir.path(),
+            &sor_manifest(Some(json!([landlord_unit_json()]))),
+        );
+        run_apply(&store, &with).unwrap();
+        let without = write_manifest(dir.path(), &sor_manifest(None));
+        let outcome = run_apply(&store, &without).unwrap();
+        assert!(
+            !step_actions(&outcome.result)
+                .iter()
+                .any(|(k, _)| k == "set-sor-units")
+        );
+        assert_eq!(recorded_unit_ids(&store), vec!["landlord".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_sor_units_list_clears_the_recorded_set() {
+        let (dir, store) = seeded_store();
+        let with = write_manifest(
+            dir.path(),
+            &sor_manifest(Some(json!([landlord_unit_json()]))),
+        );
+        run_apply(&store, &with).unwrap();
+        let empty = write_manifest(dir.path(), &sor_manifest(Some(json!([]))));
+        let outcome = run_apply(&store, &empty).unwrap();
+        assert!(step_actions(&outcome.result).contains(&("set-sor-units".into(), "update".into())));
+        assert!(recorded_unit_ids(&store).is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_plans_sor_units_without_writing_them() {
+        let (dir, store) = seeded_store();
+        let path = write_manifest(
+            dir.path(),
+            &sor_manifest(Some(json!([landlord_unit_json()]))),
+        );
+        let outcome = run_dry(&store, &path).unwrap();
+        assert!(step_actions(&outcome.result).contains(&("set-sor-units".into(), "create".into())));
+        assert!(recorded_unit_ids(&store).is_empty());
     }
 
     /// The manifest shape the demo uses: declaring `updates` IS the
