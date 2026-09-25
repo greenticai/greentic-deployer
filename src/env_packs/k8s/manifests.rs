@@ -54,6 +54,7 @@ use sha2::{Digest, Sha256};
 
 use crate::environment::runtime_config::materialize_runtime_config;
 
+pub mod sor;
 mod telemetry;
 use crate::env_packs::telemetry::{self as telemetry_answers, TelemetryAnswers};
 pub use telemetry::TELEMETRY_HEADERS_SECRET_NAME;
@@ -1071,11 +1072,9 @@ fn render_worker_service_account(env: &Environment, params: &K8sParams) -> Value
 /// every already-published runtime image regardless.
 const RAYON_THREADS: &str = "4";
 
-/// Boot env shared by router + worker. `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0`
-/// binds all interfaces (the kubelet probes the pod IP, not loopback, so the
-/// runtime's `127.0.0.1` default would make every probe fail); `HOME` roots
-/// the env store on the writable staging volume; `RAYON_NUM_THREADS` caps the
-/// bundle-unpack thread pool (see [`RAYON_THREADS`]).
+/// Registry-pull env shared by every pod that pulls over OCI at boot (router,
+/// worker, SoR): the plain-HTTP allow-list, the plain username, and the
+/// password from the env's [`OCI_CREDENTIALS_SECRET_NAME`] Secret.
 ///
 /// `OCI_USERNAME` / `OCI_PASSWORD` authenticate the boot-pull against a
 /// private registry: both roles do a `start --env` boot-pull of a routed
@@ -1089,13 +1088,8 @@ const RAYON_THREADS: &str = "4";
 /// `optional` so a pod rendered without that env-level Secret having been
 /// applied yet (a single-revision `warm_revision` ahead of the first full
 /// `reconcile`) still boots — just without the credential.
-fn runtime_boot_env(env: &Environment, params: &K8sParams) -> Vec<Value> {
-    let mut vars = vec![
-        json!({"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()}),
-        json!({"name": "HOME", "value": STAGE_HOME}),
-        json!({"name": "GREENTIC_GATEWAY_LISTEN_ADDR", "value": "0.0.0.0"}),
-        json!({"name": "RAYON_NUM_THREADS", "value": RAYON_THREADS}),
-    ];
+fn oci_pull_env(params: &K8sParams) -> Vec<Value> {
+    let mut vars = Vec::new();
     // greentic-start honors this only on the digest-gated OCI boot-pull; emitting
     // it when unset would be a harmless no-op, but skip it to keep the pod spec lean.
     if !params.oci_insecure_registries.is_empty() {
@@ -1119,6 +1113,22 @@ fn runtime_boot_env(env: &Environment, params: &K8sParams) -> Vec<Value> {
             },
         }));
     }
+    vars
+}
+
+/// Boot env shared by router + worker. `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0`
+/// binds all interfaces (the kubelet probes the pod IP, not loopback, so the
+/// runtime's `127.0.0.1` default would make every probe fail); `HOME` roots
+/// the env store on the writable staging volume; `RAYON_NUM_THREADS` caps the
+/// bundle-unpack thread pool (see [`RAYON_THREADS`]).
+fn runtime_boot_env(env: &Environment, params: &K8sParams) -> Vec<Value> {
+    let mut vars = vec![
+        json!({"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()}),
+        json!({"name": "HOME", "value": STAGE_HOME}),
+        json!({"name": "GREENTIC_GATEWAY_LISTEN_ADDR", "value": "0.0.0.0"}),
+        json!({"name": "RAYON_NUM_THREADS", "value": RAYON_THREADS}),
+    ];
+    vars.extend(oci_pull_env(params));
     vars
 }
 
@@ -2244,6 +2254,22 @@ mod tests {
             serde_json::to_string(&wa).unwrap(),
             serde_json::to_string(&wb).unwrap()
         );
+        let sa = sor::render_sor_manifests(
+            &env,
+            &sor::tests::unit(),
+            &sor::tests::inputs(true),
+            &params,
+        );
+        let sb = sor::render_sor_manifests(
+            &env,
+            &sor::tests::unit(),
+            &sor::tests::inputs(true),
+            &params,
+        );
+        assert_eq!(
+            serde_json::to_string(&sa).unwrap(),
+            serde_json::to_string(&sb).unwrap()
+        );
     }
 
     #[test]
@@ -2811,9 +2837,16 @@ mod tests {
     #[test]
     fn every_pod_spec_passes_the_restricted_hardening_gate() {
         let (env, params) = fixture();
+        let sor = sor::render_sor_deployment(
+            &env,
+            &sor::tests::unit(),
+            &sor::tests::inputs(true),
+            &params,
+        );
         let pods = [
             render_worker_deployment(&env, &env.revisions[0], &params),
             render_router_deployment(&env, &params),
+            sor,
         ];
         for d in &pods {
             let pod = &d["spec"]["template"]["spec"];
@@ -2832,10 +2865,12 @@ mod tests {
             assert!(c["resources"]["limits"]["memory"].is_string());
             assert!(c["readinessProbe"]["httpGet"]["path"].is_string());
             // The staging init container rides the same restricted profile.
-            let ic = &pod["initContainers"][0];
-            assert_eq!(ic["securityContext"]["allowPrivilegeEscalation"], false);
-            assert_eq!(ic["securityContext"]["readOnlyRootFilesystem"], true);
-            assert_eq!(ic["securityContext"]["capabilities"]["drop"][0], "ALL");
+            // A SoR pod has no init container.
+            if let Some(ic) = pod["initContainers"].get(0) {
+                assert_eq!(ic["securityContext"]["allowPrivilegeEscalation"], false);
+                assert_eq!(ic["securityContext"]["readOnlyRootFilesystem"], true);
+                assert_eq!(ic["securityContext"]["capabilities"]["drop"][0], "ALL");
+            }
         }
     }
 

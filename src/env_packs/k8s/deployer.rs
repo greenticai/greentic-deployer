@@ -51,7 +51,7 @@ use crate::env_packs::render::ManifestRenderer;
 
 /// Cluster failures surface as provider failures — the verb's
 /// preconditions have already passed by the time the seam is touched.
-fn provider(err: K8sClusterError) -> DeployerError {
+pub(super) fn provider(err: K8sClusterError) -> DeployerError {
     DeployerError::Provider(err.to_string())
 }
 
@@ -62,7 +62,7 @@ fn provider(err: K8sClusterError) -> DeployerError {
 /// and grants no cluster-scoped verbs, so applying these would 403 — yet the
 /// bootstrap pack already created the namespace, so dropping them is correct,
 /// not a loss of desired state.
-fn is_cluster_scoped(manifest: &Value) -> bool {
+pub(super) fn is_cluster_scoped(manifest: &Value) -> bool {
     manifest.get("kind").and_then(Value::as_str) == Some("Namespace")
 }
 
@@ -71,7 +71,7 @@ fn is_cluster_scoped(manifest: &Value) -> bool {
 /// → sandbox defaults. A malformed answers blob fails here — before any
 /// cluster call, so no partial state — surfaced as a provider error (there is
 /// no typed answers-rejection variant; this mirrors `reconcile`).
-fn params_from_answers(
+pub(super) fn params_from_answers(
     env: &Environment,
     answers: Option<&Value>,
 ) -> Result<K8sParams, DeployerError> {
@@ -114,7 +114,7 @@ fn warm_rollout_timeout() -> Duration {
 ///
 /// `timeout` / `poll_interval` are parameters (not the module consts) so the
 /// unit tests can drive the loop deterministically under a paused clock.
-async fn wait_for_worker_rollout(
+pub(super) async fn wait_for_worker_rollout(
     cluster: &dyn K8sCluster,
     deployment: &ObjectRef,
     desired_replicas: i32,
@@ -251,6 +251,25 @@ impl K8sDeployerHandler {
         // `params` is recomputed (pure, cheap) only to render the prune set;
         // the present set already came from `render_environment` above.
         let params = params_from_answers(env, answers)?;
+        let pruned = self.prune_absent(env, &params).await?;
+        let router_address = self.read_router_address(env, &params).await;
+        Ok(ReconcileReport {
+            applied,
+            pruned,
+            router_address,
+            sor_units: Vec::new(),
+            sor_skipped_input_refs: Vec::new(),
+        })
+    }
+
+    /// Delete what must not survive a converge: the stale dev-store Secret of a
+    /// Vault env, and the worker pair of every revision without cluster
+    /// presence. Shared by [`Self::reconcile`] and the SoR reconcile.
+    pub(super) async fn prune_absent(
+        &self,
+        env: &Environment,
+        params: &K8sParams,
+    ) -> Result<Vec<ObjectRef>, DeployerError> {
         let mut pruned = Vec::new();
         // A Vault-backed env ships no secret material into the cluster, so a
         // DevStore→Vault migration must remove the stale `gtc-dev-secrets`
@@ -271,19 +290,14 @@ impl K8sDeployerHandler {
         }
         for revision in &env.revisions {
             if !has_cluster_presence(revision.lifecycle) {
-                for manifest in render_worker_manifests(env, revision, &params) {
+                for manifest in render_worker_manifests(env, revision, params) {
                     let object = ObjectRef::from_manifest(&manifest).map_err(provider)?;
                     self.cluster.delete(&object).await.map_err(provider)?;
                     pruned.push(object);
                 }
             }
         }
-        let router_address = self.read_router_address(env, &params).await;
-        Ok(ReconcileReport {
-            applied,
-            pruned,
-            router_address,
-        })
+        Ok(pruned)
     }
 
     /// Read the router Service back so the report can say where the env is
@@ -296,7 +310,7 @@ impl K8sDeployerHandler {
     /// [`RouterAddress::Unknown`] carrying the reason. The `ObjectRef` is built
     /// from the same [`render_router_service`] the apply used, so the object
     /// read is the object written.
-    async fn read_router_address(
+    pub(super) async fn read_router_address(
         &self,
         env: &Environment,
         params: &K8sParams,
@@ -332,8 +346,15 @@ impl K8sDeployerHandler {
         answers: Option<&Value>,
         manage_namespace: bool,
         wait_for_rollout: bool,
+        sor: Option<&super::sor_reconcile::SorReconcile<'_>>,
     ) -> Result<ReconcileReport, DeployerError> {
-        let report = self.reconcile(env, answers, manage_namespace).await?;
+        let report = match sor {
+            Some(sor) => {
+                self.reconcile_with_sor(env, answers, manage_namespace, sor)
+                    .await?
+            }
+            None => self.reconcile(env, answers, manage_namespace).await?,
+        };
         if !wait_for_rollout {
             return Ok(report);
         }
@@ -460,6 +481,17 @@ pub struct ReconcileReport {
     /// [`RouterAddress::Unknown`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub router_address: Option<RouterAddress>,
+    /// The SoR units this reconcile brought up (contract C3). Skipped on the
+    /// wire when empty, so an env without SoR units reports exactly what it
+    /// reported before. `ready` is always `true` here: a unit that is not
+    /// Available fails the reconcile instead.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sor_units: Vec<super::sor_reconcile::SorUnitStatus>,
+    /// Stale SoR input rel-paths reconcile did NOT delete because they lie
+    /// outside their unit's own `sor-<unit_id>/` segment. Paths only, never a
+    /// value; skipped on the wire when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sor_skipped_input_refs: Vec<String>,
 }
 
 #[async_trait]
@@ -1266,7 +1298,7 @@ mod tests {
         let env = build_fixture_env();
 
         let report = handler
-            .reconcile_and_wait(&env, None, true, false)
+            .reconcile_and_wait(&env, None, true, false, None)
             .await
             .expect("wait_for_rollout=false must not poll");
         assert!(
@@ -1289,7 +1321,7 @@ mod tests {
         let env = build_fixture_env();
 
         let report = handler
-            .reconcile_and_wait(&env, None, true, true)
+            .reconcile_and_wait(&env, None, true, true, None)
             .await
             .expect("already-ready Deployments resolve on the first poll");
         assert!(

@@ -30,6 +30,8 @@ use greentic_deploy_spec::BundleDeploymentStatus;
 use super::OpError;
 use super::bundles::{RevenueShareEntryPayload, RouteBindingPayload, TenantSelectorPayload};
 
+pub use crate::environment::sor_units::SorUnit as ManifestSorUnit;
+
 /// Exact `schema` discriminator the manifest must carry.
 pub const ENV_MANIFEST_SCHEMA_V1: &str = "greentic.env-manifest.v1";
 
@@ -92,6 +94,13 @@ pub struct EnvManifest {
     /// bind). Ignored by plain `env apply`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_bootstrap: Option<VaultBootstrapConfig>,
+    /// System-of-Record units (SoRLa phase 3, contract C2). JSON-first like
+    /// `cluster` / `updates` / `vault_bootstrap`: not a wizard question, not in
+    /// the emitted schema. Absent = leave the recorded set untouched; `[]` =
+    /// remove every SoR unit. `op env apply` records it in
+    /// `<env_dir>/sor-units.json`; `op env reconcile` deploys it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sor_units: Option<Vec<ManifestSorUnit>>,
 }
 
 /// `updates` block of [`EnvManifest`] — a declarative mirror of
@@ -987,6 +996,10 @@ impl EnvManifest {
                     )));
                 }
             }
+        }
+
+        if let Some(units) = &self.sor_units {
+            super::env_sor::validate_sor_units(units)?;
         }
         Ok(())
     }
@@ -1900,6 +1913,7 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
         // JSON-first block (like `cluster`/`updates`); the wizard never asks
         // about in-cluster Vault provisioning.
         vault_bootstrap: None,
+        sor_units: None,
         trust_root,
         secrets,
         packs: Vec::new(),
@@ -3935,5 +3949,83 @@ mod tests {
         .unwrap();
         let err2 = m2.validate_shape().unwrap_err();
         assert!(matches!(err2, OpError::InvalidArgument(_)), "{err2}");
+    }
+
+    fn sor_unit_json() -> Value {
+        serde_json::json!({
+            "unit_id": "landlord",
+            "sor": "landlord-tenant-sor",
+            "pack_ref": format!("oci://registry.example/greentic/sor-landlord:sor-landlord-3f2a9c1b8d7e@sha256:{}", "b".repeat(64)),
+            "image": "ghcr.io/greenticai/greentic-sorx:0.2.36114419551",
+            "tenant_id": "acme",
+            "answers_ref": "default/_/sor-landlord/answers",
+            "postgres_url_ref": "default/_/sor-landlord/postgres_url",
+            "postgres_ca_ref": null,
+            "shared_secret_ref": "default/_/sor-landlord/shared_secret"
+        })
+    }
+
+    #[test]
+    fn sor_units_round_trip_keeping_their_shape() {
+        let doc = serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "sor_units": [sor_unit_json()]
+        });
+        let m: EnvManifest = serde_json::from_value(doc.clone()).expect("parses");
+        m.validate_shape().expect("valid");
+        assert_eq!(m.sor_units.as_ref().unwrap()[0].unit_id, "landlord");
+        let back = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            back["sor_units"], doc["sor_units"],
+            "the C2 shape survives a round trip"
+        );
+    }
+
+    #[test]
+    fn an_absent_sor_units_key_is_none_and_an_empty_list_is_some() {
+        let absent: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"}
+        }))
+        .unwrap();
+        assert!(absent.sor_units.is_none());
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("sor_units")
+                .is_none()
+        );
+        let empty: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"}, "sor_units": []
+        }))
+        .unwrap();
+        assert_eq!(empty.sor_units.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn an_unknown_sor_unit_key_is_refused() {
+        let mut unit = sor_unit_json();
+        unit["replicas"] = serde_json::json!(2);
+        let err = serde_json::from_value::<EnvManifest>(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"}, "sor_units": [unit]
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("replicas"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_sor_unit_id_fails_validate_shape() {
+        let mut second = sor_unit_json();
+        second["sor"] = serde_json::json!("other-sor");
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"},
+            "sor_units": [sor_unit_json(), second]
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate unit_id `landlord`"),
+            "{err}"
+        );
     }
 }

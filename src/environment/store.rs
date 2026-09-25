@@ -36,6 +36,9 @@ use thiserror::Error;
 
 use super::atomic_write::{AtomicWriteError, atomic_write_json, copy_to_backup};
 use super::file_lock::{EnvFlock, LockError};
+use super::sor_units::{
+    AppliedSorUnit, SOR_LEDGER_V1, SOR_UNITS_V1, SorLedgerDoc, SorUnit, SorUnitsDoc,
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -197,6 +200,28 @@ fn safe_env_segment(env_id: &EnvId) -> Result<&str, StoreError> {
     Ok(s)
 }
 
+/// The env-id binding + schema discriminator check every sidecar shares.
+fn check_sidecar_identity(
+    env_id: &EnvId,
+    recorded: &EnvId,
+    schema: &str,
+    expected: &'static str,
+) -> Result<(), StoreError> {
+    if recorded != env_id {
+        return Err(StoreError::EnvIdMismatch {
+            file: env_id.clone(),
+            value: recorded.clone(),
+        });
+    }
+    if schema != expected {
+        return Err(StoreError::Spec(SpecError::SchemaMismatch {
+            expected,
+            actual: schema.to_string(),
+        }));
+    }
+    Ok(())
+}
+
 /// Local-FS persistence contract.
 ///
 /// All methods are synchronous. Wrap in `tokio::task::spawn_blocking` at call
@@ -314,6 +339,64 @@ impl LocalFsStore {
         let target = self.update_channel_path(&cfg.environment_id)?;
         copy_to_backup(&target, &self.backups_dir(&cfg.environment_id)?)?;
         atomic_write_json(&target, cfg)?;
+        Ok(())
+    }
+
+    /// `<env_dir>/sor-units.json` — the SoR units `op env apply` last declared.
+    fn sor_units_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("sor-units.json"))
+    }
+
+    /// `<env_dir>/sor-units.applied.json` — the reconcile-owned ledger.
+    fn sor_ledger_path(&self, env_id: &EnvId) -> Result<PathBuf, StoreError> {
+        Ok(self.env_dir(env_id)?.join("sor-units.applied.json"))
+    }
+
+    /// The declared SoR units. Absent file → none declared.
+    pub fn load_sor_units(&self, env_id: &EnvId) -> Result<Vec<SorUnit>, StoreError> {
+        let path = self.sor_units_path(env_id)?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let doc: SorUnitsDoc = self.read_json(&path)?;
+        check_sidecar_identity(env_id, &doc.environment_id, &doc.schema, SOR_UNITS_V1)?;
+        Ok(doc.units)
+    }
+
+    /// The applied ledger. Absent file → nothing recorded.
+    pub fn load_sor_ledger(&self, env_id: &EnvId) -> Result<Vec<AppliedSorUnit>, StoreError> {
+        let path = self.sor_ledger_path(env_id)?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let doc: SorLedgerDoc = self.read_json(&path)?;
+        check_sidecar_identity(env_id, &doc.environment_id, &doc.schema, SOR_LEDGER_V1)?;
+        Ok(doc.units)
+    }
+
+    /// Caller holds the env flock (via [`Locked`]).
+    fn save_sor_units_locked(&self, env_id: &EnvId, units: &[SorUnit]) -> Result<(), StoreError> {
+        let doc = SorUnitsDoc {
+            schema: SOR_UNITS_V1.to_string(),
+            environment_id: env_id.clone(),
+            units: units.to_vec(),
+        };
+        atomic_write_json(&self.sor_units_path(env_id)?, &doc)?;
+        Ok(())
+    }
+
+    /// Caller holds the env flock (via [`Locked`]).
+    fn save_sor_ledger_locked(
+        &self,
+        env_id: &EnvId,
+        units: &[AppliedSorUnit],
+    ) -> Result<(), StoreError> {
+        let doc = SorLedgerDoc {
+            schema: SOR_LEDGER_V1.to_string(),
+            environment_id: env_id.clone(),
+            units: units.to_vec(),
+        };
+        atomic_write_json(&self.sor_ledger_path(env_id)?, &doc)?;
         Ok(())
     }
 
@@ -1073,6 +1156,22 @@ impl<'a> Locked<'a> {
             });
         }
         self.store.save_update_channel_locked(cfg)
+    }
+
+    pub fn load_sor_units(&self) -> Result<Vec<SorUnit>, StoreError> {
+        self.store.load_sor_units(&self.env_id)
+    }
+
+    pub fn save_sor_units(&self, units: &[SorUnit]) -> Result<(), StoreError> {
+        self.store.save_sor_units_locked(&self.env_id, units)
+    }
+
+    pub fn load_sor_ledger(&self) -> Result<Vec<AppliedSorUnit>, StoreError> {
+        self.store.load_sor_ledger(&self.env_id)
+    }
+
+    pub fn save_sor_ledger(&self, units: &[AppliedSorUnit]) -> Result<(), StoreError> {
+        self.store.save_sor_ledger_locked(&self.env_id, units)
     }
 
     pub fn load_pack_answers(&self, slot: CapabilitySlot) -> Result<Option<Value>, StoreError> {

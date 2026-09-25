@@ -865,6 +865,20 @@ pub fn reconcile(
     // resolves `secret://` refs against — dev-store (values shipped in via the
     // Secret above) or Vault (pod identity + `VAULT_*` env, no values shipped).
     let secrets_backend = resolve_secrets_backend(store, &env)?;
+    // SoR units (SoRLa storage phase 3): resolved, and refused if unworkable,
+    // before any cluster call; their route documents are written
+    // mid-reconcile, after the SoRs are Available and before any worker rolls.
+    // An env with no SoR units never parses the answers here, so it fails
+    // exactly where and how it did before SoR units existed.
+    let prepared = super::env_sor::prepare(store, &env, answers.as_ref(), &secrets_backend)?;
+    // The publisher exists only when there is a SoR phase to publish for.
+    let publisher = prepared
+        .as_ref()
+        .map(|_| super::env_sor::StoreRoutePublisher::new(store, &env));
+    let sor = prepared
+        .as_ref()
+        .zip(publisher.as_ref())
+        .map(|(p, publisher)| p.as_reconcile(publisher));
     let report = reconcile_k8s_cluster(
         &env,
         answers.as_ref(),
@@ -872,35 +886,67 @@ pub fn reconcile(
         dev_secrets,
         secrets_backend,
         false,
+        sor.as_ref(),
     )?;
+    if let Some(prepared) = &prepared {
+        super::env_sor::record_applied(store, &env_id, prepared)?;
+    }
 
     Ok(OpOutcome::new(
         NOUN,
         "reconcile",
-        json!({
-            "environment_id": env.environment_id.as_str(),
-            "kind": descriptor.as_str(),
-            "answers_ref": answers_ref_wire,
-            // Identity the cluster was mutated as: "bound" = the env's
-            // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
-            // the CLI's kubeconfig / in-cluster identity (no bound credential).
-            // Surfaced so a live mutation is never silent about which identity
-            // it ran as.
-            "identity": identity,
-            "applied_count": report.applied.len(),
-            "pruned_count": report.pruned.len(),
-            "applied": report.applied,
-            "pruned": report.pruned,
-            // Where the router is reachable from outside the cluster, for an
-            // env whose `service_type` answer asked to be exposed. Absent
-            // (`null`, dropped by `skip_serializing_if`) for the default
-            // `ClusterIP`, so a reconcile that never answered `service_type`
-            // emits exactly the fields it emitted before this shipped. A
-            // present value distinguishes an assigned address from one still
-            // being provisioned — see `RouterAddress`.
-            "router_address": report.router_address,
-        }),
+        reconcile_result_json(
+            &env,
+            descriptor.as_str(),
+            &answers_ref_wire,
+            identity,
+            &report,
+        ),
     ))
+}
+
+/// The `op env reconcile` result object. `sor_units` appears only when the
+/// env has SoR units, so every other env's output is unchanged; each entry is
+/// `{unit_id, sor, service, url, ready}` and never carries a secret value.
+fn reconcile_result_json(
+    env: &Environment,
+    kind: &str,
+    answers_ref_wire: &Value,
+    identity: &str,
+    report: &crate::env_packs::k8s::ReconcileReport,
+) -> Value {
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": kind,
+        "answers_ref": answers_ref_wire,
+        // Identity the cluster was mutated as: "bound" = the env's
+        // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
+        // the CLI's kubeconfig / in-cluster identity (no bound credential).
+        // Surfaced so a live mutation is never silent about which identity
+        // it ran as.
+        "identity": identity,
+        "applied_count": report.applied.len(),
+        "pruned_count": report.pruned.len(),
+        "applied": report.applied,
+        "pruned": report.pruned,
+        // Where the router is reachable from outside the cluster, for an
+        // env whose `service_type` answer asked to be exposed. Absent
+        // (`null`, dropped by `skip_serializing_if`) for the default
+        // `ClusterIP`, so a reconcile that never answered `service_type`
+        // emits exactly the fields it emitted before this shipped. A
+        // present value distinguishes an assigned address from one still
+        // being provisioned — see `RouterAddress`.
+        "router_address": report.router_address,
+    });
+    if !report.sor_units.is_empty() {
+        result["sor_units"] = json!(report.sor_units);
+    }
+    // Stale SoR inputs outside their unit's own segment are never deleted;
+    // named here (paths only) so an operator can remove them by hand.
+    if !report.sor_skipped_input_refs.is_empty() {
+        result["sor_skipped_input_refs"] = json!(report.sor_skipped_input_refs);
+    }
+    result
 }
 
 /// Connect to the cluster (binding's `kubeconfig_context`, with `bound_token`
@@ -914,6 +960,7 @@ pub(crate) fn reconcile_k8s_cluster(
     dev_secrets: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     wait_for_rollout: bool,
+    sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -941,7 +988,7 @@ pub(crate) fn reconcile_k8s_cluster(
         )
         .with_secrets_backend(secrets_backend);
         handler
-            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout)
+            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout, sor)
             .await
             .map_err(|e| OpError::Conflict(e.to_string()))
     })
@@ -956,6 +1003,7 @@ pub(crate) fn reconcile_k8s_cluster(
     _dev_secrets: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     _wait_for_rollout: bool,
+    _sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -1034,7 +1082,9 @@ fn staging_excluded_uris(env: &Environment) -> Vec<String> {
 /// Any control-plane material (`staging_excluded_uris`) is hard-excluded from
 /// the returned bytes via a filtered copy, so the staged seed cannot resolve the
 /// bound deployer credential even with the shared dev master key. The operator's
-/// on-disk store is never modified.
+/// on-disk store is never modified. Every SoR input — each declared unit's,
+/// and each one the applied ledger records for a retired or re-pointed unit —
+/// is excluded the same way (see `env_sor::sor_input_uris`).
 ///
 /// **Concurrency.** The exclusion is derived from a fresh env load and the
 /// dev-store is snapshotted inside a single `store.transact` critical section,
@@ -1061,7 +1111,18 @@ pub(crate) fn read_dev_secrets_bytes(
         let env = locked
             .load()
             .map_err(|e| OpError::Conflict(format!("reloading env for staging: {e}")))?;
-        let exclude = staging_excluded_uris(&env);
+        let mut exclude = staging_excluded_uris(&env);
+        let sor_units = locked
+            .load_sor_units()
+            .map_err(|e| OpError::Conflict(format!("reading SoR units for staging: {e}")))?;
+        let sor_ledger = locked
+            .load_sor_ledger()
+            .map_err(|e| OpError::Conflict(format!("reading the SoR ledger for staging: {e}")))?;
+        exclude.extend(super::env_sor::sor_input_uris(
+            env_id,
+            &sor_units,
+            &sor_ledger,
+        ));
 
         // A dev-store file may not exist yet — guarded no-op (a missing file
         // stages nothing; the worker's staging init is then a no-op).
@@ -4965,6 +5026,141 @@ mod tests {
         assert!(outcome.result.get("input_schema").is_some());
     }
 
+    /// `op env render` does not show SoR objects (amendment 6), and nothing a
+    /// SoR unit reads — its inputs or its route document — reaches its output.
+    #[test]
+    fn render_shows_no_sor_object_and_no_sor_secret_value() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let env_id = EnvId::try_from("zain").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            "greentic.secrets.dev-store@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let render_now = || {
+            render(
+                &store,
+                &builtins(),
+                &OpFlags::default(),
+                render_args("zain", None, None),
+            )
+            .unwrap()
+            .result
+        };
+        let before = render_now();
+        let mut unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        unit.postgres_ca_ref = Some("default/_/sor-landlord/postgres_ca".into());
+        crate::cli::env_sor::set_sor_units(&store, &env_id, std::slice::from_ref(&unit)).unwrap();
+        let kind = crate::cli::secrets::DEV_STORE_KIND_PATH;
+        for rel in unit.input_refs() {
+            crate::cli::secrets::put_env_secret(
+                &store,
+                &env,
+                &env_id,
+                kind,
+                rel,
+                "SOR-INPUT-SECRET",
+            )
+            .unwrap();
+        }
+        crate::cli::secrets::put_env_secret(
+            &store,
+            &env,
+            &env_id,
+            kind,
+            "default/_/sorla/landlord-tenant-sor",
+            r#"{"token":"ROUTE-TOKEN-SECRET"}"#,
+        )
+        .unwrap();
+
+        let after = render_now();
+        let text = serde_json::to_string(&after).unwrap();
+        for needle in [
+            "gtc-sor",
+            "landlord",
+            "sorx",
+            "SOR-INPUT-SECRET",
+            "ROUTE-TOKEN-SECRET",
+        ] {
+            assert!(!text.contains(needle), "render leaked `{needle}`");
+        }
+        assert_eq!(
+            before, after,
+            "declaring a SoR unit changes nothing `op env render` shows"
+        );
+    }
+
+    #[test]
+    fn the_reconcile_envelope_lists_sor_units_only_when_there_are_some() {
+        use crate::env_packs::k8s::{ReconcileReport, SorUnitStatus};
+        let env = make_env("local");
+        let mut report = ReconcileReport::default();
+        let plain = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert!(
+            plain.get("sor_units").is_none(),
+            "byte-identical for an env without SoR units"
+        );
+        assert_eq!(
+            plain,
+            json!({
+                "environment_id": "local",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "answers_ref": null,
+                "identity": "ambient",
+                "applied_count": 0,
+                "pruned_count": 0,
+                "applied": [],
+                "pruned": [],
+                "router_address": null,
+            }),
+            "every pre-existing key is unchanged"
+        );
+        report.sor_units.push(SorUnitStatus {
+            unit_id: "landlord".into(),
+            sor: "landlord-tenant-sor".into(),
+            service: "gtc-sor-landlord".into(),
+            url: "http://gtc-sor-landlord.gtc-local.svc.cluster.local:8787".into(),
+            ready: true,
+        });
+        let with = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert_eq!(with["sor_units"][0]["unit_id"], "landlord");
+        assert_eq!(with["sor_units"][0]["ready"], true);
+        let entry = with["sor_units"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["ready", "service", "sor", "unit_id", "url"]);
+        assert!(with.get("sor_skipped_input_refs").is_none());
+
+        report.sor_skipped_input_refs = vec!["default/_/worker/api_token".into()];
+        let skipped = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert_eq!(
+            skipped["sor_skipped_input_refs"],
+            json!(["default/_/worker/api_token"]),
+            "a stale ref reconcile would not delete is named by path"
+        );
+    }
+
     // -- reconcile ----------------------------------------------------------
 
     use crate::cli::dispatch::EnvReconcileArgs;
@@ -5596,6 +5792,60 @@ mod tests {
         match err {
             OpError::Conflict(msg) => assert!(msg.contains("bound to deployer"), "{msg}"),
             other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
+    }
+
+    /// An env with no SoR units must fail on bad deployer answers exactly as it
+    /// did before SoR units existed: through the cluster path as a `Conflict`,
+    /// never the SoR preparation's `invalid-argument`. With a SoR unit
+    /// declared, the namespace IS resolved up front and the answers refused.
+    #[test]
+    fn reconcile_without_sor_units_keeps_the_pre_sor_answers_error() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        binding.answers_ref = Some(PathBuf::from("env-packs/deployer/answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        let env_dir = store.env_dir(&env.environment_id).unwrap();
+        std::fs::create_dir_all(env_dir.join("env-packs/deployer")).unwrap();
+        // An invalid namespace, and a kubeconfig context that cannot exist, so
+        // the cluster path fails without any network call.
+        std::fs::write(
+            env_dir.join("env-packs/deployer/answers.json"),
+            r#"{"namespace": "NOT_A_DNS_LABEL", "kubeconfig_context": "no-such-context-sor-f2"}"#,
+        )
+        .unwrap();
+
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match &err {
+            OpError::Conflict(msg) => assert!(!msg.contains("invalid deployer answers"), "{msg}"),
+            other => panic!("expected the pre-SoR Conflict, got {other:?}"),
+        }
+
+        let unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        crate::cli::env_sor::set_sor_units(&store, &env.environment_id, &[unit]).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match &err {
+            OpError::InvalidArgument(msg) => {
+                assert!(msg.contains("invalid deployer answers"), "{msg}")
+            }
+            other => panic!("expected invalid-argument with a SoR unit, got {other:?}"),
         }
     }
 
@@ -6314,6 +6564,50 @@ mod tests {
             excluded.iter().filter(|u| **u == uri).count(),
             1,
             "the same store URI must appear once, not once per source"
+        );
+    }
+
+    #[test]
+    fn the_worker_seed_excludes_every_sor_input_but_keeps_the_route_document() {
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let mut unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        unit.postgres_ca_ref = Some("default/_/sor-landlord/postgres_ca".into());
+        crate::cli::env_sor::set_sor_units(&store, &env_id, std::slice::from_ref(&unit)).unwrap();
+        let kind = crate::cli::secrets::DEV_STORE_KIND_PATH;
+        for rel in unit.input_refs() {
+            crate::cli::secrets::put_env_secret(&store, &env, &env_id, kind, rel, "SOR-INPUT")
+                .unwrap();
+        }
+        let route = "default/_/sorla/landlord-tenant-sor";
+        crate::cli::secrets::put_env_secret(&store, &env, &env_id, kind, route, "{\"url\":\"u\"}")
+            .unwrap();
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a seed");
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let read = |uri: &str| -> Result<Vec<u8>, ()> {
+            let dev = DevStore::with_path(staged_path.clone()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { dev.get(uri).await.map_err(|_| ()) })
+        };
+        for rel in unit.input_refs() {
+            let uri = crate::cli::secrets::dev_store_key(&env_id, rel);
+            assert!(read(&uri).is_err(), "`{rel}` must not reach any worker");
+        }
+        assert!(
+            read(&crate::cli::secrets::dev_store_key(&env_id, route)).is_ok(),
+            "the route document is exactly what the workers need"
         );
     }
 
