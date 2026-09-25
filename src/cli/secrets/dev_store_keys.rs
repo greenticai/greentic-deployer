@@ -176,9 +176,10 @@ fn list_keys_in_existing_store(
     env_id: &EnvId,
     prefix: &DevStorePrefix,
 ) -> Result<Vec<StoredKey>, OpError> {
-    // The env segment is decided by the ONE shared derivation (`mcp`/`a2a` live
-    // under `default`, everything else under the env id), so a listing looks in
-    // exactly the scope a put writes to. The probe name is never looked up.
+    // The env segment is decided by the ONE shared derivation (`mcp`/`a2a`/
+    // `sorla` live under `default`, everything else under the env id), so a
+    // listing looks in exactly the scope a put writes to. The probe name is
+    // never looked up.
     let probe_rel = format!(
         "{}/{}/{}/probe",
         prefix.tenant, prefix.team, prefix.category

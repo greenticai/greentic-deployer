@@ -115,13 +115,13 @@ fn is_verbatim_category_rel_path(rel_path: &str) -> bool {
 ///
 /// greentic-runner reads it at `secrets://default/<tenant>/_/llm/<ref>`
 /// (`resolve_in_process_llm_key`) — the `default` env segment is hardcoded
-/// there, exactly as it is for `mcp`. Unlike `mcp`/`a2a` the NAME is not
-/// verbatim: greentic-start's reader carve-out covers only those two, so it
-/// canonicalizes an `llm` name before lookup, and the ordinary canonical-name
-/// validation below is what makes the write land on that same key. Only the
-/// env segment differs from an ordinary key, and it is the whole defect: keyed
-/// by the environment id, every staged LLM key sat one segment away from the
-/// read and the agent ran with no key at all.
+/// there, exactly as it is for `mcp`. Unlike `mcp`/`a2a`/`sorla` the NAME is
+/// not verbatim: greentic-start's reader carve-out covers only those three,
+/// so it canonicalizes an `llm` name before lookup, and the ordinary
+/// canonical-name validation below is what makes the write land on that same
+/// key. Only the env segment differs from an ordinary key, and it is the
+/// whole defect: keyed by the environment id, every staged LLM key sat one
+/// segment away from the read and the agent ran with no key at all.
 const LLM_CATEGORY: &str = "llm";
 
 /// Whether `rel_path` names the `llm` category (pack position only, like
