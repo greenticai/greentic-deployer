@@ -1496,6 +1496,8 @@ fn remote_reconcile(
         None,
         secrets_backend,
         false,
+        // A remote store carries no sor-units.json sidecar (amendment 6).
+        None,
     )?;
 
     Ok(OpOutcome::new(

@@ -186,6 +186,39 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_postgres_ca_is_read_and_a_missing_one_is_refused_by_its_ref() {
+        let mut with_ca = unit();
+        with_ca.postgres_ca_ref = Some("default/_/sor-landlord/postgres_ca".into());
+
+        let mut values = all_inputs();
+        values.push((
+            "default/_/sor-landlord/postgres_ca",
+            "-----BEGIN CA-SECRET-----",
+        ));
+        let (_d, store, env) = seeded(&values);
+        let renders = resolve_sor_inputs(&store, &env, std::slice::from_ref(&with_ca)).unwrap();
+        assert_eq!(
+            renders[0]
+                .inputs
+                .postgres_ca
+                .as_ref()
+                .map(SecretValue::expose),
+            Some("-----BEGIN CA-SECRET-----")
+        );
+
+        let (_d2, store, env) = seeded(&all_inputs());
+        let msg = resolve_sor_inputs(&store, &env, std::slice::from_ref(&with_ca))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("postgres_ca_ref"), "{msg}");
+        assert!(msg.contains("default/_/sor-landlord/postgres_ca"), "{msg}");
+        assert!(
+            !msg.contains("CA-SECRET") && !msg.contains("pw-SECRET"),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn a_missing_input_names_the_unit_and_the_ref_never_a_value() {
         let (_d, store, env) = seeded(&all_inputs()[..2]);
         let msg = resolve_sor_inputs(&store, &env, &[unit()])

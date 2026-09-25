@@ -590,6 +590,22 @@ pub(super) fn get_env_secret(
     }
 }
 
+/// Delete one key from the env's dev store. `Ok(false)` when it (or the store
+/// file) was absent. Dev-store only — the only backend with a delete. The
+/// store file resolves exactly as `put`/`get` resolve it.
+pub(super) fn delete_env_secret(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    rel_path: &str,
+) -> Result<bool, OpError> {
+    validate_dev_store_secret_path(rel_path)?;
+    let dev_path = env_dev_store_path(store, env_id)?;
+    if !dev_path.exists() {
+        return Ok(false);
+    }
+    dev_store_keys::delete_key(&dev_path, &dev_store_key(env_id, rel_path))
+}
+
 /// Build the `get` outcome body: identity fields + a `present` flag, plus the
 /// decrypted value only when `reveal` is set (so a non-revealing `get` never
 /// puts material into logs/audit). `extra` carries the backend-specific field

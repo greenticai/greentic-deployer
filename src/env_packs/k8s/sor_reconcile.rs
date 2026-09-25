@@ -70,7 +70,11 @@ pub struct RouteDocument {
 pub trait SorRoutePublisher: Send + Sync {
     /// Write every route document (bare name), delete the documents of
     /// `retired_sors`, and return the env's dev-store seed as it stands after
-    /// both (base64; `None` when no store file exists).
+    /// both (base64).
+    ///
+    /// `None` means "there is no store file" and renders an EMPTY dev-store
+    /// Secret — it never means "nothing changed". An implementation that
+    /// skipped every write must still return `Some(seed)` when the file exists.
     fn publish(
         &self,
         routes: &[RouteDocument],

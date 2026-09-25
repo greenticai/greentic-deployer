@@ -865,6 +865,16 @@ pub fn reconcile(
     // resolves `secret://` refs against — dev-store (values shipped in via the
     // Secret above) or Vault (pod identity + `VAULT_*` env, no values shipped).
     let secrets_backend = resolve_secrets_backend(store, &env)?;
+    // SoR units (SoRLa storage phase 3): resolved, and refused if unworkable,
+    // before any cluster call; their route documents are written
+    // mid-reconcile, after the SoRs are Available and before any worker rolls.
+    let namespace =
+        crate::env_packs::k8s::manifests::K8sParams::from_answers(&env, answers.as_ref())
+            .map_err(|e| OpError::InvalidArgument(format!("invalid deployer answers: {e}")))?
+            .namespace;
+    let prepared = super::env_sor::prepare(store, &env, &namespace, &secrets_backend)?;
+    let publisher = super::env_sor::StoreRoutePublisher::new(store, &env);
+    let sor = prepared.as_ref().map(|p| p.as_reconcile(&publisher));
     let report = reconcile_k8s_cluster(
         &env,
         answers.as_ref(),
@@ -872,35 +882,62 @@ pub fn reconcile(
         dev_secrets,
         secrets_backend,
         false,
+        sor.as_ref(),
     )?;
+    if let Some(prepared) = &prepared {
+        super::env_sor::record_applied(store, &env_id, prepared)?;
+    }
 
     Ok(OpOutcome::new(
         NOUN,
         "reconcile",
-        json!({
-            "environment_id": env.environment_id.as_str(),
-            "kind": descriptor.as_str(),
-            "answers_ref": answers_ref_wire,
-            // Identity the cluster was mutated as: "bound" = the env's
-            // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
-            // the CLI's kubeconfig / in-cluster identity (no bound credential).
-            // Surfaced so a live mutation is never silent about which identity
-            // it ran as.
-            "identity": identity,
-            "applied_count": report.applied.len(),
-            "pruned_count": report.pruned.len(),
-            "applied": report.applied,
-            "pruned": report.pruned,
-            // Where the router is reachable from outside the cluster, for an
-            // env whose `service_type` answer asked to be exposed. Absent
-            // (`null`, dropped by `skip_serializing_if`) for the default
-            // `ClusterIP`, so a reconcile that never answered `service_type`
-            // emits exactly the fields it emitted before this shipped. A
-            // present value distinguishes an assigned address from one still
-            // being provisioned — see `RouterAddress`.
-            "router_address": report.router_address,
-        }),
+        reconcile_result_json(
+            &env,
+            descriptor.as_str(),
+            &answers_ref_wire,
+            identity,
+            &report,
+        ),
     ))
+}
+
+/// The `op env reconcile` result object. `sor_units` appears only when the
+/// env has SoR units, so every other env's output is unchanged; each entry is
+/// `{unit_id, sor, service, url, ready}` and never carries a secret value.
+fn reconcile_result_json(
+    env: &Environment,
+    kind: &str,
+    answers_ref_wire: &Value,
+    identity: &str,
+    report: &crate::env_packs::k8s::ReconcileReport,
+) -> Value {
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": kind,
+        "answers_ref": answers_ref_wire,
+        // Identity the cluster was mutated as: "bound" = the env's
+        // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
+        // the CLI's kubeconfig / in-cluster identity (no bound credential).
+        // Surfaced so a live mutation is never silent about which identity
+        // it ran as.
+        "identity": identity,
+        "applied_count": report.applied.len(),
+        "pruned_count": report.pruned.len(),
+        "applied": report.applied,
+        "pruned": report.pruned,
+        // Where the router is reachable from outside the cluster, for an
+        // env whose `service_type` answer asked to be exposed. Absent
+        // (`null`, dropped by `skip_serializing_if`) for the default
+        // `ClusterIP`, so a reconcile that never answered `service_type`
+        // emits exactly the fields it emitted before this shipped. A
+        // present value distinguishes an assigned address from one still
+        // being provisioned — see `RouterAddress`.
+        "router_address": report.router_address,
+    });
+    if !report.sor_units.is_empty() {
+        result["sor_units"] = json!(report.sor_units);
+    }
+    result
 }
 
 /// Connect to the cluster (binding's `kubeconfig_context`, with `bound_token`
@@ -914,6 +951,7 @@ pub(crate) fn reconcile_k8s_cluster(
     dev_secrets: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     wait_for_rollout: bool,
+    sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -941,7 +979,7 @@ pub(crate) fn reconcile_k8s_cluster(
         )
         .with_secrets_backend(secrets_backend);
         handler
-            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout, None)
+            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout, sor)
             .await
             .map_err(|e| OpError::Conflict(e.to_string()))
     })
@@ -956,6 +994,7 @@ pub(crate) fn reconcile_k8s_cluster(
     _dev_secrets: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     _wait_for_rollout: bool,
+    _sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -4968,6 +5007,126 @@ mod tests {
         };
         let outcome = render(&store, &reg, &flags, render_args("zain", None, None)).unwrap();
         assert!(outcome.result.get("input_schema").is_some());
+    }
+
+    /// `op env render` does not show SoR objects (amendment 6), and nothing a
+    /// SoR unit reads — its inputs or its route document — reaches its output.
+    #[test]
+    fn render_shows_no_sor_object_and_no_sor_secret_value() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let env_id = EnvId::try_from("zain").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            "greentic.secrets.dev-store@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let render_now = || {
+            render(
+                &store,
+                &builtins(),
+                &OpFlags::default(),
+                render_args("zain", None, None),
+            )
+            .unwrap()
+            .result
+        };
+        let before = render_now();
+        let mut unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        unit.postgres_ca_ref = Some("default/_/sor-landlord/postgres_ca".into());
+        crate::cli::env_sor::set_sor_units(&store, &env_id, std::slice::from_ref(&unit)).unwrap();
+        let kind = crate::cli::secrets::DEV_STORE_KIND_PATH;
+        for rel in unit.input_refs() {
+            crate::cli::secrets::put_env_secret(
+                &store,
+                &env,
+                &env_id,
+                kind,
+                rel,
+                "SOR-INPUT-SECRET",
+            )
+            .unwrap();
+        }
+        crate::cli::secrets::put_env_secret(
+            &store,
+            &env,
+            &env_id,
+            kind,
+            "default/_/sorla/landlord-tenant-sor",
+            r#"{"token":"ROUTE-TOKEN-SECRET"}"#,
+        )
+        .unwrap();
+
+        let after = render_now();
+        let text = serde_json::to_string(&after).unwrap();
+        for needle in [
+            "gtc-sor",
+            "landlord",
+            "sorx",
+            "SOR-INPUT-SECRET",
+            "ROUTE-TOKEN-SECRET",
+        ] {
+            assert!(!text.contains(needle), "render leaked `{needle}`");
+        }
+        assert_eq!(
+            before, after,
+            "declaring a SoR unit changes nothing `op env render` shows"
+        );
+    }
+
+    #[test]
+    fn the_reconcile_envelope_lists_sor_units_only_when_there_are_some() {
+        use crate::env_packs::k8s::{ReconcileReport, SorUnitStatus};
+        let env = make_env("local");
+        let mut report = ReconcileReport::default();
+        let plain = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert!(
+            plain.get("sor_units").is_none(),
+            "byte-identical for an env without SoR units"
+        );
+        assert_eq!(
+            plain,
+            json!({
+                "environment_id": "local",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "answers_ref": null,
+                "identity": "ambient",
+                "applied_count": 0,
+                "pruned_count": 0,
+                "applied": [],
+                "pruned": [],
+                "router_address": null,
+            }),
+            "every pre-existing key is unchanged"
+        );
+        report.sor_units.push(SorUnitStatus {
+            unit_id: "landlord".into(),
+            sor: "landlord-tenant-sor".into(),
+            service: "gtc-sor-landlord".into(),
+            url: "http://gtc-sor-landlord.gtc-local.svc.cluster.local:8787".into(),
+            ready: true,
+        });
+        let with = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert_eq!(with["sor_units"][0]["unit_id"], "landlord");
+        assert_eq!(with["sor_units"][0]["ready"], true);
+        let entry = with["sor_units"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["ready", "service", "sor", "unit_id", "url"]);
     }
 
     // -- reconcile ----------------------------------------------------------

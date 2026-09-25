@@ -322,13 +322,7 @@ pub(crate) fn up(
         })
     };
 
-    let mut result = json!({
-        "environment_id": env_id.as_str(),
-        "applied_count": report.applied.len(),
-        "pruned_count": report.pruned.len(),
-        "applied": report.applied,
-        "pruned": report.pruned,
-    });
+    let mut result = up_result_json(&env_id, &report);
     if let Some(vault) = &vault_report {
         result["vault"] = json!({
             "namespace": vault.namespace,
@@ -342,6 +336,26 @@ pub(crate) fn up(
     }
 
     Ok((OpOutcome::new(NOUN, "up", result), forward))
+}
+
+/// The `op env up` result object before any Vault block. `sor_units` appears
+/// only when the env has SoR units (`{unit_id, sor, service, url, ready}`,
+/// never a secret value), so every other env's output is unchanged.
+fn up_result_json(
+    env_id: &greentic_deploy_spec::EnvId,
+    report: &crate::env_packs::k8s::ReconcileReport,
+) -> serde_json::Value {
+    let mut result = json!({
+        "environment_id": env_id.as_str(),
+        "applied_count": report.applied.len(),
+        "pruned_count": report.pruned.len(),
+        "applied": report.applied,
+        "pruned": report.pruned,
+    });
+    if !report.sor_units.is_empty() {
+        result["sor_units"] = json!(report.sor_units);
+    }
+    result
 }
 
 /// Whether THIS build can converge the effective `op env up` deployer, or must
@@ -436,11 +450,24 @@ fn reconcile_phase(
     let (answers, _wire) = super::env::load_render_answers(store, &env, &descriptor)?;
     let answers = merge_kubeconfig_context(answers, ctx)?;
 
+    // The ONE namespace for this phase — validated by the same parser the
+    // renderer uses (explicit answer wins, otherwise `gtc-<env_id>`); the SoR
+    // ledger and the port-forward both key on it.
+    let namespace =
+        crate::env_packs::k8s::manifests::K8sParams::from_answers(&env, answers.as_ref())
+            .map_err(|e| OpError::InvalidArgument(format!("invalid deployer answers: {e}")))?
+            .namespace;
+
     let bound_token =
         crate::env_packs::k8s::resolve_bound_identity(store, &env, env_id, answers.as_ref())?;
     let dev_secrets = super::env::read_dev_secrets_b64(store, env_id)?;
     let secrets_backend = super::env::resolve_secrets_backend(store, &env)?;
 
+    // SoR units: refused-if-unworkable before any cluster call, route
+    // documents written mid-reconcile (see `env reconcile`).
+    let prepared = super::env_sor::prepare(store, &env, &namespace, &secrets_backend)?;
+    let publisher = super::env_sor::StoreRoutePublisher::new(store, &env);
+    let sor = prepared.as_ref().map(|p| p.as_reconcile(&publisher));
     let report = super::env::reconcile_k8s_cluster(
         &env,
         answers.as_ref(),
@@ -448,16 +475,11 @@ fn reconcile_phase(
         dev_secrets,
         secrets_backend,
         true,
+        sor.as_ref(),
     )?;
-
-    // Derive the namespace from the answers (same logic the renderer uses):
-    // explicit answer wins, otherwise `gtc-<env_id>`.
-    let namespace = answers
-        .as_ref()
-        .and_then(|a| a.get("namespace"))
-        .and_then(Value::as_str)
-        .map(String::from)
-        .unwrap_or_else(|| crate::env_packs::k8s::manifests::namespace_for_env(env_id));
+    if let Some(prepared) = &prepared {
+        super::env_sor::record_applied(store, env_id, prepared)?;
+    }
 
     Ok((report, namespace))
 }
@@ -1449,6 +1471,38 @@ fn preflight_detail(outcome: &crate::tool_check::ToolCheckOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_up_result_lists_sor_units_only_when_there_are_some() {
+        use crate::env_packs::k8s::{ReconcileReport, SorUnitStatus};
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        let mut report = ReconcileReport::default();
+        let plain = up_result_json(&env_id, &report);
+        assert_eq!(
+            plain,
+            json!({
+                "environment_id": "local",
+                "applied_count": 0,
+                "pruned_count": 0,
+                "applied": [],
+                "pruned": [],
+            }),
+            "unchanged for an env without SoR units"
+        );
+        report.sor_units.push(SorUnitStatus {
+            unit_id: "landlord".into(),
+            sor: "landlord-tenant-sor".into(),
+            service: "gtc-sor-landlord".into(),
+            url: "http://gtc-sor-landlord.gtc-local.svc.cluster.local:8787".into(),
+            ready: true,
+        });
+        let with = up_result_json(&env_id, &report);
+        let entry = with["sor_units"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["ready", "service", "sor", "unit_id", "url"]);
+        assert_eq!(with["sor_units"][0]["unit_id"], "landlord");
+    }
 
     #[test]
     fn kind_cluster_exists_exact_match() {
