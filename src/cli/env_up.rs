@@ -466,8 +466,14 @@ fn reconcile_phase(
     // SoR units: refused-if-unworkable before any cluster call, route
     // documents written mid-reconcile (see `env reconcile`).
     let prepared = super::env_sor::prepare(store, &env, &namespace, &secrets_backend)?;
-    let publisher = super::env_sor::StoreRoutePublisher::new(store, &env);
-    let sor = prepared.as_ref().map(|p| p.as_reconcile(&publisher));
+    // The publisher exists only when there is a SoR phase to publish for.
+    let publisher = prepared
+        .as_ref()
+        .map(|_| super::env_sor::StoreRoutePublisher::new(store, &env));
+    let sor = prepared
+        .as_ref()
+        .zip(publisher.as_ref())
+        .map(|(p, publisher)| p.as_reconcile(publisher));
     let report = super::env::reconcile_k8s_cluster(
         &env,
         answers.as_ref(),

@@ -873,8 +873,14 @@ pub fn reconcile(
             .map_err(|e| OpError::InvalidArgument(format!("invalid deployer answers: {e}")))?
             .namespace;
     let prepared = super::env_sor::prepare(store, &env, &namespace, &secrets_backend)?;
-    let publisher = super::env_sor::StoreRoutePublisher::new(store, &env);
-    let sor = prepared.as_ref().map(|p| p.as_reconcile(&publisher));
+    // The publisher exists only when there is a SoR phase to publish for.
+    let publisher = prepared
+        .as_ref()
+        .map(|_| super::env_sor::StoreRoutePublisher::new(store, &env));
+    let sor = prepared
+        .as_ref()
+        .zip(publisher.as_ref())
+        .map(|(p, publisher)| p.as_reconcile(publisher));
     let report = reconcile_k8s_cluster(
         &env,
         answers.as_ref(),

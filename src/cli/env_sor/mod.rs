@@ -233,7 +233,7 @@ mod tests {
     fn nothing_declared_and_nothing_recorded_means_no_sor_phase() {
         let (_d, store, env) = seeded_with(&[]);
         assert!(
-            prepare(&store, &env, "gtc-local", &SecretsBackend::DevStore)
+            prepare_with_override(&store, &env, "gtc-local", &SecretsBackend::DevStore, None)
                 .unwrap()
                 .is_none()
         );
@@ -247,9 +247,10 @@ mod tests {
                 l.save_sor_ledger(&[applied("a", "gtc-local")])
             })
             .unwrap();
-        let prepared = prepare(&store, &env, "gtc-local", &SecretsBackend::DevStore)
-            .unwrap()
-            .unwrap();
+        let prepared =
+            prepare_with_override(&store, &env, "gtc-local", &SecretsBackend::DevStore, None)
+                .unwrap()
+                .unwrap();
         assert_eq!(
             store.load_sor_ledger(&env.environment_id).unwrap(),
             vec![applied("a", "gtc-local"), applied("b", "gtc-local")],
@@ -272,9 +273,10 @@ mod tests {
                 l.save_sor_ledger(&[applied("b", "gtc-old")])
             })
             .unwrap();
-        let prepared = prepare(&store, &env, "gtc-new", &SecretsBackend::DevStore)
-            .unwrap()
-            .unwrap();
+        let prepared =
+            prepare_with_override(&store, &env, "gtc-new", &SecretsBackend::DevStore, None)
+                .unwrap()
+                .unwrap();
         assert_eq!(prepared.retired_units, vec![applied("b", "gtc-old")]);
         assert!(
             prepared.retired_sors.is_empty(),
@@ -291,7 +293,10 @@ mod tests {
             "default/_/sor-b/shared_secret",
         )
         .unwrap();
-        assert!(prepare(&store, &env, "gtc-local", &SecretsBackend::DevStore).is_err());
+        assert!(
+            prepare_with_override(&store, &env, "gtc-local", &SecretsBackend::DevStore, None)
+                .is_err()
+        );
         assert!(
             store
                 .load_sor_ledger(&env.environment_id)
@@ -352,7 +357,7 @@ mod tests {
             transit_key: "greentic".to_string(),
             namespace: None,
         });
-        let msg = prepare(&store, &env, "gtc-local", &vault)
+        let msg = prepare_with_override(&store, &env, "gtc-local", &vault, None)
             .err()
             .expect("refused")
             .to_string();
