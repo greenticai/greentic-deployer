@@ -3247,3 +3247,332 @@ fn telegram_inbound_drives_flow_and_delivers_reply() {
         "--wait=false",
     ]);
 }
+
+// ---------------------------------------------------------------------------
+// SoRLa storage phase 3C: one SoR unit, reached by a worker with its route
+// token. Gated on `GREENTIC_K8S_E2E` plus `GREENTIC_K8S_SORX_IMAGE` (the sorx
+// image, loaded into kind) and `GREENTIC_K8S_SOR_PACK` (the landlord SoR pack).
+// ---------------------------------------------------------------------------
+
+const SOR_UNIT: &str = "landlord";
+const SOR_KEY: &str = "landlord-tenant-sor";
+const SOR_TENANT: &str = "acme";
+const SOR_TOKEN: &str = "e2e-sor-shared-secret";
+const SOR_PG: &str = "gtc-sor-pg";
+const SOR_PACK_REPO: &str = "sor/landlord";
+
+fn sor_inputs() -> Option<(String, PathBuf)> {
+    match (
+        std::env::var("GREENTIC_K8S_SORX_IMAGE"),
+        std::env::var("GREENTIC_K8S_SOR_PACK"),
+    ) {
+        (Ok(image), Ok(pack)) if !image.trim().is_empty() && !pack.trim().is_empty() => {
+            Some((image.trim().to_string(), PathBuf::from(pack.trim())))
+        }
+        _ => {
+            eprintln!("skipping SoR E2E: set GREENTIC_K8S_SORX_IMAGE and GREENTIC_K8S_SOR_PACK");
+            None
+        }
+    }
+}
+
+/// In-namespace Postgres the SoR stores into, plus the ingress rule the env's
+/// default-deny needs for the SoR pod to reach it.
+fn start_sor_postgres() {
+    kubectl_apply_stdin(&format!(
+        "apiVersion: apps/v1
+kind: Deployment
+metadata: {{name: {SOR_PG}, namespace: {NAMESPACE}}}
+spec:
+  replicas: 1
+  selector: {{matchLabels: {{app: {SOR_PG}}}}}
+  template:
+    metadata: {{labels: {{app: {SOR_PG}}}}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - {{name: POSTGRES_PASSWORD, value: sorx}}
+            - {{name: POSTGRES_DB, value: sorx}}
+          ports: [{{containerPort: 5432}}]
+          readinessProbe:
+            exec: {{command: [pg_isready, -U, postgres]}}
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: {SOR_PG}, namespace: {NAMESPACE}}}
+spec:
+  selector: {{app: {SOR_PG}}}
+  ports: [{{port: 5432, targetPort: 5432}}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {{name: gtc-sor-pg-allow-ingress, namespace: {NAMESPACE}}}
+spec:
+  podSelector: {{matchLabels: {{app: {SOR_PG}}}}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{{podSelector: {{matchLabels: {{app.kubernetes.io/component: sor}}}}}}]
+"
+    ));
+    kubectl_ok(&[
+        "rollout",
+        "status",
+        &format!("deployment/{SOR_PG}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=180s",
+    ]);
+}
+
+/// Push the pack with the media type sorx pulls
+/// (`application/vnd.greentic.gtpack.v1+zip`) and return the digest-pinned
+/// in-cluster `oci://` reference.
+fn push_sor_pack(pack: &Path) -> String {
+    let pf = PortForward::open(&format!("deployment/{OCI_REGISTRY}"), OCI_REGISTRY_PORT);
+    let local = format!("localhost:{}/{SOR_PACK_REPO}:e2e", pf.local_port);
+    let file_ref = format!(
+        "{}:application/vnd.greentic.gtpack.v1+zip",
+        pack.to_string_lossy()
+    );
+    let out = Command::new("oras")
+        .args([
+            "push",
+            "--plain-http",
+            "--disable-path-validation",
+            &local,
+            &file_ref,
+        ])
+        .output()
+        .expect("spawn oras");
+    assert!(
+        out.status.success(),
+        "oras push: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("oras")
+        .args(["manifest", "fetch", "--plain-http", "--descriptor", &local])
+        .output()
+        .expect("spawn oras");
+    assert!(
+        out.status.success(),
+        "oras manifest fetch: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let descriptor: Value = serde_json::from_slice(&out.stdout).expect("descriptor json");
+    let digest = descriptor["digest"].as_str().expect("digest").to_string();
+    format!(
+        "oci://{}/{SOR_PACK_REPO}:e2e@{digest}",
+        oci_registry_authority()
+    )
+}
+
+/// A pod carrying the worker labels (so the SoR NetworkPolicies apply to it
+/// exactly as to a real worker) that calls the SoR with and without the token.
+fn probe_sor_as_a_worker(url: &str, token: &str) -> String {
+    let name = "gtc-sor-probe";
+    let _ = kubectl(&[
+        "delete",
+        "pod",
+        name,
+        "-n",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=true",
+    ]);
+    kubectl_apply_stdin(&format!(
+        "apiVersion: v1
+kind: Pod
+metadata:
+  name: {name}
+  namespace: {NAMESPACE}
+  labels:
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/managed-by: greentic
+    greentic.ai/env: {ENV_ID}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: busybox:1.36.1
+      command: [sh, -c]
+      args:
+        - |
+          wget -q -O- {url}/healthz && echo HEALTHZ_OK
+          wget -q -O- {url}/v1/sorx/routes >/dev/null 2>&1 && echo NO_TOKEN_ADMITTED || echo NO_TOKEN_REFUSED
+          wget -q -O- --header 'Authorization: Bearer {token}' {url}/v1/sorx/routes >/dev/null && echo TOKEN_ADMITTED
+"
+    ));
+    kubectl_ok(&[
+        "wait",
+        "--for=jsonpath={.status.phase}=Succeeded",
+        &format!("pod/{name}"),
+        "-n",
+        NAMESPACE,
+        "--timeout=120s",
+    ]);
+    kubectl_ok(&["logs", name, "-n", NAMESPACE])
+}
+
+/// SoRLa phase 3C end to end: a declared SoR unit comes up (its Postgres, its
+/// digest-pinned pack pulled from the in-cluster registry), the reconcile
+/// reports it ready, its route document lands at the bare `sorla/<sor>` name,
+/// a worker-labelled pod reaches it only with the route token, and declaring
+/// an empty list retires the unit and its route document.
+#[test]
+fn sor_unit_becomes_ready_and_a_worker_reaches_it_with_the_route_token() {
+    if !armed() {
+        return;
+    }
+    let Some((image, pack)) = sor_inputs() else {
+        return;
+    };
+    reset_namespace();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = dir.path();
+    bind_k8s_env(store, None);
+    // The deployer answers the SoR pod inherits: plain-HTTP pull from the
+    // in-cluster registry (sorx requires the digest-pinned ref for it).
+    std::fs::write(
+        store.join(ENV_ID).join("deployer-answers.json"),
+        serde_json::to_vec(
+            &serde_json::json!({"oci_insecure_registries": oci_registry_authority()}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let rebind = payload(
+        store,
+        "rebind.json",
+        serde_json::json!({
+            "environment_id": ENV_ID, "slot": "deployer", "kind": "greentic.deployer.k8s@1.0.0",
+            "pack_ref": "builtin", "answers_ref": "deployer-answers.json",
+        }),
+    );
+    op(store, Some(&rebind), &["env-packs", "update"]);
+    let secpack = payload(
+        store,
+        "sor-secpack.json",
+        serde_json::json!({
+            "environment_id": ENV_ID, "slot": "secrets",
+            "kind": "greentic.secrets.dev-store@1.0.0", "pack_ref": "greentic.secrets.dev-store",
+        }),
+    );
+    op(store, Some(&secpack), &["env-packs", "add"]);
+
+    start_oci_registry(&fixture_bundle());
+    start_sor_postgres();
+    let pack_ref = push_sor_pack(&pack);
+
+    let answers = serde_json::json!({
+        "server": {"bind": "0.0.0.0:8787", "auth": {"mode": "shared_secret", "shared_secret_ref": "env:SORX_SHARED_SECRET"}},
+        "providers": {"store": {"kind": "postgres"}},
+        "tenant": {"tenant_id": SOR_TENANT, "environment": "production"},
+    });
+    for (name, value) in [
+        ("answers", answers.to_string()),
+        (
+            "postgres_url",
+            format!(
+                "postgres://postgres:sorx@{SOR_PG}.{NAMESPACE}.svc.cluster.local:5432/sorx?sslmode=disable"
+            ),
+        ),
+        ("shared_secret", SOR_TOKEN.to_string()),
+    ] {
+        let put = payload(
+            store,
+            "sor-put.json",
+            serde_json::json!({
+                "environment_id": ENV_ID, "path": format!("default/_/sor-{SOR_UNIT}/{name}"), "value": value,
+            }),
+        );
+        op(store, Some(&put), &["secrets", "put"]);
+    }
+    let manifest = payload(
+        store,
+        "sor-manifest.json",
+        serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": ENV_ID},
+            "sor_units": [{
+                "unit_id": SOR_UNIT, "sor": SOR_KEY, "pack_ref": pack_ref, "image": image,
+                "tenant_id": SOR_TENANT,
+                "answers_ref": format!("default/_/sor-{SOR_UNIT}/answers"),
+                "postgres_url_ref": format!("default/_/sor-{SOR_UNIT}/postgres_url"),
+                "postgres_ca_ref": null,
+                "shared_secret_ref": format!("default/_/sor-{SOR_UNIT}/shared_secret"),
+            }],
+        }),
+    );
+    op(
+        store,
+        Some(&manifest),
+        &["env", "apply", "--non-interactive"],
+    );
+
+    let reconciled = op(store, None, &["env", "reconcile", ENV_ID]);
+    let unit = &reconciled["result"]["sor_units"][0];
+    let url = format!("http://gtc-sor-{SOR_UNIT}.{NAMESPACE}.svc.cluster.local:8787");
+    assert_eq!(unit["unit_id"], SOR_UNIT);
+    assert_eq!(unit["url"], url.as_str());
+    assert_eq!(unit["ready"], true);
+    assert!(
+        !reconciled.to_string().contains(SOR_TOKEN),
+        "the report never carries the token"
+    );
+
+    let got = payload(
+        store,
+        "sor-get.json",
+        serde_json::json!({
+            "environment_id": ENV_ID, "path": format!("default/_/sorla/{SOR_KEY}"), "reveal": true,
+        }),
+    );
+    let route: Value = serde_json::from_str(
+        op(store, Some(&got), &["secrets", "get"])["result"]["value"]
+            .as_str()
+            .expect("route document"),
+    )
+    .unwrap();
+    assert_eq!(route["url"], url.as_str());
+    assert_eq!(route["token"], SOR_TOKEN);
+    assert_eq!(route["tenant"], SOR_TENANT);
+
+    let logs = probe_sor_as_a_worker(&url, SOR_TOKEN);
+    assert!(logs.contains("HEALTHZ_OK"), "{logs}");
+    assert!(logs.contains("NO_TOKEN_REFUSED"), "{logs}");
+    assert!(logs.contains("TOKEN_ADMITTED"), "{logs}");
+
+    // Retire it: an empty list prunes the objects and the route document.
+    let empty = payload(
+        store,
+        "sor-empty.json",
+        serde_json::json!({
+            "schema": "greentic.env-manifest.v1", "environment": {"id": ENV_ID}, "sor_units": [],
+        }),
+    );
+    op(store, Some(&empty), &["env", "apply", "--non-interactive"]);
+    op(store, None, &["env", "reconcile", ENV_ID]);
+    assert!(!object_exists(
+        "deployment",
+        &format!("gtc-sor-{SOR_UNIT}"),
+        Some(NAMESPACE)
+    ));
+    assert!(!object_exists(
+        "secret",
+        &format!("gtc-sor-{SOR_UNIT}"),
+        Some(NAMESPACE)
+    ));
+    let gone = op(store, Some(&got), &["secrets", "get"]);
+    assert_eq!(gone["result"]["present"], false);
+
+    let _ = kubectl(&[
+        "delete",
+        "namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=false",
+    ]);
+}
