@@ -1008,9 +1008,20 @@ fn worker_failure_diagnostics(worker: &str) -> String {
             vec!["logs", &server_dep, "-n", NAMESPACE, "--tail=60"],
         ),
     ];
+    diagnostics_for(&probes)
+}
+
+/// Run each `(label, args)` probe through `kubectl` and stringify the result
+/// under its label — the shared loop `worker_failure_diagnostics` and
+/// `sor_failure_diagnostics` both build on, so the two do not duplicate the
+/// "run kubectl, don't assert, concatenate" pattern. Every probe is
+/// best-effort: a probe that itself fails (e.g. `--previous` against a
+/// container with no prior instance) still returns an `Output`, whose
+/// stdout/stderr just gets folded in — nothing here panics.
+fn diagnostics_for(probes: &[(&str, Vec<&str>)]) -> String {
     let mut out = String::new();
     for (label, args) in probes {
-        let res = kubectl(&args);
+        let res = kubectl(args);
         out.push_str(&format!(
             "\n--- {label} ---\n{}{}",
             String::from_utf8_lossy(&res.stdout),
@@ -1018,6 +1029,42 @@ fn worker_failure_diagnostics(worker: &str) -> String {
         ));
     }
     out
+}
+
+/// Dump the state behind a SoR unit that never became Available: pod state
+/// (wide + full describe), its own logs — current and, if it crash-looped,
+/// `--previous` — and namespace events sorted by time. Called BEFORE the
+/// caller panics with the deployer's own stdout/stderr, so the cluster-side
+/// cause and the deployer-side symptom land in the same failure output.
+fn sor_failure_diagnostics(sor_deployment: &str) -> String {
+    let dep = format!("deployment/{sor_deployment}");
+    let probes: [(&str, Vec<&str>); 5] = [
+        (
+            "pods (wide)",
+            vec!["get", "pods", "-n", NAMESPACE, "-o", "wide"],
+        ),
+        ("pods describe", vec!["describe", "pods", "-n", NAMESPACE]),
+        (
+            "SoR logs (previous crash)",
+            vec![
+                "logs",
+                &dep,
+                "-n",
+                NAMESPACE,
+                "--all-containers",
+                "--previous",
+            ],
+        ),
+        (
+            "SoR logs",
+            vec!["logs", &dep, "-n", NAMESPACE, "--all-containers"],
+        ),
+        (
+            "namespace events",
+            vec!["get", "events", "-n", NAMESPACE, "--sort-by=.lastTimestamp"],
+        ),
+    ];
+    diagnostics_for(&probes)
 }
 
 #[test]
@@ -3396,13 +3443,21 @@ spec:
   restartPolicy: Never
   containers:
     - name: probe
-      image: busybox:1.36.1
+      image: busybox:1.36
       command: [sh, -c]
       args:
         - |
           wget -q -O- {url}/healthz && echo HEALTHZ_OK
-          wget -q -O- {url}/v1/sorx/routes >/dev/null 2>&1 && echo NO_TOKEN_ADMITTED || echo NO_TOKEN_REFUSED
+          NO_TOKEN_ERR=$(wget -q -O- {url}/v1/sorx/routes 2>&1 >/dev/null)
+          if [ $? -eq 0 ]; then
+            echo NO_TOKEN_ADMITTED
+          elif echo \"$NO_TOKEN_ERR\" | grep -q 401; then
+            echo NO_TOKEN_REFUSED
+          else
+            echo \"NO_TOKEN_OTHER_FAILURE: $NO_TOKEN_ERR\"
+          fi
           wget -q -O- --header 'Authorization: Bearer {token}' {url}/v1/sorx/routes >/dev/null && echo TOKEN_ADMITTED
+          exit 0
 "
     ));
     kubectl_ok(&[
@@ -3414,6 +3469,37 @@ spec:
         "--timeout=120s",
     ]);
     kubectl_ok(&["logs", name, "-n", NAMESPACE])
+}
+
+/// Run `op env reconcile` the way `op()` does, except that a failure dumps
+/// `sor_deployment`'s live-cluster diagnostics to stderr FIRST — best-effort —
+/// before panicking with the deployer's own stdout/stderr. A SoR unit that
+/// never becomes Available fails the reconcile (see
+/// `sor_ready_timeout`/`wait_for_worker_rollout` in `sor_reconcile.rs`), and
+/// `op()`'s own assert only ever shows the deployer's side of that: this test
+/// has never run against a real cluster, so its first real failure needs the
+/// pod-level cause, not just the deployer's error string. Cannot reuse `op()`
+/// unmodified — its `assert!` panics before any diagnostics could be dumped.
+fn reconcile_or_dump_sor_diagnostics(store: &Path, sor_deployment: &str) -> Value {
+    let mut cmd = Command::new(deployer_bin());
+    cmd.arg("op")
+        .arg("--store-root")
+        .arg(store)
+        .args(["env", "reconcile", ENV_ID]);
+    let out = cmd.output().expect("spawn greentic-deployer");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        eprintln!(
+            "=== `op env reconcile {ENV_ID}` failed; live-cluster diagnostics for {sor_deployment} ===\n{}",
+            sor_failure_diagnostics(sor_deployment)
+        );
+        panic!(
+            "`op env reconcile {ENV_ID}` failed:\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("`op env reconcile` stdout is not json ({e}):\n{stdout}"))
 }
 
 /// SoRLa phase 3C end to end: a declared SoR unit comes up (its Postgres, its
@@ -3512,7 +3598,8 @@ fn sor_unit_becomes_ready_and_a_worker_reaches_it_with_the_route_token() {
         &["env", "apply", "--non-interactive"],
     );
 
-    let reconciled = op(store, None, &["env", "reconcile", ENV_ID]);
+    let sor_deployment = format!("gtc-sor-{SOR_UNIT}");
+    let reconciled = reconcile_or_dump_sor_diagnostics(store, &sor_deployment);
     let unit = &reconciled["result"]["sor_units"][0];
     let url = format!("http://gtc-sor-{SOR_UNIT}.{NAMESPACE}.svc.cluster.local:8787");
     assert_eq!(unit["unit_id"], SOR_UNIT);
@@ -3565,6 +3652,20 @@ fn sor_unit_becomes_ready_and_a_worker_reaches_it_with_the_route_token() {
         &format!("gtc-sor-{SOR_UNIT}"),
         Some(NAMESPACE)
     ));
+    // The three SoR NetworkPolicies (`render_sor_network_policies` in
+    // src/env_packs/k8s/manifests/sor.rs) are additive on top of the env's
+    // `gtc-default-deny` and are pruned only once no unit needs them —
+    // confirm they went with the unit, not just its Deployment/Service/Secret.
+    for policy in [
+        "gtc-allow-sor-ingress",
+        "gtc-allow-sor-egress",
+        "gtc-allow-worker-to-sor",
+    ] {
+        assert!(
+            !object_exists("networkpolicy", policy, Some(NAMESPACE)),
+            "SoR NetworkPolicy `{policy}` must be pruned once no SoR unit remains"
+        );
+    }
     let gone = op(store, Some(&got), &["secrets", "get"]);
     assert_eq!(gone["result"]["present"], false);
 
