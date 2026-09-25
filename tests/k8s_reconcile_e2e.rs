@@ -3305,7 +3305,10 @@ const SOR_UNIT: &str = "landlord";
 const SOR_KEY: &str = "landlord-tenant-sor";
 const SOR_TENANT: &str = "acme";
 const SOR_TOKEN: &str = "e2e-sor-shared-secret";
-const SOR_PG: &str = "gtc-sor-pg";
+/// Deliberately NOT `gtc-sor-*`: that name space belongs to the deployer's
+/// own SoR objects, and a test fixture there could be mistaken for (or pruned
+/// as) one.
+const SOR_PG: &str = "sor-e2e-pg";
 const SOR_PACK_REPO: &str = "sor/landlord";
 
 fn sor_inputs() -> Option<(String, PathBuf)> {
@@ -3356,7 +3359,7 @@ spec:
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
-metadata: {{name: gtc-sor-pg-allow-ingress, namespace: {NAMESPACE}}}
+metadata: {{name: {SOR_PG}-allow-ingress, namespace: {NAMESPACE}}}
 spec:
   podSelector: {{matchLabels: {{app: {SOR_PG}}}}}
   policyTypes: [Ingress]
@@ -3668,6 +3671,23 @@ fn sor_unit_becomes_ready_and_a_worker_reaches_it_with_the_route_token() {
     }
     let gone = op(store, Some(&got), &["secrets", "get"]);
     assert_eq!(gone["result"]["present"], false);
+    // The retired unit's own inputs are deleted from the store too (asked by
+    // key; nothing here reveals a value), so no later seed can ship them into
+    // a router or worker.
+    for name in ["answers", "postgres_url", "shared_secret"] {
+        let probe = payload(
+            store,
+            "sor-input-get.json",
+            serde_json::json!({
+                "environment_id": ENV_ID, "path": format!("default/_/sor-{SOR_UNIT}/{name}"),
+            }),
+        );
+        let input = op(store, Some(&probe), &["secrets", "get"]);
+        assert_eq!(
+            input["result"]["present"], false,
+            "retired input `{name}` must be deleted from the env store"
+        );
+    }
 
     let _ = kubectl(&[
         "delete",
