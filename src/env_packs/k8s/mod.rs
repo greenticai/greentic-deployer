@@ -78,6 +78,7 @@ pub mod deployer;
 pub mod kube_client;
 pub mod manifests;
 pub mod render;
+pub mod sor_reconcile;
 #[cfg(feature = "k8s-client")]
 pub mod vault_bootstrap;
 #[cfg(feature = "k8s-client")]
@@ -99,6 +100,9 @@ pub use credentials::{K8sDeployerCredentials, K8sValidatorClient};
 pub use deployer::{ReconcileReport, RouterAddress};
 #[cfg(feature = "k8s-client")]
 pub use kube_client::{KubeCluster, KubeValidatorClient};
+pub use sor_reconcile::{
+    RouteDocument, SorReconcile, SorRoutePublisher, SorUnitRender, SorUnitStatus,
+};
 
 /// Native handler for the K8s deployer env-pack.
 #[derive(Debug)]

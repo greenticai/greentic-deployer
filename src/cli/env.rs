@@ -941,7 +941,7 @@ pub(crate) fn reconcile_k8s_cluster(
         )
         .with_secrets_backend(secrets_backend);
         handler
-            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout)
+            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout, None)
             .await
             .map_err(|e| OpError::Conflict(e.to_string()))
     })
