@@ -1739,6 +1739,7 @@ fn broadcast_target_violation(manifest: &EnvManifest) -> Option<&'static str> {
         messaging_endpoints,
         cluster,
         vault_bootstrap,
+        sor_units,
     } = manifest;
     let ManifestEnvironment {
         id: _,
@@ -1793,6 +1794,9 @@ fn broadcast_target_violation(manifest: &EnvManifest) -> Option<&'static str> {
     }
     if vault_bootstrap.is_some() {
         return Some("vault_bootstrap");
+    }
+    if sor_units.is_some() {
+        return Some("sor_units");
     }
     None
 }
@@ -7354,6 +7358,7 @@ uVbcKfZbU024RZ5zYGS0n3L4l6TVqpqQzrDfXjZNzyq0r/TK8g==
                 "vault_bootstrap",
                 json!({"vault_bootstrap": {"deploy": "dev-in-cluster"}}),
             ),
+            ("sor_units", json!({"sor_units": []})),
         ];
         for (field, extra) in top_level {
             let mut doc = json!({

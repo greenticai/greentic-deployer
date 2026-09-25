@@ -22,6 +22,7 @@ pub mod mutations_local;
 pub mod reads;
 pub mod runtime_config;
 pub mod snapshot;
+pub mod sor_units;
 pub mod store;
 pub mod trust_root;
 

@@ -50,6 +50,7 @@ pub mod env;
 pub mod env_apply;
 pub mod env_manifest;
 pub mod env_packs;
+pub(crate) mod env_sor;
 pub mod env_up;
 pub mod extensions;
 pub mod messaging;
