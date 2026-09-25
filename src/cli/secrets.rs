@@ -70,34 +70,43 @@ pub(crate) const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secr
 /// Pack segments whose keys are owned by greentic-designer-admin rather
 /// than by an environment: stored VERBATIM, under the `default` env segment.
 /// `mcp` keys an MCP server by its hyphenated UUID; `a2a` keys an external
-/// A2A agent the same way (`agent_id` is a hyphenated UUID too). Both are
-/// written and read byte-for-byte because the admin mints the id and the
-/// runtime looks it up unmodified — canonicalising either would rewrite the
-/// hyphens to underscores and resolve nothing, silently, since a missing
-/// credential of either kind is reported as an ordinary node/tool error.
+/// A2A agent the same way (`agent_id` is a hyphenated UUID too); `sorla` keys
+/// a SoRLa route document (`secrets://default/<tenant>/_/sorla/<sor>`) by the
+/// hyphenated capability-URI pack segment greentic-designer already mints —
+/// including the `<sor>.unit-<slug>-<hex>` per-unit form. All three are
+/// written and read byte-for-byte because the writer mints the name and the
+/// runtime looks it up unmodified — canonicalising any of them would rewrite
+/// the hyphens to underscores and resolve nothing, silently, since a missing
+/// credential in any of these categories is reported as an ordinary
+/// node/tool error.
 ///
 /// Mirrors greentic-start's reader carve-out (`src/secrets_client.rs`,
 /// `canonicalize_dev_store_secret_uri`) exactly. The two must agree: a writer
 /// that normalizes a key the reader does not — or files it under a different
 /// env segment — stores a credential nothing ever looks up, and the failure
-/// surfaces only as an ordinary MCP/A2A node error.
+/// surfaces only as an ordinary MCP/A2A/SoRLa node error.
 const MCP_CATEGORY: &str = "mcp";
 
 /// See [`MCP_CATEGORY`] — the same verbatim-storage rule applies to `a2a`.
 const A2A_CATEGORY: &str = "a2a";
 
-/// Env segment every `mcp`/`a2a` key is written under, matching
+/// See [`MCP_CATEGORY`]: SoRLa route documents (`secrets://default/<tenant>/_/sorla/<sor>`,
+/// `<sor>` a hyphenated capability-URI pack segment) are read verbatim by
+/// greentic-runner's `sorla_route::resolve_route`, at the `default` env segment.
+const SORLA_CATEGORY: &str = "sorla";
+
+/// Env segment every `mcp`/`a2a`/`sorla` key is written under, matching
 /// `greentic_aw_runtime::mcp_secrets::MCP_ENV_SEGMENT`.
 const MCP_ENV_SEGMENT: &str = "default";
 
 /// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) names a category
-/// whose secret name is stored verbatim (`mcp` or `a2a`). Keyed on the PACK
-/// position, never a substring: a tenant or a secret merely called `mcp` or
-/// `a2a` is an ordinary key.
+/// whose secret name is stored verbatim (`mcp`, `a2a` or `sorla`). Keyed on
+/// the PACK position, never a substring: a tenant or a secret merely called
+/// `mcp`, `a2a` or `sorla` is an ordinary key.
 fn is_verbatim_category_rel_path(rel_path: &str) -> bool {
     matches!(
         rel_path.split('/').nth(2),
-        Some(MCP_CATEGORY | A2A_CATEGORY)
+        Some(MCP_CATEGORY | A2A_CATEGORY | SORLA_CATEGORY)
     )
 }
 
@@ -106,13 +115,13 @@ fn is_verbatim_category_rel_path(rel_path: &str) -> bool {
 ///
 /// greentic-runner reads it at `secrets://default/<tenant>/_/llm/<ref>`
 /// (`resolve_in_process_llm_key`) — the `default` env segment is hardcoded
-/// there, exactly as it is for `mcp`. Unlike `mcp`/`a2a` the NAME is not
-/// verbatim: greentic-start's reader carve-out covers only those two, so it
-/// canonicalizes an `llm` name before lookup, and the ordinary canonical-name
-/// validation below is what makes the write land on that same key. Only the
-/// env segment differs from an ordinary key, and it is the whole defect: keyed
-/// by the environment id, every staged LLM key sat one segment away from the
-/// read and the agent ran with no key at all.
+/// there, exactly as it is for `mcp`. Unlike `mcp`/`a2a`/`sorla` the NAME is
+/// not verbatim: greentic-start's reader carve-out covers only those three,
+/// so it canonicalizes an `llm` name before lookup, and the ordinary
+/// canonical-name validation below is what makes the write land on that same
+/// key. Only the env segment differs from an ordinary key, and it is the
+/// whole defect: keyed by the environment id, every staged LLM key sat one
+/// segment away from the read and the agent ran with no key at all.
 const LLM_CATEGORY: &str = "llm";
 
 /// Whether `rel_path` names the `llm` category (pack position only, like
@@ -991,21 +1000,24 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
              name without surrounding whitespace)"
         )));
     }
-    // Outside the `mcp`/`a2a` categories the runtime reader canonicalizes the
-    // name segment before lookup (greentic-start
+    // Outside the `mcp`/`a2a`/`sorla` categories the runtime reader
+    // canonicalizes the name segment before lookup (greentic-start
     // `secret_name::canonical_secret_name`), so a non-canonical name would be
     // written but never found. Reject instead of silently transforming —
     // producer and consumer must share one derivation, and we share it by
     // only accepting already-canonical input.
     //
-    // The `mcp` and `a2a` categories are exempt, mirroring greentic-start's
-    // reader (`src/secrets_client.rs`, `canonicalize_dev_store_secret_uri`):
-    // admin keys an MCP server, and an external A2A agent, by a hyphenated
-    // UUID, and the runtime reads each verbatim (`greentic_aw_runtime::
-    // mcp_secrets`, and the A2A equivalent). Normalizing here would rewrite
-    // the lookup to `…/mcp/ff308b9c_951a_…` (or `…/a2a/…`) and resolve
-    // nothing — silently, because a missing MCP/A2A credential is reported
-    // as an ordinary node/tool error.
+    // The `mcp`, `a2a` and `sorla` categories are exempt, mirroring
+    // greentic-start's reader (`src/secrets_client.rs`,
+    // `canonicalize_dev_store_secret_uri`): admin keys an MCP server, and an
+    // external A2A agent, by a hyphenated UUID; greentic-designer keys a
+    // SoRLa route document by a hyphenated capability-URI pack segment. The
+    // runtime reads each verbatim (`greentic_aw_runtime::mcp_secrets`, the
+    // A2A equivalent, and `sorla_route::resolve_route`). Normalizing here
+    // would rewrite the lookup to `…/mcp/ff308b9c_951a_…` (or `…/a2a/…`, or
+    // `…/sorla/landlord_tenant_sor`) and resolve nothing — silently, because
+    // a missing MCP/A2A/SoRLa credential is reported as an ordinary
+    // node/tool error.
     //
     // The TEAM segment above is deliberately NOT exempt: the runtime
     // canonicalizes the team either way, so a literal `default` is still a key
@@ -2203,6 +2215,47 @@ mod tests {
             get_outcome.result.get("value").and_then(|v| v.as_str()),
             Some("t0k")
         );
+    }
+
+    #[test]
+    fn a_sorla_route_document_is_keyed_verbatim_under_the_default_segment() {
+        // greentic-runner reads `secrets://default/<tenant>/_/sorla/<sor>`
+        // verbatim (`sorla_route::resolve_route`), where `<sor>` is a
+        // hyphenated capability-URI pack segment — including the
+        // `<sor>.unit-<slug>-<hex>` per-unit form — never canonicalized to
+        // underscores. Keying a SoRLa route document by the environment id
+        // instead stores it where no lookup ever goes.
+        let env = EnvId::try_from("prod").expect("env id");
+        assert_eq!(
+            dev_store_key(&env, "default/_/sorla/landlord-tenant-sor"),
+            "secrets://default/default/_/sorla/landlord-tenant-sor"
+        );
+        assert_eq!(
+            dev_store_key(
+                &env,
+                "default/_/sorla/landlord-tenant-sor.unit-abc-0123456789ab"
+            ),
+            "secrets://default/default/_/sorla/landlord-tenant-sor.unit-abc-0123456789ab"
+        );
+    }
+
+    #[test]
+    fn a_hyphenated_sorla_name_passes_validation() {
+        validate_dev_store_secret_path("default/_/sorla/landlord-tenant-sor")
+            .expect("verbatim category");
+    }
+
+    #[test]
+    fn a_secret_merely_named_sorla_is_still_canonical() {
+        // `sorla` anywhere but the pack position is an ordinary key. A tenant
+        // literally named `sorla`, or a secret named `sorla`, must not skip
+        // canonicalization.
+        let env = EnvId::try_from("prod").expect("env id");
+        assert_eq!(
+            dev_store_key(&env, "default/_/somepack/sorla"),
+            "secrets://prod/default/_/somepack/sorla"
+        );
+        assert!(validate_dev_store_secret_path("sorla/_/somepack/Bad-Name").is_err());
     }
 
     #[test]
