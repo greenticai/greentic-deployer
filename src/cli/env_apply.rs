@@ -2071,6 +2071,9 @@ fn sor_units_step(
     ctx: &ApplyContext,
     units: &[super::env_manifest::ManifestSorUnit],
 ) -> Result<ApplyStep, OpError> {
+    if !units.is_empty() {
+        refuse_sor_units_off_k8s(ctx)?;
+    }
     let key = ctx.env_id.as_str().to_string();
     let current = store.load_sor_units(&ctx.env_id)?;
     if current.as_slice() == units {
@@ -2100,6 +2103,40 @@ fn sor_units_step(
         idempotency_key: Some(ikey),
         op: StepOp::SetSorUnits(units.to_vec()),
     })
+}
+
+/// SoR units are deployed only by the k8s env-pack's reconcile. The deployer
+/// that counts is the one this apply leaves bound: the manifest's own
+/// `deployer` pack when it declares one, else the env's current binding (or,
+/// for an env this apply creates, the default binding). An empty list is
+/// always accepted — it only clears the record.
+fn refuse_sor_units_off_k8s(ctx: &ApplyContext) -> Result<(), OpError> {
+    let k8s = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    let declared = ctx
+        .manifest
+        .packs
+        .iter()
+        .find(|p| p.slot == CapabilitySlot::Deployer)
+        .map(|p| p.kind.clone());
+    let kind = match declared {
+        Some(kind) => Some(kind),
+        None => match &ctx.env {
+            Some(env) => env
+                .pack_for_slot(CapabilitySlot::Deployer)
+                .map(|b| b.kind.to_string()),
+            None => Some(crate::defaults::LOCAL_DEPLOYER_PACK.to_string()),
+        },
+    };
+    let path = kind.as_deref().map(|k| k.split('@').next().unwrap_or(k));
+    if path == Some(k8s) {
+        return Ok(());
+    }
+    Err(OpError::InvalidArgument(format!(
+        "sor_units: SoR units are deployed only by the `{k8s}` deployer env-pack; environment \
+         `{}` is bound to `{}` — declare `sor_units: []` or bind the k8s deployer",
+        ctx.env_id.as_str(),
+        kind.as_deref().unwrap_or("no deployer")
+    )))
 }
 
 /// The `updates` block's steps, in the order they must execute.
@@ -3623,6 +3660,20 @@ mod tests {
         (dir, store)
     }
 
+    /// [`seeded_store`] with the env bound to the k8s deployer — the only one
+    /// that deploys SoR units.
+    fn seeded_k8s_store() -> (tempfile::TempDir, LocalFsStore) {
+        let (dir, store) = seeded_store();
+        let mut env = load_local(&store);
+        env.packs.retain(|b| b.slot != CapabilitySlot::Deployer);
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.k8s@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        (dir, store)
+    }
+
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/bundles/perf-smoke-bundle.gtbundle")
@@ -3814,7 +3865,7 @@ mod tests {
 
     #[test]
     fn sor_units_are_recorded_and_reapply_is_a_noop() {
-        let (dir, store) = seeded_store();
+        let (dir, store) = seeded_k8s_store();
         let path = write_manifest(
             dir.path(),
             &sor_manifest(Some(json!([landlord_unit_json()]))),
@@ -3833,7 +3884,7 @@ mod tests {
 
     #[test]
     fn absent_sor_units_leave_the_recorded_set_untouched() {
-        let (dir, store) = seeded_store();
+        let (dir, store) = seeded_k8s_store();
         let with = write_manifest(
             dir.path(),
             &sor_manifest(Some(json!([landlord_unit_json()]))),
@@ -3851,7 +3902,7 @@ mod tests {
 
     #[test]
     fn an_empty_sor_units_list_clears_the_recorded_set() {
-        let (dir, store) = seeded_store();
+        let (dir, store) = seeded_k8s_store();
         let with = write_manifest(
             dir.path(),
             &sor_manifest(Some(json!([landlord_unit_json()]))),
@@ -3865,7 +3916,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_plans_sor_units_without_writing_them() {
-        let (dir, store) = seeded_store();
+        let (dir, store) = seeded_k8s_store();
         let path = write_manifest(
             dir.path(),
             &sor_manifest(Some(json!([landlord_unit_json()]))),
@@ -3873,6 +3924,33 @@ mod tests {
         let outcome = run_dry(&store, &path).unwrap();
         assert!(step_actions(&outcome.result).contains(&("set-sor-units".into(), "create".into())));
         assert!(recorded_unit_ids(&store).is_empty());
+    }
+
+    #[test]
+    fn sor_units_are_refused_when_the_deployer_is_not_k8s() {
+        let (dir, store) = seeded_store();
+        let mut env = load_local(&store);
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            crate::defaults::LOCAL_DEPLOYER_PACK,
+        ));
+        store.save(&env).unwrap();
+        let path = write_manifest(
+            dir.path(),
+            &sor_manifest(Some(json!([landlord_unit_json()]))),
+        );
+        match run_apply(&store, &path) {
+            Err(OpError::InvalidArgument(msg)) => {
+                assert!(msg.contains("greentic.deployer.local-process"), "{msg}");
+                assert!(msg.contains("greentic.deployer.k8s"), "{msg}");
+            }
+            other => panic!("expected invalid-argument, got {other:?}"),
+        }
+        assert!(recorded_unit_ids(&store).is_empty(), "nothing recorded");
+
+        // An empty list only clears the record, so any deployer accepts it.
+        let empty = write_manifest(dir.path(), &sor_manifest(Some(json!([]))));
+        run_apply(&store, &empty).expect("an empty sor_units list is always accepted");
     }
 
     /// The manifest shape the demo uses: declaring `updates` IS the
