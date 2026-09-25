@@ -17,6 +17,7 @@ use super::{
     ENV_LABEL, K8sParams, common_labels, container_security_context, oci_pull_env,
     pod_security_context, resource_baseline,
 };
+use crate::env_packs::k8s::cluster::ObjectRef;
 use crate::environment::sor_units::SorUnit;
 use crate::runtime_secrets::SecretValue;
 
@@ -131,6 +132,10 @@ pub fn render_sor_deployment(
     let from_secret =
         |key: &str| json!({"name": key, "valueFrom": {"secretKeyRef": {"name": name, "key": key}}});
     let mut env_vars = vec![
+        // Pins the image's own HOME (matching `runtime_boot_env`'s pin for
+        // router/worker) so sorx's `$HOME/.config/…` write lands on the
+        // `HOME_VOLUME` emptyDir even if the base image's HOME changes.
+        json!({"name": "HOME", "value": SOR_HOME}),
         from_secret(SOR_ANSWERS_KEY),
         from_secret(SOR_POSTGRES_URL_KEY),
         from_secret(SOR_SHARED_SECRET_KEY),
@@ -242,6 +247,120 @@ pub fn render_sor_manifests(
     ]
 }
 
+pub const SOR_INGRESS_POLICY: &str = "gtc-allow-sor-ingress";
+pub const SOR_EGRESS_POLICY: &str = "gtc-allow-sor-egress";
+pub const WORKER_TO_SOR_POLICY: &str = "gtc-allow-worker-to-sor";
+
+/// Three additive policies on top of the env's `gtc-default-deny`: SoR
+/// ingress from workers on [`SOR_PORT`]; SoR egress anywhere (Postgres and
+/// the registry live outside the cluster); worker egress to SoRs on
+/// [`SOR_PORT`]. Every `podSelector` is built from `common_labels`, the same
+/// env-scoped idiom `render_network_policies` uses for its own per-role
+/// policies (it stamps [`super::ENV_LABEL`] beside the component label) —
+/// never a bare `app.kubernetes.io/component` match, so a SoR or worker pod
+/// belonging to a sibling environment sharing this namespace never matches.
+/// Rendered only while the env has SoR units, so an env without any renders
+/// exactly what it rendered before. Not part of `render_environment_manifests`
+/// (see the module doc); the apply path renders these only for an env
+/// declaring `sor_units`.
+pub fn render_sor_network_policies(env: &Environment, params: &K8sParams) -> Vec<Value> {
+    let sor = common_labels(env, SOR_COMPONENT);
+    let worker = common_labels(env, "worker");
+    let port = json!([{"protocol": "TCP", "port": SOR_PORT}]);
+    let policy = |name: &str, spec: Value| {
+        json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": name,
+                "namespace": params.namespace,
+                "labels": common_labels(env, "network-policy"),
+            },
+            "spec": spec,
+        })
+    };
+    vec![
+        policy(
+            SOR_INGRESS_POLICY,
+            json!({
+                "podSelector": {"matchLabels": sor},
+                "policyTypes": ["Ingress"],
+                "ingress": [{"from": [{"podSelector": {"matchLabels": worker}}], "ports": port}],
+            }),
+        ),
+        policy(
+            SOR_EGRESS_POLICY,
+            json!({
+                "podSelector": {"matchLabels": sor},
+                "policyTypes": ["Egress"],
+                "egress": [{}],
+            }),
+        ),
+        policy(
+            WORKER_TO_SOR_POLICY,
+            json!({
+                "podSelector": {"matchLabels": worker},
+                "policyTypes": ["Egress"],
+                "egress": [{"to": [{"podSelector": {"matchLabels": sor}}], "ports": port}],
+            }),
+        ),
+    ]
+}
+
+/// Contract C1 `url`: in-cluster address of the unit's Service, no trailing
+/// slash.
+pub fn sor_service_url(unit_id: &str, namespace: &str) -> String {
+    format!(
+        "http://{}.{namespace}.svc.cluster.local:{SOR_PORT}",
+        sor_object_name(unit_id)
+    )
+}
+
+/// Contract C1 value `{url, token, tenant}` for `default/_/sorla/<sor>`.
+/// Returned as a [`SecretValue`] because it carries the shared secret — its
+/// `Debug` redacts to `<redacted>`, so it must never reach a log line or a
+/// rendered manifest.
+pub fn route_document(unit: &SorUnit, inputs: &SorUnitInputs, namespace: &str) -> SecretValue {
+    SecretValue::from(
+        json!({
+            "url": sor_service_url(&unit.unit_id, namespace),
+            "token": inputs.shared_secret.expose(),
+            "tenant": unit.tenant_id,
+        })
+        .to_string(),
+    )
+}
+
+fn object_ref(api_version: &str, kind: &str, namespace: &str, name: &str) -> ObjectRef {
+    ObjectRef {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: Some(namespace.to_string()),
+        name: name.to_string(),
+    }
+}
+
+/// The unit's objects in PRUNE order: the pod first (so a retiring unit stops
+/// serving before its Service and Secret disappear), the Secret last (so the
+/// pod that reads it is already gone).
+pub fn sor_object_refs(unit_id: &str, namespace: &str) -> Vec<ObjectRef> {
+    let name = sor_object_name(unit_id);
+    vec![
+        object_ref("apps/v1", "Deployment", namespace, &name),
+        object_ref("v1", "Service", namespace, &name),
+        object_ref("v1", "Secret", namespace, &name),
+    ]
+}
+
+/// The three SoR NetworkPolicy objects, in the same order
+/// [`render_sor_network_policies`] renders them.
+pub fn sor_policy_refs(namespace: &str) -> Vec<ObjectRef> {
+    [SOR_INGRESS_POLICY, SOR_EGRESS_POLICY, WORKER_TO_SOR_POLICY]
+        .into_iter()
+        .map(|name| object_ref("networking.k8s.io/v1", "NetworkPolicy", namespace, name))
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -333,6 +452,12 @@ pub(crate) mod tests {
             d.pointer("/spec/template/spec/automountServiceAccountToken")
                 .unwrap(),
             false
+        );
+        assert_eq!(
+            env_var(&d, "HOME").unwrap()["value"],
+            "/home/nonroot",
+            "sorx's $HOME/.config writes must land on the emptyDir even if the \
+             base image's HOME changes"
         );
     }
 
@@ -519,5 +644,176 @@ pub(crate) mod tests {
         assert_ne!(base, hash(&new_answers));
         assert_ne!(base, hash(&inputs(true)), "adding a CA is a change");
         assert!(!base.contains("pw-SECRET"));
+    }
+
+    #[test]
+    fn policies_admit_workers_to_the_sor_port_and_let_the_sor_reach_outside() {
+        let env = build_fixture_env();
+        let params = K8sParams::for_env(&env);
+        let policies = render_sor_network_policies(&env, &params);
+        let names: Vec<&str> = policies
+            .iter()
+            .map(|p| p["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [SOR_INGRESS_POLICY, SOR_EGRESS_POLICY, WORKER_TO_SOR_POLICY]
+        );
+
+        let worker = render_worker_deployment_labels(&env);
+        let sor_pod = render_sor_deployment(&env, &unit(), &inputs(false), &params)
+            .pointer("/spec/template/metadata/labels")
+            .unwrap()
+            .clone();
+        let selects = |selector: &Value, labels: &Value| {
+            selector
+                .as_object()
+                .unwrap()
+                .iter()
+                .all(|(k, v)| labels.get(k) == Some(v))
+        };
+
+        let ingress = &policies[0];
+        assert!(selects(
+            ingress.pointer("/spec/podSelector/matchLabels").unwrap(),
+            &sor_pod
+        ));
+        assert!(!selects(
+            ingress.pointer("/spec/podSelector/matchLabels").unwrap(),
+            &worker
+        ));
+        assert_eq!(
+            ingress.pointer("/spec/policyTypes").unwrap(),
+            &serde_json::json!(["Ingress"])
+        );
+        assert!(selects(
+            ingress
+                .pointer("/spec/ingress/0/from/0/podSelector/matchLabels")
+                .unwrap(),
+            &worker
+        ));
+        assert_eq!(
+            ingress.pointer("/spec/ingress/0/ports/0/port").unwrap(),
+            8787
+        );
+
+        let egress = &policies[1];
+        assert!(selects(
+            egress.pointer("/spec/podSelector/matchLabels").unwrap(),
+            &sor_pod
+        ));
+        assert_eq!(
+            egress.pointer("/spec/egress").unwrap(),
+            &serde_json::json!([{}])
+        );
+
+        let worker_out = &policies[2];
+        assert!(selects(
+            worker_out.pointer("/spec/podSelector/matchLabels").unwrap(),
+            &worker
+        ));
+        assert_eq!(
+            worker_out.pointer("/spec/policyTypes").unwrap(),
+            &serde_json::json!(["Egress"])
+        );
+        assert!(selects(
+            worker_out
+                .pointer("/spec/egress/0/to/0/podSelector/matchLabels")
+                .unwrap(),
+            &sor_pod
+        ));
+        assert_eq!(
+            worker_out.pointer("/spec/egress/0/ports/0/port").unwrap(),
+            8787
+        );
+    }
+
+    fn render_worker_deployment_labels(env: &Environment) -> Value {
+        let params = K8sParams::for_env(env);
+        super::super::render_worker_deployment(env, &env.revisions[0], &params)
+            .pointer("/spec/template/metadata/labels")
+            .unwrap()
+            .clone()
+    }
+
+    /// Two environments sharing a namespace must not cross-select: the SoR
+    /// selector is scoped by [`ENV_LABEL`] via `common_labels`, the same
+    /// idiom `render_network_policies` uses for its own per-role policies —
+    /// never a bare `app.kubernetes.io/component` match.
+    #[test]
+    fn sor_network_policies_do_not_cross_select_across_environments() {
+        let env = build_fixture_env();
+        let params = K8sParams::for_env(&env);
+        let policies = render_sor_network_policies(&env, &params);
+        let ingress_selector = policies[0]
+            .pointer("/spec/podSelector/matchLabels")
+            .unwrap();
+        assert_eq!(
+            ingress_selector.get(ENV_LABEL).unwrap(),
+            env.environment_id.as_str()
+        );
+
+        let mut sibling_env = env.clone();
+        sibling_env.environment_id =
+            greentic_deploy_spec::EnvId::try_from("conformance-sibling").expect("valid env id");
+        let sibling_sor_pod = render_sor_deployment(&sibling_env, &unit(), &inputs(false), &params)
+            .pointer("/spec/template/metadata/labels")
+            .unwrap()
+            .clone();
+        let selects = |selector: &Value, labels: &Value| {
+            selector
+                .as_object()
+                .unwrap()
+                .iter()
+                .all(|(k, v)| labels.get(k) == Some(v))
+        };
+        assert!(
+            !selects(ingress_selector, &sibling_sor_pod),
+            "a sibling environment's SoR pod must not match this env's policy"
+        );
+    }
+
+    #[test]
+    fn the_route_document_names_the_in_cluster_url_the_token_and_the_tenant() {
+        let doc: Value =
+            serde_json::from_str(route_document(&unit(), &inputs(false), "gtc-prod").expose())
+                .unwrap();
+        assert_eq!(
+            doc["url"],
+            "http://gtc-sor-landlord.gtc-prod.svc.cluster.local:8787"
+        );
+        assert_eq!(doc["token"], "shared-SECRET-token");
+        assert_eq!(doc["tenant"], "acme");
+        assert_eq!(doc.as_object().unwrap().len(), 3);
+        assert!(!doc["url"].as_str().unwrap().ends_with('/'));
+        assert_eq!(
+            format!("{:?}", route_document(&unit(), &inputs(false), "ns")),
+            "<redacted>"
+        );
+    }
+
+    #[test]
+    fn object_refs_address_the_rendered_objects() {
+        let env = build_fixture_env();
+        let params = K8sParams::for_env(&env);
+        let rendered: Vec<crate::env_packs::k8s::cluster::ObjectRef> =
+            render_sor_manifests(&env, &unit(), &inputs(false), &params)
+                .iter()
+                .map(|m| crate::env_packs::k8s::cluster::ObjectRef::from_manifest(m).unwrap())
+                .collect();
+        let refs = sor_object_refs("landlord", &params.namespace);
+        for r in &refs {
+            assert!(rendered.contains(r), "{r:?} must address a rendered object");
+        }
+        assert_eq!(
+            refs.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            ["Deployment", "Service", "Secret"]
+        );
+        let policy_refs = sor_policy_refs(&params.namespace);
+        let policies: Vec<_> = render_sor_network_policies(&env, &params)
+            .iter()
+            .map(|m| crate::env_packs::k8s::cluster::ObjectRef::from_manifest(m).unwrap())
+            .collect();
+        assert_eq!(policy_refs, policies);
     }
 }
