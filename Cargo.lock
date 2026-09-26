@@ -1260,9 +1260,9 @@ dependencies = [
 
 [[package]]
 name = "component-qa"
-version = "1.2.0-dev.35754484282"
+version = "1.2.0-dev.36144844781"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3df65fb37d78d17cf69cea14b1fa42fb6f317706be1e3705e4fcb39b8a64d9"
+checksum = "fbd55eb11ce34b095605a94bf1104e850971be3aacf2b29332934bd2391c2d49"
 dependencies = [
  "greentic-interfaces-guest",
  "greentic-types",
@@ -2766,9 +2766,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.35759705430"
+version = "1.2.0-dev.36209837095"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a0d3cb60c3e0e6025316e435cb9459f3fe1a831211520aed989fddea5c6a6de"
+checksum = "505be7c394253569a63e075f8dd49edf214d7c8d304fefbb8f928f531a81aab2"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2800,9 +2800,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.35759705430"
+version = "1.2.0-dev.36209837095"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d7281abee61d3342af32b13a81a0688bf8cc15c91202572fd26e75332fabecc"
+checksum = "63a0e34cc4dbfa72f44cbb908a4bb268d3d73d2be200d32c65f2e0b72f91ebfe"
 dependencies = [
  "backhand",
  "serde",
@@ -2811,9 +2811,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-config"
-version = "1.2.0-dev.35753417805"
+version = "1.2.0-dev.36106494435"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a2a53bc834dba3f98ac5b2cb0403547c2b1a248f8b35c482fdb9ac7b3f5dc71"
+checksum = "ac96bcb083b3624966588a41eaf643cb2eaa536ce7e955a1e71d61a58d90fa59"
 dependencies = [
  "anyhow",
  "camino",
@@ -2831,9 +2831,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-config-types"
-version = "1.2.0-dev.35753417805"
+version = "1.2.0-dev.36106494435"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b4a8f06f4b76226d9c700a4b7b6a8d06e92762f5bee202ea7c3ce49fd63e8b5"
+checksum = "766cc374cb0686e72c6497f5b6512ab1c6d5c2cc1f1661de55668cc9347fabd0"
 dependencies = [
  "greentic-types",
  "serde",
@@ -2944,9 +2944,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.2.0-dev.35757697239"
+version = "1.2.0-dev.36147451919"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fe855cd6f5a9cf1cfe9c54a59576e356ff1430217f7c13397673c5150e0d09f"
+checksum = "6b78df0d8431acc3fa61fc8144cf7c5b03c7d7bb0a689455488f19185be70663"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2990,9 +2990,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces"
-version = "1.2.0-dev.35753415975"
+version = "1.2.0-dev.36143909043"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e60eb9a8ed1e727083681c90f06b07b2a68d0ca0526eb579401200857b1d09"
+checksum = "fef58f88ebda8467fc2718d2aea1abbcffce50736a62c586a66f9e47568f07f1"
 dependencies = [
  "anyhow",
  "constant_time_eq 0.4.2",
@@ -3008,9 +3008,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces-guest"
-version = "1.2.0-dev.35753415975"
+version = "1.2.0-dev.36143909043"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cbae902e486e9bd75fdd51ac57a8f4b0338b9797775c9db1df63e77345b0af7"
+checksum = "ef0cea6f4ede2bca4d7633e95fcd5edbad7bd444b1a3774814db478b3a867e3d"
 dependencies = [
  "greentic-interfaces",
  "greentic-types",
@@ -3065,9 +3065,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-qa-lib"
-version = "1.2.0-dev.35754484282"
+version = "1.2.0-dev.36144844781"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1ca4fd28894b6cd790f56d9e67d372bba9f753ebd5cdfcd5e687f028fdb420d"
+checksum = "248a5af3cc65aad3f4323877d25dae4b6b78caf0e74abd183c8ccec85fcab730"
 dependencies = [
  "component-qa",
  "qa-spec",
@@ -3079,9 +3079,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-api"
-version = "1.2.0-dev.35756158093"
+version = "1.2.0-dev.36144862692"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a90b09be6c0b072613e409ab8461913f6ad1e038fe0de2d26d2d2e2c58c5c2d"
+checksum = "74ca05113aa932b0d168189471fa39d84f965ace4c3a1228fcc30f7578627071"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3090,9 +3090,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-core"
-version = "1.2.0-dev.35756158093"
+version = "1.2.0-dev.36144862692"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c9819b4f2532ffafd377824129003bd09241041782c8e2a9283f8404a64c7ff"
+checksum = "bad4eb7bbfb5e94410f49d346a760ff2228dba82a52739c067161f7eb898abc9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3118,9 +3118,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-lib"
-version = "1.2.0-dev.35756158093"
+version = "1.2.0-dev.36144862692"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0af2d2abe1e3747b95aff1d8e3018a62270ce0937b0567ba358230bf173bd7ea"
+checksum = "4d178b000473c5d276b11db5aaf3d5ceca5b409505fbbfe821a046975dfad207"
 dependencies = [
  "async-trait",
  "greentic-secrets-api",
@@ -3133,9 +3133,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-dev"
-version = "1.2.0-dev.35756158093"
+version = "1.2.0-dev.36144862692"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99c5b343e5c4b9f90bed8b63fe3224fedbda01d7553f3bfef37f70c7980c351e"
+checksum = "4bd011e608b668e003ce5cc6721e30feec05622d750a8165589dbeb6b5d2d365"
 dependencies = [
  "async-trait",
  "base64",
@@ -3151,9 +3151,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-vault-kv"
-version = "1.2.0-dev.35756158093"
+version = "1.2.0-dev.36144862692"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "184cde12468c40609cdabb1bd96bec60c384d7b2fd803727893489e86b8d4066"
+checksum = "94baf55a0178760babf0dc479f5f34452ef3427b561e43228399612545553d39"
 dependencies = [
  "anyhow",
  "base64",
@@ -3166,9 +3166,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-spec"
-version = "1.2.0-dev.35756158093"
+version = "1.2.0-dev.36144862692"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5040306f4a66250eca430baf76ce9b5606257042ec9117fc38fa9d833233ae3"
+checksum = "448cbcdc4a2e613b93ce281e12d5813523a2f8654084c528ffc94e2cbb61b981"
 dependencies = [
  "async-trait",
  "greentic-types",
@@ -3225,9 +3225,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-types"
-version = "1.2.0-dev.35752963135"
+version = "1.2.0-dev.35968333096"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c44b7b6ecfefb00d3079874706cc784bf09749d92668a16b806dd3406eb5522a"
+checksum = "5e70ad0a2af494d3873afa7129ed59641abd6debfca50b2d7313a80286914f11"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3256,9 +3256,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-types-macros"
-version = "1.2.0-dev.35752963135"
+version = "1.2.0-dev.35968333096"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b8f463c8c60d91ed6f12f40325a63a3f0e5f06f74bff46c97e1af0712337932"
+checksum = "290f6327dd285f16139a970d24808ff0447a4feef4e40cdaf94bd257baf4461f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3267,9 +3267,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "1.2.0-dev.35759228855"
+version = "1.2.0-dev.36209875106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e077ce245a0cf02e663339e012776f531104b5e7836cf671974f390f2a1d0ed3"
+checksum = "d6209a0808769637dbaa5429fb2fcf39df4f4a3957dcbdf0317c1810ef597ce5"
 dependencies = [
  "chrono",
  "flate2",
@@ -5093,9 +5093,9 @@ dependencies = [
 
 [[package]]
 name = "qa-spec"
-version = "1.2.0-dev.35754484282"
+version = "1.2.0-dev.36144844781"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ead6ec156fef236db7b4681f195c4982b045d0829723d5d3f6c4bf99aca2e16"
+checksum = "d800f5bbcfeb891e7254d4c84a54d07d5ef59d74b2f7f10383c1a19e38ae5f35"
 dependencies = [
  "globset",
  "handlebars",
@@ -7888,7 +7888,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
