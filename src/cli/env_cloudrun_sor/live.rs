@@ -82,12 +82,14 @@ pub(crate) fn sor_finish(
 
 /// `op env destroy`: delete every Cloud Run SoR service and secret the ledger
 /// records (ownership-checked). Runs under the destroy flock; reads the ledger
-/// without taking it.
+/// without taking it. `Ok(None)` when the ledger holds no SoR unit, so the
+/// caller can omit the `"sor"` result key entirely rather than reporting an
+/// empty object.
 pub(crate) fn teardown_sor_units(
     store: &LocalFsStore,
     env_id: &EnvId,
     credentials: Option<GcpCredentialMaterial>,
-) -> Result<Value, String> {
+) -> Result<Option<Value>, String> {
     let places: Vec<CloudRunSorPlacement> = store
         .load_sor_ledger(env_id)
         .map_err(|e| format!("reading the SoR ledger: {e}"))?
@@ -95,7 +97,7 @@ pub(crate) fn teardown_sor_units(
         .filter_map(|a| a.cloud_run)
         .collect();
     if places.is_empty() {
-        return Ok(json!({}));
+        return Ok(None);
     }
     let targets = RealSorTargets { credentials };
     let out = run_gcp_async(cloudrun::retire_all(
@@ -105,9 +107,35 @@ pub(crate) fn teardown_sor_units(
         &targets,
     ))
     .map_err(|e| e.to_string())?;
-    Ok(json!({
+    Ok(Some(json!({
         "deleted_services": out.deleted_services,
         "deleted_secrets": out.deleted_secrets,
         "notes": out.notes,
-    }))
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::tests_common::make_env;
+    use crate::environment::EnvironmentStore as _;
+
+    /// A plain Cloud Run destroy — no SoR unit ever declared for this
+    /// environment — must report no `sor` result at all, not an empty
+    /// object: the caller (`CloudRunProviderTeardown::teardown`) inserts the
+    /// `"sor"` key only when this returns `Some`.
+    #[test]
+    fn no_sor_units_ever_declared_reports_no_sor_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+
+        let sor = teardown_sor_units(&store, &env.environment_id, None).unwrap();
+
+        assert!(
+            sor.is_none(),
+            "an environment with no SoR units must not report a `sor` key"
+        );
+    }
 }

@@ -1776,15 +1776,21 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
             super::env_cloudrun_sor::teardown_sor_units(ctx.store, ctx.env_id, sor_credentials)
                 .map_err(StoreError::ProviderTeardown)?;
 
-        Ok(json!({
+        let mut result = json!({
             "provider": "gcp-cloudrun",
             "project": project,
             "region": region,
             "deleted_services": deleted_services,
             "deleted_secrets": deleted_secrets,
             "skipped_secrets": skipped_secrets,
-            "sor": sor,
-        }))
+        });
+        // Omitted (never an empty object) when the ledger held no SoR unit, so a
+        // plain Cloud Run destroy's output is unchanged from before SoR units
+        // existed.
+        if let Some(sor) = sor {
+            result["sor"] = sor;
+        }
+        Ok(result)
     }
 }
 
