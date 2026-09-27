@@ -20,6 +20,6 @@ pub mod fake;
 // #[cfg(feature = "deploy-gcp-cloudrun")]
 // pub mod real;
 // pub mod retire;
-// pub mod spec;
+pub mod spec;
 pub mod target;
 // pub mod up;
