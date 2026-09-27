@@ -3,6 +3,8 @@
 //! what `op env reconcile` (k8s) and `op env up` (Cloud Run) need from the
 //! env's store.
 
+#[cfg(feature = "creds-gcp")]
+pub(crate) mod cloudrun;
 mod inputs;
 mod prepare;
 mod publish;
