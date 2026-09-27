@@ -303,7 +303,15 @@ A revision the deployment's current split already serves with the same digest,
 source URI and drain window is **reused** — same revision, nothing pulled, no
 re-stage — so stepping the weights (10 → 50 → 100) is a traffic-only change.
 Only a revision with no such match is fetched, verified against its pin, and
-staged.
+staged — at plan time, so `--dry-run` reports an unreachable artifact and a
+real apply stages nothing rather than half a split. When the Cloud Run deployer
+answers change, nothing is reused: every revision is fetched up front and
+re-staged. The pin must be `sha256:` plus 64 lowercase hex characters.
+
+A revision may also keep a local `bundle_path` together with a
+`bundle_source_uri`, exactly as the single-revision form allows: the path is
+the artifact (and its digest source), the URI only the pull ref recorded for
+the worker.
 
 ---
 

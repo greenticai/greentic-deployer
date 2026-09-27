@@ -869,6 +869,11 @@ impl EnvManifest {
                     // pin is mandatory remote-only: it is what lets apply
                     // match an already-serving revision without pulling, and
                     // what the pull is verified against when it does.
+                    //
+                    // `bundle_path` + `bundle_source_uri` together stays
+                    // legal, exactly as in the single-revision form: the path
+                    // supplies (and is hashed as) the artifact and the URI is
+                    // only the pull ref recorded for a remote worker.
                     if rev.bundle_path.is_none() {
                         let has_uri = rev
                             .bundle_source_uri
@@ -879,6 +884,19 @@ impl EnvManifest {
                                 "bundle `{}`, revision `{}`: a revision needs a local \
                                  `bundle_path`, or a remote `bundle_source_uri` together \
                                  with a pinned `bundle_digest` (sha256:…)",
+                                b.bundle_id, rev.name
+                            )));
+                        }
+                        // The pin must be canonical before anything is pulled:
+                        // reuse matches it byte-for-byte against the stored
+                        // digest, so e.g. uppercase hex would always re-pull
+                        // and then fail the gate.
+                        let pin = rev.bundle_digest.as_deref().unwrap_or_default();
+                        if !is_canonical_sha256(pin) {
+                            return Err(OpError::InvalidArgument(format!(
+                                "bundle `{}`, revision `{}`: a remote-only revision's \
+                                 bundle_digest `{pin}` must be `sha256:` followed by 64 \
+                                 lowercase hex characters",
                                 b.bundle_id, rev.name
                             )));
                         }
@@ -1058,6 +1076,17 @@ fn validate_digest_pin(
     Err(OpError::InvalidArgument(format!(
         "{location}: bundle_digest `{digest}` must be a `sha256:<hex>` string"
     )))
+}
+
+/// `sha256:` + exactly 64 lowercase hex characters — the form the store
+/// records for a staged artifact.
+fn is_canonical_sha256(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
 }
 
 /// Validate the weight consistency of a multi-revision bundle entry.
@@ -3044,20 +3073,40 @@ mod tests {
     #[test]
     fn remote_only_and_mixed_split_revisions_are_accepted() {
         split_manifest(serde_json::json!([
-            {"name": "a", "bundle_source_uri": "oci://r/a:1", "bundle_digest": "sha256:aa",
+            {"name": "a", "bundle_source_uri": "oci://r/a:1", "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
              "weight_percent": 90},
-            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bb",
+            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
              "weight_percent": 10}
         ]))
         .validate_shape()
         .expect("remote-only split");
         split_manifest(serde_json::json!([
             {"name": "a", "bundle_path": "a.gtbundle", "weight_percent": 90},
-            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bb",
+            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
              "weight_percent": 10}
         ]))
         .validate_shape()
         .expect("mixed path + remote split");
+    }
+
+    #[test]
+    fn a_remote_only_pin_must_be_canonical_sha256() {
+        for pin in [
+            "sha256:aa".to_string(),
+            format!("sha256:{}", "A".repeat(64)),
+            "a".repeat(64),
+            format!("sha256:{}", "g".repeat(64)),
+        ] {
+            let err = split_manifest(serde_json::json!([
+                {"name": "a", "bundle_source_uri": "oci://r/a:1", "bundle_digest": pin}
+            ]))
+            .validate_shape()
+            .expect_err("non-canonical pin");
+            assert!(
+                matches!(&err, OpError::InvalidArgument(_)),
+                "{pin}: {err:?}"
+            );
+        }
     }
 
     #[test]

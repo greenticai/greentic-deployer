@@ -186,6 +186,16 @@ pub(crate) mod test_seam {
         });
     }
 
+    /// Stop serving `uri` (a later fetch of it fails like an unreachable
+    /// registry).
+    pub(crate) fn unserve(uri: &str) {
+        SEAM.with(|s| {
+            if let Some(seam) = s.borrow_mut().as_mut() {
+                seam.served.remove(uri);
+            }
+        });
+    }
+
     /// Every URI fetched on this thread since the seam was installed.
     pub(crate) fn fetched() -> Vec<String> {
         SEAM.with(|s| {

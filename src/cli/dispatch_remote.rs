@@ -3984,9 +3984,9 @@ mod tests {
             "customer_id": "acme",
             "revisions": [
                 {"name": "v1", "weight_percent": 90,
-                 "bundle_source_uri": "oci://r/app:1", "bundle_digest": "sha256:aa"},
+                 "bundle_source_uri": "oci://r/app:1", "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
                 {"name": "v2", "weight_percent": 10,
-                 "bundle_source_uri": "oci://r/app:2", "bundle_digest": "sha256:bb"}
+                 "bundle_source_uri": "oci://r/app:2", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
             ]
         }]);
         let manifest = manifest_from(j);
@@ -4010,10 +4010,10 @@ mod tests {
                 "revisions": [
                     {"name": "v1", "weight_percent": 90,
                      "bundle_source_uri": "oci://registry.example/app:1",
-                     "bundle_digest": "sha256:abc123"},
+                     "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
                     {"name": "v2", "weight_percent": 10,
                      "bundle_source_uri": "oci://registry.example/app:2",
-                     "bundle_digest": "sha256:def456"}
+                     "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
                 ]
             }]
         });

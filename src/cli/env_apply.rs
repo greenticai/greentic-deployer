@@ -88,9 +88,9 @@ use super::config::ConfigSetPayload;
 use super::deploy::BundleDeployPayload;
 use super::env::EnvInitPayload;
 use super::env_manifest::{
-    ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestBundle, ManifestEndpoint, ManifestRevision,
-    ManifestUpdates, ManifestWelcomeFlow, TrustRootDirective, compute_effective_weights_bps,
-    manifest_schema,
+    ENV_MANIFEST_SCHEMA_V1, EnvManifest, ManifestBundle, ManifestEndpoint, ManifestPack,
+    ManifestRevision, ManifestUpdates, ManifestWelcomeFlow, TrustRootDirective,
+    compute_effective_weights_bps, manifest_schema,
 };
 use super::env_packs::EnvPackBindingPayload;
 use super::extensions::ExtensionBindingPayload;
@@ -387,6 +387,12 @@ struct ApplyContext {
     /// order, then bundles in manifest order.
     missing: Vec<MissingItem>,
     warnings: Vec<String>,
+    /// An existing Cloud Run deployer binding's answers change in this apply,
+    /// decided once in [`resolve_and_validate`] with the same predicate the
+    /// diff uses ([`cloudrun_answers_differ`]). Every existing deployment is
+    /// then re-staged fresh, so resolution must NOT skip fetching a remote-only
+    /// split revision on the strength of a reuse that will not happen.
+    cloudrun_deployer_answers_changed: bool,
     updated_by: String,
     /// Directory of the manifest file. Pack-binding `answers_ref`s resolve
     /// against it, and apply stages them into the env store so reconcile
@@ -858,6 +864,24 @@ fn resolve_and_validate(
         }
     }
 
+    // Decided before the bundles, because it decides whether a remote-only
+    // split revision may skip its fetch (see below). Only an EXISTING env has
+    // deployments to re-stage.
+    let mut cloudrun_deployer_answers_changed = false;
+    if let Some(env) = &env {
+        for mp in manifest
+            .packs
+            .iter()
+            .filter(|mp| is_cloudrun_deployer_pack(mp))
+        {
+            if let Some(binding) = env.pack_for_slot(mp.slot)
+                && cloudrun_answers_differ(store, &env_id, manifest_dir, mp, binding)?
+            {
+                cloudrun_deployer_answers_changed = true;
+            }
+        }
+    }
+
     // Bundle artifacts: existence + digest, plus the B10 billing-principal
     // rule, all before any mutation. The principal rule stays fail-fast
     // (a manifest bug); an absent artifact is a missing input — the bundle
@@ -974,10 +998,12 @@ fn resolve_and_validate(
                 // plan time. The pull is deferred to after the reuse check
                 // below, so a revision an existing split already serves is
                 // never fetched.
-                let digest = spec
-                    .bundle_digest
-                    .clone()
-                    .expect("validate_shape: a remote-only revision pins bundle_digest");
+                let digest = spec.bundle_digest.clone().ok_or_else(|| {
+                    OpError::InvalidArgument(format!(
+                        "internal: {location} has no bundle_path and no pinned bundle_digest \
+                         (validate_shape admits neither)"
+                    ))
+                })?;
                 resolved_revs.push(ResolvedRevision {
                     spec,
                     resolved_path: None,
@@ -1026,9 +1052,15 @@ fn resolve_and_validate(
         // (`split_reuse::reusable_revisions` over the whole split, so
         // duplicate artifacts claim distinct revisions); a revision matched
         // here is routed to without any pull.
+        //
+        // When the Cloud Run deployer answers change, every revision of an
+        // existing deployment is re-staged fresh — no reuse — so every
+        // remote-only revision is fetched and verified HERE, before any
+        // mutation (and in a dry run), never lazily mid-split.
         if resolved_revs.iter().any(|r| r.resolved_path.is_none()) {
-            let reusable = env
-                .as_ref()
+            let reusable = (!cloudrun_deployer_answers_changed)
+                .then_some(())
+                .and(env.as_ref())
                 .and_then(|env| {
                     env.bundles
                         .iter()
@@ -1234,6 +1266,7 @@ fn resolve_and_validate(
         env,
         canonical_public_base_url,
         missing,
+        cloudrun_deployer_answers_changed,
         warnings,
         updated_by,
         manifest_dir: manifest_dir.to_path_buf(),
@@ -1478,7 +1511,9 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
     // deployment is re-staged below. Cloud Run only: K8s re-renders its worker
     // in place from the current answers, and a re-stage there would leave one
     // more permanent worker behind per answers edit.
-    let mut cloudrun_deployer_answers_changed = false;
+    // Seeded from the resolver's decision (same predicate), so the resolver's
+    // "fetch every remote-only revision" and this re-stage always agree.
+    let mut cloudrun_deployer_answers_changed = ctx.cloudrun_deployer_answers_changed;
     for mp in &ctx.manifest.packs {
         let existing = match &ctx.env {
             Some(e) => e.pack_for_slot(mp.slot),
@@ -1519,35 +1554,10 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             Some(b) => {
                 let kind_differs = b.kind.to_string() != mp.kind;
                 let pack_ref_differs = b.pack_ref.as_str() != mp.pack_ref;
-                // Content-aware + ref-aware: the stored ref is the env-relative
-                // staged path (rewritten on apply), so a raw string compare
-                // against the manifest-relative ref would always differ.
-                // Compare the staged file's bytes to the manifest source AND
-                // verify the binding's `answers_ref` points at the canonical
-                // staged path — a prior interrupted apply could have staged the
-                // file but failed to persist the ref on the binding, so checking
-                // bytes alone would miss that drift. (A manifest that drops
-                // answers_ref is left as-is here, matching the prior behaviour.)
-                let answers_ref_differs = match &mp.answers_ref {
-                    Some(ar) => {
-                        let content_outdated = staged_answers_outdated(
-                            store,
-                            &ctx.env_id,
-                            &ctx.manifest_dir,
-                            mp.slot,
-                            ar,
-                        )?;
-                        let ref_wrong =
-                            b.answers_ref.as_deref() != Some(staged_answers_rel(mp.slot).as_path());
-                        content_outdated || ref_wrong
-                    }
-                    None => false,
-                };
-                if answers_ref_differs
-                    && mp.slot == CapabilitySlot::Deployer
-                    && greentic_deploy_spec::PackDescriptor::try_new(&mp.kind)
-                        .is_ok_and(|d| super::env::is_cloudrun_kind(&d))
-                {
+                // See `cloudrun_answers_differ` (content- and ref-aware).
+                let answers_ref_differs =
+                    cloudrun_answers_differ(store, &ctx.env_id, &ctx.manifest_dir, mp, b)?;
+                if answers_ref_differs && is_cloudrun_deployer_pack(mp) {
                     cloudrun_deployer_answers_changed = true;
                 }
                 if kind_differs || pack_ref_differs || answers_ref_differs {
@@ -3126,6 +3136,40 @@ fn resolve_answers_src(manifest_dir: &Path, manifest_ref: &Path) -> PathBuf {
     }
 }
 
+/// Whether a manifest pack binds the Cloud Run deployer (the one kind whose
+/// answers change forces fresh revisions).
+fn is_cloudrun_deployer_pack(mp: &ManifestPack) -> bool {
+    mp.slot == CapabilitySlot::Deployer
+        && greentic_deploy_spec::PackDescriptor::try_new(&mp.kind)
+            .is_ok_and(|d| super::env::is_cloudrun_kind(&d))
+}
+
+/// Whether a manifest pack's `answers_ref` differs from the existing binding.
+/// Content-aware + ref-aware: the stored ref is the env-relative staged path
+/// (rewritten on apply), so a raw string compare against the manifest-relative
+/// ref would always differ. Compare the staged file's bytes to the manifest
+/// source AND verify the binding's `answers_ref` points at the canonical
+/// staged path — a prior interrupted apply could have staged the file but
+/// failed to persist the ref on the binding, so checking bytes alone would miss
+/// that drift. (A manifest that drops answers_ref is left as-is.)
+///
+/// The ONE predicate both the diff and [`resolve_and_validate`] use, so the
+/// resolver's fetch decision and the planner's re-stage cannot disagree.
+fn cloudrun_answers_differ(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    manifest_dir: &Path,
+    mp: &ManifestPack,
+    binding: &greentic_deploy_spec::EnvPackBinding,
+) -> Result<bool, OpError> {
+    let Some(ar) = &mp.answers_ref else {
+        return Ok(false);
+    };
+    let content_outdated = staged_answers_outdated(store, env_id, manifest_dir, mp.slot, ar)?;
+    let ref_wrong = binding.answers_ref.as_deref() != Some(staged_answers_rel(mp.slot).as_path());
+    Ok(content_outdated || ref_wrong)
+}
+
 /// True when the staged answers file is missing or its content differs from
 /// the manifest source — i.e. apply must (re)stage it. Identical content
 /// re-applies as a no-op, so apply stays idempotent.
@@ -3436,8 +3480,10 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
             short_digest(&rev.expected_digest)
         );
         // TOCTOU re-check per revision. A remote-only revision planned for
-        // reuse but staged after all (the deployer answers changed, or the
-        // store moved since planning) is fetched now, gated on its pin.
+        // reuse but staged after all is fetched now, gated on its pin. That is
+        // only the residual case of the store moving between plan and execute:
+        // a deployer-answers change is known at plan time, and resolution then
+        // fetches every remote-only revision before any mutation.
         let artifact = match &rev.resolved_path {
             Some(path) => {
                 ensure_artifact_unchanged(path, &rev.expected_digest)?;
@@ -5765,9 +5811,63 @@ mod tests {
         assert!(test_seam::fetched().is_empty());
     }
 
+    /// When the Cloud Run deployer answers change, every revision is re-staged
+    /// fresh, so every remote-only revision must be fetched and verified at
+    /// PLAN time — an unreachable second revision is a missing input reported
+    /// by the dry run, and apply stages nothing (no half-applied split).
+    #[test]
+    fn answers_change_fetches_every_remote_revision_before_any_mutation() {
+        let (dir, store) = seeded_store();
+        let kind = "greentic.deployer.gcp-cloudrun@1.0.0";
+        let manifest = |answers: Value| {
+            json!({
+                "schema": ENV_MANIFEST_SCHEMA_V1,
+                "environment": {"id": "local"},
+                "packs": [{
+                    "slot": "deployer", "kind": kind, "pack_ref": "builtin",
+                    "answers": answers
+                }],
+                "bundles": [{"bundle_id": "canary", "revisions": [
+                    remote_rev("a", &fixture(), 9_000),
+                    remote_rev("b", &provider_fixture(), 1_000),
+                ]}]
+            })
+        };
+        let v1 = json!({"project": "p", "region": "europe-west1"});
+        apply_value(&store, dir.path(), "m1.json", &manifest(v1.clone()));
+        let revisions_before = load_local(&store).revisions.len();
+
+        let mut v2 = v1;
+        v2["runtime_image_digest"] =
+            json!("sha256:15be7f3bc3e34594485f02db69c2531c98055902370090ed4361748dbfc4c992");
+        let m2 = manifest(v2);
+        test_seam::unserve("oci://test/b:1");
+        test_seam::reset_fetched();
+        let path = write_manifest(dir.path(), &m2);
+
+        let plan = run_dry(&store, &path).expect("dry-run reports, does not fail");
+        let missing = plan.result["missing"].as_array().expect("missing list");
+        assert!(
+            missing.iter().any(|m| m["key"] == "canary:b"),
+            "the dry run must check fetchability: {}",
+            plan.result
+        );
+        assert!(test_seam::fetched().contains(&"oci://test/b:1".to_string()));
+
+        assert!(
+            run_apply(&store, &path).is_err(),
+            "unreachable revision refuses apply"
+        );
+        assert_eq!(
+            load_local(&store).revisions.len(),
+            revisions_before,
+            "nothing may be staged when a revision cannot be fetched"
+        );
+    }
+
     /// A remote-only revision planned for reuse carries no artifact; when the
-    /// executor must stage it after all (here: `reuse_ready: false`, what a
-    /// deployer-answers change emits) it fetches and verifies it then.
+    /// executor must stage it after all (the residual store-moved case, forced
+    /// here with `reuse_ready: false`) it fetches and verifies it then.
     #[test]
     fn an_unfetched_remote_revision_is_pulled_when_it_must_be_staged() {
         let (dir, store) = seeded_store();
@@ -7501,6 +7601,7 @@ mod tests {
             canonical_public_base_url: None,
             missing: Vec::new(),
             warnings: Vec::new(),
+            cloudrun_deployer_answers_changed: false,
             updated_by: "test".to_string(),
             manifest_dir: PathBuf::from("."),
             env_dir: None,
