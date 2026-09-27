@@ -55,9 +55,8 @@ pub const SOR_REQUIRED_IAM_PERMISSIONS: &[&str] = &[
     "secretmanager.secrets.delete",
 ];
 
-/// The reader grant is best effort; these stay OUT of
-/// `VALIDATED_GCP_PERMISSIONS` on purpose (a deployer without them still
-/// deploys, and gets a note carrying the `gcloud` command).
+/// The reader grant is best effort; these stay OUT of `VALIDATED_GCP_PERMISSIONS`
+/// on purpose (a deployer without them deploys and gets the `gcloud` note).
 pub const SOR_BEST_EFFORT_IAM_PERMISSIONS: &[&str] = &[
     "artifactregistry.repositories.getIamPolicy",
     "artifactregistry.repositories.setIamPolicy",
@@ -91,8 +90,7 @@ impl RealSorTarget {
         })
     }
 
-    /// The same clients as a [`CloudRunTarget`](super::super::deploy_target::CloudRunTarget),
-    /// for staging the unit's secret.
+    /// The same clients as a `CloudRunTarget`, for staging the unit's secret.
     pub fn run_target(&self) -> RealCloudRunTarget {
         self.run.clone()
     }
@@ -133,8 +131,7 @@ impl SorServiceTarget for RealSorTarget {
             Err(e) => return Err(classify("get_service", &e)),
         };
         let mut status = sor_status_from(&svc);
-        // Cloud Run's reason lives on the revision, not the service. Best
-        // effort: a failed read leaves the reason empty, never the status.
+        // The reason lives on the revision; best effort (never alters status).
         if status.failed()
             && !svc.latest_created_revision.is_empty()
             && let Ok(rev) = self
@@ -152,20 +149,25 @@ impl SorServiceTarget for RealSorTarget {
         Ok(Some(status))
     }
 
+    /// Returns once Cloud Run ACCEPTS the create/update; never waits for the
+    /// rollout. Only a request-level refusal errors (a stale etag stays
+    /// `PreconditionFailed`); a revision that then fails to boot is observed by
+    /// `up::wait_ready` via `get_sor_service`, within `SorReadyTiming` and with
+    /// Cloud Run's reason. Awaiting the operation would turn that into an
+    /// operation error (maybe `FAILED_PRECONDITION`, retried as an etag race).
     async fn upsert_sor_service(
         &self,
         spec: &SorServiceSpec,
         etag: Option<&str>,
     ) -> Result<SorServiceStatus, CloudRunTargetError> {
         let message = build_sor_service_message(spec, etag);
-        let svc = match etag {
+        let _operation = match etag {
             Some(_) => self
                 .run
                 .services
                 .update_service()
                 .set_service(message)
-                .poller()
-                .until_done()
+                .send()
                 .await
                 .map_err(|e| classify("update_service", &e))?,
             None => self
@@ -178,12 +180,11 @@ impl SorServiceTarget for RealSorTarget {
                 ))
                 .set_service_id(spec.service.name.clone())
                 .set_service(message)
-                .poller()
-                .until_done()
+                .send()
                 .await
                 .map_err(|e| classify("create_service", &e))?,
         };
-        Ok(sor_status_from(&svc))
+        Ok(accepted_status(spec))
     }
 
     async fn set_sor_invoker_public(
@@ -234,8 +235,7 @@ impl SorServiceTarget for RealSorTarget {
     ) -> Result<(), CloudRunTargetError> {
         let url = format!("{AR_API}/{}", repo.resource());
         let headers = self.auth_headers().await?;
-        // `requestedPolicyVersion=3` makes Google return conditional bindings
-        // WITH their condition, so writing the policy back cannot broaden them.
+        // Policy version 3 keeps conditional bindings' conditions on write-back.
         let response = self
             .http
             .get(format!(
@@ -295,8 +295,7 @@ fn sor_service_fqn(service: &SorServiceRef) -> String {
     )
 }
 
-/// `latest_created_revision` is a full resource name; accept a bare revision
-/// id too rather than asking Cloud Run for a name it cannot resolve.
+/// `latest_created_revision` is a full resource name; qualify a bare id.
 fn revision_fqn(service: &SorServiceRef, revision: &str) -> String {
     if revision.contains('/') {
         revision.to_string()
@@ -420,13 +419,10 @@ pub(super) fn build_sor_service_message(spec: &SorServiceSpec, etag: Option<&str
     service
 }
 
-/// Project a live service onto the seam status.
-///
-/// `ready` is NOT Cloud Run's Ready condition alone: right after an upsert
-/// that condition can still describe the PREVIOUS revision. Ready means the
-/// service's observed generation caught up with its generation AND the latest
-/// CREATED revision is the latest ready one (and the service reports Ready).
-/// A lagging generation is a rollout (`reconciling`), never a failure.
+/// `ready` is NOT the Ready condition alone (right after an upsert it can still
+/// describe the PREVIOUS revision): the observed generation must have caught up
+/// AND the latest CREATED revision must be the latest ready one. A lagging
+/// generation is a rollout (`reconciling`), never a failure.
 pub(super) fn sor_status_from(svc: &run::Service) -> SorServiceStatus {
     let reconciling = svc.reconciling || svc.observed_generation != svc.generation;
     let latest_created_ready = !svc.latest_created_revision.is_empty()
@@ -438,6 +434,21 @@ pub(super) fn sor_status_from(svc: &run::Service) -> SorServiceStatus {
         ready: !reconciling && latest_created_ready && service_ready(svc),
         reconciling,
         url: non_empty(svc.uri.clone()),
+        not_ready_reason: None,
+        log_uri: None,
+    }
+}
+
+/// An accepted upsert: reconciling (neither ready nor failed); the caller
+/// polls the live service for the outcome.
+pub(super) fn accepted_status(spec: &SorServiceSpec) -> SorServiceStatus {
+    SorServiceStatus {
+        etag: String::new(),
+        owner: Some(spec.labels.owner.clone()),
+        intent: Some(spec.labels.intent.clone()),
+        ready: false,
+        reconciling: true,
+        url: None,
         not_ready_reason: None,
         log_uri: None,
     }

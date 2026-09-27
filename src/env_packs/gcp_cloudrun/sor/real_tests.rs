@@ -230,3 +230,34 @@ fn the_sor_permission_contract_holds() {
         );
     }
 }
+
+/// An accepted upsert is a rollout in progress: never ready (that would skip
+/// the wait) and never failed (that would fail the run before Cloud Run has
+/// booted anything). `up::wait_ready` reads the real outcome.
+#[test]
+fn an_accepted_upsert_reports_a_rollout_in_progress_not_an_outcome() {
+    let status = accepted_status(&spec(false));
+    assert!(!status.ready && status.reconciling && !status.failed());
+    assert_eq!(status.owner.as_deref(), Some("local-stamp"));
+    assert_eq!(
+        status.intent.as_deref(),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(status.url, None);
+}
+
+#[test]
+fn revision_fqn_keeps_a_full_name_and_qualifies_a_bare_one() {
+    let service = spec(false).service;
+    let full = "projects/proj/locations/europe-west1/services/gtc-sor-landlord/revisions/r-1";
+    assert_eq!(revision_fqn(&service, full), full);
+    assert_eq!(revision_fqn(&service, "r-1"), full);
+}
+
+#[test]
+fn a_spec_without_a_ca_renders_no_volume_and_no_mount() {
+    let svc = build_sor_service_message(&spec(false), None);
+    let template = svc.template.as_ref().expect("template");
+    assert!(template.volumes.is_empty());
+    assert!(template.containers[0].volume_mounts.is_empty());
+}
