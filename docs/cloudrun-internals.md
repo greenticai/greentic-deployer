@@ -23,6 +23,7 @@ failure.
 | `credentials.rs` | 1145 | `DeployerCredentials`: ADC principal resolution + the `testIamPermissions` preflight. |
 | `bootstrap.rs` | 414 | Renders the minimum-privilege Terraform module (deployer SA, runtime SA, custom role). |
 | `bound_session.rs` | 261 | Resolves the env's bound credential material into live `Credentials`. |
+| `sor/` | ~1100 | SoR units (SoRLa phase 3E): the SorServiceTarget seam + fake, pure builders, bring-up/retire, the real target. |
 
 Feature gating is two-tier and deliberate:
 
@@ -287,9 +288,47 @@ Not gaps to fix casually — each has a reason:
 
 ---
 
+## 10. SoR units (SoRLa phase 3E)
+
+`op env up` on a Cloud Run environment deploys each declared `sor_units[]`
+entry as its own Cloud Run service `gtc-sor-<unit_id>` BEFORE any worker is
+warmed, because a worker finds its SoR through the route document
+`default/_/sorla/<sor>` in the dev store, and a revision keeps the seed it was
+created with. There is no `op env reconcile` here: the whole SoR phase runs
+inside `op env up` (`cli::env_cloudrun_sor`, core in `cli::env_sor::cloudrun`).
+
+- **Two seams.** Inputs are versions of ONE owner-stamped secret
+  `<secret_prefix>-sor-<unit_id>` staged through `CloudRunTarget` (same
+  claim-then-write ownership rule as the seed, but an unstamped secret is
+  refused, not adopted). The service goes through `sor::target::SorServiceTarget`
+  because it is addressed by name, not `DeploymentId`.
+- **Intent, not existence.** The service carries `greentic-sor-intent`, a
+  digest of image, pack, runtime identity, every input and the fixed shape. A
+  re-run with the same intent stages nothing and deploys nothing — unless the
+  latest revision FAILED, which is always redeployed.
+- **Order per run:** stage → Artifact Registry reader grant (best effort; a
+  refusal is a `sor_notes` entry carrying the `gcloud` command) → upsert → wait
+  (`GREENTIC_GCP_SOR_READY_TIMEOUT_SECS`, default 300) → `allUsers` invoker →
+  route document → workers → traffic → retire → narrow the ledger.
+- **Retirement** deletes only what this environment's owner stamp owns, and
+  never a service or secret a declared unit still uses.
+- **Permissions.** The SoR path needs nothing beyond
+  `REAL_CLOUDRUN_TARGET_IAM_PERMISSIONS` (pinned by
+  `sor::real::tests::the_sor_permission_contract_holds`). The reader grant's
+  `artifactregistry.repositories.{get,set}IamPolicy` are deliberately NOT
+  validated.
+- **Ledger.** `sor-units.applied.json` entries carry `cloud_run: {service,
+  secret, project, region}` instead of `namespace`; a ledger of the other lane
+  is refused, not migrated. `op env destroy` retires every Cloud Run SoR unit it
+  records.
+- **Live E2E:** `tests/gcp_cloudrun_sor_e2e.rs` (`GREENTIC_GCP_E2E=1`).
+
+---
+
 ## See also
 
 - [`cloudrun-deployment.md`](cloudrun-deployment.md) — the operator-facing guide.
 - [`env-packs.md`](env-packs.md) — authoring an env-pack.
 - `../CLAUDE.md` — repo orientation, and the two-architectures warning.
 - `tests/gcp_cloudrun_e2e.rs` — the executable version of the lifecycle above.
+- `tests/gcp_cloudrun_sor_e2e.rs` — the SoR-unit lifecycle in §10, live.
