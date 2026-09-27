@@ -196,7 +196,10 @@ impl ApplyStepKind {
 #[derive(Debug, Clone)]
 struct SplitRevisionEntry {
     name: String,
-    resolved_path: PathBuf,
+    /// Local artifact, re-hashed before use. `None` for a remote-only
+    /// revision that planning matched to a serving revision and so never
+    /// fetched; the executor fetches it only if it has to stage after all.
+    resolved_path: Option<PathBuf>,
     expected_digest: String,
     weight_bps: u32,
     drain_seconds: Option<u32>,
@@ -328,7 +331,9 @@ impl ApplyStep {
 /// One resolved revision inside a multi-revision bundle entry.
 struct ResolvedRevision {
     spec: ManifestRevision,
-    resolved_path: PathBuf,
+    /// `None` only for a remote-only split revision that an existing split
+    /// already serves unchanged: reuse routes to it without a pull.
+    resolved_path: Option<PathBuf>,
     digest: String,
     /// Effective weight in basis points, computed by
     /// [`compute_effective_weights_bps`].
@@ -863,9 +868,9 @@ fn resolve_and_validate(
 
         // Single-revision, remote-only source: no local `bundle_path`. Fetch the
         // artifact from `bundle_source_uri` so it stages exactly like a local
-        // bundle, then verify any declared digest. (Multi-revision remote-only
-        // is a follow-up; `validate_shape` permits URI-only for the
-        // single-revision form only.)
+        // bundle, then verify any declared digest. A multi-revision remote-only
+        // revision goes through the same fetch below (`fetch_remote_revision`),
+        // but only when no serving revision can be reused for it.
         if b.bundle_path.is_none() && b.revisions.is_none() {
             let uri = b
                 .bundle_source_uri
@@ -899,7 +904,7 @@ fn resolve_and_validate(
                         name: "default".to_string(),
                         // Vestigial: `deploy_payload` reads `resolved_path`, not
                         // this. The fetched cache file is the local location.
-                        bundle_path: fetched.clone(),
+                        bundle_path: Some(fetched.clone()),
                         weight_percent: None,
                         weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
                         drain_seconds: None,
@@ -909,7 +914,7 @@ fn resolve_and_validate(
                         bundle_source_uri: None,
                         bundle_digest: None,
                     },
-                    resolved_path: fetched,
+                    resolved_path: Some(fetched),
                     digest,
                     weight_bps: super::deploy::FULL_TRAFFIC_BPS,
                 }],
@@ -917,13 +922,15 @@ fn resolve_and_validate(
             continue;
         }
 
-        // Resolve each artifact path (single-revision or multi-revision).
-        let artifact_specs: Vec<(&std::path::Path, Option<&ManifestRevision>)> =
+        // Resolve each artifact source (single-revision or multi-revision).
+        // `None` path = a remote-only revision (validated to carry a
+        // `bundle_source_uri` and a pinned `bundle_digest`).
+        let artifact_specs: Vec<(Option<&std::path::Path>, Option<&ManifestRevision>)> =
             if let Some(bp) = &b.bundle_path {
-                vec![(bp.as_path(), None)]
+                vec![(Some(bp.as_path()), None)]
             } else if let Some(revs) = &b.revisions {
                 revs.iter()
-                    .map(|r| (r.bundle_path.as_path(), Some(r)))
+                    .map(|r| (r.bundle_path.as_deref(), Some(r)))
                     .collect()
             } else {
                 // validate_shape already rejects this, but be safe.
@@ -942,6 +949,43 @@ fn resolve_and_validate(
         };
 
         for (i, (artifact_path, rev_spec)) in artifact_specs.iter().enumerate() {
+            let location = match rev_spec {
+                Some(r) => format!("bundle `{}`, revision `{}`", b.bundle_id, r.name),
+                None => format!("bundle `{}`", b.bundle_id),
+            };
+            let spec = rev_spec.cloned().unwrap_or_else(|| {
+                // Synthesize a ManifestRevision for single-revision entries.
+                ManifestRevision {
+                    name: "default".to_string(),
+                    bundle_path: b.bundle_path.clone(),
+                    weight_percent: None,
+                    weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
+                    drain_seconds: None,
+                    abort_metrics: Vec::new(),
+                    // Single-revision pull ref lives on the bundle
+                    // (`rb.spec.bundle_source_uri`, read by `deploy_payload`),
+                    // not on this synthetic revision.
+                    bundle_source_uri: None,
+                    bundle_digest: None,
+                }
+            });
+            let Some(artifact_path) = artifact_path else {
+                // Remote-only: the pinned digest IS the artifact identity at
+                // plan time. The pull is deferred to after the reuse check
+                // below, so a revision an existing split already serves is
+                // never fetched.
+                let digest = spec
+                    .bundle_digest
+                    .clone()
+                    .expect("validate_shape: a remote-only revision pins bundle_digest");
+                resolved_revs.push(ResolvedRevision {
+                    spec,
+                    resolved_path: None,
+                    digest,
+                    weight_bps: weights[i],
+                });
+                continue;
+            };
             let resolved_path = if artifact_path.is_absolute() {
                 artifact_path.to_path_buf()
             } else {
@@ -964,36 +1008,58 @@ fn resolve_and_validate(
                 Some(r) => r.bundle_digest.as_deref(),
                 None => b.bundle_digest.as_deref(),
             };
-            let location = match rev_spec {
-                Some(r) => format!("bundle `{}`, revision `{}`", b.bundle_id, r.name),
-                None => format!("bundle `{}`", b.bundle_id),
-            };
             let digest = resolved_artifact_digest(&resolved_path, declared_digest, &location)?;
-            let spec = rev_spec.cloned().unwrap_or_else(|| {
-                // Synthesize a ManifestRevision for single-revision entries.
-                ManifestRevision {
-                    name: "default".to_string(),
-                    bundle_path: b
-                        .bundle_path
-                        .clone()
-                        .expect("single-revision has bundle_path"),
-                    weight_percent: None,
-                    weight_bps: Some(super::deploy::FULL_TRAFFIC_BPS),
-                    drain_seconds: None,
-                    abort_metrics: Vec::new(),
-                    // Single-revision pull ref lives on the bundle
-                    // (`rb.spec.bundle_source_uri`, read by `deploy_payload`),
-                    // not on this synthetic revision.
-                    bundle_source_uri: None,
-                    bundle_digest: None,
-                }
-            });
             resolved_revs.push(ResolvedRevision {
                 spec,
-                resolved_path,
+                resolved_path: Some(resolved_path),
                 digest,
                 weight_bps: weights[i],
             });
+        }
+
+        if any_missing {
+            continue;
+        }
+
+        // Remote-only revisions: reuse first, fetch only what reuse cannot
+        // serve. The match is the same one the executor makes
+        // (`split_reuse::reusable_revisions` over the whole split, so
+        // duplicate artifacts claim distinct revisions); a revision matched
+        // here is routed to without any pull.
+        if resolved_revs.iter().any(|r| r.resolved_path.is_none()) {
+            let reusable = env
+                .as_ref()
+                .and_then(|env| {
+                    env.bundles
+                        .iter()
+                        .find(|d| {
+                            d.bundle_id.as_str() == b.bundle_id && d.customer_id == customer_id
+                        })
+                        .map(|dep| {
+                            let wanted: Vec<split_reuse::WantedRevision<'_>> =
+                                resolved_revs.iter().map(wanted_revision).collect();
+                            split_reuse::reusable_revisions(
+                                env,
+                                dep.deployment_id,
+                                &wanted,
+                                Some(env_dir.as_path()),
+                            )
+                        })
+                })
+                .unwrap_or_else(|| vec![None; resolved_revs.len()]);
+            for (rr, reuse) in resolved_revs.iter_mut().zip(reusable) {
+                if rr.resolved_path.is_some() || reuse.is_some() {
+                    continue;
+                }
+                match fetch_remote_revision(&b.bundle_id, &rr.spec, &rr.digest) {
+                    Ok(path) => rr.resolved_path = Some(path),
+                    Err(RemoteFetch::Missing(item)) => {
+                        missing.push(item);
+                        any_missing = true;
+                    }
+                    Err(RemoteFetch::Fatal(err)) => return Err(err),
+                }
+            }
         }
 
         if any_missing {
@@ -2435,7 +2501,11 @@ fn execute(store: &LocalFsStore, ctx: &ApplyContext, steps: &[ApplyStep]) -> Res
     // steps in the same run can still race with external writes.
     for rb in &ctx.bundles {
         for rr in &rb.revisions {
-            ensure_artifact_unchanged(&rr.resolved_path, &rr.digest)?;
+            // A remote-only revision matched for reuse was never fetched:
+            // there is no local artifact to re-hash.
+            if let Some(path) = &rr.resolved_path {
+                ensure_artifact_unchanged(path, &rr.digest)?;
+            }
         }
     }
 
@@ -3165,7 +3235,9 @@ fn deploy_payload(
         environment_id: env_id.to_string(),
         bundle_id: rb.spec.bundle_id.clone(),
         customer_id: rb.spec.customer_id.clone(),
-        bundle_path: Some(rb.revisions[0].resolved_path.clone()),
+        // Single-revision entries always resolve an artifact (only a
+        // remote-only SPLIT revision defers its pull).
+        bundle_path: rb.revisions[0].resolved_path.clone(),
         // Single-revision pull ref: a K8s worker fetches the bundle from here
         // at boot; `bundle_path` above supplies the integrity digest.
         bundle_source_uri: rb.spec.bundle_source_uri.clone(),
@@ -3184,17 +3256,54 @@ fn deploy_payload(
 /// The reuse key of every revision a multi-revision bundle declares, in
 /// manifest order.
 fn wanted_revisions(rb: &ResolvedBundle) -> Vec<split_reuse::WantedRevision<'_>> {
-    rb.revisions
-        .iter()
-        .map(|rr| split_reuse::WantedRevision {
-            digest: rr.digest.as_str(),
-            source_uri: rr.spec.bundle_source_uri.as_deref(),
-            drain_seconds: rr
-                .spec
-                .drain_seconds
-                .unwrap_or_else(super::revisions::default_drain_seconds),
-        })
-        .collect()
+    rb.revisions.iter().map(wanted_revision).collect()
+}
+
+/// The reuse key of one resolved revision.
+fn wanted_revision(rr: &ResolvedRevision) -> split_reuse::WantedRevision<'_> {
+    split_reuse::WantedRevision {
+        digest: rr.digest.as_str(),
+        source_uri: rr.spec.bundle_source_uri.as_deref(),
+        drain_seconds: rr
+            .spec
+            .drain_seconds
+            .unwrap_or_else(super::revisions::default_drain_seconds),
+    }
+}
+
+/// Why a remote-only revision could not be fetched: an input gap (reported
+/// and skipped, like an absent local file) or a manifest bug (fail fast).
+enum RemoteFetch {
+    Missing(MissingItem),
+    Fatal(OpError),
+}
+
+/// Fetch a remote-only revision's `bundle_source_uri` and verify it against
+/// the pinned digest — the single-revision URI-only path, per revision.
+fn fetch_remote_revision(
+    bundle_id: &str,
+    spec: &ManifestRevision,
+    pinned_digest: &str,
+) -> Result<PathBuf, RemoteFetch> {
+    let uri = spec.bundle_source_uri.as_deref().unwrap_or_default();
+    let fetched = match super::bundle_fetch::fetch_bundle_uri_to_local(uri) {
+        Ok(path) => path,
+        Err(OpError::Fetch(message)) => {
+            return Err(RemoteFetch::Missing(MissingItem {
+                kind: MissingKind::BundleArtifact,
+                key: format!("{bundle_id}:{}", spec.name),
+                source: format!("uri:{uri} ({message})"),
+            }));
+        }
+        Err(other) => return Err(RemoteFetch::Fatal(other)),
+    };
+    resolved_artifact_digest(
+        &fetched,
+        Some(pinned_digest),
+        &format!("bundle `{bundle_id}`, revision `{}`", spec.name),
+    )
+    .map_err(RemoteFetch::Fatal)?;
+    Ok(fetched)
 }
 
 /// Build a [`StepOp::DeploySplit`] from a resolved multi-revision bundle.
@@ -3308,9 +3417,12 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
                 rev.name,
                 short_digest(&rev.expected_digest)
             );
-            // The manifest artifact must still be the one the match was made
-            // against, exactly as for a fresh stage.
-            ensure_artifact_unchanged(&rev.resolved_path, &rev.expected_digest)?;
+            // A local manifest artifact must still be the one the match was
+            // made against, exactly as for a fresh stage. A remote-only one
+            // was matched by its pinned digest and is never pulled here.
+            if let Some(path) = &rev.resolved_path {
+                ensure_artifact_unchanged(path, &rev.expected_digest)?;
+            }
             traffic_entries.push(TrafficSetEntryPayload {
                 revision_id: revision_id.to_string(),
                 weight_bps: Some(rev.weight_bps),
@@ -3323,8 +3435,27 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
             rev.name,
             short_digest(&rev.expected_digest)
         );
-        // TOCTOU re-check per revision.
-        ensure_artifact_unchanged(&rev.resolved_path, &rev.expected_digest)?;
+        // TOCTOU re-check per revision. A remote-only revision planned for
+        // reuse but staged after all (the deployer answers changed, or the
+        // store moved since planning) is fetched now, gated on its pin.
+        let artifact = match &rev.resolved_path {
+            Some(path) => {
+                ensure_artifact_unchanged(path, &rev.expected_digest)?;
+                path.clone()
+            }
+            None => {
+                let uri = rev.bundle_source_uri.as_deref().ok_or_else(|| {
+                    OpError::InvalidArgument(format!(
+                        "internal: split revision `{}` has neither an artifact nor a \
+                         bundle_source_uri",
+                        rev.name
+                    ))
+                })?;
+                let fetched = super::bundle_fetch::fetch_bundle_uri_to_local(uri)?;
+                ensure_artifact_unchanged(&fetched, &rev.expected_digest)?;
+                fetched
+            }
+        };
 
         let stage_payload = RevisionStagePayload {
             environment_id: env_id.to_string(),
@@ -3332,7 +3463,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
             // Local `--bundle` stage: the store mints the id + key.
             revision_id: None,
             idempotency_key: None,
-            bundle_path: Some(rev.resolved_path.clone()),
+            bundle_path: Some(artifact),
             bundle_digest: super::revisions::default_bundle_digest(),
             // Pull ref the manifest declared for this revision (`oci://` /
             // `repo://` / `store://`); a K8s worker fetches the bundle from
@@ -5206,7 +5337,7 @@ mod tests {
         ResolvedRevision {
             spec: ManifestRevision {
                 name: name.to_string(),
-                bundle_path: PathBuf::from(format!("{name}.gtbundle")),
+                bundle_path: Some(PathBuf::from(format!("{name}.gtbundle"))),
                 weight_percent: None,
                 weight_bps: Some(weight_bps),
                 drain_seconds: None,
@@ -5214,7 +5345,7 @@ mod tests {
                 bundle_source_uri: None,
                 bundle_digest: None,
             },
-            resolved_path: PathBuf::from(format!("{name}.gtbundle")),
+            resolved_path: Some(PathBuf::from(format!("{name}.gtbundle"))),
             digest: digest.to_string(),
             weight_bps,
         }
@@ -5502,6 +5633,199 @@ mod tests {
         assert_eq!(a_before, a_after, "the unchanged revision keeps its id");
     }
 
+    // --- Remote-only split revisions (no bundle_path) ---
+
+    use super::super::bundle_fetch::test_seam;
+
+    /// A remote-only revision entry: `oci://test/<name>` served (by the fetch
+    /// seam) from `path`, pinned to its real digest.
+    fn remote_rev(name: &str, path: &Path, bps: u32) -> Value {
+        let uri = format!("oci://test/{name}:1");
+        test_seam::serve(&uri, path.to_path_buf());
+        json!({
+            "name": name,
+            "bundle_source_uri": uri,
+            "bundle_digest": super::super::bundle_stage::sha256_file(path).unwrap(),
+            "weight_bps": bps
+        })
+    }
+
+    fn split_of(revisions: Vec<Value>) -> Value {
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "canary", "revisions": revisions}]
+        })
+    }
+
+    #[test]
+    fn a_remote_only_split_is_fetched_verified_and_staged() {
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m.json",
+            &split_of(vec![
+                remote_rev("a", &fixture(), 9_000),
+                remote_rev("b", &provider_fixture(), 1_000),
+            ]),
+        );
+        assert_eq!(test_seam::fetched(), ["oci://test/a:1", "oci://test/b:1"]);
+        let env = load_local(&store);
+        assert_eq!(env.revisions.len(), 2);
+        let mut uris: Vec<_> = env
+            .revisions
+            .iter()
+            .map(|r| r.bundle_source_uri.clone().unwrap_or_default())
+            .collect();
+        uris.sort();
+        assert_eq!(
+            uris,
+            ["oci://test/a:1", "oci://test/b:1"],
+            "pull refs recorded"
+        );
+    }
+
+    #[test]
+    fn a_mixed_path_and_remote_split_applies() {
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m.json",
+            &split_of(vec![
+                json!({"name": "a", "bundle_path": fixture(), "weight_bps": 9_000}),
+                remote_rev("b", &provider_fixture(), 1_000),
+            ]),
+        );
+        assert_eq!(test_seam::fetched(), ["oci://test/b:1"], "only b is pulled");
+        let (live, _) = live_split_by_digest(&store);
+        assert_eq!(live.len(), 2);
+    }
+
+    #[test]
+    fn a_remote_revision_without_a_pinned_digest_is_refused() {
+        let (dir, store) = seeded_store();
+        let path = write_manifest(
+            dir.path(),
+            &split_of(vec![json!({
+                "name": "a", "bundle_source_uri": "oci://test/a:1", "weight_bps": 10_000
+            })]),
+        );
+        let err = run_apply(&store, &path).expect_err("uri without digest");
+        assert!(matches!(err, OpError::InvalidArgument(_)), "{err:?}");
+        assert!(test_seam::fetched().is_empty(), "refused before any pull");
+    }
+
+    #[test]
+    fn a_remote_only_split_that_does_not_match_its_pin_is_refused() {
+        let (dir, store) = seeded_store();
+        let mut rev = remote_rev("a", &fixture(), 10_000);
+        // Serve a DIFFERENT artifact than the one the pin names.
+        test_seam::serve("oci://test/a:1", provider_fixture());
+        rev["bundle_digest"] = json!(super::super::bundle_stage::sha256_file(&fixture()).unwrap());
+        let path = write_manifest(dir.path(), &split_of(vec![rev]));
+        assert!(run_apply(&store, &path).is_err(), "digest gate must hold");
+        assert!(load_local(&store).revisions.is_empty());
+    }
+
+    #[test]
+    fn re_weighting_a_remote_only_split_pulls_nothing() {
+        let (dir, store) = seeded_store();
+        let m = |a: u32, b: u32| {
+            split_of(vec![
+                remote_rev("a", &fixture(), a),
+                remote_rev("b", &provider_fixture(), b),
+            ])
+        };
+        apply_value(&store, dir.path(), "m1.json", &m(9_000, 1_000));
+        let (before, gen_before) = live_split_by_digest(&store);
+        test_seam::reset_fetched();
+
+        let outcome = apply_value(&store, dir.path(), "m2.json", &m(5_000, 5_000));
+        assert!(
+            split_step_detail(&outcome.result).starts_with("traffic-only"),
+            "{}",
+            outcome.result
+        );
+        assert!(
+            test_seam::fetched().is_empty(),
+            "a traffic-only step must not pull: {:?}",
+            test_seam::fetched()
+        );
+        let (after, gen_after) = live_split_by_digest(&store);
+        let ids = |v: &[(String, RevisionId, u32)]| v.iter().map(|e| e.1).collect::<Vec<_>>();
+        assert_eq!(ids(&before), ids(&after));
+        assert_eq!(gen_after, gen_before + 1);
+
+        // A converged re-apply (and its dry run) pulls nothing either.
+        let path = dir.path().join("m2.json");
+        run_dry(&store, &path).expect("dry-run");
+        run_apply(&store, &path).expect("re-apply");
+        assert!(test_seam::fetched().is_empty());
+    }
+
+    /// A remote-only revision planned for reuse carries no artifact; when the
+    /// executor must stage it after all (here: `reuse_ready: false`, what a
+    /// deployer-answers change emits) it fetches and verifies it then.
+    #[test]
+    fn an_unfetched_remote_revision_is_pulled_when_it_must_be_staged() {
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m1.json",
+            &split_of(vec![remote_rev("a", &fixture(), 10_000)]),
+        );
+        test_seam::reset_fetched();
+        let op = StepOp::DeploySplit {
+            env_id: "local".into(),
+            bundle_id: "canary".into(),
+            customer_id: None,
+            config_overrides: None,
+            route_binding: None,
+            revenue_share: None,
+            revisions: vec![SplitRevisionEntry {
+                name: "a".into(),
+                resolved_path: None,
+                expected_digest: super::super::bundle_stage::sha256_file(&fixture()).unwrap(),
+                weight_bps: 10_000,
+                drain_seconds: None,
+                bundle_source_uri: Some("oci://test/a:1".into()),
+            }],
+            reuse_ready: false,
+        };
+        execute_deploy_split(&store, &OpFlags::default(), &op).expect("execute");
+        assert_eq!(test_seam::fetched(), ["oci://test/a:1"]);
+        assert_eq!(load_local(&store).revisions.len(), 2, "re-staged fresh");
+    }
+
+    #[test]
+    fn a_changed_digest_in_a_remote_split_pulls_only_that_revision() {
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m1.json",
+            &split_of(vec![
+                remote_rev("a", &fixture(), 9_000),
+                remote_rev("b", &provider_fixture(), 1_000),
+            ]),
+        );
+        test_seam::reset_fetched();
+        apply_value(
+            &store,
+            dir.path(),
+            "m2.json",
+            &split_of(vec![
+                remote_rev("a", &fixture(), 9_000),
+                remote_rev("c", &templates_fixture(), 1_000),
+            ]),
+        );
+        assert_eq!(test_seam::fetched(), ["oci://test/c:1"]);
+        assert_eq!(load_local(&store).revisions.len(), 3);
+    }
+
     #[test]
     fn a_revision_dropped_by_a_cut_over_is_staged_fresh_not_reused() {
         let (dir, store) = seeded_store();
@@ -5564,7 +5888,7 @@ mod tests {
                 .map(|(name, path, bps)| SplitRevisionEntry {
                     name: name.into(),
                     expected_digest: super::super::bundle_stage::sha256_file(&path).unwrap(),
-                    resolved_path: path,
+                    resolved_path: Some(path),
                     weight_bps: bps,
                     drain_seconds: None,
                     bundle_source_uri: None,

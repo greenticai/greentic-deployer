@@ -285,6 +285,26 @@ greentic-deployer op env up --answers cloudrun.env.json --dry-run
 so a `bundle_path` pointing at a local `.gtbundle` on your laptop is unreachable
 from the container. Use `bundle_source_uri` (`oci://…`) with a `bundle_digest`.
 
+**Traffic splits can be remote too.** A `revisions[]` entry may omit
+`bundle_path` and carry a `bundle_source_uri` plus a pinned `bundle_digest`
+instead (both required when there is no path; a URI without a digest is
+refused):
+
+```json
+"revisions": [
+  {"name": "baseline", "weight_percent": 90,
+   "bundle_source_uri": "oci://…/app:v1", "bundle_digest": "sha256:…"},
+  {"name": "candidate", "weight_percent": 10,
+   "bundle_source_uri": "oci://…/app:v2", "bundle_digest": "sha256:…"}
+]
+```
+
+A revision the deployment's current split already serves with the same digest,
+source URI and drain window is **reused** — same revision, nothing pulled, no
+re-stage — so stepping the weights (10 → 50 → 100) is a traffic-only change.
+Only a revision with no such match is fetched, verified against its pin, and
+staged.
+
 ---
 
 ## 5. Secrets — the seed contract

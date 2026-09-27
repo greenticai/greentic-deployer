@@ -40,6 +40,10 @@ const OCI_SCHEME: &str = "oci://";
 /// Only `oci://host/repo:tag` / `oci://host/repo@sha256:…` references are
 /// supported; any other scheme is [`OpError::NotYetImplemented`].
 pub fn fetch_bundle_uri_to_local(reference: &str) -> Result<PathBuf, OpError> {
+    #[cfg(test)]
+    if let Some(result) = test_seam::intercept(reference) {
+        return result;
+    }
     let trimmed = reference.trim();
     if trimmed.is_empty() {
         return Err(OpError::InvalidArgument(
@@ -148,6 +152,71 @@ fn artifact_registry_client(
     _oci_ref: &str,
 ) -> Option<DefaultRegistryClient> {
     None
+}
+
+/// Test-only fetch seam: lets apply tests serve a URI from a local fixture
+/// and count how many pulls a plan/apply performed, without a registry.
+/// Thread-local, so parallel tests never see each other's overrides.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::OpError;
+
+    #[derive(Default)]
+    struct Seam {
+        served: BTreeMap<String, PathBuf>,
+        fetches: Vec<String>,
+    }
+
+    thread_local! {
+        static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
+    }
+
+    /// Serve `uri` from `path` for the rest of this thread's test. Installing
+    /// the first entry also turns on fetch recording.
+    pub(crate) fn serve(uri: &str, path: PathBuf) {
+        SEAM.with(|s| {
+            s.borrow_mut()
+                .get_or_insert_with(Seam::default)
+                .served
+                .insert(uri.to_string(), path);
+        });
+    }
+
+    /// Every URI fetched on this thread since the seam was installed.
+    pub(crate) fn fetched() -> Vec<String> {
+        SEAM.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|s| s.fetches.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Forget the recorded fetches (keep the served URIs).
+    pub(crate) fn reset_fetched() {
+        SEAM.with(|s| {
+            if let Some(seam) = s.borrow_mut().as_mut() {
+                seam.fetches.clear();
+            }
+        });
+    }
+
+    /// `Some` when the seam is installed on this thread: the served path, or
+    /// a `Fetch` error for an unknown URI (never a real network pull).
+    pub(super) fn intercept(reference: &str) -> Option<Result<PathBuf, OpError>> {
+        SEAM.with(|s| {
+            let mut guard = s.borrow_mut();
+            let seam = guard.as_mut()?;
+            seam.fetches.push(reference.to_string());
+            Some(seam.served.get(reference).cloned().ok_or_else(|| {
+                OpError::Fetch(format!("test seam: nothing served at `{reference}`"))
+            }))
+        })
+    }
 }
 
 #[cfg(test)]
