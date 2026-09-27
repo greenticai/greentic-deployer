@@ -108,6 +108,7 @@ fn fetch_oci_to_cache(oci_ref: &str) -> Result<PathBuf, OpError> {
 }
 
 /// Host suffix that identifies a Google Artifact Registry reference.
+#[cfg(feature = "deploy-gcp-cloudrun")]
 const ARTIFACT_REGISTRY_SUFFIX: &str = "-docker.pkg.dev";
 
 /// An authenticated registry client for a Google Artifact Registry reference,
@@ -117,7 +118,13 @@ const ARTIFACT_REGISTRY_SUFFIX: &str = "-docker.pkg.dev";
 /// the caller then falls back to the anonymous client and the registry reports
 /// the denial itself. Failing here instead would turn "this deployment has no
 /// GCP credential" into a fetch error on references that never needed one.
-#[cfg(feature = "creds-gcp")]
+///
+/// Gated on `deploy-gcp-cloudrun` (not the narrower `creds-gcp`) because it
+/// calls `credentials::build_ambient_client`, which reaches the real
+/// `google-cloud-auth`-backed client and only exists under that feature. A
+/// `creds-gcp`-only build (the seam/fake/orchestration slice) has no ambient
+/// client to build, so it falls through to the `None`-returning stub below.
+#[cfg(feature = "deploy-gcp-cloudrun")]
 fn artifact_registry_client(
     rt: &tokio::runtime::Runtime,
     oci_ref: &str,
@@ -145,8 +152,10 @@ fn artifact_registry_client(
     })
 }
 
-/// Without the GCP credential stack there is nothing to authenticate with.
-#[cfg(not(feature = "creds-gcp"))]
+/// Without the real GCP credential stack there is nothing to authenticate
+/// with — including under `creds-gcp` alone, which has the seam and the fake
+/// but no ambient-ADC client.
+#[cfg(not(feature = "deploy-gcp-cloudrun"))]
 fn artifact_registry_client(
     _rt: &tokio::runtime::Runtime,
     _oci_ref: &str,
