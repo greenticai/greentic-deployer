@@ -492,15 +492,23 @@ pub struct ManifestBundle {
 }
 
 /// One revision in a multi-revision bundle entry. Each carries its own
-/// bundle artifact path and optional traffic weight / drain / abort knobs.
+/// artifact source and optional traffic weight / drain / abort knobs.
+///
+/// The source is a local `bundle_path` (optionally with a `bundle_source_uri`
+/// pull ref recorded alongside it) OR, remote-only, a `bundle_source_uri` plus
+/// a pinned `bundle_digest` with no `bundle_path` — fetched and verified
+/// exactly like a single-revision URI-only bundle. A remote-only revision that
+/// an existing split already serves unchanged is not fetched at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestRevision {
     /// Manifest-local handle — unique within the bundle's `revisions[]`.
     pub name: String,
     /// Local `.gtbundle`. Same path-resolution rules as
-    /// [`ManifestBundle::bundle_path`].
-    pub bundle_path: PathBuf,
+    /// [`ManifestBundle::bundle_path`]. Absent = remote-only: then
+    /// `bundle_source_uri` AND `bundle_digest` are both required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<PathBuf>,
     /// Traffic weight as a percentage (0..=100). Mutually exclusive with
     /// `weight_bps` on the same revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -517,14 +525,16 @@ pub struct ManifestRevision {
     /// canary-evaluation engine (not consumed by apply today).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub abort_metrics: Vec<String>,
-    /// Optional `oci://`/`repo://`/`store://` pull ref recorded on this staged
-    /// revision so a K8s worker can fetch it at boot. `bundle_path` stays
-    /// required (integrity digest). Absent = local-serve only.
+    /// `oci://`/`repo://`/`store://` pull ref recorded on this staged revision
+    /// so a remote worker can fetch it at boot. With a `bundle_path` it rides
+    /// alongside (the path is the digest source); without one it is the
+    /// artifact source (`oci://` only, like the single-revision form).
+    /// Absent = local-serve only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_source_uri: Option<String>,
-    /// Optional `sha256:<hex>` integrity pin for `bundle_path`. When set, apply
-    /// fails closed unless the artifact hashes to this; absent = record the
-    /// computed digest.
+    /// `sha256:<hex>` integrity pin for the artifact. When set, apply fails
+    /// closed unless the artifact hashes to this; absent = record the computed
+    /// digest. Required for a remote-only revision (no `bundle_path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_digest: Option<String>,
 }
@@ -854,6 +864,43 @@ impl EnvManifest {
                         Some(&rev.name),
                         rev.bundle_digest.as_deref(),
                     )?;
+                    // Source: a local `bundle_path`, or remote-only — a
+                    // `bundle_source_uri` with a pinned `bundle_digest`. The
+                    // pin is mandatory remote-only: it is what lets apply
+                    // match an already-serving revision without pulling, and
+                    // what the pull is verified against when it does.
+                    //
+                    // `bundle_path` + `bundle_source_uri` together stays
+                    // legal, exactly as in the single-revision form: the path
+                    // supplies (and is hashed as) the artifact and the URI is
+                    // only the pull ref recorded for a remote worker.
+                    if rev.bundle_path.is_none() {
+                        let has_uri = rev
+                            .bundle_source_uri
+                            .as_deref()
+                            .is_some_and(|u| !u.trim().is_empty());
+                        if !has_uri || rev.bundle_digest.is_none() {
+                            return Err(OpError::InvalidArgument(format!(
+                                "bundle `{}`, revision `{}`: a revision needs a local \
+                                 `bundle_path`, or a remote `bundle_source_uri` together \
+                                 with a pinned `bundle_digest` (sha256:…)",
+                                b.bundle_id, rev.name
+                            )));
+                        }
+                        // The pin must be canonical before anything is pulled:
+                        // reuse matches it byte-for-byte against the stored
+                        // digest, so e.g. uppercase hex would always re-pull
+                        // and then fail the gate.
+                        let pin = rev.bundle_digest.as_deref().unwrap_or_default();
+                        if !is_canonical_sha256(pin) {
+                            return Err(OpError::InvalidArgument(format!(
+                                "bundle `{}`, revision `{}`: a remote-only revision's \
+                                 bundle_digest `{pin}` must be `sha256:` followed by 64 \
+                                 lowercase hex characters",
+                                b.bundle_id, rev.name
+                            )));
+                        }
+                    }
                 }
                 // Weight consistency: all-set must sum to FULL_TRAFFIC_BPS;
                 // all-unset = equal split (computed at resolve time); mixed = error.
@@ -1029,6 +1076,17 @@ fn validate_digest_pin(
     Err(OpError::InvalidArgument(format!(
         "{location}: bundle_digest `{digest}` must be a `sha256:<hex>` string"
     )))
+}
+
+/// `sha256:` + exactly 64 lowercase hex characters — the form the store
+/// records for a staged artifact.
+fn is_canonical_sha256(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
 }
 
 /// Validate the weight consistency of a multi-revision bundle entry.
@@ -1223,17 +1281,17 @@ pub fn manifest_schema() -> Value {
                             "description": "multi-revision / traffic-split form; mutually exclusive with `bundle_path`",
                             "items": {
                                 "type": "object",
-                                "required": ["name", "bundle_path"],
+                                "required": ["name"],
                                 "additionalProperties": false,
                                 "properties": {
                                     "name": {"type": "string", "description": "manifest-local handle, unique within the bundle"},
-                                    "bundle_path": {"type": "string", "description": "local .gtbundle; relative to the manifest file"},
+                                    "bundle_path": {"type": ["string", "null"], "description": "local .gtbundle; relative to the manifest file. Absent = remote-only: bundle_source_uri + bundle_digest required"},
                                     "weight_percent": {"type": ["integer", "null"], "description": "0..100; mutually exclusive with weight_bps"},
                                     "weight_bps": {"type": ["integer", "null"], "description": "0..10000; mutually exclusive with weight_percent"},
                                     "drain_seconds": {"type": ["integer", "null"], "description": "per-revision drain window override"},
                                     "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"},
-                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"},
-                                    "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for bundle_path; verified at apply"}
+                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for remote boot; rides alongside bundle_path (digest source), or without one is the artifact source (oci:// only, fetched at apply unless an unchanged serving revision is reused); absent = local-serve only"},
+                                    "bundle_digest": {"type": ["string", "null"], "description": "sha256:<hex> integrity pin, verified at apply; required when bundle_path is absent"}
                                 }
                             }
                         },
@@ -3001,6 +3059,72 @@ mod tests {
         let revs = manifest.bundles[0].revisions.as_ref().unwrap();
         let weights = compute_effective_weights_bps(revs);
         assert_eq!(weights, vec![7000, 3000]);
+    }
+
+    fn split_manifest(revisions: serde_json::Value) -> EnvManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "split", "revisions": revisions}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_only_and_mixed_split_revisions_are_accepted() {
+        split_manifest(serde_json::json!([
+            {"name": "a", "bundle_source_uri": "oci://r/a:1", "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+             "weight_percent": 90},
+            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "weight_percent": 10}
+        ]))
+        .validate_shape()
+        .expect("remote-only split");
+        split_manifest(serde_json::json!([
+            {"name": "a", "bundle_path": "a.gtbundle", "weight_percent": 90},
+            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "weight_percent": 10}
+        ]))
+        .validate_shape()
+        .expect("mixed path + remote split");
+    }
+
+    #[test]
+    fn a_remote_only_pin_must_be_canonical_sha256() {
+        for pin in [
+            "sha256:aa".to_string(),
+            format!("sha256:{}", "A".repeat(64)),
+            "a".repeat(64),
+            format!("sha256:{}", "g".repeat(64)),
+        ] {
+            let err = split_manifest(serde_json::json!([
+                {"name": "a", "bundle_source_uri": "oci://r/a:1", "bundle_digest": pin}
+            ]))
+            .validate_shape()
+            .expect_err("non-canonical pin");
+            assert!(
+                matches!(&err, OpError::InvalidArgument(_)),
+                "{pin}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_revision_without_a_path_needs_a_uri_and_a_pinned_digest() {
+        for rev in [
+            serde_json::json!({"name": "a", "bundle_source_uri": "oci://r/a:1"}),
+            serde_json::json!({"name": "a", "bundle_digest": "sha256:aa"}),
+            serde_json::json!({"name": "a", "bundle_source_uri": " ", "bundle_digest": "sha256:aa"}),
+            serde_json::json!({"name": "a"}),
+        ] {
+            let err = split_manifest(serde_json::json!([rev.clone()]))
+                .validate_shape()
+                .expect_err("refused");
+            assert!(
+                matches!(&err, OpError::InvalidArgument(m) if m.contains("pinned `bundle_digest`")),
+                "{rev}: {err:?}"
+            );
+        }
     }
 
     #[test]

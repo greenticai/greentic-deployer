@@ -3974,6 +3974,68 @@ mod tests {
         assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("revision `v2`")));
     }
 
+    /// A split whose revisions carry NO `bundle_path` — each a registry
+    /// pointer + pinned digest — is the natural remote shape and is accepted.
+    #[test]
+    fn remote_only_split_passes_validation() {
+        let mut j = base_manifest_json("prod");
+        j["bundles"] = serde_json::json!([{
+            "bundle_id": "app",
+            "customer_id": "acme",
+            "revisions": [
+                {"name": "v1", "weight_percent": 90,
+                 "bundle_source_uri": "oci://r/app:1", "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                {"name": "v2", "weight_percent": 10,
+                 "bundle_source_uri": "oci://r/app:2", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+            ]
+        }]);
+        let manifest = manifest_from(j);
+        manifest
+            .validate_shape()
+            .expect("remote-only split is well-formed");
+        assert!(reject_unsupported_remote_sections(&manifest).is_ok());
+    }
+
+    #[test]
+    fn remote_apply_dry_run_plans_a_remote_only_split() {
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod", "public_base_url": "https://prod.example"},
+            "bundles": [{
+                "bundle_id": "app",
+                "customer_id": "acme",
+                "revisions": [
+                    {"name": "v1", "weight_percent": 90,
+                     "bundle_source_uri": "oci://registry.example/app:1",
+                     "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                    {"name": "v2", "weight_percent": 10,
+                     "bundle_source_uri": "oci://registry.example/app:2",
+                     "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+                ]
+            }]
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let outcome = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::DryRun,
+                ..Default::default()
+            },
+        )
+        .expect("a remote-only split plans over a remote store");
+        let steps = outcome.result["steps"].as_array().unwrap();
+        assert_eq!(
+            steps.iter().filter(|s| s["section"] == "revision").count(),
+            2,
+            "one staged revision per split entry: {steps:?}"
+        );
+        assert!(steps.iter().any(|s| s["section"] == "traffic"));
+    }
+
     #[test]
     fn clean_manifest_passes_validation() {
         let mut j = base_manifest_json("prod");
