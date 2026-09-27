@@ -765,6 +765,133 @@ gcloud secrets list --project <project>
 
 ---
 
+## 13. SoR units
+
+An environment can declare `sor_units[]` in the manifest — a System of Record
+(SoRLa) that a deployed worker reaches through a route document rather than
+through the worker's own env. Each entry is deployed as its own Cloud Run
+service, before any worker is warmed, so the worker's first revision already
+carries the route it needs.
+
+### The manifest shape
+
+Each `sor_units[]` entry (contract C2, `SorUnit` in
+`src/environment/sor_units.rs`) is:
+
+| Field | Required | Notes |
+|---|---|---|
+| `unit_id` | yes | DNS-1123 label. On Cloud Run it names the service `gtc-sor-<unit_id>`, so it must be **at most 41 characters** (`MAX_CLOUD_RUN_SOR_UNIT_ID_LEN`) — Cloud Run limits a service name to 49 characters and `gtc-sor-` takes 8. |
+| `sor` | yes | The capability-URI pack segment (e.g. `landlord-tenant-sor`). Names the route document, `default/_/sorla/<sor>`. One route document per SoR per environment — two units cannot declare the same `sor`. |
+| `pack_ref` | yes | `oci://<registry>/<repo>@sha256:<hex>` — digest-pinned. The sorx container pulls this pack at boot. |
+| `image` | yes | The sorx container image, digest-pinned, that the designer resolves. |
+| `tenant_id` | yes | Must equal the answers' `tenant.tenant_id`. Becomes the route document's `tenant`. |
+| `answers_ref` / `postgres_url_ref` / `shared_secret_ref` | yes | Store rel-paths (`default/_/sor-<unit_id>/<name>`), never values. Write them with `op secrets put` before `op env up`. |
+| `postgres_ca_ref` | no | Store rel-path to an extra trusted CA (PEM), when your Postgres needs one beyond the system trust store. |
+
+A unit's `answers_ref` value is the sorx process's own answers document; two
+fields on it are validated by this deployer, not just by sorx (see below).
+
+### A secrets pack is required
+
+A worker finds its SoR only through the route document staged into its own
+seed. That only happens because `op env up` stages the whole dev store into
+every worker revision, which only happens when the environment binds a
+`greentic.secrets.dev-store` pack in the `Secrets` slot. Declaring `sor_units`
+with no secrets pack bound is refused **before anything is written**, naming
+the pack to bind — it is never a silent no-op that deploys the SoR and leaves
+every worker unable to find it.
+
+### The sorx answers must bind the container port and require a shared secret
+
+Cloud Run routes and health-probes only the container's declared port, and
+the service is reachable from the public internet the moment it becomes
+ready — there is no equivalent of Cloud Run's "authenticated" access mode for
+a sorx service in this phase. So the sorx `answers_ref` document is validated
+before any GCP call:
+
+- `server.bind` must be `0.0.0.0:8787` — any other bind (in particular a
+  loopback address, or a different port) fails with an explained readiness
+  timeout rather than a clear refusal, so this deployer refuses it up front.
+- `server.auth.mode` must be `shared_secret`. **The service is public; the
+  shared secret is the only thing standing between the internet and your
+  data (E5).** Pick a long, random token for `shared_secret_ref`'s value, and
+  never reuse it across units or environments.
+
+### Postgres must be reachable over the public internet, with TLS
+
+sorx runs as a Cloud Run service and reaches your Postgres over the public
+internet — there is no Cloud SQL Auth Proxy or VPC connector wiring in this
+phase (E1). Your database must accept connections from Cloud Run's egress
+range and require TLS (`sslmode=require` or stronger in the connection
+string). If your Postgres needs a CA beyond the system trust store, stage it
+via `postgres_ca_ref`; sorx mounts it at `/etc/sorx/postgres-ca/ca.pem`.
+
+### What gets created per unit
+
+| Resource | Name | Notes |
+|---|---|---|
+| Cloud Run **Service** | `gtc-sor-<unit_id>` | `min_instances = 0`, `max_instances = 1`, ingress `All`, `allUsers` invoker (public — see above). |
+| **Secret Manager secret** | `<secret_prefix>-sor-<unit_id>` | One secret, one version per input (`answers`, `postgres_url`, `shared_secret`, optional `postgres_ca`). |
+| IAM: `secretAccessor` | on the unit's secret, for the runtime SA | Same rule as the worker seed — Cloud Run refuses a revision whose SA cannot read a mounted version. |
+| IAM: `artifactregistry.reader` | on the pack's Artifact Registry repository, for the runtime SA | **Best effort.** A refusal does not fail the deploy — it is reported in the `op env up` result's `sor_notes`, naming the exact command to run: |
+
+```bash
+gcloud artifacts repositories add-iam-policy-binding <repo> \
+  --location=<location> --project=<project> \
+  --member='serviceAccount:<runtime-sa>' --role=roles/artifactregistry.reader
+```
+
+### The `op env up` result
+
+When the manifest declares `sor_units`, the result gains up to three keys,
+each present only when non-empty:
+
+- `sor_units` — one entry per unit that came up: `unit_id`, `sor`, `service`,
+  `url` (its `https://…run.app` address), `ready`. Never a secret value.
+- `sor_notes` — operator-facing notes that did not fail the deploy (a
+  best-effort IAM grant that was refused, a service left in place because
+  another environment owns it).
+- `sor_skipped_input_refs` — a stale input rel-path the ledger still records
+  but no declared unit reads any more.
+
+### Retiring a unit
+
+Declare `sor_units: []` (or drop the entry) and run `op env up` again. The SoR
+phase runs **after** traffic has moved off any retiring worker revisions: the
+Cloud Run service and its Secret Manager secret are deleted only when this
+environment's owner stamp created them, and never when another declared unit
+still points at the same service or secret (a `secret_prefix` or region change
+retires the old ledger entry without touching the live service the same run
+just brought up). `op env destroy` retires every SoR unit it recorded, the
+same way.
+
+### Known limit — a worker revision keeps the seed it was created with
+
+A Cloud Run worker revision is warmed once and then reused, not re-staged.
+Since #622, a split revision with the same digest, source URI and drain
+window is reused across `op env up` runs, and even when a revision is
+freshly created, `warm_revision`'s same-intent check covers the seed secret's
+**name**, not its versions. Either way, a route document written after a
+worker revision already exists reaches that worker only through a **new**
+revision — the deployer does not force one.
+
+So a change to any of the following does **not** reach an already-warm
+worker on a re-run of `op env up` with an otherwise unchanged split:
+
+- the `sor_units` set (adding or removing a SoR);
+- a unit's URL (a new SoR service, or one that moved);
+- a unit's `shared_secret` value (a rotation).
+
+The SoR side of the change lands correctly either way — the route document
+at `default/_/sorla/<sor>` is written or removed on every run. It is the
+worker's own seed that is stale: on a rotated secret the worker keeps sending
+the old token and the sorx service answers `401`, and on a changed URL the
+worker keeps calling whatever it was seeded with. The caller (the designer)
+must produce a new worker revision — a new bundle source URI or digest —
+whenever the SoR set, a unit's URL, or a unit's `shared_secret` changes.
+
+---
+
 ## See also
 
 - [`examples/cloudrun-demo/`](../examples/cloudrun-demo/) — a runnable,
@@ -776,5 +903,7 @@ gcloud secrets list --project <project>
 - [Kubernetes Deployment Guide](k8s-deployment.md) — the declarative,
   cluster-based sibling of this path.
 - [Env-Pack Authoring Guide](env-packs.md) — how the `deployer` slot is bound.
+- `tests/gcp_cloudrun_sor_e2e.rs` — the SoR-unit lifecycle in §13, live,
+  executable against a real project with `GREENTIC_GCP_E2E=1`.
 - `tests/gcp_cloudrun_e2e.rs` — the live lifecycle this guide describes,
   executable against a real project with `GREENTIC_GCP_E2E=1`.

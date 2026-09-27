@@ -7,7 +7,11 @@ use super::*;
 use crate::cli::secrets::{DEV_STORE_KIND_PATH, dev_store_key, get_env_secret, put_env_secret};
 
 /// Store URIs the staged seed can still resolve, among `rels`.
-fn resolvable_in_seed(store: &LocalFsStore, env: &Environment, rels: &[String]) -> Vec<String> {
+pub(super) fn resolvable_in_seed(
+    store: &LocalFsStore,
+    env: &Environment,
+    rels: &[String],
+) -> Vec<String> {
     use greentic_secrets_lib::{DevStore, SecretsStore};
     let env_id = &env.environment_id;
     let staged = crate::cli::env::read_dev_secrets_bytes(store, env_id)
@@ -154,8 +158,9 @@ fn a_re_pointed_ref_removes_the_old_target_and_excludes_the_new_one() {
 #[test]
 fn no_sor_units_never_parses_the_deployer_answers() {
     let (_d, store, env) = seeded_with(&[]);
-    let refuse =
-        || -> Result<String, OpError> { Err(OpError::InvalidArgument("must not be asked".into())) };
+    let refuse = || -> Result<SorLanePlacement, OpError> {
+        Err(OpError::InvalidArgument("must not be asked".into()))
+    };
     assert!(
         prepare_with_override(&store, &env, &refuse, &SecretsBackend::DevStore, None)
             .unwrap()

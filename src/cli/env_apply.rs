@@ -77,6 +77,7 @@ use greentic_deploy_spec::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::environment::sor_units::SorLane;
 use crate::environment::{EnvironmentStore, LocalFsStore, trust_root as store_trust_root};
 use crate::runtime_secrets::SecretValue;
 
@@ -2190,8 +2191,8 @@ fn sor_units_step(
     ctx: &ApplyContext,
     units: &[super::env_manifest::ManifestSorUnit],
 ) -> Result<ApplyStep, OpError> {
-    if !units.is_empty() {
-        refuse_sor_units_off_k8s(ctx)?;
+    if !units.is_empty() && sor_units_lane(ctx)? == SorLane::CloudRun {
+        refuse_long_cloud_run_unit_ids(units)?;
     }
     let key = ctx.env_id.as_str().to_string();
     let current = store.load_sor_units(&ctx.env_id)?;
@@ -2224,12 +2225,14 @@ fn sor_units_step(
     })
 }
 
-/// SoR units are deployed only by the k8s env-pack's reconcile. The deployer
-/// that counts is the one this apply leaves bound: the manifest's own
-/// `deployer` pack when it declares one, else the env's current binding (or,
-/// for an env this apply creates, the default binding). An empty list is
-/// always accepted — it only clears the record.
-fn refuse_sor_units_off_k8s(ctx: &ApplyContext) -> Result<(), OpError> {
+/// Cloud Run limits a service name to 49 characters, and `gtc-sor-` takes 8.
+const MAX_CLOUD_RUN_SOR_UNIT_ID_LEN: usize = 41;
+
+/// The lane the deployer this apply leaves bound deploys SoR units on: the
+/// manifest's own `deployer` pack when it declares one, else the env's current
+/// binding (or, for an env this apply creates, the default binding). An empty
+/// list is always accepted — it only clears the record.
+fn sor_units_lane(ctx: &ApplyContext) -> Result<SorLane, OpError> {
     let k8s = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
     let declared = ctx
         .manifest
@@ -2248,14 +2251,43 @@ fn refuse_sor_units_off_k8s(ctx: &ApplyContext) -> Result<(), OpError> {
     };
     let path = kind.as_deref().map(|k| k.split('@').next().unwrap_or(k));
     if path == Some(k8s) {
-        return Ok(());
+        return Ok(SorLane::K8s);
+    }
+    let cloud_run = kind
+        .as_deref()
+        .and_then(|k| greentic_deploy_spec::PackDescriptor::try_new(k).ok())
+        .is_some_and(|d| super::env::is_cloudrun_kind(&d));
+    if cloud_run {
+        return Ok(SorLane::CloudRun);
     }
     Err(OpError::InvalidArgument(format!(
-        "sor_units: SoR units are deployed only by the `{k8s}` deployer env-pack; environment \
-         `{}` is bound to `{}` — declare `sor_units: []` or bind the k8s deployer",
+        "sor_units: SoR units are deployed only by the `{k8s}` and `{cr}` deployer env-packs; \
+         environment `{}` is bound to `{}` — declare `sor_units: []` or bind one of them",
         ctx.env_id.as_str(),
-        kind.as_deref().unwrap_or("no deployer")
+        kind.as_deref().unwrap_or("no deployer"),
+        cr = SorLane::CloudRun.deployer(),
     )))
+}
+
+/// Refuse a `unit_id` whose Cloud Run service name (`gtc-sor-<unit_id>`)
+/// would exceed Cloud Run's 49-character service-name limit. K8s object names
+/// have a much longer limit, so this only applies on the Cloud Run lane.
+fn refuse_long_cloud_run_unit_ids(
+    units: &[super::env_manifest::ManifestSorUnit],
+) -> Result<(), OpError> {
+    match units
+        .iter()
+        .find(|u| u.unit_id.len() > MAX_CLOUD_RUN_SOR_UNIT_ID_LEN)
+    {
+        None => Ok(()),
+        Some(u) => Err(OpError::InvalidArgument(format!(
+            "sor_units: unit_id `{}` is {} characters; on Cloud Run it names the service \
+             `gtc-sor-<unit_id>`, which Cloud Run limits to 49 characters, so unit_id may be at \
+             most {MAX_CLOUD_RUN_SOR_UNIT_ID_LEN}",
+            u.unit_id,
+            u.unit_id.len()
+        ))),
+    }
 }
 
 /// The `updates` block's steps, in the order they must execute.
@@ -3963,6 +3995,20 @@ mod tests {
         (dir, store)
     }
 
+    /// [`seeded_store`] bound to the Cloud Run deployer.
+    #[cfg(feature = "creds-gcp")]
+    fn seeded_cloudrun_store() -> (tempfile::TempDir, LocalFsStore) {
+        let (dir, store) = seeded_store();
+        let mut env = load_local(&store);
+        env.packs.retain(|b| b.slot != CapabilitySlot::Deployer);
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        (dir, store)
+    }
+
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/bundles/perf-smoke-bundle.gtbundle")
@@ -4232,6 +4278,7 @@ mod tests {
             Err(OpError::InvalidArgument(msg)) => {
                 assert!(msg.contains("greentic.deployer.local-process"), "{msg}");
                 assert!(msg.contains("greentic.deployer.k8s"), "{msg}");
+                assert!(msg.contains("greentic.deployer.gcp-cloudrun"), "{msg}");
             }
             other => panic!("expected invalid-argument, got {other:?}"),
         }
@@ -4240,6 +4287,41 @@ mod tests {
         // An empty list only clears the record, so any deployer accepts it.
         let empty = write_manifest(dir.path(), &sor_manifest(Some(json!([]))));
         run_apply(&store, &empty).expect("an empty sor_units list is always accepted");
+    }
+
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn sor_units_are_recorded_for_a_cloud_run_environment() {
+        let (dir, store) = seeded_cloudrun_store();
+        let path = write_manifest(
+            dir.path(),
+            &sor_manifest(Some(json!([landlord_unit_json()]))),
+        );
+        let outcome = run_apply(&store, &path).expect("apply");
+        assert!(step_actions(&outcome.result).contains(&("set-sor-units".into(), "create".into())));
+        assert_eq!(recorded_unit_ids(&store), vec!["landlord".to_string()]);
+    }
+
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn a_cloud_run_unit_id_its_service_name_cannot_hold_is_refused() {
+        let mut unit = landlord_unit_json();
+        unit["unit_id"] = json!("a".repeat(42));
+
+        let (dir, store) = seeded_cloudrun_store();
+        let path = write_manifest(dir.path(), &sor_manifest(Some(json!([unit.clone()]))));
+        match run_apply(&store, &path) {
+            Err(OpError::InvalidArgument(msg)) => {
+                assert!(msg.contains("49"), "{msg}");
+                assert!(msg.contains("41"), "{msg}");
+            }
+            other => panic!("expected invalid-argument, got {other:?}"),
+        }
+        assert!(recorded_unit_ids(&store).is_empty(), "nothing recorded");
+
+        let (dir, store) = seeded_k8s_store();
+        let path = write_manifest(dir.path(), &sor_manifest(Some(json!([unit]))));
+        run_apply(&store, &path).expect("k8s names objects, not Cloud Run services: 42 fits");
     }
 
     /// The manifest shape the demo uses: declaring `updates` IS the

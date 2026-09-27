@@ -605,6 +605,7 @@ mod tests {
             unit_id: "landlord".into(),
             sor: "landlord-tenant-sor".into(),
             namespace: "gtc-old".into(),
+            cloud_run: None,
             input_refs: vec!["default/_/sor-landlord/postgres_url".into()],
         }];
         let retired_sors = ["landlord-tenant-sor".to_string()];
@@ -790,6 +791,7 @@ mod tests {
             unit_id: "landlord".into(),
             sor: "landlord-tenant-sor".into(),
             namespace: "gtc-old".into(),
+            cloud_run: None,
             input_refs: vec![],
         }];
         let retired_sors = ["landlord-tenant-sor".to_string()];
