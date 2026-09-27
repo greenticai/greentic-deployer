@@ -37,6 +37,7 @@ pub mod deploy_target;
 pub mod deployer;
 #[cfg(feature = "deploy-gcp-cloudrun")]
 pub mod real_target;
+pub mod sor;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
