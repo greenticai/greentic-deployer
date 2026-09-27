@@ -64,13 +64,15 @@
 //! the standard `{op, noun, result}` JSON envelope (so the output is
 //! already machine-readable — no separate `--json` flag).
 
+mod split_reuse;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use greentic_deploy_spec::{
     BundleDeploymentStatus, CapabilitySlot, CustomerId, DeploymentId, EnvId, Environment,
-    MessagingEndpoint, RouteBinding, UpdateAction,
+    MessagingEndpoint, RevisionId, RouteBinding, UpdateAction,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -243,9 +245,11 @@ enum StepOp {
         /// step executes to shrink the validate→execute TOCTOU window.
         expected_digest: String,
     },
-    /// Multi-revision traffic-split deploy: stage each revision, warm it,
-    /// then set the combined traffic split. Each entry carries its own
-    /// artifact path and digest for TOCTOU re-verification.
+    /// Multi-revision traffic-split deploy: reuse each revision that is
+    /// already staged and ready for the same artifact (see
+    /// [`split_reuse::reusable_revisions`]), stage + warm the rest, then set
+    /// the combined traffic split. Each entry carries its own artifact path
+    /// and digest for TOCTOU re-verification.
     DeploySplit {
         env_id: String,
         bundle_id: String,
@@ -257,6 +261,11 @@ enum StepOp {
         /// existing deployment.
         revenue_share: Option<Vec<RevenueShareEntryPayload>>,
         revisions: Vec<SplitRevisionEntry>,
+        /// `false` forces a fresh stage of every revision even when a ready
+        /// one serves the same artifact — used when the Cloud Run deployer
+        /// answers changed, which is the one reason an unchanged artifact
+        /// still needs a new revision.
+        reuse_ready: bool,
     },
     UpdateHostConfig(Box<ConfigSetPayload>),
     /// Write `<env_dir>/update-channel.json` through `op updates config-set`,
@@ -1600,7 +1609,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     action: ApplyAction::Create,
                     detail,
                     idempotency_key: None,
-                    op: deploy_split_op(&env_id_str, rb),
+                    op: deploy_split_op(&env_id_str, rb, true),
                 });
             }
             None => {
@@ -1640,30 +1649,64 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     .as_ref()
                     .is_some_and(|o| *o != dep.config_overrides);
 
+                // A non-converged split no longer re-stages EVERY revision: an
+                // entry whose artifact is already staged and ready is reused
+                // (same `RevisionId`, no stage, no warm), so a weight-only
+                // change is a pure `traffic set`. Only a deployer-answers
+                // change still forces fresh revisions for unchanged artifacts.
                 let restage = !converged || cloudrun_deployer_answers_changed;
                 if restage {
+                    let reuse_ready = !cloudrun_deployer_answers_changed;
+                    let reused = if reuse_ready {
+                        let wanted = wanted_revisions(rb);
+                        split_reuse::reusable_revisions(
+                            env,
+                            dep.deployment_id,
+                            &wanted,
+                            ctx.env_dir.as_deref(),
+                        )
+                        .iter()
+                        .filter(|r| r.is_some())
+                        .count()
+                    } else {
+                        0
+                    };
                     let digests: Vec<String> = rb
                         .revisions
                         .iter()
                         .map(|r| format!("{}@{}", r.spec.name, short_digest(&r.digest)))
                         .collect();
-                    let why = if converged {
-                        "deployer answers changed"
+                    let detail = if !reuse_ready {
+                        format!(
+                            "deployer answers changed → re-deploy {} revision(s) [{}]",
+                            rb.revisions.len(),
+                            digests.join(", ")
+                        )
+                    } else if reused == rb.revisions.len() {
+                        let weights: Vec<String> = rb
+                            .revisions
+                            .iter()
+                            .map(|r| format!("{}@{}bps", r.spec.name, r.weight_bps))
+                            .collect();
+                        format!(
+                            "traffic-only: re-weight [{}] (no re-stage)",
+                            weights.join(", ")
+                        )
                     } else {
-                        "split not converged"
+                        format!(
+                            "split not converged → stage {} new, reuse {} ready revision(s) [{}]",
+                            rb.revisions.len() - reused,
+                            reused,
+                            digests.join(", ")
+                        )
                     };
-                    let detail = format!(
-                        "{why} → re-deploy {} revision(s) [{}]",
-                        rb.revisions.len(),
-                        digests.join(", ")
-                    );
                     steps.push(ApplyStep {
                         kind: ApplyStepKind::DeploySplit,
                         key: rb.spec.bundle_id.clone(),
                         action: ApplyAction::Update,
                         detail,
                         idempotency_key: None,
-                        op: deploy_split_op(&env_id_str, rb),
+                        op: deploy_split_op(&env_id_str, rb, reuse_ready),
                     });
                 }
 
@@ -3138,8 +3181,24 @@ fn deploy_payload(
     }
 }
 
+/// The reuse key of every revision a multi-revision bundle declares, in
+/// manifest order.
+fn wanted_revisions(rb: &ResolvedBundle) -> Vec<split_reuse::WantedRevision<'_>> {
+    rb.revisions
+        .iter()
+        .map(|rr| split_reuse::WantedRevision {
+            digest: rr.digest.as_str(),
+            source_uri: rr.spec.bundle_source_uri.as_deref(),
+            drain_seconds: rr
+                .spec
+                .drain_seconds
+                .unwrap_or_else(super::revisions::default_drain_seconds),
+        })
+        .collect()
+}
+
 /// Build a [`StepOp::DeploySplit`] from a resolved multi-revision bundle.
-fn deploy_split_op(env_id: &str, rb: &ResolvedBundle) -> StepOp {
+fn deploy_split_op(env_id: &str, rb: &ResolvedBundle, reuse_ready: bool) -> StepOp {
     StepOp::DeploySplit {
         env_id: env_id.to_string(),
         bundle_id: rb.spec.bundle_id.clone(),
@@ -3159,12 +3218,14 @@ fn deploy_split_op(env_id: &str, rb: &ResolvedBundle) -> StepOp {
                 bundle_source_uri: rr.spec.bundle_source_uri.clone(),
             })
             .collect(),
+        reuse_ready,
     }
 }
 
-/// Execute a multi-revision deploy: add the bundle (if new), stage each
-/// revision, warm each, then set the combined traffic split. Takes the
-/// whole `StepOp` by reference and destructures the `DeploySplit` variant.
+/// Execute a multi-revision deploy: add the bundle (if new), reuse every
+/// revision already staged and ready for the same artifact, stage + warm the
+/// rest, then set the combined traffic split. Takes the whole `StepOp` by
+/// reference and destructures the `DeploySplit` variant.
 fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> Result<(), OpError> {
     use super::bundles::{BundleAddPayload, BundleSummary};
     use super::revisions::{RevisionStagePayload, RevisionSummary, RevisionTransitionPayload};
@@ -3178,6 +3239,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         route_binding,
         revenue_share,
         revisions: split_revs,
+        reuse_ready,
     } = op
     else {
         unreachable!("execute_deploy_split called with non-DeploySplit op");
@@ -3193,6 +3255,26 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         .bundles
         .iter()
         .find(|b| b.bundle_id.as_str() == bundle_id.as_str() && b.customer_id == resolved_customer);
+
+    // Resolved against the env snapshot loaded above; a deployment created
+    // below has no revisions yet, so nothing is reusable for it.
+    let reuse: Vec<Option<RevisionId>> = match existing {
+        Some(b) if *reuse_ready => {
+            let wanted: Vec<split_reuse::WantedRevision<'_>> = split_revs
+                .iter()
+                .map(|r| split_reuse::WantedRevision {
+                    digest: r.expected_digest.as_str(),
+                    source_uri: r.bundle_source_uri.as_deref(),
+                    drain_seconds: r
+                        .drain_seconds
+                        .unwrap_or_else(super::revisions::default_drain_seconds),
+                })
+                .collect();
+            let env_dir = store.env_dir(&env_id_parsed).ok();
+            split_reuse::reusable_revisions(&env, b.deployment_id, &wanted, env_dir.as_deref())
+        }
+        _ => vec![None; split_revs.len()],
+    };
 
     let deployment_id = match existing {
         Some(b) => b.deployment_id.to_string(),
@@ -3217,9 +3299,25 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         }
     };
 
-    // Stage + warm each revision.
+    // Reuse or stage + warm each revision.
     let mut traffic_entries = Vec::with_capacity(split_revs.len());
-    for rev in split_revs {
+    for (rev, reused) in split_revs.iter().zip(reuse) {
+        if let Some(revision_id) = reused {
+            eprintln!(
+                "  split: reusing ready revision `{revision_id}` for `{}` ({})",
+                rev.name,
+                short_digest(&rev.expected_digest)
+            );
+            // The manifest artifact must still be the one the match was made
+            // against, exactly as for a fresh stage.
+            ensure_artifact_unchanged(&rev.resolved_path, &rev.expected_digest)?;
+            traffic_entries.push(TrafficSetEntryPayload {
+                revision_id: revision_id.to_string(),
+                weight_bps: Some(rev.weight_bps),
+                weight_percent: None,
+            });
+            continue;
+        }
         eprintln!(
             "  split: staging revision `{}` ({})",
             rev.name,
@@ -3272,12 +3370,18 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         });
     }
 
-    // Set the combined traffic split.
+    // Set the combined traffic split. The key is deterministic over the
+    // final (revision id, weight) pairs: with reuse, a re-weight keeps every
+    // id, and the store rejects a reused key carrying different entries.
+    // Weights come from the effective bps each entry was planned with
+    // (`compute_effective_weights_bps`), never from the payload's optional
+    // fields.
     let ikey = format!(
         "deploy-split:{deployment_id}:{}",
         traffic_entries
             .iter()
-            .map(|e| e.revision_id.as_str())
+            .zip(split_revs)
+            .map(|(e, rev)| format!("{}@{}", e.revision_id, rev.weight_bps))
             .collect::<Vec<_>>()
             .join("+")
     );
@@ -3394,12 +3498,17 @@ fn live_pack_lists_are_complete(
     })
 }
 
-/// Strict convergence: the deployment's traffic split has EXACTLY ONE entry
-/// at full weight (10,000 bps), that entry's revision exists, carries a real
-/// digest, the digest matches `expected_digest`, and `bundle_source_uri`
-/// matches (`None` vs `Some` counts as a difference — a K8s worker needs
-/// the pull ref to boot). A mixed split (e.g. 60/40 blue-green) or a
-/// degenerate placeholder digest is NOT converged.
+/// Strict convergence: the deployment's traffic split has EXACTLY ONE
+/// NONZERO entry and it is at full weight (10,000 bps), that entry's revision
+/// exists, carries a real digest, the digest matches `expected_digest`, and
+/// `bundle_source_uri` matches (`None` vs `Some` counts as a difference — a
+/// K8s worker needs the pull ref to boot). A mixed split (e.g. 60/40
+/// blue-green) or a degenerate placeholder digest is NOT converged.
+///
+/// Zero-weight entries are ignored and left in place: a staged rollout
+/// finishes at `[baseline@0, candidate@100]` and keeps the baseline for the
+/// rollback window, so the next ordinary single-revision deploy of the
+/// candidate must read as converged rather than re-stage it.
 ///
 /// Says nothing about whether the converged revision's pack list is COMPLETE —
 /// that is [`live_pack_lists_are_complete`], and both must hold.
@@ -3416,10 +3525,13 @@ fn deployment_converged(
     else {
         return false;
     };
-    if split.entries.len() != 1 || split.entries[0].weight_bps != super::deploy::FULL_TRAFFIC_BPS {
+    let mut serving = split.entries.iter().filter(|e| e.weight_bps > 0);
+    let (Some(entry), None) = (serving.next(), serving.next()) else {
+        return false;
+    };
+    if entry.weight_bps != super::deploy::FULL_TRAFFIC_BPS {
         return false;
     }
-    let entry = &split.entries[0];
     env.revisions
         .iter()
         .find(|r| r.revision_id == entry.revision_id)
@@ -5200,6 +5312,268 @@ mod tests {
             !split_converged(&env, dep_id, &expected),
             "placeholder live digest must not be treated as converged"
         );
+    }
+
+    // --- Split reuse: unchanged revisions keep their ids across a re-weight ---
+
+    fn templates_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/bundles/templates-bundle.gtbundle")
+    }
+
+    /// A two-revision split for bundle `canary`: `(name, artifact, bps)`.
+    fn two_revision_manifest(revs: [(&str, PathBuf, u32); 2]) -> Value {
+        let revisions: Vec<Value> = revs
+            .iter()
+            .map(|(name, path, bps)| json!({"name": name, "bundle_path": path, "weight_bps": bps}))
+            .collect();
+        json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "canary", "revisions": revisions}]
+        })
+    }
+
+    /// The live split of the single deployment as `(digest, revision id, bps)`
+    /// sorted by digest, plus its generation.
+    fn live_split_by_digest(store: &LocalFsStore) -> (Vec<(String, RevisionId, u32)>, u64) {
+        let env = load_local(store);
+        let split = &env.traffic_splits[0];
+        let mut entries: Vec<(String, RevisionId, u32)> = split
+            .entries
+            .iter()
+            .map(|e| {
+                let rev = env
+                    .revisions
+                    .iter()
+                    .find(|r| r.revision_id == e.revision_id)
+                    .expect("split entry resolves");
+                (rev.bundle_digest.clone(), e.revision_id, e.weight_bps)
+            })
+            .collect();
+        entries.sort();
+        (entries, split.generation)
+    }
+
+    fn apply_value(store: &LocalFsStore, dir: &Path, name: &str, manifest: &Value) -> OpOutcome {
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_vec_pretty(manifest).unwrap()).unwrap();
+        run_apply(store, &path).expect("apply")
+    }
+
+    fn split_step_detail(outcome: &Value) -> String {
+        outcome["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .find(|s| s["kind"] == "deploy-split")
+            .and_then(|s| s["detail"].as_str())
+            .expect("a deploy-split step")
+            .to_string()
+    }
+
+    #[test]
+    fn reweighting_a_split_reuses_every_revision_and_sets_traffic_once() {
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m1.json",
+            &two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]),
+        );
+        let (before, gen_before) = live_split_by_digest(&store);
+        let revisions_before = load_local(&store).revisions.len();
+
+        let outcome = apply_value(
+            &store,
+            dir.path(),
+            "m2.json",
+            &two_revision_manifest([("a", fixture(), 5_000), ("b", provider_fixture(), 5_000)]),
+        );
+        assert!(
+            split_step_detail(&outcome.result).starts_with("traffic-only"),
+            "a weight-only change must plan traffic-only: {}",
+            outcome.result
+        );
+        let (after, gen_after) = live_split_by_digest(&store);
+        assert_eq!(
+            load_local(&store).revisions.len(),
+            revisions_before,
+            "no revision may be staged for a weight-only change"
+        );
+        let ids = |v: &[(String, RevisionId, u32)]| v.iter().map(|e| e.1).collect::<Vec<_>>();
+        assert_eq!(ids(&before), ids(&after), "revision ids must be reused");
+        assert!(after.iter().all(|e| e.2 == 5_000), "new weights: {after:?}");
+        assert_eq!(gen_after, gen_before + 1, "exactly one traffic set");
+
+        // Re-applying the same split is a no-op.
+        let again = apply_value(
+            &store,
+            dir.path(),
+            "m2.json",
+            &two_revision_manifest([("a", fixture(), 5_000), ("b", provider_fixture(), 5_000)]),
+        );
+        assert_eq!(again.result["changed"], 0, "result: {}", again.result);
+    }
+
+    #[test]
+    fn flipping_a_zero_weight_split_keeps_revision_ids() {
+        let (dir, store) = seeded_store();
+        // A split carrying a 0 entry with a 10000 sum is accepted.
+        apply_value(
+            &store,
+            dir.path(),
+            "m1.json",
+            &two_revision_manifest([("a", fixture(), 10_000), ("b", provider_fixture(), 0)]),
+        );
+        let (before, _) = live_split_by_digest(&store);
+        apply_value(
+            &store,
+            dir.path(),
+            "m2.json",
+            &two_revision_manifest([("a", fixture(), 0), ("b", provider_fixture(), 10_000)]),
+        );
+        let (after, _) = live_split_by_digest(&store);
+        assert_eq!(load_local(&store).revisions.len(), 2);
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(b.1, a.1, "revision id for {} must not change", b.0);
+            assert_eq!(b.2 + a.2, 10_000, "weights flipped: {before:?} → {after:?}");
+        }
+    }
+
+    #[test]
+    fn single_revision_manifest_converges_over_a_retained_zero_weight_baseline() {
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m1.json",
+            &two_revision_manifest([("a", fixture(), 0), ("b", provider_fixture(), 10_000)]),
+        );
+        let single = json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "canary", "bundle_path": provider_fixture()}]
+        });
+        let path = write_manifest(dir.path(), &single);
+        let plan = run_dry(&store, &path).expect("dry-run");
+        assert_eq!(plan.result["changed"], 0, "plan: {}", plan.result);
+        assert!(
+            step_actions(&plan.result).contains(&("deploy-bundle".into(), "no-op".into())),
+            "plan: {}",
+            plan.result
+        );
+        // The zero-weight baseline is retained, not removed.
+        run_apply(&store, &path).expect("apply");
+        assert_eq!(load_local(&store).traffic_splits[0].entries.len(), 2);
+        assert!(run_check(&store, &path).is_ok(), "--check must pass");
+    }
+
+    #[test]
+    fn a_changed_digest_in_a_split_stages_only_that_revision() {
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m1.json",
+            &two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]),
+        );
+        let a_digest = super::super::bundle_stage::sha256_file(&fixture()).unwrap();
+        let (before, _) = live_split_by_digest(&store);
+        let a_before = before.iter().find(|e| e.0 == a_digest).unwrap().1;
+
+        let outcome = apply_value(
+            &store,
+            dir.path(),
+            "m2.json",
+            &two_revision_manifest([("a", fixture(), 9_000), ("b", templates_fixture(), 1_000)]),
+        );
+        assert!(
+            split_step_detail(&outcome.result).contains("stage 1 new, reuse 1"),
+            "{}",
+            outcome.result
+        );
+        assert_eq!(
+            load_local(&store).revisions.len(),
+            3,
+            "exactly one new revision"
+        );
+        let (after, _) = live_split_by_digest(&store);
+        let a_after = after.iter().find(|e| e.0 == a_digest).unwrap().1;
+        assert_eq!(a_before, a_after, "the unchanged revision keeps its id");
+    }
+
+    #[test]
+    fn a_revision_dropped_by_a_cut_over_is_staged_fresh_not_reused() {
+        let (dir, store) = seeded_store();
+        let single = |path: PathBuf| {
+            json!({
+                "schema": ENV_MANIFEST_SCHEMA_V1,
+                "environment": {"id": "local"},
+                "bundles": [{"bundle_id": "canary", "bundle_path": path}]
+            })
+        };
+        apply_value(&store, dir.path(), "a.json", &single(fixture()));
+        let a_old = load_local(&store).revisions[0].revision_id;
+        // Cut over to B: A leaves the split (it may stay `Ready`).
+        apply_value(&store, dir.path(), "b.json", &single(provider_fixture()));
+        let (live_b, _) = live_split_by_digest(&store);
+        let b_id = live_b
+            .iter()
+            .find(|e| e.2 == 10_000)
+            .expect("B serves 100 %")
+            .1;
+        assert!(live_b.iter().all(|e| e.1 != a_old), "A left the split");
+
+        apply_value(
+            &store,
+            dir.path(),
+            "split.json",
+            &two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]),
+        );
+        let a_digest = super::super::bundle_stage::sha256_file(&fixture()).unwrap();
+        let (after, _) = live_split_by_digest(&store);
+        let a_new = after.iter().find(|e| e.0 == a_digest).unwrap().1;
+        let b_after = after.iter().find(|e| e.0 != a_digest).unwrap().1;
+        assert_ne!(
+            a_new, a_old,
+            "A must be staged fresh, not the dropped revision"
+        );
+        assert_eq!(b_after, b_id, "B is a split member and is reused");
+    }
+
+    #[test]
+    fn deployer_answers_change_still_restages_every_split_revision() {
+        // Guarded at the op level: `reuse_ready: false` is what the planner
+        // emits when the Cloud Run deployer answers changed.
+        let (dir, store) = seeded_store();
+        apply_value(
+            &store,
+            dir.path(),
+            "m1.json",
+            &two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]),
+        );
+        let op = StepOp::DeploySplit {
+            env_id: "local".into(),
+            bundle_id: "canary".into(),
+            customer_id: None,
+            config_overrides: None,
+            route_binding: None,
+            revenue_share: None,
+            revisions: [("a", fixture(), 9_000u32), ("b", provider_fixture(), 1_000)]
+                .into_iter()
+                .map(|(name, path, bps)| SplitRevisionEntry {
+                    name: name.into(),
+                    expected_digest: super::super::bundle_stage::sha256_file(&path).unwrap(),
+                    resolved_path: path,
+                    weight_bps: bps,
+                    drain_seconds: None,
+                    bundle_source_uri: None,
+                })
+                .collect(),
+            reuse_ready: false,
+        };
+        execute_deploy_split(&store, &OpFlags::default(), &op).expect("execute");
+        assert_eq!(load_local(&store).revisions.len(), 4, "both re-staged");
     }
 
     // --- Fix 4: deploy BEFORE binding update ---

@@ -1518,6 +1518,38 @@ mod tests {
         );
     }
 
+    /// A retained rollback baseline rides the split at 0 %: Cloud Run must
+    /// accept it as a `percent: 0` target rather than rejecting the split.
+    #[test]
+    fn split_to_traffic_targets_accepts_a_zero_percent_entry() {
+        let env = build_fixture_env();
+        let (a, b) = (env.revisions[0].revision_id, env.revisions[1].revision_id);
+        let targets = split_to_traffic_targets(&[
+            TrafficSplitEntry {
+                revision_id: a,
+                weight_bps: 0,
+            },
+            TrafficSplitEntry {
+                revision_id: b,
+                weight_bps: 10_000,
+            },
+        ])
+        .expect("a 0 % entry is a whole percent");
+        assert_eq!(
+            targets,
+            vec![
+                TrafficTarget {
+                    revision_id: a,
+                    percent: 0
+                },
+                TrafficTarget {
+                    revision_id: b,
+                    percent: 100
+                },
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn apply_traffic_split_rejects_non_whole_percent_weights() {
         let (handler, _target) = handler_with_fake();
