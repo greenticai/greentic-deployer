@@ -1,5 +1,10 @@
 //! In-memory [`SorServiceTarget`] for unit tests. Readiness is decided when a
 //! service is upserted: ready, failed with a reason, or still reconciling.
+//!
+//! Services are keyed by `(project, region, name)`, as Cloud Run keys them: a
+//! unit that moved region leaves a same-named service behind in the old one.
+//! The name-only helpers address the place every test fixture deploys to,
+//! [`FAKE_PROJECT`] / [`FAKE_REGION`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -17,12 +22,38 @@ enum Boot {
     Stalls,
 }
 
+/// The project the name-only helpers address.
+pub const FAKE_PROJECT: &str = "proj";
+/// The region the name-only helpers address.
+pub const FAKE_REGION: &str = "europe-west1";
+
+/// `(project, region, name)`.
+type Place = (String, String, String);
+
+fn place_of(service: &SorServiceRef) -> Place {
+    (
+        service.project.clone(),
+        service.region.clone(),
+        service.name.clone(),
+    )
+}
+
+fn place(project: &str, region: &str, name: &str) -> Place {
+    (project.to_string(), region.to_string(), name.to_string())
+}
+
+fn default_place(name: &str) -> Place {
+    place(FAKE_PROJECT, FAKE_REGION, name)
+}
+
 #[derive(Debug, Default)]
 pub struct InMemorySorServices {
-    services: Mutex<BTreeMap<String, SorServiceStatus>>,
-    specs: Mutex<BTreeMap<String, SorServiceSpec>>,
+    services: Mutex<BTreeMap<Place, SorServiceStatus>>,
+    specs: Mutex<BTreeMap<Place, SorServiceSpec>>,
+    /// By name, in every place.
     boot: Mutex<BTreeMap<String, Boot>>,
-    public: Mutex<BTreeSet<String>>,
+    public: Mutex<BTreeSet<Place>>,
+    delete_refusal: Mutex<Option<String>>,
     ar_grants: Mutex<Vec<(String, String)>>,
     ar_refusal: Mutex<Option<String>>,
     upserts: Mutex<u32>,
@@ -63,11 +94,20 @@ impl InMemorySorServices {
     pub fn refuse_ar_grants(&self, reason: &str) {
         *lock(&self.ar_refusal) = Some(reason.to_string());
     }
-    /// A ready service created by someone (`owner`) else, or by nobody we know.
+    /// Every delete fails with `reason` (an API error).
+    pub fn refuse_deletes(&self, reason: &str) {
+        *lock(&self.delete_refusal) = Some(reason.to_string());
+    }
+    /// A ready service at the default place, created by `owner` (or by nobody
+    /// we know).
     pub fn seed_service(&self, name: &str, owner: Option<&str>) {
+        self.seed_service_at(FAKE_PROJECT, FAKE_REGION, name, owner);
+    }
+    /// [`seed_service`](Self::seed_service) at an explicit place.
+    pub fn seed_service_at(&self, project: &str, region: &str, name: &str, owner: Option<&str>) {
         let etag = self.next_etag();
         lock(&self.services).insert(
-            name.to_string(),
+            place(project, region, name),
             SorServiceStatus {
                 etag,
                 owner: owner.map(str::to_string),
@@ -81,16 +121,21 @@ impl InMemorySorServices {
         );
     }
     pub fn service(&self, name: &str) -> Option<SorServiceStatus> {
-        lock(&self.services).get(name).cloned()
+        self.service_at(FAKE_PROJECT, FAKE_REGION, name)
+    }
+    pub fn service_at(&self, project: &str, region: &str, name: &str) -> Option<SorServiceStatus> {
+        lock(&self.services)
+            .get(&place(project, region, name))
+            .cloned()
     }
     pub fn spec(&self, name: &str) -> Option<SorServiceSpec> {
-        lock(&self.specs).get(name).cloned()
+        lock(&self.specs).get(&default_place(name)).cloned()
     }
     pub fn upserts(&self) -> u32 {
         *lock(&self.upserts)
     }
     pub fn is_public(&self, name: &str) -> bool {
-        lock(&self.public).contains(name)
+        lock(&self.public).contains(&default_place(name))
     }
     pub fn ar_grants(&self) -> Vec<(String, String)> {
         lock(&self.ar_grants).clone()
@@ -108,7 +153,7 @@ impl SorServiceTarget for InMemorySorServices {
         &self,
         service: &SorServiceRef,
     ) -> Result<Option<SorServiceStatus>, CloudRunTargetError> {
-        Ok(self.service(&service.name))
+        Ok(lock(&self.services).get(&place_of(service)).cloned())
     }
 
     async fn upsert_sor_service(
@@ -117,7 +162,8 @@ impl SorServiceTarget for InMemorySorServices {
         etag: Option<&str>,
     ) -> Result<SorServiceStatus, CloudRunTargetError> {
         let name = spec.service.name.clone();
-        match (lock(&self.services).get(&name), etag) {
+        let key = place_of(&spec.service);
+        match (lock(&self.services).get(&key), etag) {
             (Some(live), Some(sent)) if live.etag != sent => {
                 return Err(CloudRunTargetError::PreconditionFailed);
             }
@@ -142,8 +188,8 @@ impl SorServiceTarget for InMemorySorServices {
             not_ready_reason,
             log_uri: None,
         };
-        lock(&self.services).insert(name.clone(), status.clone());
-        lock(&self.specs).insert(name, spec.clone());
+        lock(&self.services).insert(key.clone(), status.clone());
+        lock(&self.specs).insert(key, spec.clone());
         *lock(&self.upserts) += 1;
         Ok(status)
     }
@@ -152,14 +198,18 @@ impl SorServiceTarget for InMemorySorServices {
         &self,
         service: &SorServiceRef,
     ) -> Result<(), CloudRunTargetError> {
-        lock(&self.public).insert(service.name.clone());
+        lock(&self.public).insert(place_of(service));
         Ok(())
     }
 
     async fn delete_sor_service(&self, service: &SorServiceRef) -> Result<(), CloudRunTargetError> {
-        lock(&self.services).remove(&service.name);
-        lock(&self.specs).remove(&service.name);
-        lock(&self.public).remove(&service.name);
+        if let Some(reason) = lock(&self.delete_refusal).clone() {
+            return Err(CloudRunTargetError::Api(reason));
+        }
+        let key = place_of(service);
+        lock(&self.services).remove(&key);
+        lock(&self.specs).remove(&key);
+        lock(&self.public).remove(&key);
         Ok(())
     }
 

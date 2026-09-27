@@ -293,17 +293,32 @@ async fn retire_never_deletes_a_service_or_secret_a_declared_unit_still_uses() {
     assert!(services.service(SERVICE).is_some());
     assert!(secrets.secrets().contains_key(SECRET));
 
-    // A retired entry whose secret a declared unit still uses (a region move
-    // keeps the project-scoped secret name). The in-memory service fake is
-    // region-blind, so the entry differs by service name to reach the secret
-    // guard alone; the declared unit's secret must survive.
+    // A region move: the old entry's same-named service in the OLD region is
+    // retired, while the project-scoped secret the declared unit still uses
+    // and the service in the new region both survive.
+    services.seed_service_at(
+        "proj",
+        "us-central1",
+        SERVICE,
+        Some(&env_owner_stamp("local")),
+    );
     let moved = CloudRunSorPlacement {
-        service: "gtc-sor-moved".into(),
+        region: "us-central1".into(),
         ..placement()
     };
     let out = retire(&secrets, &services, "local", &[moved], &[placement()])
         .await
         .unwrap();
+    assert_eq!(out.deleted_services, vec![SERVICE.to_string()]);
+    assert!(
+        services
+            .service_at("proj", "us-central1", SERVICE)
+            .is_none()
+    );
+    assert!(
+        services.service(SERVICE).is_some(),
+        "the new region's service stays"
+    );
     assert!(out.deleted_secrets.is_empty(), "{:?}", out.deleted_secrets);
     assert!(
         secrets.secrets().contains_key(SECRET),
