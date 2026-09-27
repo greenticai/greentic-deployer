@@ -154,8 +154,9 @@ fn a_re_pointed_ref_removes_the_old_target_and_excludes_the_new_one() {
 #[test]
 fn no_sor_units_never_parses_the_deployer_answers() {
     let (_d, store, env) = seeded_with(&[]);
-    let refuse =
-        || -> Result<String, OpError> { Err(OpError::InvalidArgument("must not be asked".into())) };
+    let refuse = || -> Result<SorLanePlacement, OpError> {
+        Err(OpError::InvalidArgument("must not be asked".into()))
+    };
     assert!(
         prepare_with_override(&store, &env, &refuse, &SecretsBackend::DevStore, None)
             .unwrap()
