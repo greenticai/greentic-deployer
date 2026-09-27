@@ -780,7 +780,7 @@ Each `sor_units[]` entry (contract C2, `SorUnit` in
 
 | Field | Required | Notes |
 |---|---|---|
-| `unit_id` | yes | DNS-1123 label. On Cloud Run it names the service `gtc-sor-<unit_id>`, so it must be **at most 41 characters** — `gtc-sor-` plus the service's 63-char limit. |
+| `unit_id` | yes | DNS-1123 label. On Cloud Run it names the service `gtc-sor-<unit_id>`, so it must be **at most 41 characters** (`MAX_CLOUD_RUN_SOR_UNIT_ID_LEN`) — Cloud Run limits a service name to 49 characters and `gtc-sor-` takes 8. |
 | `sor` | yes | The capability-URI pack segment (e.g. `landlord-tenant-sor`). Names the route document, `default/_/sorla/<sor>`. One route document per SoR per environment — two units cannot declare the same `sor`. |
 | `pack_ref` | yes | `oci://<registry>/<repo>@sha256:<hex>` — digest-pinned. The sorx container pulls this pack at boot. |
 | `image` | yes | The sorx container image, digest-pinned, that the designer resolves. |
