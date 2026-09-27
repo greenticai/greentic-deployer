@@ -1625,7 +1625,7 @@ fn apply_revision_aws_ecs(
 /// ref bound", so the target falls back to the ambient ADC chain — the same
 /// bound-or-ambient model the AWS path uses.
 #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
-fn cloudrun_target_inputs(
+pub(crate) fn cloudrun_target_inputs(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
@@ -1717,6 +1717,7 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
         // per-deployment — delete them once, after the Services.
         let secret_name = environment_secret_name(&params.secret_prefix);
         let env_id = ctx.env_id.as_str().to_string();
+        let sor_credentials = credentials.clone();
 
         let (deleted_services, deleted_secrets, skipped_secrets) = run_gcp_async(async move {
             let target = RealCloudRunTarget::resolve(&params.project, &params.region, credentials)
@@ -1770,6 +1771,11 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
             Ok::<_, StoreError>((deleted, deleted_secrets, skipped_secrets))
         })?;
 
+        // SoR units after the workers: nothing calls a SoR that is already gone.
+        let sor =
+            super::env_cloudrun_sor::teardown_sor_units(ctx.store, ctx.env_id, sor_credentials)
+                .map_err(StoreError::ProviderTeardown)?;
+
         Ok(json!({
             "provider": "gcp-cloudrun",
             "project": project,
@@ -1777,6 +1783,7 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
             "deleted_services": deleted_services,
             "deleted_secrets": deleted_secrets,
             "skipped_secrets": skipped_secrets,
+            "sor": sor,
         }))
     }
 }
@@ -2082,6 +2089,12 @@ pub(crate) fn cloudrun_env_up(
         }
     }
 
+    // 0. SoR units (SoRLa phase 3E): every sorx service up and ready, and its
+    //    route document in the dev store, BEFORE any worker is warmed — each
+    //    warm stages the dev store as that revision's seed, and a Cloud Run
+    //    revision keeps the seed it was created with.
+    let sor = super::env_cloudrun_sor::sor_up(store, &env, env_id, answers.as_ref())?;
+
     // 1. Warm every revision that carries traffic (bring-up only — see the
     //    archival note in the doc comment). Each Cloud Run warm returns its Service's `*.run.app`
     //    URL; a deployment's revisions share one Service, so endpoints are keyed
@@ -2120,6 +2133,16 @@ pub(crate) fn cloudrun_env_up(
         )?;
     }
 
+    // 3. Only now retire what the manifest no longer declares — the previous
+    //    worker revisions have stopped taking traffic. The ledger narrows only
+    //    after this succeeds.
+    let sor_notes = match &sor {
+        Some(run) => {
+            super::env_cloudrun_sor::sor_finish(store, &env, env_id, answers.as_ref(), run)?
+        }
+        None => Vec::new(),
+    };
+
     let mut result = json!({
         "environment_id": env.environment_id.as_str(),
         "kind": descriptor.as_str(),
@@ -2137,6 +2160,9 @@ pub(crate) fn cloudrun_env_up(
         && let Some(url) = endpoints.values().next()
     {
         result["endpoint_url"] = json!(url);
+    }
+    if let Some(run) = &sor {
+        super::env_cloudrun_sor::add_sor_result(&mut result, run, sor_notes);
     }
     Ok(Some(result))
 }

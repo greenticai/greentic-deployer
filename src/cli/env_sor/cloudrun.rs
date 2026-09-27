@@ -167,9 +167,6 @@ pub(crate) struct CloudRunSorRun {
 ///
 /// A unit that never becomes ready fails the run before any route document is
 /// written; the ledger stays widened, so the next run can still retire it.
-// TRANSIENT (Task 10 removes this line): until `env_cloudrun_sor` calls these
-// entry points, `--all-features` has no non-test caller either.
-#[allow(dead_code)]
 #[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
 pub(crate) async fn up(
     store: &LocalFsStore,
@@ -231,8 +228,6 @@ pub(crate) async fn up(
 /// declares, then narrow the ledger. A failure keeps the WHOLE widened ledger,
 /// so the next `op env up` retries every retirement (an already-deleted one is
 /// a no-op).
-// TRANSIENT (Task 10 removes this line) — see `up`.
-#[allow(dead_code)]
 #[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
 pub(crate) async fn finish(
     store: &LocalFsStore,
@@ -260,8 +255,6 @@ pub(crate) async fn finish(
 /// target built for THAT place, never the place the answers name now — a
 /// same-named secret in the new project is another secret. Never touches what
 /// `keep` still uses. Also used by `op env destroy` with an empty `keep`.
-// TRANSIENT (Task 10 removes this line) — see `up`.
-#[allow(dead_code)]
 #[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
 pub(crate) async fn retire_all(
     env_id: &str,
@@ -292,8 +285,6 @@ pub(crate) async fn retire_all(
 /// Adds `sor_units`, `sor_notes` and `sor_skipped_input_refs` to the `op env
 /// up` result, each only when non-empty — an env without SoR units prints what
 /// it printed before. Never a value: statuses carry names and URLs only.
-// TRANSIENT (Task 10 removes this line) — see `up`.
-#[allow(dead_code)]
 #[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
 pub(crate) fn add_to_result(result: &mut Value, run: &CloudRunSorRun, finish_notes: Vec<String>) {
     if !run.up.statuses.is_empty() {

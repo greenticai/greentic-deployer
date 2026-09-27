@@ -48,6 +48,7 @@ pub mod dispatch;
 pub(crate) mod dispatch_remote;
 pub mod env;
 pub mod env_apply;
+pub(crate) mod env_cloudrun_sor;
 pub mod env_manifest;
 pub mod env_packs;
 pub(crate) mod env_sor;
