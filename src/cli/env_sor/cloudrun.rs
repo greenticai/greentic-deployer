@@ -1,19 +1,36 @@
 //! The Cloud Run half of the SoR phase (SoRLa phase 3E): resolving what to
-//! deploy and refusing what cannot work on Cloud Run (this task), then
-//! bringing units up and retiring them (Task 9).
+//! deploy and refusing what cannot work on Cloud Run, bringing every declared
+//! unit up before the workers ([`up`]), and retiring what the manifest no
+//! longer declares after them ([`finish`]).
+//!
+//! Every entry point here is called only by the CLI's live Cloud Run glue
+//! (`deploy-gcp-cloudrun`), so a `creds-gcp`-only build allows them dead (P7).
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::sync::Arc;
 
-use greentic_deploy_spec::{CapabilitySlot, Environment};
-use serde_json::Value;
+use async_trait::async_trait;
+use greentic_deploy_spec::{CapabilitySlot, EnvId, Environment};
+use serde_json::{Value, json};
 
-use super::prepare::{PreparedSor, SorLanePlacement, prepare_inner};
+use super::prepare::{PreparedSor, SorLanePlacement, prepare_inner, record_applied};
+use super::publish::StoreRoutePublisher;
 use crate::cli::OpError;
 use crate::cli::secrets::DEV_SECRETS_PATH_ENV;
+use crate::env_packs::gcp_cloudrun::deploy_target::CloudRunTarget;
+use crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams;
+use crate::env_packs::gcp_cloudrun::sor::retire::{SorRetireOutcome, retire};
+use crate::env_packs::gcp_cloudrun::sor::spec::SorReadyTiming;
+use crate::env_packs::gcp_cloudrun::sor::target::SorServiceTarget;
+use crate::env_packs::gcp_cloudrun::sor::up::{
+    PlacedSorUnit, SorUpContext, SorUpOutcome, bring_up,
+};
 use crate::env_packs::k8s::manifests::SecretsBackend;
 use crate::env_packs::k8s::manifests::sor::SOR_PORT;
-use crate::env_packs::k8s::sor_reconcile::SorUnitRender;
+use crate::env_packs::k8s::sor_reconcile::{SorRoutePublisher as _, SorUnitRender};
 use crate::environment::LocalFsStore;
+use crate::environment::sor_units::CloudRunSorPlacement;
 
 /// The only auth mode a publicly reachable SoR may run with (E5).
 const REQUIRED_AUTH_MODE: &str = "shared_secret";
@@ -22,9 +39,7 @@ const REQUIRED_AUTH_MODE: &str = "shared_secret";
 /// nothing was ever deployed, so an environment without SoR units runs
 /// exactly as before.
 ///
-/// Until the CLI's live Cloud Run glue (Task 9, `deploy-gcp-cloudrun`) calls
-/// this, it has no non-test caller in a `creds-gcp`-only build — allowed dead
-/// there rather than forcing a premature caller in.
+/// Called by [`up`]; no non-test caller in a `creds-gcp`-only build (P7).
 #[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
 pub(crate) fn prepare_cloud_run(
     store: &LocalFsStore,
@@ -126,6 +141,177 @@ fn check_cloud_run_answers(render: &SorUnitRender) -> Result<(), OpError> {
     Ok(())
 }
 
+/// The two seams for one `(project, region)`.
+#[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
+pub(crate) type SorTargetPair = (Arc<dyn CloudRunTarget>, Arc<dyn SorServiceTarget>);
+
+/// Hands out the seams for a place. The real resolver builds regional clients;
+/// the tests hand out fakes. A retired unit may live in another project or
+/// region than the one the answers name now, so targets are asked per place.
+#[async_trait]
+pub(crate) trait SorTargets: Send + Sync {
+    async fn at(&self, project: &str, region: &str) -> Result<SorTargetPair, OpError>;
+}
+
+/// What the SoR phase did before the workers, kept for [`finish`].
+#[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
+pub(crate) struct CloudRunSorRun {
+    pub(crate) prepared: PreparedSor,
+    pub(crate) up: SorUpOutcome,
+}
+
+/// Before the workers: resolve (refusing what cannot work), bring every
+/// declared unit up, then write its route document and delete retired route
+/// documents and stale inputs. `None` = no SoR phase at all, and no target is
+/// asked for.
+///
+/// A unit that never becomes ready fails the run before any route document is
+/// written; the ledger stays widened, so the next run can still retire it.
+// TRANSIENT (Task 10 removes this line): until `env_cloudrun_sor` calls these
+// entry points, `--all-features` has no non-test caller either.
+#[allow(dead_code)]
+#[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
+pub(crate) async fn up(
+    store: &LocalFsStore,
+    env: &Environment,
+    params: &GcpCloudRunParams,
+    backend: &SecretsBackend,
+    targets: &dyn SorTargets,
+    timing: SorReadyTiming,
+) -> Result<Option<CloudRunSorRun>, OpError> {
+    let Some(prepared) = prepare_cloud_run(
+        store,
+        env,
+        &params.project,
+        &params.region,
+        &params.secret_prefix,
+        backend,
+    )?
+    else {
+        return Ok(None);
+    };
+    let placed: Vec<PlacedSorUnit<'_>> = prepared
+        .placed_units()
+        .filter_map(|(render, entry)| {
+            entry
+                .cloud_run
+                .as_ref()
+                .map(|placement| PlacedSorUnit { render, placement })
+        })
+        .collect();
+    let outcome = if placed.is_empty() {
+        SorUpOutcome::default()
+    } else {
+        let (secrets, services) = targets.at(&params.project, &params.region).await?;
+        let env_id = env.environment_id.as_str();
+        let runtime_service_account = params.runtime_service_account(env_id);
+        let ctx = SorUpContext {
+            env_id,
+            runtime_service_account: &runtime_service_account,
+            timing,
+        };
+        bring_up(secrets.as_ref(), services.as_ref(), &ctx, &placed)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))?
+    };
+    StoreRoutePublisher::new(store, env)
+        .publish(
+            &outcome.routes,
+            &prepared.retired_sors,
+            &prepared.stale_input_refs,
+        )
+        .map_err(OpError::Conflict)?;
+    Ok(Some(CloudRunSorRun {
+        prepared,
+        up: outcome,
+    }))
+}
+
+/// After the workers and their traffic: retire what the manifest no longer
+/// declares, then narrow the ledger. A failure keeps the WHOLE widened ledger,
+/// so the next `op env up` retries every retirement (an already-deleted one is
+/// a no-op).
+// TRANSIENT (Task 10 removes this line) — see `up`.
+#[allow(dead_code)]
+#[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
+pub(crate) async fn finish(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    run: &CloudRunSorRun,
+    targets: &dyn SorTargets,
+) -> Result<Vec<String>, OpError> {
+    let retired: Vec<CloudRunSorPlacement> = run
+        .prepared
+        .retired_units
+        .iter()
+        .filter_map(|a| a.cloud_run.clone())
+        .collect();
+    let keep: Vec<CloudRunSorPlacement> = run
+        .prepared
+        .placed_units()
+        .filter_map(|(_, a)| a.cloud_run.clone())
+        .collect();
+    let out = retire_all(env_id.as_str(), &retired, &keep, targets).await?;
+    record_applied(store, env_id, &run.prepared)?;
+    Ok(out.notes)
+}
+
+/// Retire `retired`, grouped by `(project, region)`: each group goes through a
+/// target built for THAT place, never the place the answers name now — a
+/// same-named secret in the new project is another secret. Never touches what
+/// `keep` still uses. Also used by `op env destroy` with an empty `keep`.
+// TRANSIENT (Task 10 removes this line) — see `up`.
+#[allow(dead_code)]
+#[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
+pub(crate) async fn retire_all(
+    env_id: &str,
+    retired: &[CloudRunSorPlacement],
+    keep: &[CloudRunSorPlacement],
+    targets: &dyn SorTargets,
+) -> Result<SorRetireOutcome, OpError> {
+    let mut groups: BTreeMap<(String, String), Vec<CloudRunSorPlacement>> = BTreeMap::new();
+    for place in retired {
+        groups
+            .entry((place.project.clone(), place.region.clone()))
+            .or_default()
+            .push(place.clone());
+    }
+    let mut all = SorRetireOutcome::default();
+    for ((project, region), places) in groups {
+        let (secrets, services) = targets.at(&project, &region).await?;
+        let out = retire(secrets.as_ref(), services.as_ref(), env_id, &places, keep)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))?;
+        all.deleted_services.extend(out.deleted_services);
+        all.deleted_secrets.extend(out.deleted_secrets);
+        all.notes.extend(out.notes);
+    }
+    Ok(all)
+}
+
+/// Adds `sor_units`, `sor_notes` and `sor_skipped_input_refs` to the `op env
+/// up` result, each only when non-empty — an env without SoR units prints what
+/// it printed before. Never a value: statuses carry names and URLs only.
+// TRANSIENT (Task 10 removes this line) — see `up`.
+#[allow(dead_code)]
+#[cfg_attr(not(feature = "deploy-gcp-cloudrun"), allow(dead_code))]
+pub(crate) fn add_to_result(result: &mut Value, run: &CloudRunSorRun, finish_notes: Vec<String>) {
+    if !run.up.statuses.is_empty() {
+        result["sor_units"] = json!(run.up.statuses);
+    }
+    let notes: Vec<String> = run.up.notes.iter().cloned().chain(finish_notes).collect();
+    if !notes.is_empty() {
+        result["sor_notes"] = json!(notes);
+    }
+    if !run.prepared.skipped_input_refs.is_empty() {
+        result["sor_skipped_input_refs"] = json!(run.prepared.skipped_input_refs);
+    }
+}
+
 #[cfg(test)]
 #[path = "cloudrun_prepare_tests.rs"]
 mod prepare_tests;
+
+#[cfg(test)]
+#[path = "cloudrun_tests.rs"]
+mod tests;

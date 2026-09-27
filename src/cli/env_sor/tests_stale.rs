@@ -7,7 +7,11 @@ use super::*;
 use crate::cli::secrets::{DEV_STORE_KIND_PATH, dev_store_key, get_env_secret, put_env_secret};
 
 /// Store URIs the staged seed can still resolve, among `rels`.
-fn resolvable_in_seed(store: &LocalFsStore, env: &Environment, rels: &[String]) -> Vec<String> {
+pub(super) fn resolvable_in_seed(
+    store: &LocalFsStore,
+    env: &Environment,
+    rels: &[String],
+) -> Vec<String> {
     use greentic_secrets_lib::{DevStore, SecretsStore};
     let env_id = &env.environment_id;
     let staged = crate::cli::env::read_dev_secrets_bytes(store, env_id)
