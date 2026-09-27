@@ -865,6 +865,31 @@ retires the old ledger entry without touching the live service the same run
 just brought up). `op env destroy` retires every SoR unit it recorded, the
 same way.
 
+### Known limit — a worker revision keeps the seed it was created with
+
+A Cloud Run worker revision is warmed once and then reused, not re-staged.
+Since #622, a split revision with the same digest, source URI and drain
+window is reused across `op env up` runs, and even when a revision is
+freshly created, `warm_revision`'s same-intent check covers the seed secret's
+**name**, not its versions. Either way, a route document written after a
+worker revision already exists reaches that worker only through a **new**
+revision — the deployer does not force one.
+
+So a change to any of the following does **not** reach an already-warm
+worker on a re-run of `op env up` with an otherwise unchanged split:
+
+- the `sor_units` set (adding or removing a SoR);
+- a unit's URL (a new SoR service, or one that moved);
+- a unit's `shared_secret` value (a rotation).
+
+The SoR side of the change lands correctly either way — the route document
+at `default/_/sorla/<sor>` is written or removed on every run. It is the
+worker's own seed that is stale: on a rotated secret the worker keeps sending
+the old token and the sorx service answers `401`, and on a changed URL the
+worker keeps calling whatever it was seeded with. The caller (the designer)
+must produce a new worker revision — a new bundle source URI or digest —
+whenever the SoR set, a unit's URL, or a unit's `shared_secret` changes.
+
 ---
 
 ## See also
