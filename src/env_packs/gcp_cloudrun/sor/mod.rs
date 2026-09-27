@@ -15,10 +15,8 @@
 //! a Secret Manager payload or the route document.
 
 pub mod fake;
-// `real` is created in Task 8; `deploy-gcp-cloudrun` is default-on, so leaving
-// this uncommented before the file exists breaks a plain `cargo build`.
-// #[cfg(feature = "deploy-gcp-cloudrun")]
-// pub mod real;
+#[cfg(feature = "deploy-gcp-cloudrun")]
+pub mod real;
 pub mod retire;
 pub mod spec;
 pub mod target;

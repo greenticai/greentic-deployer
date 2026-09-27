@@ -93,7 +93,7 @@ pub const REAL_CLOUDRUN_TARGET_IAM_PERMISSIONS: &[&str] = &[
 /// resource-label keys/values follow GCP rules (lowercase alnum + `-`/`_`, no
 /// `/` or `.`), so these are the GCP-valid analogue of the k8s `greentic.ai/*`
 /// labels — the deployment ULID (lowercased base32) is a valid value.
-const MANAGED_LABEL_KEY: &str = "greentic-managed";
+pub(super) const MANAGED_LABEL_KEY: &str = "greentic-managed";
 const DEPLOYMENT_LABEL_KEY: &str = "greentic-deployment";
 /// Carries [`ServiceSpec::revision_intent`] on the revision it describes, so a
 /// later warm can tell its own retry from a name already taken by a different
@@ -105,15 +105,15 @@ const INTENT_LABEL_KEY: &str = "greentic-intent";
 /// it, grant its own runtime SA read over it, or delete it (plan D6). Stamped
 /// at create only; the value is whatever `deployer::env_owner_stamp` produced
 /// — the target carries it opaquely and never interprets it.
-const ENV_LABEL_KEY: &str = "greentic-env";
+pub(super) const ENV_LABEL_KEY: &str = "greentic-env";
 
 /// Production [`CloudRunTarget`]: Cloud Run Services + Revisions + Secret Manager,
 /// pinned to one `(project, region)` at construction (the env-pack binding is
 /// single-project/region, so every seam ref's `project`/`region` equal these).
 #[derive(Debug, Clone)]
 pub struct RealCloudRunTarget {
-    services: Services,
-    revisions: Revisions,
+    pub(super) services: Services,
+    pub(super) revisions: Revisions,
     secrets: SecretManagerService,
     project: String,
     region: String,
@@ -634,7 +634,10 @@ fn build_traffic(
 /// Add or remove the `allUsers` → `roles/run.invoker` binding for the access mode
 /// (plan D12), preserving every other binding. `Public` grants unauthenticated
 /// access; `Authenticated` revokes it (idempotent either way).
-fn apply_invoker_binding(mut policy: iam::Policy, access_mode: AccessMode) -> iam::Policy {
+pub(super) fn apply_invoker_binding(
+    mut policy: iam::Policy,
+    access_mode: AccessMode,
+) -> iam::Policy {
     const INVOKER_ROLE: &str = "roles/run.invoker";
     const ALL_USERS: &str = "allUsers";
 
@@ -768,7 +771,7 @@ fn traffic_targets_from(traffic: &[run::TrafficTarget]) -> Vec<TrafficTarget> {
         .collect()
 }
 
-fn revision_status_from(rev: &run::Revision) -> RevisionStatus {
+pub(super) fn revision_status_from(rev: &run::Revision) -> RevisionStatus {
     let ready = condition_ready(&rev.conditions);
     RevisionStatus {
         ready,
@@ -808,7 +811,7 @@ fn not_ready_reason(conditions: &[run::Condition]) -> Option<String> {
 
 /// A Service is ready when its terminal condition (or a `Ready` condition) has
 /// reached `ConditionSucceeded`.
-fn service_ready(svc: &run::Service) -> bool {
+pub(super) fn service_ready(svc: &run::Service) -> bool {
     if let Some(term) = &svc.terminal_condition
         && term.state == run::condition::State::ConditionSucceeded
     {
@@ -846,7 +849,7 @@ fn parse_revision_id_from_name(name: &str) -> Option<RevisionId> {
 /// [`CloudRunTargetError::PreconditionFailed`] so the deployer re-reads; a
 /// missing resource becomes [`CloudRunTargetError::NotFound`]; everything else is
 /// an opaque [`CloudRunTargetError::Api`].
-fn classify(op: &str, err: &GaxError) -> CloudRunTargetError {
+pub(super) fn classify(op: &str, err: &GaxError) -> CloudRunTargetError {
     if is_precondition(err) {
         return CloudRunTargetError::PreconditionFailed;
     }
@@ -856,7 +859,7 @@ fn classify(op: &str, err: &GaxError) -> CloudRunTargetError {
     CloudRunTargetError::Api(format!("{op}: {err}"))
 }
 
-fn is_not_found(err: &GaxError) -> bool {
+pub(super) fn is_not_found(err: &GaxError) -> bool {
     if let Some(status) = err.status()
         && status.code == Code::NotFound
     {
@@ -888,14 +891,14 @@ fn is_precondition(err: &GaxError) -> bool {
 
 // ---- Small conversions ----
 
-fn non_empty(s: String) -> Option<String> {
+pub(super) fn non_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
 /// Cloud Run scaling/percent fields are `i32`; the seam carries `u32`. Values are
 /// small (0..=100 percent, single-digit instance counts), so clamp defensively
 /// rather than risk a wrap.
-fn clamp_i32(v: u32) -> i32 {
+pub(super) fn clamp_i32(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
