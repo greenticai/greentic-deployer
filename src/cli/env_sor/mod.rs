@@ -202,6 +202,7 @@ fn prepare_with_override(
             unit_id: u.unit_id.clone(),
             sor: u.sor.clone(),
             namespace: namespace.clone(),
+            cloud_run: None,
             input_refs: u.input_refs().into_iter().map(str::to_string).collect(),
         })
         .collect();
@@ -322,6 +323,7 @@ mod tests {
             unit_id: id.into(),
             sor: format!("{id}-sor"),
             namespace: ns.into(),
+            cloud_run: None,
             input_refs: ["answers", "postgres_url", "shared_secret"]
                 .iter()
                 .map(|n| format!("default/_/sor-{id}/{n}"))
