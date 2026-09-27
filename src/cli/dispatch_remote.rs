@@ -1943,10 +1943,17 @@ struct DesiredRevision {
 /// True when the deployment's live traffic split already equals the desired
 /// revision set — the convergence skip that makes apply re-runnable without
 /// relying on the bounded server replay ledger.
+///
+/// `single_revision` (a manifest entry with no `revisions[]`) ignores live
+/// zero-weight entries, mirroring the local planner's `deployment_converged`:
+/// a retained `[baseline@0, candidate@100]` split is converged for the
+/// candidate, and the baseline is left in place for the rollback window. A
+/// multi-revision manifest stays an exact multiset, zeros included.
 fn deployment_converged_remote(
     env: &greentic_deploy_spec::Environment,
     deployment_id: DeploymentId,
     desired: &[DesiredRevision],
+    single_revision: bool,
 ) -> bool {
     // Multiset equality of `(weight_bps, source_uri, digest)` between the live
     // split and the desired set: every live entry must resolve to a real-digest
@@ -1959,11 +1966,16 @@ fn deployment_converged_remote(
     else {
         return false;
     };
-    if split.entries.len() != desired.len() {
+    let entries: Vec<&greentic_deploy_spec::TrafficSplitEntry> = split
+        .entries
+        .iter()
+        .filter(|e| !single_revision || e.weight_bps > 0)
+        .collect();
+    if entries.len() != desired.len() {
         return false;
     }
-    let mut live: Vec<(u32, Option<&str>, &str)> = Vec::with_capacity(split.entries.len());
-    for entry in &split.entries {
+    let mut live: Vec<(u32, Option<&str>, &str)> = Vec::with_capacity(entries.len());
+    for entry in entries {
         let Some(rev) = env
             .revisions
             .iter()
@@ -2367,7 +2379,7 @@ fn remote_env_apply(
         // Convergence: skip stage/warm/traffic when the live split already
         // matches the desired (weight, source_uri, digest) set.
         if let Some(dep_id) = deployment_id
-            && deployment_converged_remote(&env, dep_id, &revs)
+            && deployment_converged_remote(&env, dep_id, &revs, b.revisions.is_none())
         {
             plan.noop(json!({
                 "section": "revision", "bundle_id": b.bundle_id, "action": "converged"
@@ -4420,8 +4432,30 @@ mod tests {
         assert!(deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:1", "sha256:abc123")]
+            &[desired(10000, "oci://r/app:1", "sha256:abc123")],
+            true,
         ));
+    }
+
+    /// `[old@0, new@100]`: a single-revision manifest for `new` converges
+    /// (the retained zero-weight baseline is ignored, as in the local
+    /// planner); a multi-revision manifest naming only `new` does not.
+    #[test]
+    fn single_revision_convergence_ignores_a_zero_weight_baseline() {
+        let mut env = env_of(converged_env_json("sha256:abc123", "oci://r/app:2", 10000));
+        let mut old = env.revisions[0].clone();
+        old.revision_id = greentic_deploy_spec::RevisionId::new();
+        old.bundle_digest = "sha256:0ld000".to_string();
+        env.traffic_splits[0]
+            .entries
+            .push(greentic_deploy_spec::TrafficSplitEntry {
+                revision_id: old.revision_id,
+                weight_bps: 0,
+            });
+        env.revisions.push(old);
+        let want = [desired(10000, "oci://r/app:2", "sha256:abc123")];
+        assert!(deployment_converged_remote(&env, dep_id(), &want, true));
+        assert!(!deployment_converged_remote(&env, dep_id(), &want, false));
     }
 
     #[test]
@@ -4431,13 +4465,15 @@ mod tests {
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:1", "sha256:def456")]
+            &[desired(10000, "oci://r/app:1", "sha256:def456")],
+            true,
         ));
         // Changed pull ref (same digest) → still not converged.
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:2", "sha256:abc123")]
+            &[desired(10000, "oci://r/app:2", "sha256:abc123")],
+            true,
         ));
     }
 
@@ -4449,7 +4485,8 @@ mod tests {
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:1", "sha256:00")]
+            &[desired(10000, "oci://r/app:1", "sha256:00")],
+            true,
         ));
     }
 

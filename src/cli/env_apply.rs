@@ -3189,6 +3189,10 @@ fn wanted_revisions(rb: &ResolvedBundle) -> Vec<split_reuse::WantedRevision<'_>>
         .map(|rr| split_reuse::WantedRevision {
             digest: rr.digest.as_str(),
             source_uri: rr.spec.bundle_source_uri.as_deref(),
+            drain_seconds: rr
+                .spec
+                .drain_seconds
+                .unwrap_or_else(super::revisions::default_drain_seconds),
         })
         .collect()
 }
@@ -3261,6 +3265,9 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
                 .map(|r| split_reuse::WantedRevision {
                     digest: r.expected_digest.as_str(),
                     source_uri: r.bundle_source_uri.as_deref(),
+                    drain_seconds: r
+                        .drain_seconds
+                        .unwrap_or_else(super::revisions::default_drain_seconds),
                 })
                 .collect();
             let env_dir = store.env_dir(&env_id_parsed).ok();
@@ -3366,11 +3373,15 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
     // Set the combined traffic split. The key is deterministic over the
     // final (revision id, weight) pairs: with reuse, a re-weight keeps every
     // id, and the store rejects a reused key carrying different entries.
+    // Weights come from the effective bps each entry was planned with
+    // (`compute_effective_weights_bps`), never from the payload's optional
+    // fields.
     let ikey = format!(
         "deploy-split:{deployment_id}:{}",
         traffic_entries
             .iter()
-            .map(|e| format!("{}@{}", e.revision_id, e.weight_bps.unwrap_or(0)))
+            .zip(split_revs)
+            .map(|(e, rev)| format!("{}@{}", e.revision_id, rev.weight_bps))
             .collect::<Vec<_>>()
             .join("+")
     );
@@ -5489,6 +5500,45 @@ mod tests {
         let (after, _) = live_split_by_digest(&store);
         let a_after = after.iter().find(|e| e.0 == a_digest).unwrap().1;
         assert_eq!(a_before, a_after, "the unchanged revision keeps its id");
+    }
+
+    #[test]
+    fn a_revision_dropped_by_a_cut_over_is_staged_fresh_not_reused() {
+        let (dir, store) = seeded_store();
+        let single = |path: PathBuf| {
+            json!({
+                "schema": ENV_MANIFEST_SCHEMA_V1,
+                "environment": {"id": "local"},
+                "bundles": [{"bundle_id": "canary", "bundle_path": path}]
+            })
+        };
+        apply_value(&store, dir.path(), "a.json", &single(fixture()));
+        let a_old = load_local(&store).revisions[0].revision_id;
+        // Cut over to B: A leaves the split (it may stay `Ready`).
+        apply_value(&store, dir.path(), "b.json", &single(provider_fixture()));
+        let (live_b, _) = live_split_by_digest(&store);
+        let b_id = live_b
+            .iter()
+            .find(|e| e.2 == 10_000)
+            .expect("B serves 100 %")
+            .1;
+        assert!(live_b.iter().all(|e| e.1 != a_old), "A left the split");
+
+        apply_value(
+            &store,
+            dir.path(),
+            "split.json",
+            &two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]),
+        );
+        let a_digest = super::super::bundle_stage::sha256_file(&fixture()).unwrap();
+        let (after, _) = live_split_by_digest(&store);
+        let a_new = after.iter().find(|e| e.0 == a_digest).unwrap().1;
+        let b_after = after.iter().find(|e| e.0 != a_digest).unwrap().1;
+        assert_ne!(
+            a_new, a_old,
+            "A must be staged fresh, not the dropped revision"
+        );
+        assert_eq!(b_after, b_id, "B is a split member and is reused");
     }
 
     #[test]

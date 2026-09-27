@@ -22,19 +22,30 @@ use greentic_deploy_spec::{DeploymentId, Environment, RevisionId, RevisionLifecy
 pub(super) struct WantedRevision<'a> {
     pub digest: &'a str,
     pub source_uri: Option<&'a str>,
+    /// The drain window the manifest declares (its default when unset).
+    pub drain_seconds: u32,
 }
 
 /// For each `wanted` entry (in order), the id of an existing revision that can
 /// serve it unchanged, or `None` when it must be staged fresh.
 ///
 /// A revision is reusable when ALL of these hold:
-/// - it belongs to `deployment_id`;
+/// - it belongs to `deployment_id` AND is an entry of that deployment's
+///   CURRENT traffic split, at any weight including 0. A `Ready` revision a
+///   cut-over or `traffic set` dropped from the split is never reused: it may
+///   have been created under older deployer answers (Cloud Run then refuses
+///   to warm it) and it pins seed/secret versions from before anything staged
+///   since. Split members are always current — a deployer-answers change
+///   re-stages every one of them (`reuse_ready = false`);
 /// - its lifecycle is `Ready` (staged AND warmed — `traffic set` admits only
 ///   `Ready` revisions, so anything else could not be routed to anyway);
 /// - its `bundle_digest` is real (not the `sha256:00` placeholder) and equals
 ///   the wanted digest;
 /// - its `bundle_source_uri` equals the wanted one (`None` only matches
 ///   `None`: a K8s worker needs the pull ref to boot);
+/// - its `drain_seconds` equals the manifest's. A reused revision keeps the
+///   value it was staged with, so a changed drain window re-stages instead of
+///   being silently dropped;
 /// - its pack list is complete when that can be judged locally — reusing a
 ///   short-locked revision would make the heal re-stage a no-op forever;
 /// - no earlier entry in `wanted` already claimed it (two entries naming the
@@ -49,12 +60,17 @@ pub(super) fn reusable_revisions(
     wanted: &[WantedRevision<'_>],
     env_dir: Option<&Path>,
 ) -> Vec<Option<RevisionId>> {
-    let live_weight = |revision_id: RevisionId| -> u32 {
-        env.traffic_splits
+    let split_entries = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)
+        .map_or(&[][..], |s| s.entries.as_slice());
+    // `None` = not in the current split (never reusable).
+    let split_weight = |revision_id: RevisionId| -> Option<u32> {
+        split_entries
             .iter()
-            .find(|s| s.deployment_id == deployment_id)
-            .and_then(|s| s.entries.iter().find(|e| e.revision_id == revision_id))
-            .map_or(0, |e| e.weight_bps)
+            .find(|e| e.revision_id == revision_id)
+            .map(|e| e.weight_bps)
     };
     let mut claimed: BTreeSet<RevisionId> = BTreeSet::new();
     wanted
@@ -65,10 +81,12 @@ pub(super) fn reusable_revisions(
                 .iter()
                 .filter(|r| {
                     r.deployment_id == deployment_id
+                        && split_weight(r.revision_id).is_some()
                         && r.lifecycle == RevisionLifecycle::Ready
                         && super::digest_is_real(&r.bundle_digest)
                         && r.bundle_digest == w.digest
                         && r.bundle_source_uri.as_deref() == w.source_uri
+                        && r.drain_seconds == w.drain_seconds
                         && !claimed.contains(&r.revision_id)
                         && env_dir.is_none_or(|dir| {
                             super::super::bundle_stage::pack_list_is_complete(
@@ -78,7 +96,7 @@ pub(super) fn reusable_revisions(
                             )
                         })
                 })
-                .max_by_key(|r| (live_weight(r.revision_id) > 0, r.sequence))
+                .max_by_key(|r| (split_weight(r.revision_id).unwrap_or(0) > 0, r.sequence))
                 .map(|r| r.revision_id);
             if let Some(id) = best {
                 claimed.insert(id);
@@ -96,15 +114,19 @@ mod tests {
     };
     use greentic_deploy_spec::TrafficSplitEntry;
 
+    const DRAIN: u32 = 30;
+
     fn wanted(digest: &str) -> WantedRevision<'_> {
         WantedRevision {
             digest,
             source_uri: None,
+            drain_seconds: DRAIN,
         }
     }
 
-    /// Env with one deployment and three revisions: two `Ready` copies of
-    /// `sha256:aa` (seq 1 carrying traffic, seq 3 idle) and one of `sha256:bb`.
+    /// Env with one deployment and three `Ready` split members: two copies of
+    /// `sha256:aa` (seq 1 at 90 %, seq 3 at 0 %) and one of `sha256:bb`
+    /// (10 %).
     fn env_with_revisions() -> (Environment, DeploymentId, [RevisionId; 3]) {
         let mut env = make_env("local");
         let dep = make_bundle_deployment("local", "b");
@@ -121,8 +143,15 @@ mod tests {
             revision_id: r2.revision_id,
             weight_bps: 1_000,
         });
+        split.entries.push(TrafficSplitEntry {
+            revision_id: r3.revision_id,
+            weight_bps: 0,
+        });
         let ids = [r1.revision_id, r2.revision_id, r3.revision_id];
         env.bundles.push(dep);
+        for r in [&mut r1, &mut r2, &mut r3] {
+            r.drain_seconds = DRAIN;
+        }
         env.revisions.extend([r1, r2, r3]);
         env.traffic_splits.push(split);
         (env, dep_id, ids)
@@ -163,6 +192,7 @@ mod tests {
                 WantedRevision {
                     digest: "sha256:aa",
                     source_uri: Some("oci://x/b:1"),
+                    drain_seconds: DRAIN,
                 },
             ],
             None,
@@ -177,6 +207,34 @@ mod tests {
             r.bundle_digest = "sha256:00".into();
         }
         let got = reusable_revisions(&env, dep_id, &[wanted("sha256:00")], None);
+        assert_eq!(got, vec![None]);
+    }
+
+    #[test]
+    fn a_ready_revision_outside_the_current_split_is_never_reused() {
+        let (mut env, dep_id, [_, _, r3]) = env_with_revisions();
+        // r3 (`aa`, 0 %) leaves the split but stays `Ready`, and r1 too.
+        env.traffic_splits[0]
+            .entries
+            .retain(|e| e.weight_bps == 1_000);
+        let got = reusable_revisions(&env, dep_id, &[wanted("sha256:aa")], None);
+        assert_eq!(got, vec![None]);
+        assert!(env.revisions.iter().any(|r| r.revision_id == r3));
+    }
+
+    #[test]
+    fn a_changed_drain_window_is_staged_fresh() {
+        let (env, dep_id, _) = env_with_revisions();
+        let got = reusable_revisions(
+            &env,
+            dep_id,
+            &[WantedRevision {
+                digest: "sha256:bb",
+                source_uri: None,
+                drain_seconds: DRAIN + 1,
+            }],
+            None,
+        );
         assert_eq!(got, vec![None]);
     }
 }
