@@ -526,7 +526,7 @@ fn parse_access_mode(key: &str, value: &Value) -> Result<AccessMode, GcpCloudRun
 }
 
 /// Wrap a [`CloudRunTargetError`] as a [`DeployerError::Provider`].
-fn provider(err: CloudRunTargetError) -> DeployerError {
+pub(crate) fn provider(err: CloudRunTargetError) -> DeployerError {
     DeployerError::Provider(err.to_string())
 }
 

@@ -19,7 +19,7 @@ pub mod fake;
 // this uncommented before the file exists breaks a plain `cargo build`.
 // #[cfg(feature = "deploy-gcp-cloudrun")]
 // pub mod real;
-// pub mod retire;
+pub mod retire;
 pub mod spec;
 pub mod target;
-// pub mod up;
+pub mod up;
