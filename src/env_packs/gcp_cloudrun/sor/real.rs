@@ -83,11 +83,12 @@ impl RealSorTarget {
         }
         .map_err(CloudRunTargetError::Api)?;
         let run = RealCloudRunTarget::resolve(project, region, credentials).await?;
-        Ok(Self {
-            run,
-            auth,
-            http: reqwest::Client::new(),
-        })
+        // Bounded, or a hung best-effort AR grant hangs `op env up` itself.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| CloudRunTargetError::Api(format!("building the AR HTTP client: {e}")))?;
+        Ok(Self { run, auth, http })
     }
 
     /// The same clients as a `CloudRunTarget`, for staging the unit's secret.
