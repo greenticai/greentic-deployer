@@ -646,26 +646,40 @@ limitation with a workaround.
 Retiring is a sequence, not a delete: move the revision's traffic weight away →
 **drain** → archive → remove.
 
-- **`op env drain-revision <env> <rev>`** refuses a revision the recorded split
-  still routes to, waits its `drain_seconds` (capped by
-  `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`, default 600) so in-flight sessions
-  finish, scales the worker Deployment to 0, then polls until the worker runs
-  no pod (up to `GREENTIC_DEPLOYER_DRAIN_CONFIRM_TIMEOUT_SECS`, default 120).
+- **`op env drain-revision <env> <rev>`** first stamps a `Ready` revision
+  `Draining` in the store (so the next `op env reconcile` does not re-apply its
+  replicas), then confirms routing is already at 0 — the recorded split, AND
+  the router's LIVE runtime-config ConfigMap after projecting the store's split
+  into it (a split recorded or cleared but never pushed still routes; an
+  unreadable ConfigMap fails closed). Only then does it wait the revision's
+  `drain_seconds` (capped by `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`, default 600;
+  every env duration is clamped to 24 h) as grace for sessions in flight at the
+  cut, scale the worker Deployment to 0, and poll until it runs no pod (up to
+  `GREENTIC_DEPLOYER_DRAIN_CONFIRM_TIMEOUT_SECS`, default 120).
   **The confirmation signal is "zero ready endpoints"**, read from the worker
   Deployment's `status.replicas` / `availableReplicas`: the router
   (greentic-start) exposes no per-revision in-flight or session count to ask
   instead. The Deployment status is read rather than EndpointSlices because the
   bound Role already grants `deployments get` but not `endpointslices list`.
 - **`op env apply-revision` on an absent revision (the archive branch) is
-  gated:** it checks, right then, that the worker has no ready pod, and refuses
+  gated:** it checks, right then, that the live router config no longer weights
+  the revision and that the worker has no READY pod (zero ready endpoints — a
+  worker whose pods never became ready serves nothing and passes), and refuses
   with `not-drained` naming the revision otherwise. `--force-drain` archives
-  anyway (logged). A `reconcile` of a revision still recorded as `Draining`
-  re-applies its replica count; the gate then refuses until it is drained again.
+  anyway (logged, evidence `forced`). `op bundles retire` drains its revisions
+  concurrently (at most 4 at a time), so a retire waits about one window.
 - **`op env sweep <env> [--apply]`** lists worker Deployments/Services carrying
   `app.kubernetes.io/managed-by=greentic`, `app.kubernetes.io/component=worker`
-  and `greentic.ai/env=<env>`, and removes those whose `greentic.ai/revision` is
-  absent from the store — the orphans `reconcile`'s prune cannot see. Dry-run by
-  default; unlabeled objects are never listed, so never touched. Listing needs
+  and `greentic.ai/env=<env>`. The env id is not unique across stores (every
+  designer-driven store is `local`, often sharing one namespace), so every
+  worker is also stamped `greentic.ai/store=<hash of the store's env dir>` on
+  apply, and the sweep deletes ONLY objects carrying this store's label whose
+  `greentic.ai/revision` is absent from the store. An object without the store
+  label (rendered before it existed; it gains it on the next reconcile) is
+  reported `unattributed`, one with another store's label is `skipped` — neither
+  is ever deleted. Each delete re-checks every ownership label on the live
+  object. Dry-run by default; `--apply` holds the env lock for the whole
+  list → delete span. Listing needs
   `get`/`list` on `deployments` and `services`: the bootstrap Role grants them,
   but `op credentials requirements` does **not** probe them, so an env bound
   before they existed keeps validating. The sweep checks them itself first

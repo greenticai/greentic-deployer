@@ -69,7 +69,15 @@ impl K8sDeployerHandler {
         ObjectRef::from_manifest(deployment).map_err(provider)
     }
 
-    async fn probe_drained(&self, deployment: &ObjectRef) -> Result<DrainProbe, DeployerError> {
+    /// `endpoints_only` (the archive gate): drained once no pod is READY, i.e.
+    /// the Service has zero ready endpoints — a worker whose pods never became
+    /// ready (a failed warm) serves nothing and can be archived. The drain
+    /// itself (`false`) also waits for the scaled-down pods to be gone.
+    async fn probe_drained(
+        &self,
+        deployment: &ObjectRef,
+        endpoints_only: bool,
+    ) -> Result<DrainProbe, DeployerError> {
         let status = self
             .cluster
             .get_rollout_status_opt(deployment)
@@ -80,7 +88,7 @@ impl K8sDeployerHandler {
                 deployment: deployment.name.clone(),
                 absent: true,
             }),
-            Some(s) if s.replicas == 0 && s.available_replicas == 0 => {
+            Some(s) if s.available_replicas == 0 && (endpoints_only || s.replicas == 0) => {
                 DrainProbe::Drained(DrainEvidence::ZeroReadyEndpoints {
                     deployment: deployment.name.clone(),
                     absent: false,
@@ -178,7 +186,7 @@ impl K8sDeployerHandler {
             .await
             .map_err(provider)?;
         let evidence = confirm_within(revision_id, &self.drain_policy, || {
-            self.probe_drained(&deployment)
+            self.probe_drained(&deployment, false)
         })
         .await?;
         Ok(DrainOutcome {
@@ -197,7 +205,7 @@ impl K8sDeployerHandler {
         self.require_router_unrouted(env, revision_id, answers)
             .await?;
         confirm_within(revision_id, &DrainPolicy::immediate(), || {
-            self.probe_drained(&deployment)
+            self.probe_drained(&deployment, true)
         })
         .await
     }
@@ -367,6 +375,62 @@ mod tests {
                 available_replicas: 1,
             }))
         }
+    }
+
+    /// A worker whose only pod never became ready (a failed warm).
+    #[derive(Debug, Default)]
+    struct NeverReady(InMemoryCluster);
+
+    #[async_trait]
+    impl K8sCluster for NeverReady {
+        async fn apply(&self, m: &Value) -> Result<(), K8sClusterError> {
+            self.0.apply(m).await
+        }
+        async fn delete(&self, o: &ObjectRef) -> Result<(), K8sClusterError> {
+            self.0.delete(o).await
+        }
+        async fn get_rollout_status(
+            &self,
+            o: &ObjectRef,
+        ) -> Result<RolloutStatus, K8sClusterError> {
+            self.0.get_rollout_status(o).await
+        }
+        async fn get_service_status(
+            &self,
+            o: &ObjectRef,
+        ) -> Result<ServiceStatus, K8sClusterError> {
+            self.0.get_service_status(o).await
+        }
+        async fn get_object(&self, o: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+            self.0.get_object(o).await
+        }
+        async fn get_rollout_status_opt(
+            &self,
+            _: &ObjectRef,
+        ) -> Result<Option<RolloutStatus>, K8sClusterError> {
+            Ok(Some(RolloutStatus {
+                generation: 1,
+                observed_generation: Some(1),
+                replicas: 1,
+                updated_replicas: 1,
+                available_replicas: 0,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_archive_gate_passes_a_worker_with_zero_ready_endpoints() {
+        let h = K8sDeployerHandler::with_cluster(Arc::new(NeverReady::default()))
+            .with_drain_policy(DrainPolicy::immediate());
+        let env = unrouted_env();
+        let evidence = h
+            .confirm_drained(&env, env.revisions[1].revision_id, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            evidence,
+            DrainEvidence::ZeroReadyEndpoints { absent: false, .. }
+        ));
     }
 
     #[tokio::test(start_paused = true)]
