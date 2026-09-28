@@ -72,14 +72,20 @@ pub(crate) mod async_bridge;
 pub mod bootstrap;
 pub mod bound_identity;
 pub mod cluster;
+#[cfg(test)]
+pub(crate) mod cluster_fake;
 pub mod credentials;
 pub mod deployer;
+mod drain;
 mod ingress_prune;
 #[cfg(feature = "k8s-client")]
 pub mod kube_client;
+#[cfg(feature = "k8s-client")]
+mod kube_ops;
 pub mod manifests;
 pub mod render;
 pub mod sor_reconcile;
+pub mod sweep;
 #[cfg(feature = "k8s-client")]
 pub mod vault_bootstrap;
 #[cfg(feature = "k8s-client")]
@@ -90,6 +96,7 @@ use std::sync::Arc;
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
 
+use super::deployer::DrainPolicy;
 use super::slot::EnvPackHandler;
 use crate::tool_check::ToolCheck;
 
@@ -123,6 +130,9 @@ pub struct K8sDeployerHandler {
     /// [`Self::with_secrets_backend`]; defaults to
     /// [`SecretsBackend::DevStore`](manifests::SecretsBackend::DevStore).
     secrets_backend: manifests::SecretsBackend,
+    /// How `drain_revision` waits and confirms (P5-R2). Defaults to
+    /// [`DrainPolicy::from_env`]; tests inject [`DrainPolicy::immediate`].
+    pub(crate) drain_policy: DrainPolicy,
 }
 
 impl Default for K8sDeployerHandler {
@@ -132,6 +142,7 @@ impl Default for K8sDeployerHandler {
             cluster: Arc::new(UnconfiguredCluster),
             dev_secrets_data: None,
             secrets_backend: manifests::SecretsBackend::DevStore,
+            drain_policy: DrainPolicy::from_env(),
         }
     }
 }
@@ -155,6 +166,7 @@ impl K8sDeployerHandler {
             cluster,
             dev_secrets_data: None,
             secrets_backend: manifests::SecretsBackend::DevStore,
+            drain_policy: DrainPolicy::from_env(),
         }
     }
 
@@ -171,6 +183,7 @@ impl K8sDeployerHandler {
             cluster,
             dev_secrets_data,
             secrets_backend: manifests::SecretsBackend::DevStore,
+            drain_policy: DrainPolicy::from_env(),
         }
     }
 
@@ -181,6 +194,12 @@ impl K8sDeployerHandler {
     /// `VAULT_*` env).
     pub fn with_secrets_backend(mut self, secrets_backend: manifests::SecretsBackend) -> Self {
         self.secrets_backend = secrets_backend;
+        self
+    }
+
+    /// Override the drain wait/confirm policy (builder-style).
+    pub fn with_drain_policy(mut self, drain_policy: DrainPolicy) -> Self {
+        self.drain_policy = drain_policy;
         self
     }
 }

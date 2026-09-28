@@ -7,9 +7,11 @@
 //! 1. **clear** — refuse if a messaging endpoint would be stranded, mark the
 //!    deployment retiring (status `archived`) and remove its split.
 //! 2. **drain** — stamp `Ready` revisions `Draining`, then run the drain hook
-//!    for every draining revision (the bound deployer's `drain_revision`;
-//!    PD2 makes that wait for in-flight work — until then it returns at once,
-//!    and an env without a live deployer reports the hook `unavailable`).
+//!    for every draining revision (the bound deployer's enforced
+//!    `drain_revision`: wait the drain window, then confirm it serves nothing;
+//!    an env without a live deployer reports the hook `unavailable`). An
+//!    undrained revision stops the retire unless `--force-drain`, which records
+//!    it and lets the teardown skip the drain gate.
 //! 3. **teardown, then archive** — per revision, tear it down provider-side
 //!    (`archive_revision`) FIRST and archive it in the store only once that
 //!    succeeded. A failed teardown leaves the revision live in the store, so
@@ -53,6 +55,9 @@ pub struct BundleRetirePayload {
     /// Skip the provider drain / teardown hooks.
     #[serde(default)]
     pub store_only: bool,
+    /// Tear down revisions the deployer cannot confirm drained (P5-R2).
+    #[serde(default)]
+    pub force_drain: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
@@ -80,6 +85,9 @@ pub(crate) trait RetireHooks {
 pub(crate) struct ProviderHooks<'a> {
     pub store: &'a LocalFsStore,
     pub registry: &'a crate::env_packs::EnvPackRegistry,
+    /// `--force-drain`: an undrained revision is reported, not fatal, and its
+    /// teardown skips the drain gate.
+    pub force_drain: bool,
 }
 
 impl ProviderHooks<'_> {
@@ -89,9 +97,21 @@ impl ProviderHooks<'_> {
         revision_id: RevisionId,
         verb: RevisionVerb,
     ) -> Result<HookResult, OpError> {
-        match provider_revision_step(self.store, self.registry, env_id, revision_id, verb)? {
-            ProviderStep::Done { .. } => Ok(HookResult::Done),
-            ProviderStep::Unavailable(why) => Ok(HookResult::Unavailable(why)),
+        let step = provider_revision_step(
+            self.store,
+            self.registry,
+            env_id,
+            revision_id,
+            verb,
+            self.force_drain,
+        );
+        match step {
+            Ok(ProviderStep::Done { .. }) => Ok(HookResult::Done),
+            Ok(ProviderStep::Unavailable(why)) => Ok(HookResult::Unavailable(why)),
+            Err(OpError::NotDrained { reason, .. }) if self.force_drain => Ok(
+                HookResult::Unavailable(format!("not drained, forced past: {reason}")),
+            ),
+            Err(e) => Err(e),
         }
     }
 }
@@ -130,6 +150,7 @@ pub fn payload_from_retire_args(
         bundle,
         customer,
         store_only,
+        force_drain,
         idempotency_key,
     } = args;
     if env_id.is_none() && bundle.is_none() {
@@ -146,6 +167,7 @@ pub fn payload_from_retire_args(
         bundle,
         customer_id: customer,
         store_only,
+        force_drain,
         idempotency_key,
     }))
 }
@@ -173,7 +195,12 @@ pub fn retire(
     if payload.store_only {
         retire_with_hooks(store, &StoreOnlyHooks, payload)
     } else {
-        retire_with_hooks(store, &ProviderHooks { store, registry }, payload)
+        let hooks = ProviderHooks {
+            store,
+            registry,
+            force_drain: payload.force_drain,
+        };
+        retire_with_hooks(store, &hooks, payload)
     }
 }
 
@@ -356,6 +383,7 @@ fn retire_schema() -> Value {
             "bundle": {"type": "string", "description": "Deployment ULID or bundle id"},
             "customer_id": {"type": "string"},
             "store_only": {"type": "boolean", "default": false},
+            "force_drain": {"type": "boolean", "default": false},
             "idempotency_key": {"type": "string"}
         },
         "additionalProperties": false

@@ -403,6 +403,8 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
                 "version_skew": extension_report.version_skew,
             },
             "stale_revisions": stale_revisions,
+            // P5-R3: what the bound deployer can do (`null` when unresolved).
+            "deployer_capabilities": super::env_drain::doctor_capabilities(&registry, &env),
             "has_runtime": runtime.is_some(),
             "checked_at": Utc::now(),
         }),
@@ -1289,6 +1291,7 @@ pub fn apply_revision(
             answers.as_ref(),
             bound_token,
             secrets_backend,
+            args.force_drain,
         )?;
         (identity, worker_name, None)
     } else {
@@ -1300,6 +1303,7 @@ pub fn apply_revision(
             verb,
             answers.as_ref(),
             &descriptor,
+            args.force_drain,
         )?
     };
 
@@ -1321,6 +1325,10 @@ pub fn apply_revision(
     // surface the field only when present — their outcomes stay byte-identical.
     if let Some(url) = endpoint_url {
         result["endpoint_url"] = json!(url);
+    }
+    // An archive that skipped the drain gate says so in its outcome.
+    if !present && args.force_drain {
+        result["force_drain"] = json!(true);
     }
     Ok(OpOutcome::new(NOUN, "apply-revision", result))
 }
@@ -1376,6 +1384,7 @@ pub(crate) fn provider_revision_step(
     env_id: &EnvId,
     revision_id: RevisionId,
     verb: RevisionVerb,
+    force_drain: bool,
 ) -> Result<ProviderStep, OpError> {
     let env = store.load(env_id)?;
     if !deployer_supports_remove(&env)? {
@@ -1405,6 +1414,7 @@ pub(crate) fn provider_revision_step(
             answers.as_ref(),
             bound_token,
             secrets_backend,
+            force_drain,
         )?;
     } else {
         apply_revision_non_k8s(
@@ -1415,6 +1425,7 @@ pub(crate) fn provider_revision_step(
             verb,
             answers.as_ref(),
             &descriptor,
+            force_drain,
         )?;
     }
     Ok(ProviderStep::Done {
@@ -1433,6 +1444,7 @@ fn apply_revision_k8s_cluster(
     answers: Option<&Value>,
     bound_token: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+    force_drain: bool,
 ) -> Result<(), OpError> {
     use crate::env_packs::deployer::Deployer;
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
@@ -1450,18 +1462,35 @@ fn apply_revision_k8s_cluster(
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
         let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
             .with_secrets_backend(secrets_backend);
-        let result = match verb {
+        match verb {
             RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
                 .await
-                .map(|_| ()),
-            RevisionVerb::Drain => handler.drain_revision(env, revision_id).await.map(|_| ()),
-            RevisionVerb::Archive => handler
-                .archive_revision(env, revision_id, answers)
+                .map(|_| ())
+                .map_err(|e| OpError::Conflict(e.to_string())),
+            // P5-R2: the enforced drain (typed `not-drained` on failure).
+            RevisionVerb::Drain => handler
+                .drain_revision(env, revision_id, answers)
                 .await
-                .map(|_| ()),
-        };
-        result.map_err(|e| OpError::Conflict(e.to_string()))
+                .map(|_| ())
+                .map_err(super::env_drain::drain_error),
+            RevisionVerb::Archive => {
+                // P5-R2: archive only a drained revision (or --force-drain).
+                super::env_drain::archive_drain_gate(
+                    &handler,
+                    env,
+                    revision_id,
+                    answers,
+                    force_drain,
+                )
+                .await?;
+                handler
+                    .archive_revision(env, revision_id, answers)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| OpError::Conflict(e.to_string()))
+            }
+        }
     })
 }
 
@@ -1474,6 +1503,7 @@ fn apply_revision_k8s_cluster(
     _answers: Option<&Value>,
     _bound_token: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+    _force_drain: bool,
 ) -> Result<(), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -1537,7 +1567,10 @@ fn apply_revision_non_k8s(
     verb: RevisionVerb,
     answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
+    force_drain: bool,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
+    // AWS-ECS has no drain capability, so its archive is not gated.
+    let _ = force_drain;
     #[cfg(feature = "creds-aws")]
     {
         if is_aws_ecs_kind(descriptor) {
@@ -1547,7 +1580,15 @@ fn apply_revision_non_k8s(
     #[cfg(feature = "creds-gcp")]
     {
         if is_cloudrun_kind(descriptor) {
-            return apply_revision_cloudrun(store, env, env_id, revision_id, verb, answers);
+            return apply_revision_cloudrun(
+                store,
+                env,
+                env_id,
+                revision_id,
+                verb,
+                answers,
+                force_drain,
+            );
         }
     }
     Err(unsupported_apply_kind(descriptor))
@@ -1563,6 +1604,7 @@ fn apply_revision_non_k8s(
     _verb: RevisionVerb,
     _answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
+    _force_drain: bool,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(unsupported_apply_kind(descriptor))
 }
@@ -1700,7 +1742,10 @@ fn apply_revision_aws_ecs(
                 .warm_revision(env, revision_id, answers)
                 .await
                 .map(|_| ()),
-            RevisionVerb::Drain => handler.drain_revision(env, revision_id).await.map(|_| ()),
+            RevisionVerb::Drain => handler
+                .drain_revision(env, revision_id, answers)
+                .await
+                .map(|_| ()),
             RevisionVerb::Archive => handler
                 .archive_revision(env, revision_id, answers)
                 .await
@@ -1772,7 +1817,7 @@ pub(crate) fn cloudrun_target_inputs(
 /// on the warm outcome (read from the upsert response), so the caller needs no
 /// separate handle on the target.
 #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
-async fn resolve_cloudrun_handler(
+pub(crate) async fn resolve_cloudrun_handler(
     project: &str,
     region: &str,
     credentials: Option<crate::env_packs::gcp_cloudrun::bound_session::GcpCredentialMaterial>,
@@ -1932,6 +1977,7 @@ fn apply_revision_cloudrun(
     revision_id: RevisionId,
     verb: RevisionVerb,
     answers: Option<&Value>,
+    force_drain: bool,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     use crate::env_packs::deployer::Deployer;
     use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
@@ -1971,11 +2017,15 @@ fn apply_revision_cloudrun(
             Ok::<Option<String>, OpError>(outcome.endpoint_url)
         } else if verb == RevisionVerb::Drain {
             handler
-                .drain_revision(env, revision_id)
+                .drain_revision(env, revision_id, answers)
                 .await
-                .map_err(|e| OpError::Conflict(e.to_string()))?;
+                .map_err(super::env_drain::drain_error)?;
             Ok::<Option<String>, OpError>(None)
         } else {
+            // P5-R2: archive only a revision the live Service routes 0 % to
+            // (or under --force-drain).
+            super::env_drain::archive_drain_gate(&handler, env, revision_id, answers, force_drain)
+                .await?;
             handler
                 .archive_revision(env, revision_id, answers)
                 .await
@@ -1997,6 +2047,7 @@ fn apply_revision_cloudrun(
     _revision_id: RevisionId,
     _verb: RevisionVerb,
     _answers: Option<&Value>,
+    _force_drain: bool,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `deploy-gcp-cloudrun` feature; \
@@ -2237,6 +2288,7 @@ pub(crate) fn cloudrun_env_up(
             RevisionVerb::Warm,
             answers.as_ref(),
             &descriptor,
+            false,
         )?;
         if let Some(url) = url {
             endpoints.insert(revision.deployment_id.to_string(), url);
@@ -5436,6 +5488,7 @@ mod tests {
             env_id: env_id.to_string(),
             revision_id: revision_id.to_string(),
             kind: kind.map(str::to_string),
+            force_drain: false,
         }
     }
 

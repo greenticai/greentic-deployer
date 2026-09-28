@@ -550,6 +550,7 @@ impl Deployer for AwsEcsDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        _answers: Option<&serde_json::Value>,
     ) -> Result<DrainOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         // Routing-side only — see the module table. Task sets stay up so

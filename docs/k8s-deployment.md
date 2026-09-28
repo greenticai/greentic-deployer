@@ -641,6 +641,39 @@ limitation with a workaround.
   remote `revisions stage`/`warm` verbs are not yet wired end-to-end. Until then,
   each operator's named envs live in their own local store.
 
+### Retiring a revision: drain, archive, sweep (P5-R2)
+
+Retiring is a sequence, not a delete: move the revision's traffic weight away →
+**drain** → archive → remove.
+
+- **`op env drain-revision <env> <rev>`** refuses a revision the recorded split
+  still routes to, waits its `drain_seconds` (capped by
+  `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`, default 600) so in-flight sessions
+  finish, scales the worker Deployment to 0, then polls until the worker runs
+  no pod (up to `GREENTIC_DEPLOYER_DRAIN_CONFIRM_TIMEOUT_SECS`, default 120).
+  **The confirmation signal is "zero ready endpoints"**, read from the worker
+  Deployment's `status.replicas` / `availableReplicas`: the router
+  (greentic-start) exposes no per-revision in-flight or session count to ask
+  instead. The Deployment status is read rather than EndpointSlices because the
+  bound Role already grants `deployments get` but not `endpointslices list`.
+- **`op env apply-revision` on an absent revision (the archive branch) is
+  gated:** it checks, right then, that the worker has no ready pod, and refuses
+  with `not-drained` naming the revision otherwise. `--force-drain` archives
+  anyway (logged). A `reconcile` of a revision still recorded as `Draining`
+  re-applies its replica count; the gate then refuses until it is drained again.
+- **`op env sweep <env> [--apply]`** lists worker Deployments/Services carrying
+  `app.kubernetes.io/managed-by=greentic`, `app.kubernetes.io/component=worker`
+  and `greentic.ai/env=<env>`, and removes those whose `greentic.ai/revision` is
+  absent from the store — the orphans `reconcile`'s prune cannot see. Dry-run by
+  default; unlabeled objects are never listed, so never touched. Listing needs
+  `list` on `deployments` and `services`, which the bootstrap Role does **not**
+  grant (adding it would fail `op credentials requirements` for every env bound
+  before this) — run the sweep with an identity that can list.
+- **`op env capabilities <env>`** (also under `deployer_capabilities` in
+  `op env doctor`) reports the adapter's flags: K8s claims `drain`,
+  `traffic_split`, `private_registry_auth`, `remove`; not `ingress_managed` (no
+  Ingress is rendered) nor `multi_instance_safe` (no shared session store).
+
 ---
 
 ## 10. Troubleshooting

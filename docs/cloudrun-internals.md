@@ -286,6 +286,19 @@ Not gaps to fix casually — each has a reason:
 - **Secret versions accumulate.** Each warm adds versions; nothing GCs them.
   `op env destroy` deletes the whole secret.
 
+### Drain and capabilities (P5-R2 / P5-R3)
+
+`drain_revision` waits the revision's `drain_seconds` (capped by
+`GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`), then reads the live Service and
+confirms its `traffic[]` gives the revision **0 %** — the live traffic, not the
+recorded split, because a split recorded but never pushed still routes
+requests. Cloud Run then scales the revision to zero itself. The archive branch
+of `op env apply-revision` runs the same check without waiting and refuses
+(`not-drained`) unless `--force-drain`. The adapter claims `drain`,
+`traffic_split`, `ingress_managed`, `remove`; it does **not** claim
+`multi_instance_safe` (the session store is `/tmp`, see above) or
+`private_registry_auth`.
+
 ---
 
 ## 10. SoR units (SoRLa phase 3E)

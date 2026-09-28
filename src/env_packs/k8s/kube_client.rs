@@ -43,7 +43,8 @@ use serde_json::Value;
 
 use super::bootstrap::DEPLOYER_IDENTITY_BEARER_KEY;
 use super::cluster::{
-    K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, ServiceStatus, manifest_field,
+    K8sCluster, K8sClusterError, LabeledObject, ObjectRef, RolloutStatus, ServiceStatus,
+    manifest_field,
 };
 use super::credentials::{
     AccessDecision, ClusterIdentity, K8sBootstrapClient, K8sClientError, K8sOperation,
@@ -496,6 +497,29 @@ impl K8sCluster for KubeCluster {
             ingress_hostname: ingress.and_then(|i| i.hostname.clone()),
             ingress_ip: ingress.and_then(|i| i.ip.clone()),
         })
+    }
+
+    async fn list(
+        &self,
+        namespace: &str,
+        label_selector: &str,
+    ) -> Result<Vec<LabeledObject>, K8sClusterError> {
+        super::kube_ops::list_labeled(&self.client, namespace, label_selector).await
+    }
+
+    async fn scale_deployment(
+        &self,
+        deployment: &ObjectRef,
+        replicas: i32,
+    ) -> Result<bool, K8sClusterError> {
+        super::kube_ops::scale_deployment(&self.client, deployment, replicas).await
+    }
+
+    async fn get_rollout_status_opt(
+        &self,
+        deployment: &ObjectRef,
+    ) -> Result<Option<RolloutStatus>, K8sClusterError> {
+        super::kube_ops::rollout_status_opt(&self.client, deployment).await
     }
 }
 

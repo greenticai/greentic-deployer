@@ -368,6 +368,22 @@ pub enum EnvVerb {
     /// down) — the surgical counterpart of `reconcile`. K8s deployer env-pack
     /// only today; connects through the binding's `kubeconfig_context` answer.
     ApplyRevision(EnvApplyRevisionArgs),
+    /// Drain ONE revision against the live provider (P5-R2): wait its drain
+    /// window, then confirm it serves nothing — K8s scales the worker to zero
+    /// and checks it has no ready endpoints; Cloud Run checks the Service
+    /// routes it 0 %. Refused by capability name on a deployer without `drain`.
+    DrainRevision(EnvDrainRevisionArgs),
+    /// Remove K8s worker objects labeled for this env whose revision is no
+    /// longer in the store (orphans `reconcile` cannot see). Dry-run unless
+    /// `--apply`.
+    Sweep(EnvSweepArgs),
+    /// Report the bound deployer's adapter capability flags (P5-R3).
+    Capabilities {
+        env_id: String,
+        /// Deployer kind (defaults to the env's Deployer-slot binding).
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Push one deployment's recorded traffic split to its live ALB listener
     /// (the routing-side counterpart of `apply-revision`). AWS-ECS deployer
     /// env-pack only — K8s serves splits from its in-process runtime router, so
@@ -658,6 +674,43 @@ pub struct EnvApplyRevisionArgs {
     /// Deployer env-pack kind to apply with — a full `<path>@<version>`
     /// descriptor, or a bare path matching the env's deployer binding.
     /// Defaults to the env's Deployer-slot binding.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Archive branch only: tear the revision down even when the deployer
+    /// cannot confirm it is drained (K8s: its worker still has ready pods;
+    /// Cloud Run: the Service still routes it traffic). Without it such an
+    /// archive is refused, naming the revision (P5-R2).
+    #[arg(long)]
+    pub force_drain: bool,
+}
+
+/// Args for `op env drain-revision <env_id> <revision_id> [--kind]`: wait the
+/// revision's drain window (capped by `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`),
+/// then confirm against the live provider that it serves nothing. Move its
+/// traffic weight away first (`op traffic set` + `op env apply-traffic`).
+#[derive(Args, Debug)]
+pub struct EnvDrainRevisionArgs {
+    /// Environment id.
+    pub env_id: String,
+    /// Revision id (ULID) to drain.
+    pub revision_id: String,
+    /// Deployer kind (defaults to the env's Deployer-slot binding).
+    #[arg(long)]
+    pub kind: Option<String>,
+}
+
+/// Args for `op env sweep <env_id> [--apply] [--kind]`: find K8s worker
+/// Deployments/Services this deployer labeled for the env whose revision is
+/// absent from the store. Dry-run unless `--apply`; unlabeled objects are
+/// never touched.
+#[derive(Args, Debug)]
+pub struct EnvSweepArgs {
+    /// Environment id.
+    pub env_id: String,
+    /// Delete the orphans (default: report only).
+    #[arg(long)]
+    pub apply: bool,
+    /// Deployer kind (defaults to the env's Deployer-slot binding).
     #[arg(long)]
     pub kind: Option<String>,
 }
@@ -1152,6 +1205,10 @@ pub struct BundleRetireArgs {
     /// Anything still running provider-side is left for `op env sweep`.
     #[arg(long = "store-only")]
     pub store_only: bool,
+    /// Tear revisions down even when the deployer cannot confirm they are
+    /// drained (P5-R2). Without it an undrained revision stops the retire.
+    #[arg(long = "force-drain")]
+    pub force_drain: bool,
     /// Caller-supplied idempotency key (minted when absent).
     #[arg(long = "idempotency-key")]
     pub idempotency_key: Option<String>,
@@ -1482,6 +1539,9 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 EnvVerb::Render(_) => "render",
                 EnvVerb::Reconcile(_) => "reconcile",
                 EnvVerb::ApplyRevision(_) => "apply-revision",
+                EnvVerb::DrainRevision(_) => "drain-revision",
+                EnvVerb::Sweep(_) => "sweep",
+                EnvVerb::Capabilities { .. } => "capabilities",
                 EnvVerb::ApplyTraffic(_) => "apply-traffic",
                 EnvVerb::Destroy { .. } => "destroy",
                 EnvVerb::MigrateDev { .. } => "migrate-dev",
@@ -1656,6 +1716,13 @@ fn dispatch_env(
         EnvVerb::Render(args) => super::env::render(store, registry, flags, args)?,
         EnvVerb::Reconcile(args) => super::env::reconcile(store, registry, flags, args)?,
         EnvVerb::ApplyRevision(args) => super::env::apply_revision(store, registry, flags, args)?,
+        EnvVerb::DrainRevision(args) => {
+            super::env_drain::drain_revision(store, registry, flags, args)?
+        }
+        EnvVerb::Sweep(args) => super::env_drain::sweep(store, registry, flags, args)?,
+        EnvVerb::Capabilities { env_id, kind } => {
+            super::env_drain::capabilities(store, registry, flags, &env_id, kind.as_deref())?
+        }
         EnvVerb::ApplyTraffic(args) => super::env::apply_traffic(store, registry, flags, args)?,
         EnvVerb::Destroy {
             env_id,

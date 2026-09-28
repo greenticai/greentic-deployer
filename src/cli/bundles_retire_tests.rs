@@ -55,6 +55,7 @@ fn payload(bundle: &str) -> BundleRetirePayload {
         bundle: bundle.to_string(),
         customer_id: None,
         store_only: false,
+        force_drain: false,
         idempotency_key: None,
     }
 }
@@ -189,6 +190,7 @@ fn a_bound_deployer_that_cannot_tear_down_refuses_before_touching_anything() {
     let hooks = ProviderHooks {
         store: &store,
         registry: &registry,
+        force_drain: false,
     };
     let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
     assert_eq!(err.kind(), "conflict", "{err}");
@@ -265,6 +267,7 @@ fn provider_hooks_report_unavailable_without_a_deployer_binding() {
     let hooks = ProviderHooks {
         store: &store,
         registry: &registry,
+        force_drain: false,
     };
     let out = retire_with_hooks(&store, &hooks, payload("acme")).expect("retires");
     let teardown = out.result["teardown"]

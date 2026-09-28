@@ -50,6 +50,7 @@ pub(crate) mod dispatch_remote;
 pub mod env;
 pub mod env_apply;
 pub(crate) mod env_cloudrun_sor;
+pub mod env_drain;
 pub mod env_manifest;
 pub mod env_packs;
 pub(crate) mod env_sor;
@@ -133,6 +134,16 @@ pub enum OpError {
     /// envelopes.
     #[error("operator key: {0}")]
     OperatorKey(#[from] crate::operator_key::OperatorKeyError),
+    /// Archiving a revision that still serves (P5-R2). Names the revision;
+    /// `op env drain-revision` drains it, `--force-drain` overrides.
+    #[error(
+        "revision `{revision_id}` is not drained: {reason} — drain it first \
+         (`op env drain-revision`), or pass --force-drain to archive anyway"
+    )]
+    NotDrained { revision_id: String, reason: String },
+    /// A plan needs an adapter capability the bound deployer lacks (P5-R3).
+    #[error("{0}")]
+    CapabilityMissing(#[from] crate::env_packs::deployer::CapabilityMissing),
 }
 
 impl From<LifecycleError> for OpError {
@@ -217,6 +228,8 @@ impl OpError {
             OpError::RevenuePolicy(_) => "revenue-policy",
             OpError::TrustRoot(_) => "trust-root",
             OpError::OperatorKey(_) => "operator-key",
+            OpError::NotDrained { .. } => "not-drained",
+            OpError::CapabilityMissing(_) => "capability-missing",
         }
     }
 }
