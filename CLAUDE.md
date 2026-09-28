@@ -199,6 +199,7 @@ the exact var, not an opaque GCP error three calls later.
 | `docs/cloudrun-deployment.md` | operators | how to deploy to Cloud Run |
 | `docs/cloudrun-internals.md` | agents / contributors | how the Cloud Run deployer is built |
 | `docs/k8s-deployment.md` | operators | the declarative sibling path |
+| `docs/removal.md` | operators | `op traffic clear`, `op bundles retire`, `op env apply --prune` |
 | `docs/env-packs.md` | contributors | authoring an env-pack |
 | `docs/deployment-packs.md` | contributors | the legacy deployment-pack contract |
 | `examples/cloudrun-demo/` | everyone | a runnable, live-verified walkthrough |

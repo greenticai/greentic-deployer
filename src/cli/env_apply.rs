@@ -5,8 +5,10 @@
 //! `--answers <PATH>` payload convention) and reconciles the environment
 //! toward it: **validate → diff → plan → execute → verify**.
 //!
-//! - Upsert-only: resources in the store but absent from the manifest are
-//!   left untouched. No pruning, no deletes (v1 decision).
+//! - Upsert-only by default: resources in the store but absent from the
+//!   manifest are left untouched — omission is never deletion. Removal is
+//!   the opt-in `--prune --confirm-prune` (`prune.rs`), which only touches
+//!   what the manifest's own ownership ledger (`ownership.rs`) records.
 //! - Wiring only: the manifest starts at "artifacts exist" — no pack or
 //!   bundle building.
 //! - Safe re-run: a second apply of an unchanged manifest is a visible
@@ -64,6 +66,8 @@
 //! the standard `{op, noun, result}` JSON envelope (so the output is
 //! already machine-readable — no separate `--json` flag).
 
+mod ownership;
+mod prune;
 mod split_reuse;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -499,6 +503,11 @@ pub struct ApplyOptions {
     /// here so apply does not prompt again; env-sourced secrets ignore this.
     /// Never serialized — `SecretValue`'s `Debug` renders a placeholder.
     pub prefilled_secrets: BTreeMap<String, SecretValue>,
+    /// Opt-in removal (P5-R1): also remove what this environment's manifest
+    /// owns but no longer declares. Refused without [`Self::confirm_prune`].
+    pub prune: bool,
+    /// The explicit confirmation `prune` requires.
+    pub confirm_prune: bool,
 }
 
 /// Write the skeleton `greentic.env-manifest.v1` template to `path`.
@@ -631,7 +640,10 @@ fn apply_with_lookups(
         yes,
         non_interactive,
         prefilled_secrets,
+        prune,
+        confirm_prune,
     } = opts;
+    prune::require_confirmation(prune, confirm_prune)?;
     let yes = yes || non_interactive;
     let manifest_path = flags.answers.clone().ok_or_else(|| {
         OpError::InvalidArgument(
@@ -661,13 +673,35 @@ fn apply_with_lookups(
     )?;
     let steps = diff(store, &ctx)?;
     render_plan(&steps, &ctx.warnings, &ctx.missing);
+    // Ownership is keyed per manifest, so one manifest never prunes what
+    // another declared.
+    let owner = ownership::Owner::for_manifest(&manifest_path);
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let hooks = super::bundles_retire::ProviderHooks {
+        store,
+        registry: &registry,
+    };
+    // `None` unless `--prune`: the default report carries no `prune` key.
+    let prune_preview = if prune {
+        Some(prune::preview(store, &ctx, &owner, &hooks)?)
+    } else {
+        None
+    };
+    let with_prune = |mut report: Value, value: Option<Value>| {
+        if let Some(v) = value {
+            report["prune"] = v;
+        }
+        report
+    };
+    let preview_json = prune_preview.as_ref().map(|p| prune::plan_json(p, &owner));
+    let prune_pending = prune_preview.as_ref().map_or(0, |p| p.retire.len());
 
     match mode {
         ApplyMode::DryRun => {
             return Ok(OpOutcome::new(
                 NOUN,
                 VERB,
-                report_json(&ctx, &steps, mode.as_str(), None),
+                with_prune(report_json(&ctx, &steps, mode.as_str(), None), preview_json),
             ));
         }
         ApplyMode::Check => {
@@ -675,7 +709,8 @@ fn apply_with_lookups(
             // convergence gate must be runnable without holding the secret
             // values themselves (they're excluded from the verdict as
             // undiffable anyway). Mutating apply still requires them below.
-            let diffable_pending = steps.iter().filter(|s| s.action.counts_as_drift()).count();
+            let diffable_pending =
+                steps.iter().filter(|s| s.action.counts_as_drift()).count() + prune_pending;
             if diffable_pending > 0 {
                 return Err(OpError::Conflict(format!(
                     "env `{}` is not converged: {diffable_pending} pending change(s) — \
@@ -687,7 +722,7 @@ fn apply_with_lookups(
             return Ok(OpOutcome::new(
                 NOUN,
                 VERB,
-                report_json(&ctx, &steps, mode.as_str(), None),
+                with_prune(report_json(&ctx, &steps, mode.as_str(), None), preview_json),
             ));
         }
         ApplyMode::Apply => {}
@@ -713,7 +748,8 @@ fn apply_with_lookups(
     let pending = steps
         .iter()
         .filter(|s| s.action != ApplyAction::NoOp)
-        .count();
+        .count()
+        + prune_pending;
     if pending > 0 && !yes && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         eprint!(
             "apply {pending} change(s) to env `{}`? [y/N] ",
@@ -736,10 +772,31 @@ fn apply_with_lookups(
 
     execute(store, &ctx, &steps)?;
     let verify = verify(store, &ctx)?;
+    // Record what this manifest owns (only what prune may ever remove). A
+    // ledger that cannot be written fails a pruning apply, but never an
+    // upsert-only one: its outcome must not depend on the removal feature.
+    let applied = store.load(&ctx.env_id)?;
+    let declared = prune::declared_ids(&applied, &ctx);
+    if let Err(err) = ownership::record(store, &ctx.env_id, &applied, &owner, &declared) {
+        if prune {
+            return Err(err);
+        }
+        tracing::warn!(
+            env_id = %ctx.env_id,
+            error = %err,
+            "env apply: could not record the ownership ledger; a later --prune will not \
+             consider this apply's deployments"
+        );
+    }
+    let pruned = if prune {
+        Some(prune::execute(store, &ctx, &owner, &hooks)?)
+    } else {
+        None
+    };
     Ok(OpOutcome::new(
         NOUN,
         VERB,
-        report_json(&ctx, &steps, "apply", Some(verify)),
+        with_prune(report_json(&ctx, &steps, "apply", Some(verify)), pruned),
     ))
 }
 

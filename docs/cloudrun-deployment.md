@@ -677,8 +677,10 @@ Environment variables read by the deployer itself:
 - **Basis-point granularity.** Cloud Run traffic is whole integer percents
   summing to exactly 100. Splits that are not whole multiples of 100 bps
   (i.e. not whole percents) are **rejected**, not silently rounded.
-- **No `op env reconcile`** for Cloud Run; there is no declarative prune. Use
-  `op env destroy` to reclaim.
+- **No `op env reconcile`** for Cloud Run. Remove a deployment with
+  `op bundles retire` (drains, then deletes each revision's Cloud Run
+  resources), or opt into `op env apply --prune --confirm-prune` — see
+  [removal.md](removal.md). `op env destroy` reclaims the whole environment.
 - **No `op env render`** for Cloud Run.
 - **Secret version accumulation.** Each warm adds seed versions; they are not
   garbage-collected. `op env destroy` deletes the whole secret.

@@ -1256,6 +1256,11 @@ pub fn apply_revision(
     // use; the lifecycle→presence predicate is backend-agnostic.
     let present = crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle);
     let action = if present { "warmed" } else { "archived" };
+    let verb = if present {
+        RevisionVerb::Warm
+    } else {
+        RevisionVerb::Archive
+    };
     let lifecycle = revision.lifecycle;
 
     // Backend dispatch: connect as the bound identity (fail-closed when a ref is
@@ -1280,7 +1285,7 @@ pub fn apply_revision(
         apply_revision_k8s_cluster(
             &env,
             revision_id,
-            present,
+            verb,
             answers.as_ref(),
             bound_token,
             secrets_backend,
@@ -1292,7 +1297,7 @@ pub fn apply_revision(
             &env,
             &env_id,
             revision_id,
-            present,
+            verb,
             answers.as_ref(),
             &descriptor,
         )?
@@ -1320,6 +1325,103 @@ pub fn apply_revision(
     Ok(OpOutcome::new(NOUN, "apply-revision", result))
 }
 
+/// Which `Deployer` verb a single-revision provider call drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RevisionVerb {
+    Warm,
+    Drain,
+    Archive,
+}
+
+/// Outcome of [`provider_revision_step`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderStep {
+    /// The env's bound deployer ran the verb (`kind` = its descriptor).
+    Done { kind: String },
+    /// Nothing provider-side exists to act on: the env has no deployer
+    /// binding at all.
+    Unavailable(String),
+}
+
+/// Refuse up front when the env's BOUND deployer has no live single-revision
+/// teardown path (P5-R3 `remove` capability): removing a store record it
+/// cannot tear down could orphan a running workload. `Ok(false)` = no
+/// deployer bound (nothing provider-side to act on); `Ok(true)` = capable.
+pub(crate) fn deployer_supports_remove(env: &Environment) -> Result<bool, OpError> {
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
+        return Ok(false);
+    };
+    let descriptor = &binding.kind;
+    let is_k8s = descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if is_k8s || is_aws_ecs_kind(descriptor) || is_cloudrun_kind(descriptor) {
+        return Ok(true);
+    }
+    Err(OpError::Conflict(
+        greentic_deploy_spec::RemovalError::MissingCapability {
+            deployer: descriptor.path().to_string(),
+            capability: "remove".to_string(),
+        }
+        .to_string(),
+    ))
+}
+
+/// Drive ONE revision's provider-side `Deployer` verb through the env's
+/// bound deployer, with the same identity and answer resolution as
+/// `op env apply-revision`. Used by `op bundles retire` (drain, then
+/// teardown) — unlike `apply-revision` the verb is chosen by the caller, not
+/// derived from the recorded lifecycle.
+pub(crate) fn provider_revision_step(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    verb: RevisionVerb,
+) -> Result<ProviderStep, OpError> {
+    let env = store.load(env_id)?;
+    if !deployer_supports_remove(&env)? {
+        return Ok(ProviderStep::Unavailable(
+            "env has no deployer binding".to_string(),
+        ));
+    }
+    let descriptor = resolve_live_deployer_kind(&env, None)?;
+    registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+    let is_k8s = descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if !env.revisions.iter().any(|r| r.revision_id == revision_id) {
+        return Err(OpError::NotFound(format!(
+            "revision `{revision_id}` not found in env `{env_id}`"
+        )));
+    }
+    let (answers, _) = load_render_answers(store, &env, &descriptor)?;
+    if is_k8s {
+        let bound_token =
+            crate::env_packs::k8s::resolve_bound_identity(store, &env, env_id, answers.as_ref())?;
+        let secrets_backend = resolve_secrets_backend(store, &env)?;
+        apply_revision_k8s_cluster(
+            &env,
+            revision_id,
+            verb,
+            answers.as_ref(),
+            bound_token,
+            secrets_backend,
+        )?;
+    } else {
+        apply_revision_non_k8s(
+            store,
+            &env,
+            env_id,
+            revision_id,
+            verb,
+            answers.as_ref(),
+            &descriptor,
+        )?;
+    }
+    Ok(ProviderStep::Done {
+        kind: descriptor.as_str().to_string(),
+    })
+}
+
 /// Connect to the cluster and dispatch the single revision's Deployer verb:
 /// `warm_revision` when present, `archive_revision` when absent. Requires the
 /// `k8s-client` feature.
@@ -1327,7 +1429,7 @@ pub fn apply_revision(
 fn apply_revision_k8s_cluster(
     env: &Environment,
     revision_id: RevisionId,
-    present: bool,
+    verb: RevisionVerb,
     answers: Option<&Value>,
     bound_token: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
@@ -1348,16 +1450,16 @@ fn apply_revision_k8s_cluster(
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
         let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
             .with_secrets_backend(secrets_backend);
-        let result = if present {
-            handler
+        let result = match verb {
+            RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
                 .await
-                .map(|_| ())
-        } else {
-            handler
+                .map(|_| ()),
+            RevisionVerb::Drain => handler.drain_revision(env, revision_id).await.map(|_| ()),
+            RevisionVerb::Archive => handler
                 .archive_revision(env, revision_id, answers)
                 .await
-                .map(|_| ())
+                .map(|_| ()),
         };
         result.map_err(|e| OpError::Conflict(e.to_string()))
     })
@@ -1368,7 +1470,7 @@ fn apply_revision_k8s_cluster(
 fn apply_revision_k8s_cluster(
     _env: &Environment,
     _revision_id: RevisionId,
-    _present: bool,
+    _verb: RevisionVerb,
     _answers: Option<&Value>,
     _bound_token: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
@@ -1432,20 +1534,20 @@ fn apply_revision_non_k8s(
     env: &Environment,
     env_id: &EnvId,
     revision_id: RevisionId,
-    present: bool,
+    verb: RevisionVerb,
     answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     #[cfg(feature = "creds-aws")]
     {
         if is_aws_ecs_kind(descriptor) {
-            return apply_revision_aws_ecs(store, env, env_id, revision_id, present, answers);
+            return apply_revision_aws_ecs(store, env, env_id, revision_id, verb, answers);
         }
     }
     #[cfg(feature = "creds-gcp")]
     {
         if is_cloudrun_kind(descriptor) {
-            return apply_revision_cloudrun(store, env, env_id, revision_id, present, answers);
+            return apply_revision_cloudrun(store, env, env_id, revision_id, verb, answers);
         }
     }
     Err(unsupported_apply_kind(descriptor))
@@ -1458,7 +1560,7 @@ fn apply_revision_non_k8s(
     _env: &Environment,
     _env_id: &EnvId,
     _revision_id: RevisionId,
-    _present: bool,
+    _verb: RevisionVerb,
     _answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
@@ -1575,7 +1677,7 @@ fn apply_revision_aws_ecs(
     env: &Environment,
     env_id: &EnvId,
     revision_id: RevisionId,
-    present: bool,
+    verb: RevisionVerb,
     answers: Option<&Value>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     use crate::env_packs::aws::credentials::run_aws_async;
@@ -1593,17 +1695,18 @@ fn apply_revision_aws_ecs(
 
     run_aws_async(async move {
         let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
-        if present {
-            handler
+        match verb {
+            RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
                 .await
-                .map_err(|e| OpError::Conflict(e.to_string()))?;
-        } else {
-            handler
+                .map(|_| ()),
+            RevisionVerb::Drain => handler.drain_revision(env, revision_id).await.map(|_| ()),
+            RevisionVerb::Archive => handler
                 .archive_revision(env, revision_id, answers)
                 .await
-                .map_err(|e| OpError::Conflict(e.to_string()))?;
+                .map(|_| ()),
         }
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
         Ok::<(), OpError>(())
     })?;
     Ok((identity, worker_name, None))
@@ -1615,7 +1718,7 @@ fn apply_revision_aws_ecs(
     _env: &Environment,
     _env_id: &EnvId,
     _revision_id: RevisionId,
-    _present: bool,
+    _verb: RevisionVerb,
     _answers: Option<&Value>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(OpError::Conflict(
@@ -1827,7 +1930,7 @@ fn apply_revision_cloudrun(
     env: &Environment,
     env_id: &EnvId,
     revision_id: RevisionId,
-    present: bool,
+    verb: RevisionVerb,
     answers: Option<&Value>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     use crate::env_packs::deployer::Deployer;
@@ -1847,7 +1950,7 @@ fn apply_revision_cloudrun(
     // resolves `secret://` against the dev-store backend, never Vault, and only
     // on the warm path (`present`). Keeps operator-local Vault material and any
     // bound deployer credentials in the dev-store out of the runtime seed.
-    let dev_secrets = if present && cloudrun_stages_dev_secrets(env) {
+    let dev_secrets = if verb == RevisionVerb::Warm && cloudrun_stages_dev_secrets(env) {
         read_dev_secrets_bytes(store, env_id)?
     } else {
         None
@@ -1857,7 +1960,7 @@ fn apply_revision_cloudrun(
         let handler =
             resolve_cloudrun_handler(&params.project, &params.region, credentials, dev_secrets)
                 .await?;
-        if present {
+        if verb == RevisionVerb::Warm {
             // The Service's live `*.run.app` URL rides back on the warm outcome
             // (read from the upsert response — no extra round-trip): the "one
             // command → live URL" milestone.
@@ -1866,6 +1969,12 @@ fn apply_revision_cloudrun(
                 .await
                 .map_err(|e| OpError::Conflict(e.to_string()))?;
             Ok::<Option<String>, OpError>(outcome.endpoint_url)
+        } else if verb == RevisionVerb::Drain {
+            handler
+                .drain_revision(env, revision_id)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+            Ok::<Option<String>, OpError>(None)
         } else {
             handler
                 .archive_revision(env, revision_id, answers)
@@ -1886,7 +1995,7 @@ fn apply_revision_cloudrun(
     _env: &Environment,
     _env_id: &EnvId,
     _revision_id: RevisionId,
-    _present: bool,
+    _verb: RevisionVerb,
     _answers: Option<&Value>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(OpError::Conflict(
@@ -2125,7 +2234,7 @@ pub(crate) fn cloudrun_env_up(
             &env,
             env_id,
             revision.revision_id,
-            true,
+            RevisionVerb::Warm,
             answers.as_ref(),
             &descriptor,
         )?;

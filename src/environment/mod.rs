@@ -20,6 +20,7 @@ pub mod messaging;
 pub mod mutations;
 pub mod mutations_local;
 pub mod reads;
+pub mod removal_local;
 pub mod runtime_config;
 pub mod snapshot;
 pub mod sor_units;
