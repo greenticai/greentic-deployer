@@ -105,7 +105,8 @@ fn minting_writes_once_and_never_re_mints() {
     let first = dev_store_get_value(&dev_path, &held[0])
         .expect("read")
         .expect("minted");
-    assert_eq!(first.len(), 20, "the declared length");
+    // 20 declared bytes, base64url-encoded (the asset default) without padding.
+    assert_eq!(first.len(), 27, "the declared length, encoded");
 
     let again = mint_missing(&dev_path, &plans).expect("second mint");
     assert_eq!(again, held);
