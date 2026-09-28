@@ -272,6 +272,53 @@ questions:
     constraint:
       pattern: '^[0-9]{1,5}$'
 
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # `container_env` and `sidecars` — structured, manifest-only answers.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Both are parsed by `AwsEcsParams::from_answers` and belong to the
+  # launch set (supply them alongside execution_role_arn + subnets +
+  # security_groups). Neither appears as a question below, because every
+  # question type this spec has is a single-line `string` and neither of
+  # these has a safe single-line encoding:
+  #
+  #   container_env: {NAME: value} — arbitrary environment variables on the
+  #     app container. The escape hatch for a setting with no dedicated
+  #     answer of its own. Written as a mapping, not a delimited string:
+  #     this pack's other multi-valued answers are comma-separated, and a
+  #     comma is an ordinary character inside a multi-endpoint broker URL
+  #     or a connection string, so a CSV encoding would silently split
+  #     exactly the values this exists to carry.
+  #
+  #       container_env:
+  #         GREENTIC_EVENTS_NATS_URL: "nats://127.0.0.1:4222"
+  #         RUST_LOG: "info"
+  #
+  #     Values must be strings (a YAML `08` or `no` would otherwise reach a
+  #     live container as `8` / `false`). Names in
+  #     `DEPLOYER_MANAGED_ENV_KEYS` are REFUSED — they carry the
+  #     deployment's identity, which the deployer mints per revision.
+  #
+  #     VALUES ARE SECRET-BEARING BY ASSUMPTION. Nothing in this crate
+  #     renders one: no error variant carries a value, and the launch
+  #     config's Debug prints names only. Keep it that way.
+  #
+  #   sidecars: [{name, image, port?, memory_reservation_mib?, env?}] —
+  #     extra containers in the SAME task definition, so a small dependency
+  #     (a broker, a metrics shipper) runs beside the app and is reached on
+  #     127.0.0.1. Fargate bills the task reservation, not the container
+  #     count, so a sidecar on a task with headroom costs nothing.
+  #
+  #       sidecars:
+  #         - name: nats
+  #           image: public.ecr.aws/nats/nats:2.10
+  #           port: 4222
+  #           memory_reservation_mib: 128
+  #
+  #     Sidecars are always non-essential (an essential one could take the
+  #     app's task down with it), and container names must be unique across
+  #     the task — the app container included, since the load balancer
+  #     routes by container name.
+
   - id: target_group_arns
     type: string
     title: Target-group pool
