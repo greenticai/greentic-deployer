@@ -277,3 +277,30 @@ fn provider_hooks_report_unavailable_without_a_deployer_binding() {
     assert_eq!(teardown.len(), 2);
     assert!(teardown.iter().all(|t| t["result"] == "unavailable"));
 }
+
+#[test]
+fn retire_drains_revisions_concurrently_and_keeps_input_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let ids: Vec<RevisionId> = (0..6).map(|_| RevisionId::new()).collect();
+    let live = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let started = Instant::now();
+    let results = drain_concurrently(&ids, |r| {
+        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        live.fetch_sub(1, Ordering::SeqCst);
+        if r == ids[4] {
+            Err(OpError::Conflict("boom".to_string()))
+        } else {
+            Ok(HookResult::Done)
+        }
+    });
+    // 6 revisions at 4 at a time = two batches, not six sequential waits.
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(peak.load(Ordering::SeqCst), DRAIN_CONCURRENCY);
+    assert_eq!(results.len(), 6);
+    assert!(results[4].is_err());
+    assert!(results.iter().enumerate().all(|(i, r)| i == 4 || r.is_ok()));
+}

@@ -529,6 +529,7 @@ impl Deployer for K8sDeployerHandler {
         // `with_secrets_backend`), matching `reconcile` / `op env render` —
         // otherwise a Vault env's warm would emit a DevStore-shaped worker.
         params.secrets_backend = self.secrets_backend.clone();
+        params.store_label = self.store_label.clone();
         let manifests = render_worker_manifests(env, revision, &params);
         self.apply_all(&manifests).await?;
 

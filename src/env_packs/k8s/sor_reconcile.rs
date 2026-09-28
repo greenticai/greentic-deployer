@@ -168,6 +168,7 @@ impl K8sDeployerHandler {
         let mut params = params_from_answers(env, answers)?;
         params.dev_secrets_data = self.dev_secrets_data.clone();
         params.secrets_backend = self.secrets_backend.clone();
+        params.store_label = self.store_label.clone();
         let keep = |m: &Value| manage_namespace || !is_cluster_scoped(m);
         let mut applied = Vec::new();
 

@@ -521,6 +521,18 @@ impl K8sCluster for KubeCluster {
     ) -> Result<Option<RolloutStatus>, K8sClusterError> {
         super::kube_ops::rollout_status_opt(&self.client, deployment).await
     }
+
+    async fn get_object(&self, object: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+        let (resource, scope) = api_route_for(&object.api_version, &object.kind)?;
+        let namespace = object.namespace.as_deref().unwrap_or_default();
+        let api = dynamic_api(&self.client, &resource, scope, namespace);
+        match api.get_opt(&object.name).await.map_err(map_cluster_error)? {
+            None => Ok(None),
+            Some(found) => serde_json::to_value(found)
+                .map(Some)
+                .map_err(|e| K8sClusterError::Api(format!("decoding `{object}`: {e}"))),
+        }
+    }
 }
 
 /// Validator failures: auth-shaped problems map to `NoClusterAccess`,

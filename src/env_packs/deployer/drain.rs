@@ -42,6 +42,10 @@ pub const DEFAULT_DRAIN_MAX_WAIT: Duration = Duration::from_secs(600);
 /// revision drained (pods terminating, a traffic write settling).
 pub const DEFAULT_DRAIN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Hard ceiling on any drain duration read from the environment (24 h). Keeps
+/// an absurd override from overflowing `Instant` arithmetic.
+pub const DRAIN_DURATION_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Poll cadence while waiting for confirmation.
 pub const DEFAULT_DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -76,7 +80,7 @@ impl DrainPolicy {
             std::env::var(name)
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(Duration::from_secs)
+                .map(|secs| Duration::from_secs(secs).min(DRAIN_DURATION_CEILING))
         };
         let default = Self::default();
         Self {
@@ -99,7 +103,9 @@ impl DrainPolicy {
     /// The drain window for `revision`: its recorded `drain_seconds`, capped at
     /// [`Self::max_wait`].
     pub fn window(&self, revision: &Revision) -> Duration {
-        Duration::from_secs(u64::from(revision.drain_seconds)).min(self.max_wait)
+        Duration::from_secs(u64::from(revision.drain_seconds))
+            .min(self.max_wait)
+            .min(DRAIN_DURATION_CEILING)
     }
 }
 
@@ -120,6 +126,15 @@ pub enum DrainEvidence {
         /// `true` when the Deployment does not exist at all.
         absent: bool,
     },
+    /// Cloud Run whole-bundle retire: the deployment is retiring and no
+    /// messaging endpoint references its bundle, so after the window the
+    /// whole Service is deleted (its last revision can never reach 0 %).
+    ServiceRetiring {
+        /// Cloud Run Service name.
+        service: String,
+    },
+    /// The drain gate was skipped with `--force-drain`; nothing was confirmed.
+    Forced,
     /// Cloud Run: the Service's live `traffic[]` gives the revision 0 %.
     ZeroTrafficPercent {
         /// Cloud Run Service name.
@@ -177,7 +192,10 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<DrainProbe, DeployerError>>,
 {
-    let deadline = Instant::now() + policy.confirm_timeout;
+    let timeout = policy.confirm_timeout.min(DRAIN_DURATION_CEILING);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
     loop {
         match probe().await? {
             DrainProbe::Drained(evidence) => return Ok(evidence),

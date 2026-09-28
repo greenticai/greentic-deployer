@@ -926,6 +926,20 @@ impl Deployer for GcpCloudRunDeployerHandler {
         let revision = find_revision(env, revision_id).expect("require_revision passed");
         let deployment_id = revision.deployment_id;
         let params = params_from_answers(env, answers)?;
+        // A whole-bundle retire tears down the Service: its last revision is
+        // always routed (traffic sums to 100 %), so it cannot be deleted
+        // on its own. Idempotent against an absent Service.
+        if super::drain::whole_bundle_retiring(env, revision_id) {
+            self.target
+                .delete_service(&ServiceRef {
+                    deployment_id,
+                    project: params.project,
+                    region: params.region,
+                })
+                .await
+                .map_err(provider)?;
+            return Ok(ArchiveOutcome::default());
+        }
         self.target
             .delete_revision(&RevisionRef {
                 deployment_id,

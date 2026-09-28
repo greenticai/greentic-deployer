@@ -13,6 +13,11 @@
 //!   against a cluster that ignores the selector);
 //! - an object whose `greentic.ai/revision` names a revision still in the
 //!   store is kept, whatever its lifecycle (`reconcile` owns those);
+//! - the env id is NOT unique across stores (every designer store is
+//!   `local`), so an orphan is claimed only when it also carries THIS store's
+//!   `greentic.ai/store` label; one without it is reported `unattributed` and
+//!   one with another store's label is skipped — neither is ever deleted;
+//! - each delete re-checks every ownership label on the live object;
 //! - dry-run is the default; `apply` deletes.
 //!
 //! Listing needs `list` on `deployments` and `services`. The bootstrap Role
@@ -22,15 +27,17 @@
 //! permission and the re-bootstrap, when the identity lacks it.
 
 use std::collections::BTreeSet;
+use std::path::Path;
+use std::str::FromStr;
 
-use greentic_deploy_spec::Environment;
+use greentic_deploy_spec::{Environment, RevisionId};
 use serde::Serialize;
 use serde_json::Value;
 
 use super::K8sDeployerHandler;
 use super::credentials::{AccessDecision, K8sValidatorClient, SWEEP_K8S_OPERATIONS};
 use super::deployer::{params_from_answers, provider};
-use super::manifests::ENV_LABEL;
+use super::manifests::{ENV_LABEL, STORE_LABEL};
 use crate::env_packs::deployer::DeployerError;
 
 const MANAGED_BY: (&str, &str) = ("app.kubernetes.io/managed-by", "greentic");
@@ -107,6 +114,19 @@ pub fn worker_selector(env: &Environment) -> String {
     )
 }
 
+/// This store's identity for [`STORE_LABEL`]: a short hash of the store's
+/// canonical env directory. Stable for a store (the path never moves under a
+/// live store); distinct for two stores that share an env id. A store that is
+/// moved gets a new label and its existing workers read as another store's —
+/// the safe direction: they are skipped, never deleted.
+pub fn store_label_for(env_dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = std::fs::canonicalize(env_dir).unwrap_or_else(|_| env_dir.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("s-{hex}")
+}
+
 /// One worker object the sweep classified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SweptObject {
@@ -128,25 +148,41 @@ pub struct SkippedObject {
 pub struct SweepReport {
     pub namespace: String,
     pub label_selector: String,
+    /// This store's [`STORE_LABEL`] value — the only one the sweep claims.
+    pub store_label: String,
     pub dry_run: bool,
-    /// Workers whose revision is absent from the store.
+    /// Workers stamped with THIS store's label whose revision is absent from
+    /// the store.
     pub orphans: Vec<SweptObject>,
     /// The orphans actually deleted (empty on a dry run).
     pub removed: Vec<SweptObject>,
     /// Workers whose revision the store still records.
     pub kept: Vec<SweptObject>,
+    /// Workers with no store label (rendered before store identity existed,
+    /// or by a remote store): ownership cannot be proven, so never deleted.
+    pub unattributed: Vec<SweptObject>,
     pub skipped: Vec<SkippedObject>,
 }
 
 impl K8sDeployerHandler {
-    /// Find (and with `apply`, delete) worker Deployments/Services labeled for
-    /// this env whose revision is absent from `env.revisions`.
+    /// Find (and with `apply`, delete) worker Deployments/Services stamped
+    /// with this env's AND this store's labels whose revision is absent from
+    /// `env.revisions`. Each delete re-checks every ownership label on the
+    /// live object (`delete_if_labeled`), so a label changed after the list
+    /// leaves the object alone.
     pub async fn sweep(
         &self,
         env: &Environment,
         answers: Option<&Value>,
         apply: bool,
     ) -> Result<SweepReport, DeployerError> {
+        let store = self.store_label.clone().ok_or_else(|| {
+            DeployerError::Provider(
+                "the sweep needs this store's identity (store label) to prove ownership; \
+                 none was supplied"
+                    .to_string(),
+            )
+        })?;
         let params = params_from_answers(env, answers)?;
         let selector = worker_selector(env);
         let listed = self
@@ -154,27 +190,25 @@ impl K8sDeployerHandler {
             .list(&params.namespace, &selector)
             .await
             .map_err(provider)?;
-        let known: BTreeSet<String> = env
-            .revisions
-            .iter()
-            .map(|r| r.revision_id.0.to_string())
-            .collect();
+        let known: BTreeSet<RevisionId> = env.revisions.iter().map(|r| r.revision_id).collect();
         let env_id = env.environment_id.as_str();
 
         let mut report = SweepReport {
             namespace: params.namespace.clone(),
             label_selector: selector,
+            store_label: store.clone(),
             dry_run: !apply,
             orphans: Vec::new(),
             removed: Vec::new(),
             kept: Vec::new(),
+            unattributed: Vec::new(),
             skipped: Vec::new(),
         };
         for item in listed {
-            let skip = |reason: &str| SkippedObject {
+            let skip = |reason: String| SkippedObject {
                 kind: item.object.kind.clone(),
                 name: item.object.name.clone(),
-                reason: reason.to_string(),
+                reason,
             };
             let label = |k: &str| item.labels.get(k).map(String::as_str);
             if label(MANAGED_BY.0) != Some(MANAGED_BY.1)
@@ -183,29 +217,72 @@ impl K8sDeployerHandler {
             {
                 report
                     .skipped
-                    .push(skip("does not carry this env's worker labels"));
+                    .push(skip("does not carry this env's worker labels".into()));
                 continue;
             }
             if !matches!(item.object.kind.as_str(), "Deployment" | "Service") {
-                report.skipped.push(skip("not a worker Deployment/Service"));
+                report
+                    .skipped
+                    .push(skip("not a worker Deployment/Service".into()));
                 continue;
             }
-            let Some(revision_id) = label(REVISION_LABEL) else {
-                report.skipped.push(skip("no `greentic.ai/revision` label"));
+            let Some(raw_revision) = label(REVISION_LABEL) else {
+                report
+                    .skipped
+                    .push(skip("no `greentic.ai/revision` label".into()));
                 continue;
             };
+            let Ok(ulid) = ulid::Ulid::from_str(raw_revision) else {
+                report.skipped.push(skip(format!(
+                    "unparseable `greentic.ai/revision` label `{raw_revision}`"
+                )));
+                continue;
+            };
+            let revision_id = RevisionId(ulid);
             let swept = SweptObject {
                 kind: item.object.kind.clone(),
                 name: item.object.name.clone(),
                 revision_id: revision_id.to_string(),
             };
-            if known.contains(revision_id) {
+            if known.contains(&revision_id) {
                 report.kept.push(swept);
                 continue;
             }
+            match label(STORE_LABEL) {
+                None => {
+                    report.unattributed.push(swept);
+                    continue;
+                }
+                Some(other) if other != store => {
+                    report.skipped.push(skip(format!(
+                        "owned by another store (`{STORE_LABEL}={other}`)"
+                    )));
+                    continue;
+                }
+                Some(_) => {}
+            }
             if apply {
-                self.cluster.delete(&item.object).await.map_err(provider)?;
-                report.removed.push(swept.clone());
+                let ownership = [
+                    MANAGED_BY,
+                    COMPONENT,
+                    (ENV_LABEL, env_id),
+                    (STORE_LABEL, store.as_str()),
+                    (REVISION_LABEL, raw_revision),
+                ];
+                let deleted = self
+                    .cluster
+                    .delete_if_labeled(&item.object, &ownership)
+                    .await
+                    .map_err(provider)?;
+                if deleted {
+                    report.removed.push(swept.clone());
+                } else {
+                    report.skipped.push(skip(
+                        "ownership labels changed or object gone before the delete; left alone"
+                            .into(),
+                    ));
+                    continue;
+                }
             }
             report.orphans.push(swept);
         }
@@ -214,218 +291,5 @@ impl K8sDeployerHandler {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use serde_json::json;
-
-    use super::*;
-    use crate::env_packs::deployer::Deployer;
-    use crate::env_packs::deployer::conformance::build_fixture_env;
-    use crate::env_packs::k8s::cluster::{InMemoryCluster, K8sCluster, ObjectRef};
-
-    /// Fixture env with one live worker (revision 0) plus, in the cluster:
-    /// an orphaned worker pair for a revision the store no longer has, an
-    /// unlabeled look-alike, and another env's worker.
-    async fn seeded() -> (K8sDeployerHandler, Arc<InMemoryCluster>, Environment) {
-        let cluster = Arc::new(InMemoryCluster::default());
-        let h = K8sDeployerHandler::with_cluster(cluster.clone());
-        let mut env = build_fixture_env();
-        h.warm_revision(&env, env.revisions[0].revision_id, None)
-            .await
-            .unwrap();
-        // Warm revision 1 too, then drop it from the store → orphan.
-        h.warm_revision(&env, env.revisions[1].revision_id, None)
-            .await
-            .unwrap();
-        env.revisions.remove(1);
-        let ns = params_from_answers(&env, None).unwrap().namespace;
-        cluster
-            .apply(&json!({"apiVersion": "apps/v1", "kind": "Deployment",
-                "metadata": {"name": "gtc-worker-handmade", "namespace": ns}}))
-            .await
-            .unwrap();
-        cluster
-            .apply(&json!({"apiVersion": "apps/v1", "kind": "Deployment",
-                "metadata": {"name": "gtc-worker-other", "namespace": ns, "labels": {
-                    "app.kubernetes.io/managed-by": "greentic",
-                    "app.kubernetes.io/component": "worker",
-                    "greentic.ai/env": "someone-else",
-                    "greentic.ai/revision": "01ZZZZZZZZZZZZZZZZZZZZZZZZ"}}}))
-            .await
-            .unwrap();
-        (h, cluster, env)
-    }
-
-    fn names(objs: &[SweptObject]) -> Vec<(String, String)> {
-        objs.iter()
-            .map(|o| (o.kind.clone(), o.name.clone()))
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn dry_run_reports_orphans_and_deletes_nothing() {
-        let (h, cluster, env) = seeded().await;
-        let before = cluster.objects().len();
-        let report = h.sweep(&env, None, false).await.unwrap();
-        assert!(report.dry_run);
-        assert_eq!(report.orphans.len(), 2, "{report:?}");
-        assert!(report.removed.is_empty());
-        assert_eq!(report.kept.len(), 2, "revision 0's worker pair");
-        assert_eq!(cluster.objects().len(), before, "dry run mutates nothing");
-    }
-
-    #[tokio::test]
-    async fn apply_removes_only_labeled_orphans() {
-        let (h, cluster, env) = seeded().await;
-        let report = h.sweep(&env, None, true).await.unwrap();
-        assert!(!report.dry_run);
-        assert_eq!(names(&report.removed), names(&report.orphans));
-        assert_eq!(report.removed.len(), 2);
-        let left: Vec<String> = cluster.objects().keys().map(|r| r.name.clone()).collect();
-        assert!(
-            left.iter().any(|n| n == "gtc-worker-handmade"),
-            "unlabeled kept"
-        );
-        assert!(
-            left.iter().any(|n| n == "gtc-worker-other"),
-            "other env kept"
-        );
-        for orphan in &report.removed {
-            assert!(!left.contains(&orphan.name), "{} removed", orphan.name);
-        }
-        // Idempotent: a second apply finds nothing.
-        let again = h.sweep(&env, None, true).await.unwrap();
-        assert!(again.orphans.is_empty());
-    }
-
-    #[tokio::test]
-    async fn an_object_lacking_the_revision_label_is_skipped() {
-        let cluster = Arc::new(InMemoryCluster::default());
-        let h = K8sDeployerHandler::with_cluster(cluster.clone());
-        let env = build_fixture_env();
-        let ns = params_from_answers(&env, None).unwrap().namespace;
-        let m = json!({"apiVersion": "v1", "kind": "Service",
-            "metadata": {"name": "gtc-worker-x", "namespace": ns, "labels": {
-                "app.kubernetes.io/managed-by": "greentic",
-                "app.kubernetes.io/component": "worker",
-                "greentic.ai/env": env.environment_id.as_str()}}});
-        cluster.apply(&m).await.unwrap();
-        let report = h.sweep(&env, None, true).await.unwrap();
-        assert_eq!(report.skipped.len(), 1);
-        assert!(report.orphans.is_empty());
-        assert!(
-            cluster
-                .objects()
-                .contains_key(&ObjectRef::from_manifest(&m).unwrap())
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unconfigured_cluster_fails_honestly() {
-        let h = K8sDeployerHandler::default();
-        let err = h
-            .sweep(&build_fixture_env(), None, false)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DeployerError::Provider(_)), "{err:?}");
-    }
-
-    /// Validator fake: denies every `list`, or fails the review outright.
-    #[derive(Debug)]
-    struct Reviewer {
-        deny_list: bool,
-        fail: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl K8sValidatorClient for Reviewer {
-        async fn who_am_i(
-            &self,
-        ) -> Result<
-            crate::env_packs::k8s::credentials::ClusterIdentity,
-            crate::env_packs::k8s::credentials::K8sClientError,
-        > {
-            Ok(crate::env_packs::k8s::credentials::ClusterIdentity { user: "t".into() })
-        }
-        async fn review_access<'a>(
-            &'a self,
-            _namespace: &'a str,
-            operations: &'a [crate::env_packs::k8s::credentials::K8sOperation],
-        ) -> Result<
-            Vec<crate::env_packs::k8s::credentials::OperationDecision>,
-            crate::env_packs::k8s::credentials::K8sClientError,
-        > {
-            if self.fail {
-                return Err(
-                    crate::env_packs::k8s::credentials::K8sClientError::ApiRejected("boom".into()),
-                );
-            }
-            Ok(operations
-                .iter()
-                .map(|op| crate::env_packs::k8s::credentials::OperationDecision {
-                    operation: *op,
-                    decision: if self.deny_list && op.verb == "list" {
-                        AccessDecision::Denied("rbac".into())
-                    } else {
-                        AccessDecision::Allowed
-                    },
-                })
-                .collect())
-        }
-        async fn review_cluster_access<'a>(
-            &'a self,
-            operations: &'a [crate::env_packs::k8s::credentials::K8sOperation],
-        ) -> Result<
-            Vec<crate::env_packs::k8s::credentials::OperationDecision>,
-            crate::env_packs::k8s::credentials::K8sClientError,
-        > {
-            self.review_access("", operations).await
-        }
-    }
-
-    #[tokio::test]
-    async fn preflight_passes_when_list_is_granted() {
-        let r = Reviewer {
-            deny_list: false,
-            fail: false,
-        };
-        require_sweep_access(&r, "zain", "gtc-zain").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn preflight_names_the_missing_permission_and_the_rebootstrap() {
-        let r = Reviewer {
-            deny_list: true,
-            fail: false,
-        };
-        let err = require_sweep_access(&r, "zain", "gtc-zain")
-            .await
-            .unwrap_err();
-        match &err {
-            SweepPreflightError::MissingPermission { permissions, .. } => assert_eq!(
-                permissions,
-                &vec![
-                    "k8s.rbac.allow:apps/deployments:list".to_string(),
-                    "k8s.rbac.allow:core/services:list".to_string()
-                ]
-            ),
-            other => panic!("expected MissingPermission, got {other:?}"),
-        }
-        let msg = err.to_string();
-        assert!(msg.contains("gtc op credentials bootstrap zain"), "{msg}");
-        assert!(msg.contains("apps/deployments:list"), "{msg}");
-    }
-
-    #[tokio::test]
-    async fn preflight_fails_closed_when_the_review_fails() {
-        let r = Reviewer {
-            deny_list: false,
-            fail: true,
-        };
-        assert!(matches!(
-            require_sweep_access(&r, "zain", "gtc-zain").await,
-            Err(SweepPreflightError::ReviewFailed(_))
-        ));
-    }
-}
+#[path = "sweep_tests.rs"]
+mod tests;

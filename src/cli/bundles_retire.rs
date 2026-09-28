@@ -78,6 +78,16 @@ pub(crate) trait RetireHooks {
         Ok(())
     }
     fn drain(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError>;
+    /// Drain every revision; results in input order. Default: one after
+    /// another. [`ProviderHooks`] drains concurrently (bounded), so a retire
+    /// of N revisions waits about one drain window, not N.
+    fn drain_all(
+        &self,
+        env_id: &EnvId,
+        revisions: &[RevisionId],
+    ) -> Vec<Result<HookResult, OpError>> {
+        revisions.iter().map(|r| self.drain(env_id, *r)).collect()
+    }
     fn teardown(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError>;
 }
 
@@ -122,6 +132,13 @@ impl RetireHooks for ProviderHooks<'_> {
     }
     fn drain(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError> {
         self.run(env_id, revision_id, RevisionVerb::Drain)
+    }
+    fn drain_all(
+        &self,
+        env_id: &EnvId,
+        revisions: &[RevisionId],
+    ) -> Vec<Result<HookResult, OpError>> {
+        drain_concurrently(revisions, |r| self.drain(env_id, r))
     }
     fn teardown(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError> {
         self.run(env_id, revision_id, RevisionVerb::Archive)
@@ -276,7 +293,13 @@ fn run_sequence(
         store.drain_revision(env_id, *r, key.clone()).map_err(map)?;
         committed.mark_committed();
     }
-    let drain_hooks = run_hook(&steps.drain_hook, |r| hooks.drain(env_id, r))?;
+    let drained = hooks.drain_all(env_id, &steps.drain_hook);
+    let mut drained = drained.into_iter();
+    let drain_hooks = run_hook(&steps.drain_hook, |_| {
+        drained
+            .next()
+            .unwrap_or_else(|| Err(OpError::Conflict("drain produced no result".to_string())))
+    })?;
     // Provider first, store second: a revision is archived only once its
     // workload is gone, so a failed teardown leaves it live in the store.
     let teardown = run_hook(&steps.teardown, |r| {
@@ -311,6 +334,40 @@ fn run_sequence(
         "teardown": teardown,
         "pruned_revision_ids": ids(&removed.pruned_revision_ids),
     }))
+}
+
+/// How many revisions a retire drains at once.
+pub(crate) const DRAIN_CONCURRENCY: usize = 4;
+
+/// Run `drain` over `revisions` on at most [`DRAIN_CONCURRENCY`] threads at a
+/// time; results in input order. Each drain waits its own window, so a batch
+/// costs about one window rather than one per revision.
+pub(crate) fn drain_concurrently<F>(
+    revisions: &[RevisionId],
+    drain: F,
+) -> Vec<Result<HookResult, OpError>>
+where
+    F: Fn(RevisionId) -> Result<HookResult, OpError> + Sync,
+{
+    let mut out = Vec::with_capacity(revisions.len());
+    for batch in revisions.chunks(DRAIN_CONCURRENCY) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|r| {
+                    let drain = &drain;
+                    let r = *r;
+                    scope.spawn(move || drain(r))
+                })
+                .collect();
+            for handle in handles {
+                out.push(handle.join().unwrap_or_else(|_| {
+                    Err(OpError::Conflict("a drain thread panicked".to_string()))
+                }));
+            }
+        });
+    }
+    out
 }
 
 fn run_hook(

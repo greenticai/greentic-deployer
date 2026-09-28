@@ -12,7 +12,9 @@
 //! - **capabilities** reports the bound adapter's capability flags. A verb
 //!   needing a capability the adapter lacks is refused with the name.
 
-use greentic_deploy_spec::{CapabilitySlot, EnvId, Environment, PackDescriptor, RevisionId};
+use greentic_deploy_spec::{
+    CapabilitySlot, EnvId, Environment, PackDescriptor, RevisionId, RevisionLifecycle,
+};
 use serde_json::{Value, json};
 
 use super::dispatch::{EnvDrainRevisionArgs, EnvSweepArgs};
@@ -65,7 +67,7 @@ pub(crate) async fn archive_drain_gate<D: Deployer + ?Sized>(
             revision_id = %revision_id,
             "--force-drain: archiving without confirming the revision is drained"
         );
-        return Ok(DrainEvidence::Unsupported);
+        return Ok(DrainEvidence::Forced);
     }
     deployer
         .confirm_drained(env, revision_id, answers)
@@ -115,6 +117,15 @@ fn parse_revision(env: &Environment, raw: &str) -> Result<RevisionId, OpError> {
             env.environment_id
         )))
     }
+}
+
+/// This store's K8s ownership label ([`crate::env_packs::k8s::sweep::store_label_for`]
+/// of the env's directory). `None` only when the env id cannot name a directory.
+pub(crate) fn k8s_store_label(store: &LocalFsStore, env_id: &EnvId) -> Option<String> {
+    store
+        .env_dir(env_id)
+        .ok()
+        .map(|dir| crate::env_packs::k8s::sweep::store_label_for(&dir))
 }
 
 /// `op env capabilities <env_id> [--kind]`.
@@ -183,6 +194,21 @@ pub fn drain_revision(
         .capabilities()
         .require(descriptor.path(), Capability::Drain)?;
     let revision_id = parse_revision(&env, &args.revision_id)?;
+    // Stamp the store `Draining` first, so a later `op env reconcile` does not
+    // resurrect the worker this drain stops (a `Ready` revision keeps its
+    // replicas in the desired state; a `Draining` one is gated at archive).
+    let mut stamped = false;
+    if env
+        .revisions
+        .iter()
+        .any(|r| r.revision_id == revision_id && r.lifecycle == RevisionLifecycle::Ready)
+    {
+        store
+            .drain_revision(&env_id, revision_id, super::resolve_idempotency_key(None)?)
+            .map_err(super::map_store_err_preserving_noun)?;
+        stamped = true;
+    }
+    let env = store.load(&env_id)?;
     let (answers, _) = load_render_answers(store, &env, &descriptor)?;
     let outcome = live::drain(store, &env, &env_id, &descriptor, revision_id, answers)?;
     Ok(OpOutcome::new(
@@ -192,6 +218,7 @@ pub fn drain_revision(
             "environment_id": env.environment_id.as_str(),
             "kind": descriptor.as_str(),
             "revision_id": revision_id.to_string(),
+            "stamped_draining": stamped,
             "waited_seconds": outcome.waited_seconds,
             "evidence": outcome.evidence,
         }),
@@ -224,8 +251,19 @@ pub fn sweep(
             descriptor.path()
         )));
     }
-    let (answers, _) = load_render_answers(store, &env, &descriptor)?;
-    let report = live::sweep_k8s(store, &env, &env_id, answers, args.apply)?;
+    // `--apply` holds the env lock for the whole reload → list → classify →
+    // delete span, so a concurrent apply cannot warm a revision this sweep
+    // then reads as absent. A dry run mutates nothing and takes no lock.
+    let report = if args.apply {
+        store.transact(&env_id, |_locked| {
+            let env = store.load(&env_id)?;
+            let (answers, _) = load_render_answers(store, &env, &descriptor)?;
+            live::sweep_k8s(store, &env, &env_id, answers, true)
+        })?
+    } else {
+        let (answers, _) = load_render_answers(store, &env, &descriptor)?;
+        live::sweep_k8s(store, &env, &env_id, answers, false)?
+    };
     let mut result = serde_json::to_value(report)
         .map_err(|e| OpError::Conflict(format!("sweep report: {e}")))?;
     result["environment_id"] = json!(env.environment_id.as_str());
@@ -265,6 +303,7 @@ mod live {
     async fn k8s_handler(
         kubeconfig_context: Option<String>,
         bound_token: Option<String>,
+        store_label: Option<String>,
     ) -> Result<(crate::env_packs::k8s::K8sDeployerHandler, kube::Client), OpError> {
         use crate::env_packs::k8s::kube_client::connect;
         use crate::env_packs::k8s::{K8sDeployerHandler, KubeCluster};
@@ -272,7 +311,8 @@ mod live {
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
         let handler =
-            K8sDeployerHandler::with_cluster(std::sync::Arc::new(KubeCluster::new(client.clone())));
+            K8sDeployerHandler::with_cluster(std::sync::Arc::new(KubeCluster::new(client.clone())))
+                .with_store_label(store_label);
         Ok((handler, client))
     }
 
@@ -298,8 +338,9 @@ mod live {
     ) -> Result<DrainOutcome, OpError> {
         use crate::env_packs::k8s::async_bridge::run_k8s_async;
         let (context, token) = k8s_inputs(store, env, env_id, answers.as_ref())?;
+        let label = k8s_store_label(store, env_id);
         run_k8s_async(async move {
-            let (handler, _) = k8s_handler(context, token).await?;
+            let (handler, _) = k8s_handler(context, token, label).await?;
             handler
                 .drain_revision(env, revision_id, answers.as_ref())
                 .await
@@ -339,11 +380,12 @@ mod live {
         use crate::env_packs::k8s::manifests::K8sParams;
         use crate::env_packs::k8s::sweep::require_sweep_access;
         let (context, token) = k8s_inputs(store, env, env_id, answers.as_ref())?;
+        let label = k8s_store_label(store, env_id);
         let namespace = K8sParams::from_answers(env, answers.as_ref())
             .map_err(|e| OpError::InvalidArgument(format!("invalid answers: {e}")))?
             .namespace;
         run_k8s_async(async move {
-            let (handler, client) = k8s_handler(context, token).await?;
+            let (handler, client) = k8s_handler(context, token, label).await?;
             // Check `list` BEFORE listing: a Role bootstrapped before the sweep
             // existed lacks it, and `credentials requirements` does not probe it.
             require_sweep_access(

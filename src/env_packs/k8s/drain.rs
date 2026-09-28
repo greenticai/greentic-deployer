@@ -6,12 +6,15 @@
 //!
 //! 1. refuse a revision the recorded split still routes to
 //!    ([`require_unrouted`]) — before any cluster call;
-//! 2. wait the drain window (`drain_seconds`, capped by the policy) so
-//!    in-flight sessions on the worker finish;
-//! 3. scale the worker Deployment to 0 replicas — nothing new can land on
+//! 2. project the store's split into the router's runtime-config ConfigMap,
+//!    then read the ConfigMap back and refuse if the LIVE router config still
+//!    weights the revision (a split recorded but never pushed still routes);
+//! 3. wait the drain window (`drain_seconds`, capped by the policy) so
+//!    sessions in flight at the cut finish;
+//! 4. scale the worker Deployment to 0 replicas — nothing new can land on
 //!    it (the router stopped sending when the split moved) and nothing old
 //!    stays up past the window;
-//! 4. poll the Deployment until it runs no pod (`status.replicas == 0`,
+//! 5. poll the Deployment until it runs no pod (`status.replicas == 0`,
 //!    `availableReplicas == 0`), which is exactly "its Service has zero ready
 //!    endpoints". An absent Deployment is drained.
 //!
@@ -30,7 +33,11 @@ use serde_json::Value;
 use super::K8sDeployerHandler;
 use super::cluster::ObjectRef;
 use super::deployer::{params_from_answers, provider};
-use super::manifests::render_worker_manifests;
+use super::manifests::{render_runtime_config_map, render_worker_manifests};
+use greentic_deploy_spec::RuntimeConfig;
+
+/// Key the runtime-config JSON lives under in the router's ConfigMap.
+const RUNTIME_CONFIG_KEY: &str = "runtime-config.json";
 use crate::env_packs::deployer::drain::{confirm_within, require_unrouted};
 use crate::env_packs::deployer::{
     DeployerError, DrainEvidence, DrainOutcome, DrainPolicy, DrainProbe, require_revision,
@@ -86,6 +93,61 @@ impl K8sDeployerHandler {
         })
     }
 
+    /// The router's LIVE routing: read the runtime-config ConfigMap it reloads
+    /// back from the cluster and refuse if it still weights the revision. An
+    /// absent ConfigMap routes nothing; an unreadable one fails closed.
+    async fn require_router_unrouted(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<(), DeployerError> {
+        let params = params_from_answers(env, answers)?;
+        let config_map =
+            ObjectRef::from_manifest(&render_runtime_config_map(env, &params)).map_err(provider)?;
+        let Some(live) = self
+            .cluster
+            .get_object(&config_map)
+            .await
+            .map_err(provider)?
+        else {
+            return Ok(());
+        };
+        let not_drained = |reason: String| DeployerError::NotDrained {
+            revision_id,
+            reason,
+        };
+        let raw = live
+            .pointer(&format!("/data/{RUNTIME_CONFIG_KEY}"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                not_drained(format!(
+                    "the router's `{config_map}` has no `{RUNTIME_CONFIG_KEY}`; cannot prove \
+                     it no longer routes here"
+                ))
+            })?;
+        let config: RuntimeConfig = serde_json::from_str(raw)
+            .map_err(|e| not_drained(format!("the router's `{config_map}` is unreadable ({e})")))?;
+        let weight: u32 = config
+            .revisions
+            .iter()
+            .filter(|b| b.revision_id == revision_id)
+            .map(|b| b.weight_bps)
+            .sum();
+        if weight == 0 {
+            Ok(())
+        } else {
+            Err(not_drained(format!(
+                "the router's live runtime-config (`{config_map}`) still routes {weight} bps to it"
+            )))
+        }
+    }
+
+    /// Enforced drain: stop routing and CONFIRM it (store split at 0, the
+    /// store's split projected into the router's ConfigMap, the live
+    /// ConfigMap read back at 0), THEN wait the window as grace for sessions
+    /// in flight at the cut, THEN stop the worker and confirm zero ready
+    /// endpoints.
     pub(super) async fn drain_enforced(
         &self,
         env: &Environment,
@@ -94,6 +156,16 @@ impl K8sDeployerHandler {
     ) -> Result<DrainOutcome, DeployerError> {
         let deployment = Self::worker_deployment(env, revision_id, answers)?;
         require_unrouted(env, revision_id)?;
+        // Project the store's split into the router (the same idempotent write
+        // `apply_traffic_split` makes). Without it a split recorded — or
+        // cleared by `op bundles retire` — but never pushed keeps routing.
+        let params = params_from_answers(env, answers)?;
+        self.cluster
+            .apply(&render_runtime_config_map(env, &params))
+            .await
+            .map_err(provider)?;
+        self.require_router_unrouted(env, revision_id, answers)
+            .await?;
         let window = env
             .revisions
             .iter()
@@ -122,6 +194,8 @@ impl K8sDeployerHandler {
         answers: Option<&Value>,
     ) -> Result<DrainEvidence, DeployerError> {
         let deployment = Self::worker_deployment(env, revision_id, answers)?;
+        self.require_router_unrouted(env, revision_id, answers)
+            .await?;
         confirm_within(revision_id, &DrainPolicy::immediate(), || {
             self.probe_drained(&deployment)
         })
@@ -207,6 +281,50 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn drain_pushes_the_moved_split_into_the_router_before_stopping_the_worker() {
+        let cluster = Arc::new(InMemoryCluster::default());
+        let h = handler(cluster.clone());
+        let routed = build_fixture_env();
+        let r = routed.revisions[1].revision_id;
+        // The router still has the OLD split (5000 bps to r) live.
+        let params = params_from_answers(&routed, None).unwrap();
+        cluster
+            .apply(&render_runtime_config_map(&routed, &params))
+            .await
+            .unwrap();
+        let env = unrouted_env();
+        // Archive gate (no push): the live router config still routes r.
+        let gate = h.confirm_drained(&env, r, None).await.unwrap_err();
+        assert!(
+            matches!(gate, DeployerError::NotDrained { ref reason, .. }
+                if reason.contains("live runtime-config") && reason.contains("5000")),
+            "{gate:?}"
+        );
+        // The drain projects the moved split, reads it back at 0, then drains.
+        h.drain_revision(&env, r, None).await.unwrap();
+        h.confirm_drained(&env, r, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_router_config_fails_closed() {
+        let cluster = Arc::new(InMemoryCluster::default());
+        let h = handler(cluster.clone());
+        let env = unrouted_env();
+        let params = params_from_answers(&env, None).unwrap();
+        let mut cm = render_runtime_config_map(&env, &params);
+        cm["data"]["runtime-config.json"] = serde_json::json!("{not json");
+        cluster.apply(&cm).await.unwrap();
+        let err = h
+            .confirm_drained(&env, env.revisions[1].revision_id, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DeployerError::NotDrained { ref reason, .. } if reason.contains("unreadable")),
+            "{err:?}"
+        );
+    }
+
     /// A cluster whose pods never terminate.
     #[derive(Debug, Default)]
     struct StuckPods(InMemoryCluster);
@@ -230,6 +348,9 @@ mod tests {
             o: &ObjectRef,
         ) -> Result<ServiceStatus, K8sClusterError> {
             self.0.get_service_status(o).await
+        }
+        async fn get_object(&self, o: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+            self.0.get_object(o).await
         }
         async fn scale_deployment(&self, _: &ObjectRef, _: i32) -> Result<bool, K8sClusterError> {
             Ok(true)

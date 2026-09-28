@@ -133,6 +133,10 @@ pub struct K8sDeployerHandler {
     /// How `drain_revision` waits and confirms (P5-R2). Defaults to
     /// [`DrainPolicy::from_env`]; tests inject [`DrainPolicy::immediate`].
     pub(crate) drain_policy: DrainPolicy,
+    /// This store's identity, stamped on every worker it renders
+    /// ([`manifests::STORE_LABEL`]); the orphan sweep claims only matching
+    /// workers. `None` stamps nothing.
+    pub(crate) store_label: Option<String>,
 }
 
 impl Default for K8sDeployerHandler {
@@ -143,6 +147,7 @@ impl Default for K8sDeployerHandler {
             dev_secrets_data: None,
             secrets_backend: manifests::SecretsBackend::DevStore,
             drain_policy: DrainPolicy::from_env(),
+            store_label: None,
         }
     }
 }
@@ -167,6 +172,7 @@ impl K8sDeployerHandler {
             dev_secrets_data: None,
             secrets_backend: manifests::SecretsBackend::DevStore,
             drain_policy: DrainPolicy::from_env(),
+            store_label: None,
         }
     }
 
@@ -184,6 +190,7 @@ impl K8sDeployerHandler {
             dev_secrets_data,
             secrets_backend: manifests::SecretsBackend::DevStore,
             drain_policy: DrainPolicy::from_env(),
+            store_label: None,
         }
     }
 
@@ -194,6 +201,12 @@ impl K8sDeployerHandler {
     /// `VAULT_*` env).
     pub fn with_secrets_backend(mut self, secrets_backend: manifests::SecretsBackend) -> Self {
         self.secrets_backend = secrets_backend;
+        self
+    }
+
+    /// Set this store's identity (builder-style); see [`sweep::store_label_for`].
+    pub fn with_store_label(mut self, store_label: Option<String>) -> Self {
+        self.store_label = store_label;
         self
     }
 

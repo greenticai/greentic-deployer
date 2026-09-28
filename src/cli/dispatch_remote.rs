@@ -1503,6 +1503,8 @@ fn remote_reconcile(
         false,
         // A remote store carries no sor-units.json sidecar (amendment 6).
         None,
+        // No local store identity: workers stay unattributed, never swept.
+        None,
     )?;
 
     Ok(OpOutcome::new(

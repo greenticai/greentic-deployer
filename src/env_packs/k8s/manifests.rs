@@ -404,6 +404,14 @@ pub struct K8sParams {
     /// `ingress_cert_manager_issuer` answers (see [`ingress`]). `None` → no
     /// Ingress rendered, exactly the set rendered before these answers existed.
     pub ingress: Option<IngressConfig>,
+    /// Store-unique ownership stamp ([`STORE_LABEL`]) put on every worker
+    /// Deployment/Service's `metadata.labels` (never on a selector, which is
+    /// immutable). The env id is not unique across stores — every
+    /// designer-driven store is `local` — so the orphan sweep claims a worker
+    /// only when this label matches its own store. `None` (preview renders,
+    /// remote stores) stamps nothing; the sweep then reports such workers as
+    /// unattributed and never deletes them.
+    pub store_label: Option<String>,
 }
 
 impl K8sParams {
@@ -425,6 +433,7 @@ impl K8sParams {
             telemetry: TelemetryAnswers::default(),
             image_pull_secret: None,
             ingress: None,
+            store_label: None,
         }
     }
 
@@ -680,6 +689,8 @@ impl K8sParams {
             telemetry,
             image_pull_secret,
             ingress,
+            // Store identity comes from the call site, never the answers.
+            store_label: defaults.store_label,
         })
     }
 }
@@ -851,6 +862,10 @@ fn sanitize_dns1123_label(raw: &str) -> String {
 /// guard reads it back — they MUST share this constant so a rename can't
 /// silently turn the guard into a no-op.
 pub const ENV_LABEL: &str = "greentic.ai/env";
+
+/// Label key carrying the owning STORE's identity on worker objects — see
+/// [`K8sParams::store_label`].
+pub const STORE_LABEL: &str = "greentic.ai/store";
 
 /// Shared labels stamped on every object the env-pack renders.
 fn common_labels(env: &Environment, component: &str) -> Value {
@@ -1435,10 +1450,21 @@ pub fn render_worker_manifests(
     revision: &Revision,
     params: &K8sParams,
 ) -> Vec<Value> {
-    vec![
+    let mut manifests = vec![
         render_worker_deployment(env, revision, params),
         render_worker_service(env, revision, params),
-    ]
+    ];
+    if let Some(store) = &params.store_label {
+        for manifest in &mut manifests {
+            if let Some(labels) = manifest
+                .pointer_mut("/metadata/labels")
+                .and_then(Value::as_object_mut)
+            {
+                labels.insert(STORE_LABEL.to_string(), json!(store));
+            }
+        }
+    }
+    manifests
 }
 
 /// Whether a revision's persisted lifecycle puts its worker objects in the

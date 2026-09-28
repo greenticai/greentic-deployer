@@ -187,6 +187,15 @@ impl K8sCluster for InMemoryCluster {
         }
     }
 
+    async fn get_object(&self, object: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+        Ok(self
+            .objects
+            .lock()
+            .expect("mutex not poisoned")
+            .get(object)
+            .cloned())
+    }
+
     async fn get_rollout_status_opt(
         &self,
         deployment: &ObjectRef,

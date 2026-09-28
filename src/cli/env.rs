@@ -765,6 +765,10 @@ pub fn render(
         let secrets_backend = resolve_secrets_backend(store, &env)?;
         crate::env_packs::k8s::K8sDeployerHandler::default()
             .with_secrets_backend(secrets_backend)
+            .with_store_label(super::env_drain::k8s_store_label(
+                store,
+                &env.environment_id,
+            ))
             .render_environment(&env, answers.as_ref())
             .map_err(|e| OpError::Conflict(e.to_string()))?
     } else {
@@ -889,6 +893,7 @@ pub fn reconcile(
         secrets_backend,
         false,
         sor.as_ref(),
+        super::env_drain::k8s_store_label(store, &env_id),
     )?;
     if let Some(prepared) = &prepared {
         super::env_sor::record_applied(store, &env_id, prepared)?;
@@ -966,6 +971,7 @@ fn reconcile_result_json(
 /// overriding the ambient identity when the env has a resolved credential) and
 /// converge desired state. Requires the `k8s-client` feature.
 #[cfg(feature = "k8s-client")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_k8s_cluster(
     env: &Environment,
     answers: Option<&Value>,
@@ -974,6 +980,7 @@ pub(crate) fn reconcile_k8s_cluster(
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     wait_for_rollout: bool,
     sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
+    store_label: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -999,7 +1006,8 @@ pub(crate) fn reconcile_k8s_cluster(
             Arc::new(KubeCluster::new(client)),
             dev_secrets,
         )
-        .with_secrets_backend(secrets_backend);
+        .with_secrets_backend(secrets_backend)
+        .with_store_label(store_label);
         handler
             .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout, sor)
             .await
@@ -1009,6 +1017,7 @@ pub(crate) fn reconcile_k8s_cluster(
 
 /// `k8s-client`-less builds cannot talk to a cluster.
 #[cfg(not(feature = "k8s-client"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_k8s_cluster(
     _env: &Environment,
     _answers: Option<&Value>,
@@ -1017,6 +1026,7 @@ pub(crate) fn reconcile_k8s_cluster(
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     _wait_for_rollout: bool,
     _sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
+    _store_label: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -1292,6 +1302,7 @@ pub fn apply_revision(
             bound_token,
             secrets_backend,
             args.force_drain,
+            super::env_drain::k8s_store_label(store, &env_id),
         )?;
         (identity, worker_name, None)
     } else {
@@ -1415,6 +1426,7 @@ pub(crate) fn provider_revision_step(
             bound_token,
             secrets_backend,
             force_drain,
+            super::env_drain::k8s_store_label(store, env_id),
         )?;
     } else {
         apply_revision_non_k8s(
@@ -1437,6 +1449,7 @@ pub(crate) fn provider_revision_step(
 /// `warm_revision` when present, `archive_revision` when absent. Requires the
 /// `k8s-client` feature.
 #[cfg(feature = "k8s-client")]
+#[allow(clippy::too_many_arguments)]
 fn apply_revision_k8s_cluster(
     env: &Environment,
     revision_id: RevisionId,
@@ -1445,6 +1458,7 @@ fn apply_revision_k8s_cluster(
     bound_token: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     force_drain: bool,
+    store_label: Option<String>,
 ) -> Result<(), OpError> {
     use crate::env_packs::deployer::Deployer;
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
@@ -1461,7 +1475,8 @@ fn apply_revision_k8s_cluster(
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
         let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
-            .with_secrets_backend(secrets_backend);
+            .with_secrets_backend(secrets_backend)
+            .with_store_label(store_label);
         match verb {
             RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
@@ -1496,6 +1511,7 @@ fn apply_revision_k8s_cluster(
 
 /// `k8s-client`-less builds cannot talk to a cluster.
 #[cfg(not(feature = "k8s-client"))]
+#[allow(clippy::too_many_arguments)]
 fn apply_revision_k8s_cluster(
     _env: &Environment,
     _revision_id: RevisionId,
@@ -1504,6 +1520,7 @@ fn apply_revision_k8s_cluster(
     _bound_token: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     _force_drain: bool,
+    _store_label: Option<String>,
 ) -> Result<(), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \

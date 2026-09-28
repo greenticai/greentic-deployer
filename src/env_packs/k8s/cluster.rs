@@ -352,6 +352,14 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
         Err(K8sClusterError::Unconfigured)
     }
 
+    /// Read one object back as JSON; `None` when absent. The drain reads the
+    /// router's runtime-config ConfigMap through it (`configmaps get` is in
+    /// the bound Role). Default: unconfigured.
+    async fn get_object(&self, object: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+        let _ = object;
+        Err(K8sClusterError::Unconfigured)
+    }
+
     /// [`Self::get_rollout_status`] that reports an absent Deployment as
     /// `None` rather than an error — the drain probe, where "gone" is a
     /// drained answer. Default: unconfigured.

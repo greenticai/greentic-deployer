@@ -487,6 +487,7 @@ fn reconcile_phase(
         secrets_backend,
         true,
         sor.as_ref(),
+        super::env_drain::k8s_store_label(store, env_id),
     )?;
     if let Some(prepared) = &prepared {
         super::env_sor::record_applied(store, env_id, prepared)?;
