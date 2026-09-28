@@ -86,6 +86,30 @@ pub const VALIDATED_GCP_PERMISSIONS: &[&str] = &[
     "artifactregistry.repositories.downloadArtifacts",
 ];
 
+/// Permissions a revision with a `vpcAccess` block needs from the deployer:
+/// `vpcaccess.connectors.use` for a Serverless VPC Access connector,
+/// `compute.subnetworks.use` for Direct VPC egress (both are what Cloud Run
+/// checks against the deploying principal when the template names one).
+///
+/// Deliberately NOT in [`VALIDATED_GCP_PERMISSIONS`]: most environments answer
+/// no VPC, and a credential bootstrapped before these answers existed must keep
+/// passing its preflight. They are probed only when the binding answers a VPC
+/// ([`GcpDeployerCredentials::with_vpc_egress`]), and the bootstrap custom role
+/// always grants them ([`bootstrap_permissions`]) so a fresh deployer can
+/// enable VPC egress later without re-applying Terraform.
+pub const VPC_EGRESS_PERMISSIONS: &[&str] =
+    &["vpcaccess.connectors.use", "compute.subnetworks.use"];
+
+/// Every permission the rendered bootstrap custom role grants: the validated
+/// surface plus [`VPC_EGRESS_PERMISSIONS`].
+pub fn bootstrap_permissions() -> Vec<&'static str> {
+    VALIDATED_GCP_PERMISSIONS
+        .iter()
+        .chain(VPC_EGRESS_PERMISSIONS)
+        .copied()
+        .collect()
+}
+
 /// The one permission validated against the *runtime service-account resource*
 /// rather than the project: the deployer needs `actAs` on the specific runtime
 /// SA it attaches to each revision (plan D7), and scoping the probe to that SA —
@@ -192,6 +216,9 @@ pub struct GcpDeployerCredentials {
     /// the SA a live `op env up` attaches to the revision (a `service_account`
     /// answer override honored).
     service_account: Option<String>,
+    /// Whether the binding answers a VPC (`vpc_connector` / `vpc_network`), so
+    /// the preflight also probes [`VPC_EGRESS_PERMISSIONS`]. Set by the CLI.
+    vpc_egress: bool,
 }
 
 impl std::fmt::Debug for GcpDeployerCredentials {
@@ -231,6 +258,23 @@ impl GcpDeployerCredentials {
     pub fn with_service_account(mut self, service_account: impl Into<String>) -> Self {
         self.service_account = Some(service_account.into());
         self
+    }
+
+    /// Also probe [`VPC_EGRESS_PERMISSIONS`] — the binding answers a VPC, so a
+    /// warm will render a `vpcAccess` block. Set by the connected CLI path.
+    pub fn with_vpc_egress(mut self, vpc_egress: bool) -> Self {
+        self.vpc_egress = vpc_egress;
+        self
+    }
+
+    /// The permissions this credential is validated against: the fixed surface,
+    /// plus the VPC pair when the binding answers a VPC.
+    fn validated_permissions(&self) -> Vec<&'static str> {
+        let mut perms = VALIDATED_GCP_PERMISSIONS.to_vec();
+        if self.vpc_egress {
+            perms.extend_from_slice(VPC_EGRESS_PERMISSIONS);
+        }
+        perms
     }
 
     /// Return the injected client, or build the real ADC-backed one.
@@ -287,12 +331,13 @@ impl GcpDeployerCredentials {
     /// permission test could not run: identity passes, every permission fails
     /// with the same reason.
     fn identity_pass_permissions_failed(&self, reason: &str) -> RequirementsReport {
-        let mut checks = Vec::with_capacity(1 + VALIDATED_GCP_PERMISSIONS.len());
+        let perms = self.validated_permissions();
+        let mut checks = Vec::with_capacity(1 + perms.len());
         checks.push(CapabilityCheck {
             capability: self.caller_identity_capability(),
             status: CapabilityStatus::Pass,
         });
-        for perm in VALIDATED_GCP_PERMISSIONS {
+        for perm in &perms {
             checks.push(CapabilityCheck {
                 capability: self.permission_capability(perm),
                 status: CapabilityStatus::Fail {
@@ -318,9 +363,10 @@ impl DeployerCredentials for GcpDeployerCredentials {
     }
 
     fn required_capabilities(&self) -> Vec<Capability> {
-        let mut caps = Vec::with_capacity(1 + VALIDATED_GCP_PERMISSIONS.len());
+        let perms = self.validated_permissions();
+        let mut caps = Vec::with_capacity(1 + perms.len());
         caps.push(self.caller_identity_capability());
-        for perm in VALIDATED_GCP_PERMISSIONS {
+        for perm in &perms {
             caps.push(self.permission_capability(perm));
         }
         caps
@@ -352,7 +398,8 @@ impl DeployerCredentials for GcpDeployerCredentials {
 
         // Project-scoped permissions: everything except `actAs`, which is probed
         // against the runtime SA resource (below) rather than the project (D7).
-        let project_perms: Vec<&str> = VALIDATED_GCP_PERMISSIONS
+        let perms = self.validated_permissions();
+        let project_perms: Vec<&str> = perms
             .iter()
             .copied()
             .filter(|p| *p != ACT_AS_PERMISSION)
@@ -386,12 +433,12 @@ impl DeployerCredentials for GcpDeployerCredentials {
             )),
         };
 
-        let mut checks = Vec::with_capacity(1 + VALIDATED_GCP_PERMISSIONS.len());
+        let mut checks = Vec::with_capacity(1 + perms.len());
         checks.push(CapabilityCheck {
             capability: self.caller_identity_capability(),
             status: CapabilityStatus::Pass,
         });
-        for perm in VALIDATED_GCP_PERMISSIONS {
+        for perm in &perms {
             let status = if *perm == ACT_AS_PERMISSION {
                 match &act_as_probe {
                     Ok(true) => CapabilityStatus::Pass,
@@ -431,10 +478,11 @@ impl DeployerCredentials for GcpDeployerCredentials {
             ));
         }
 
+        let permissions = bootstrap_permissions();
         let rules_pack = render_bootstrap_rules_pack(&GcpBootstrapInput {
             env_id: input.env_id.as_str(),
             admin_identity_hint: admin_hint,
-            permissions: VALIDATED_GCP_PERMISSIONS,
+            permissions: &permissions,
         });
 
         // Render-only: the admin applies the Terraform offline, then binds the
@@ -900,6 +948,26 @@ mod tests {
         assert_eq!(caps[0].id, GCP_CALLER_IDENTITY_CAP);
         for (cap, perm) in caps[1..].iter().zip(VALIDATED_GCP_PERMISSIONS) {
             assert_eq!(cap.id, format!("gcp.iam.allow:{perm}"));
+        }
+    }
+
+    /// The VPC pair is probed only when the binding answers a VPC, so a
+    /// credential bootstrapped before VPC egress keeps passing; the bootstrap
+    /// role always grants it.
+    #[test]
+    fn vpc_egress_permissions_are_probed_only_when_answered_and_always_bootstrapped() {
+        let plain = GcpDeployerCredentials::default().required_capabilities();
+        let vpc = GcpDeployerCredentials::default()
+            .with_vpc_egress(true)
+            .required_capabilities();
+        assert_eq!(plain.len(), 1 + VALIDATED_GCP_PERMISSIONS.len());
+        assert_eq!(vpc.len(), plain.len() + VPC_EGRESS_PERMISSIONS.len());
+        for perm in VPC_EGRESS_PERMISSIONS {
+            let id = format!("gcp.iam.allow:{perm}");
+            assert!(!plain.iter().any(|c| c.id == id), "{perm} probed unasked");
+            assert!(vpc.iter().any(|c| c.id == id), "{perm} not probed");
+            assert!(bootstrap_permissions().contains(perm), "{perm} not granted");
+            assert!(!VALIDATED_GCP_PERMISSIONS.contains(perm));
         }
     }
 

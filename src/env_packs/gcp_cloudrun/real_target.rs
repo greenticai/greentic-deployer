@@ -57,6 +57,7 @@ use super::deploy_target::{
     SecretVersion, ServiceRef, ServiceSpec, ServiceStatus, TrafficTarget,
 };
 use super::deployer::{revision_name, service_name};
+use super::shared_state::{VpcAccess, VpcEgress, VpcTarget};
 
 /// The IAM permissions [`RealCloudRunTarget`]'s methods exercise at deploy time —
 /// the authoritative Cloud Run / Secret Manager runtime surface. A test pins this
@@ -512,7 +513,7 @@ fn service_fqn(project: &str, region: &str, deployment_id: DeploymentId) -> Stri
 /// Build the revision template: single container, scale-to-zero, the resolved
 /// runtime SA (D7), session affinity (D11), and read-only secret volumes (D6).
 fn build_revision_template(spec: &ServiceSpec) -> run::RevisionTemplate {
-    run::RevisionTemplate::new()
+    let template = run::RevisionTemplate::new()
         .set_revision(revision_name(spec.deployment_id, spec.revision_id))
         .set_service_account(spec.runtime_service_account.clone())
         .set_session_affinity(spec.session_affinity)
@@ -520,7 +521,34 @@ fn build_revision_template(spec: &ServiceSpec) -> run::RevisionTemplate {
         .set_scaling(build_scaling(spec))
         .set_labels(revision_labels(spec))
         .set_volumes(build_secret_volumes(spec))
-        .set_containers([build_container(spec)])
+        .set_containers([build_container(spec)]);
+    // Only set when answered: an env with no VPC answer renders the template
+    // exactly as before, with no `vpcAccess` field at all.
+    match &spec.vpc_access {
+        Some(vpc) => template.set_vpc_access(build_vpc_access(vpc)),
+        None => template,
+    }
+}
+
+/// The seam's [`VpcAccess`] → Cloud Run `vpcAccess`: a Serverless VPC Access
+/// connector, or Direct VPC egress through one network interface, plus which
+/// destinations route through the VPC.
+fn build_vpc_access(vpc: &VpcAccess) -> run::VpcAccess {
+    let access = match &vpc.target {
+        VpcTarget::Connector(connector) => run::VpcAccess::new().set_connector(connector.clone()),
+        VpcTarget::Direct {
+            network,
+            subnetwork,
+        } => {
+            run::VpcAccess::new().set_network_interfaces([run::vpc_access::NetworkInterface::new()
+                .set_network(network.clone())
+                .set_subnetwork(subnetwork.clone())])
+        }
+    };
+    access.set_egress(match vpc.egress {
+        VpcEgress::PrivateRangesOnly => run::vpc_access::VpcEgress::PrivateRangesOnly,
+        VpcEgress::AllTraffic => run::vpc_access::VpcEgress::AllTraffic,
+    })
 }
 
 /// Stable, deterministic volume name for the `index`-th secret mount.
@@ -943,7 +971,51 @@ mod tests {
             secrets,
             env: Vec::new(),
             secret_env: Vec::new(),
+            vpc_access: None,
         }
+    }
+
+    /// No VPC answer renders no `vpcAccess` at all (the template is exactly
+    /// what it was before VPC egress existed); a connector or Direct VPC egress
+    /// renders the matching block with its egress setting.
+    #[test]
+    fn build_service_renders_vpc_access_only_when_answered() {
+        let plain = build_service_message(&spec(vec![], vec![]), None);
+        assert_eq!(
+            plain.template.as_ref().and_then(|t| t.vpc_access.as_ref()),
+            None
+        );
+
+        let mut connector = spec(vec![], vec![]);
+        connector.vpc_access = Some(VpcAccess {
+            target: VpcTarget::Connector("gtc-conn".to_string()),
+            egress: VpcEgress::PrivateRangesOnly,
+        });
+        let vpc = build_service_message(&connector, None)
+            .template
+            .and_then(|t| t.vpc_access)
+            .expect("vpc access rendered");
+        assert_eq!(vpc.connector, "gtc-conn");
+        assert!(vpc.network_interfaces.is_empty());
+        assert_eq!(vpc.egress, run::vpc_access::VpcEgress::PrivateRangesOnly);
+
+        let mut direct = spec(vec![], vec![]);
+        direct.vpc_access = Some(VpcAccess {
+            target: VpcTarget::Direct {
+                network: "default".to_string(),
+                subnetwork: "gtc-sub".to_string(),
+            },
+            egress: VpcEgress::AllTraffic,
+        });
+        let vpc = build_service_message(&direct, None)
+            .template
+            .and_then(|t| t.vpc_access)
+            .expect("vpc access rendered");
+        assert!(vpc.connector.is_empty());
+        assert_eq!(vpc.network_interfaces.len(), 1);
+        assert_eq!(vpc.network_interfaces[0].network, "default");
+        assert_eq!(vpc.network_interfaces[0].subnetwork, "gtc-sub");
+        assert_eq!(vpc.egress, run::vpc_access::VpcEgress::AllTraffic);
     }
 
     #[test]

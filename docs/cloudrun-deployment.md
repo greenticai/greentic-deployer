@@ -641,11 +641,29 @@ in the manifest or via `answers_ref`:
 | `secret_prefix` | no | `gtc-<env>` | Seed secret name prefix. **Must differ between environments sharing a project** (§5). |
 | `cpu` | no | `"1"` | |
 | `memory` | no | `"512Mi"` | |
-| `max_instances` | no | `"1"` | **Do not raise in dev** — see §10. |
+| `max_instances` | no | `"1"` | Anything but `1` (including `0`, Cloud Run's default ceiling) is **refused** unless `redis_url` + a VPC route are answered and the env stages a dev-store seed — see §10. |
 | `min_instances` | no | `"0"` | `0` = scale to zero. Raising it forfeits zero idle cost. |
 | `concurrency` | no | `"80"` | Requests per instance. |
 | `telemetry_env` | no | *(unset)* | Plain telemetry env vars (`OTLP_ENDPOINT`, `OTEL_*`, `GREENTIC_TELEMETRY_*`, …), exact-name allow-listed, appended to the boot env sorted with `greentic.role=worker` set on `OTEL_RESOURCE_ATTRIBUTES`. Boot env and `revision_intent` are unchanged from before this key existed only when **neither** `telemetry_env` nor `telemetry_headers` is answered — answering either one on its own still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=worker` to the boot env (and so to `revision_intent`'s boot-env hash). |
 | `telemetry_headers` | no | *(unset)* | The OTLP header credential. Staged as another version of the environment secret and referenced as `OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS` via `secretKeyRef` — never a literal. `revision_intent` hashes only the secret-sourced env var NAMES, never the secret version or value; a header change is a deployer-answers change, which `op env apply` (#603) rolls into a new revision. Answering this alone (with `telemetry_env` unset) still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=worker` to the boot env — see `telemetry_env` above. |
+| `redis_url` | no | *(unset)* | Memorystore for Redis with AUTH over the private VPC, `redis://:<auth>@<private-ip>:6379`. Selects `GREENTIC_RUNNER_SESSION_BACKEND=redis` + `GREENTIC_RUNNER_STATE_BACKEND=redis`; the URL itself is staged as another version of the environment secret and referenced as `GREENTIC_RUNNER_REDIS_URL` / `GREENTIC_REVISION_PIN_REDIS_URL` via `secretKeyRef` — never a literal, never logged. **`rediss://` is refused** (greentic-start trusts public web roots only; Memorystore TLS uses a Google-private CA). Requires a VPC route. Changing it (a rotated AUTH string) is a deployer-answers change, which `op env apply` rolls into a new revision — the intent hashes the env-var NAMES only, so re-warming the SAME revision id keeps the old URL. Superseded secret versions are not destroyed. |
+| `vpc_connector` | no | *(unset)* | Serverless VPC Access connector. A bare name expands to `projects/<project>/locations/<region>/connectors/<name>` (the Cloud Run v2 format); a full path is kept verbatim. Alternative to Direct VPC egress. Needs `vpcaccess.connectors.use`. |
+| `vpc_network` + `vpc_subnet` | no | *(unset)* | Direct VPC egress (both, or neither). Alternative to `vpc_connector`. Needs `compute.subnetworks.use`. |
+| `vpc_egress` | no | `private-ranges-only` | `private-ranges-only` \| `all-traffic`. Only valid with a VPC route. |
+
+`redis_url`, `vpc_*` absent ⇒ the Service and `revision_intent` are byte for byte
+what they were before these keys existed. Answering a VPC adds the two VPC
+permissions to `op credentials requirements`; the bootstrap role grants them
+always.
+
+**Shared VPC / another project.** The preflight probes the VPC permissions on the
+deployer's own project only. A connector or subnet in a Shared-VPC host project
+(answered as a full path) needs `vpcaccess.connectors.use` /
+`compute.subnetworks.use` granted to the deployer IN THE HOST PROJECT, and the
+Cloud Run service agent (`service-<number>@serverless-robot-prod.iam.gserviceaccount.com`)
+needs `roles/vpcaccess.user` (connector) or `roles/compute.networkUser` (Direct
+VPC egress) there too. Neither is checked before the deploy; a missing grant
+fails at revision create.
 
 Transitional: `telemetry_env` / `telemetry_headers` carry telemetry until a
 telemetry slot binding exists; the contract may move there.
@@ -661,13 +679,23 @@ Environment variables read by the deployer itself:
 
 ## 10. Known gaps & production caveats
 
-- **`max_instances = 1` is a correctness constraint, not a cost tuning knob.**
-  The environment/session store is per-instance and lives in in-memory `/tmp`. A
-  second instance would have its own store and would not see the first's state,
-  and neither survives a cold start. Raising `max_instances` scales a runtime
-  whose state does not coordinate. A durable multi-instance store (shared
-  Postgres/backend) is the prerequisite for lifting this and is **not built
-  yet**.
+- **More than one instance needs a shared store, and the deploy enforces it.**
+  Without one, sessions, flow state and revision pins live per instance in
+  memory, and every instance mints its own `generated` secrets (e.g. the webchat
+  `jwt_signing_key`) at boot — a token signed by one fails on another. A warm with
+  any shape that can run several instances — `max_instances` other than `1`
+  (`0` means Cloud Run's default ceiling of up to 100) or `min_instances > 1`
+  — is refused unless **all** of these hold:
+  1. `redis_url` names a Memorystore reachable over the VPC (AUTH, no TLS);
+  2. a VPC route is answered (`vpc_connector`, or `vpc_network` + `vpc_subnet`);
+  3. the env binds the dev-store Secrets pack, so the deploy can pre-mint every
+     generated secret the revision's packs declare into the staged seed (it
+     writes each missing one to the local dev store once and never re-mints an
+     existing one) and verify the staged bytes carry them.
+
+  Provision first: a Memorystore instance with AUTH in the same region, and a
+  Serverless VPC Access connector (or a subnet for Direct VPC egress). The
+  runtime env store under `/tmp` is still per instance and ephemeral.
 - **Ephemeral state.** Seeded state is immutable boot config. Runtime writes to
   the store do not survive a cold start. Do not run a workload that expects
   durable local state.

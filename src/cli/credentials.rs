@@ -660,6 +660,7 @@ fn connected_cloudrun_credentials(
     let params = GcpCloudRunParams::from_answers(&env, answers.as_ref())
         .map_err(|e| OpError::Conflict(format!("invalid GCP Cloud Run answers: {e}")))?;
     let runtime_sa = params.runtime_service_account(env_id.as_str());
+    let vpc_egress = params.shared_state.vpc.is_some();
 
     // Authenticate AS THE BOUND deployer credential. No bound material ⇒ nothing
     // to probe as (see the doc comment) → `None`; a bound ref with unreadable /
@@ -673,7 +674,8 @@ fn connected_cloudrun_credentials(
     Ok(Some(Box::new(
         GcpDeployerCredentials::with_client(client)
             .with_project(params.project)
-            .with_service_account(runtime_sa),
+            .with_service_account(runtime_sa)
+            .with_vpc_egress(vpc_egress),
     )))
 }
 

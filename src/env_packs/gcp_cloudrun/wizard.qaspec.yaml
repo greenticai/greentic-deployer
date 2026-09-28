@@ -147,10 +147,13 @@ questions:
     type: string
     title: Max instances
     description: >-
-      Maximum concurrent Cloud Run instances. Defaults to `1`: the dev env-store
-      is seeded per-instance and ephemeral, so a single writer avoids
-      cross-instance divergence. Raising this above 1 requires the durable
-      shared-store follow-up.
+      Maximum concurrent Cloud Run instances. Defaults to `1`: sessions, flow
+      state and revision pins live per instance in memory. Any other value (`0`
+      means Cloud Run's default ceiling of up to 100), or `min_instances` above
+      1, is
+      REFUSED unless `redis_url` and a VPC route (`vpc_connector`, or
+      `vpc_network` + `vpc_subnet`) are answered, and the environment stages a
+      dev-store seed the deploy can pre-mint generated secrets into.
     required: false
     default_value: "1"
     constraint:
@@ -178,3 +181,51 @@ questions:
     default_value: "0"
     constraint:
       pattern: '^[0-9]+$'
+
+  - id: redis_url
+    type: string
+    title: Shared session store (Redis URL, optional)
+    description: >-
+      OPTIONAL. A Memorystore for Redis URL with AUTH, reached over the private
+      VPC, e.g. `redis://:<auth-string>@10.0.0.3:6379`. When set, sessions, flow
+      state and revision pins move to Redis, which is what makes
+      `max_instances` above 1 safe. Staged into Secret Manager, never rendered
+      into the service. `rediss://` (TLS) is refused in this release. Requires a
+      VPC route below.
+    required: false
+    secret: true
+
+  - id: vpc_connector
+    type: string
+    title: Serverless VPC Access connector (optional)
+    description: >-
+      OPTIONAL. The connector revisions use to reach the VPC (name or
+      `projects/<p>/locations/<r>/connectors/<name>`). Leave blank to use Direct
+      VPC egress (network + subnet below) or no VPC at all.
+    required: false
+
+  - id: vpc_network
+    type: string
+    title: Direct VPC egress network (optional)
+    description: >-
+      OPTIONAL. The VPC network for Direct VPC egress. Set together with
+      `vpc_subnet`; an alternative to `vpc_connector`, never both.
+    required: false
+
+  - id: vpc_subnet
+    type: string
+    title: Direct VPC egress subnet (optional)
+    description: >-
+      OPTIONAL. The subnetwork for Direct VPC egress, in the service's region.
+      Set together with `vpc_network`.
+    required: false
+
+  - id: vpc_egress
+    type: enum
+    title: VPC egress
+    description: >-
+      Which traffic leaves through the VPC. `private-ranges-only` (the default)
+      routes only private IPs (Memorystore) through it; `all-traffic` routes
+      everything, e.g. through a Cloud NAT.
+    required: false
+    choices: ["private-ranges-only", "all-traffic"]

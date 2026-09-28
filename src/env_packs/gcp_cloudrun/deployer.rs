@@ -49,6 +49,10 @@ use super::deploy_target::{
     AccessMode, CloudRunTargetError, EnsuredSecret, RevisionRef, ScalingSpec, SecretEnvVar,
     SecretMount, SecretMountItem, ServiceRef, ServiceSpec, TrafficTarget,
 };
+use super::shared_state::{
+    self, REDIS_URL_ENV_NAMES, RawSharedStateAnswers, SharedState, SharedStateAnswerError,
+    VpcAccess, VpcTarget,
+};
 
 /// Default runtime image (plan D2/D3): the public GHCR distroless image Cloud
 /// Run pulls directly. `:develop` matches this lane; digest-pinning is
@@ -140,6 +144,10 @@ pub struct GcpCloudRunParams {
     /// Telemetry profile (`telemetry_env` / `telemetry_headers`). Empty by
     /// default, which leaves the boot env and the revision intent unchanged.
     pub telemetry: TelemetryAnswers,
+    /// Redis-backed sessions + VPC egress (`redis_url`, `vpc_*`). Empty by
+    /// default, which renders the Service and the revision intent byte for
+    /// byte as before these answers existed. See [`super::shared_state`].
+    pub shared_state: SharedState,
 }
 
 impl GcpCloudRunParams {
@@ -171,6 +179,7 @@ impl GcpCloudRunParams {
             min_instances: 0,
             concurrency: 80,
             telemetry: TelemetryAnswers::default(),
+            shared_state: SharedState::default(),
         }
     }
 
@@ -189,7 +198,11 @@ impl GcpCloudRunParams {
             .ok_or(GcpCloudRunParamsError::NotAnObject)?;
         let mut telemetry_env = None;
         let mut telemetry_headers = None;
+        let mut shared = RawSharedStateAnswers::default();
         for (key, value) in obj {
+            if shared.accept(key, value) {
+                continue;
+            }
             match key.as_str() {
                 "project" => params.project = answer_string(key, value)?,
                 "region" => params.region = answer_string(key, value)?,
@@ -214,6 +227,9 @@ impl GcpCloudRunParams {
             }
         }
         params.telemetry = telemetry_answers::parse(telemetry_env, telemetry_headers)?;
+        // After the loop: a bare connector name expands against the answered
+        // project/region, whichever order the keys arrived in.
+        params.shared_state = shared_state::parse(shared, &params.project, &params.region)?;
         Ok(params)
     }
 
@@ -448,6 +464,9 @@ fn runtime_boot_env(
     if let Some(team) = &params.runtime_team {
         vars.push(("GREENTIC_TEAM".to_string(), team.clone()));
     }
+    // Shared-state backend selectors: empty unless `redis_url` is answered, so
+    // an environment without it boots byte for byte as before.
+    vars.extend(params.shared_state.boot_env());
     // Telemetry: appended last and sorted, and empty unless answered — so an
     // environment with no profile boots byte for byte as before and
     // `revision_intent` fingerprints the same value.
@@ -478,6 +497,8 @@ pub enum GcpCloudRunParamsError {
     Invalid { key: String, detail: String },
     #[error(transparent)]
     Telemetry(#[from] TelemetryAnswerError),
+    #[error(transparent)]
+    SharedState(#[from] SharedStateAnswerError),
 }
 
 fn answer_string(key: &str, value: &Value) -> Result<String, GcpCloudRunParamsError> {
@@ -632,6 +653,52 @@ fn revision_intent(
     hex::encode(&hasher.finalize()[..16])
 }
 
+/// Fold the revision's `vpcAccess` into an intent computed by
+/// [`revision_intent`]. `None` returns `intent` UNCHANGED, so every revision
+/// without a VPC answer keeps the fingerprint it was stamped with; `Some`
+/// re-hashes the base intent together with the connector (or network +
+/// subnetwork) and the egress setting, all length-prefixed like the base.
+fn revision_intent_with_vpc(intent: String, vpc: Option<&VpcAccess>) -> String {
+    use sha2::{Digest, Sha256};
+    let Some(vpc) = vpc else {
+        return intent;
+    };
+    let mut hasher = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(intent.as_bytes());
+    match &vpc.target {
+        VpcTarget::Connector(connector) => {
+            field(b"vpc-connector");
+            field(connector.as_bytes());
+        }
+        VpcTarget::Direct {
+            network,
+            subnetwork,
+        } => {
+            field(b"vpc-direct");
+            field(network.as_bytes());
+            field(subnetwork.as_bytes());
+        }
+    }
+    field(vpc.egress.as_str().as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// The names of the secret-sourced env vars a revision carries: the telemetry
+/// header pair when answered, then the Redis URL pair when answered. Empty for
+/// an environment with neither, so its intent is unchanged.
+fn secret_env_names(params: &GcpCloudRunParams) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if params.telemetry.headers().is_some() {
+        names.extend(HEADER_ENV_NAMES);
+    }
+    names.extend(params.shared_state.secret_env_names());
+    names
+}
+
 /// What the provider holds for the revision this warm intends to create.
 #[derive(Debug, PartialEq, Eq)]
 enum LiveRevision {
@@ -764,6 +831,10 @@ impl Deployer for GcpCloudRunDeployerHandler {
         let revision = find_revision(env, revision_id).expect("require_revision passed");
         let deployment_id = revision.deployment_id;
         let params = params_from_answers(env, answers)?;
+        // Pre-provider: refuse a multi-instance shape unless the shared store, the
+        // VPC route to it and the pre-minted generated secrets are all in place.
+        shared_state::gate(&params, &self.generated_secret_seed)
+            .map_err(|e| DeployerError::Provider(e.to_string()))?;
 
         let service_ref = ServiceRef {
             deployment_id,
@@ -782,22 +853,21 @@ impl Deployer for GcpCloudRunDeployerHandler {
         let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
         let secret_name = environment_secret_name(&params.secret_prefix);
         let boot_env = runtime_boot_env(env, revision, &params);
-        // Only when the operator answered a header does the revision carry a
-        // secret-sourced env var at all — mirrors `HEADER_ENV_NAMES`'s own use
-        // in `create_revision` staging, below.
-        let secret_env_names: &[&str] = if params.telemetry.headers().is_some() {
-            &HEADER_ENV_NAMES
-        } else {
-            &[]
-        };
-        let intent = revision_intent(
-            &params.image_ref(),
-            &runtime_service_account,
-            &params.scaling(),
-            SESSION_AFFINITY,
-            &secret_name,
-            &boot_env,
-            secret_env_names,
+        // Only when the operator answered a header (or a Redis URL) does the
+        // revision carry a secret-sourced env var at all — mirrors the staging
+        // in `create_revision`, below.
+        let secret_env_names = secret_env_names(&params);
+        let intent = revision_intent_with_vpc(
+            revision_intent(
+                &params.image_ref(),
+                &runtime_service_account,
+                &params.scaling(),
+                SESSION_AFFINITY,
+                &secret_name,
+                &boot_env,
+                &secret_env_names,
+            ),
+            params.shared_state.vpc.as_ref(),
         );
 
         // Create the revision only if it is not already there, then converge the
@@ -1123,6 +1193,23 @@ impl GcpCloudRunDeployerHandler {
                 });
             }
         }
+        // The Redis URL (it carries the AUTH string): likewise one more version
+        // of the SAME env-owned secret, rendered into both names from that ONE
+        // pinned version — never a literal in the template, never logged.
+        if let Some(redis_url) = &params.shared_state.redis_url {
+            let v = self
+                .target
+                .add_secret_version(secret_name, redis_url.expose().as_bytes())
+                .await
+                .map_err(provider)?;
+            for name in REDIS_URL_ENV_NAMES {
+                secret_env.push(SecretEnvVar {
+                    name: name.to_string(),
+                    secret_name: secret_name.to_string(),
+                    version: v.version.clone(),
+                });
+            }
+        }
         // Grant the runtime SA read on the secret (covers every version) —
         // load-bearing: Cloud Run rejects a revision whose SA cannot read a
         // mounted version. Idempotent, so a re-warm is a no-op.
@@ -1187,6 +1274,7 @@ impl GcpCloudRunDeployerHandler {
                 secrets: secret_mounts.clone(),
                 env: boot_env.to_vec(),
                 secret_env: secret_env.clone(),
+                vpc_access: params.shared_state.vpc.clone(),
             };
             match self.target.upsert_service(&spec, etag.as_deref()).await {
                 Ok(status) => break status.url,
@@ -1223,6 +1311,10 @@ impl GcpCloudRunDeployerHandler {
         Ok(endpoint_url)
     }
 }
+
+#[cfg(test)]
+#[path = "deployer_shared_state_tests.rs"]
+mod shared_state_warm_tests;
 
 #[cfg(test)]
 mod tests {
