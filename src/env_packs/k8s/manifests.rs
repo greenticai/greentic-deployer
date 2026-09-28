@@ -463,7 +463,7 @@ impl K8sParams {
     ///   would authenticate nothing, exactly like no `imagePullSecrets` at
     ///   all, only silently.
     /// - `ingress_host` / `ingress_class` / `ingress_tls_secret` /
-    ///   `ingress_cert_manager_issuer`: see [`ingress::parse`]. Host required
+    ///   `ingress_cert_manager_issuer`: see [`ingress`]. Host required
     ///   when any of the others is set; the two TLS answers are mutually
     ///   exclusive; `ingress_tls_secret` must not equal `image_pull_secret`.
     /// - Any other key → `Err` (fail closed on wizard version skew or

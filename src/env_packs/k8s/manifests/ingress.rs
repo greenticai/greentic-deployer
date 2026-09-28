@@ -20,7 +20,7 @@
 //!   `cert-manager.io/cluster-issuer` annotation.
 //!
 //! Unlike the other env-level objects, a deployer-owned Ingress IS removed
-//! once the answers are cleared ([`ingress_prune`](super::super::ingress_prune)),
+//! once the answers are cleared (`k8s::ingress_prune`),
 //! but only when it carries every [`owner_labels`] entry.
 
 use serde_json::{Map, Value, json};
