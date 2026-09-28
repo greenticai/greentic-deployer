@@ -74,6 +74,7 @@ pub mod bound_identity;
 pub mod cluster;
 pub mod credentials;
 pub mod deployer;
+mod ingress_prune;
 #[cfg(feature = "k8s-client")]
 pub mod kube_client;
 pub mod manifests;

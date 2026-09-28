@@ -54,9 +54,11 @@ use sha2::{Digest, Sha256};
 
 use crate::environment::runtime_config::materialize_runtime_config;
 
+pub mod ingress;
 pub mod sor;
 mod telemetry;
 use crate::env_packs::telemetry::{self as telemetry_answers, TelemetryAnswers};
+pub use ingress::{INGRESS_TLS_SECRET_NAME, IngressConfig, IngressTls};
 pub use telemetry::TELEMETRY_HEADERS_SECRET_NAME;
 
 /// Sandbox-default runtime image (S1). Tag-pinned for the sandbox only —
@@ -187,6 +189,7 @@ const RESERVED_OBJECT_NAMES: &[&str] = &[
     OCI_CREDENTIALS_SECRET_NAME,
     TELEMETRY_HEADERS_SECRET_NAME,
     WORKER_SERVICE_ACCOUNT,
+    INGRESS_TLS_SECRET_NAME,
 ];
 
 // Vault provider defaults (mirror `greentic-secrets-provider-vault-kv`). The
@@ -250,9 +253,9 @@ pub struct VaultBackend {
 /// `service_type`), i.e. `Service.spec.type` on the object the rendered
 /// Gateway / Ingress would otherwise front.
 ///
-/// The env-pack renders **no Ingress** — routing a hostname into the cluster is
-/// the operator's own decision (cert issuer, controller class, DNS), and one
-/// this deployer has no way to make correctly for an arbitrary cluster. That
+/// Unless the operator answers `ingress_host` (see [`ingress`]) the env-pack
+/// renders **no Ingress** — routing a hostname into the cluster needs the
+/// operator's own decisions (cert issuer, controller class, DNS). That
 /// left the router reachable only from inside the cluster, so an operator had
 /// no address at all short of `kubectl port-forward`. Selecting the Service
 /// TYPE closes that without an Ingress and, deliberately, **without an RBAC
@@ -396,6 +399,11 @@ pub struct K8sParams {
     /// to be set, and must not collide with an object name this pack already
     /// renders — both enforced in [`Self::from_answers`].
     pub image_pull_secret: Option<String>,
+    /// Optional managed Ingress in front of the router. From the
+    /// `ingress_host` / `ingress_class` / `ingress_tls_secret` /
+    /// `ingress_cert_manager_issuer` answers (see [`ingress`]). `None` → no
+    /// Ingress rendered, exactly the set rendered before these answers existed.
+    pub ingress: Option<IngressConfig>,
 }
 
 impl K8sParams {
@@ -416,6 +424,7 @@ impl K8sParams {
             service_type: ServiceType::ClusterIp,
             telemetry: TelemetryAnswers::default(),
             image_pull_secret: None,
+            ingress: None,
         }
     }
 
@@ -453,6 +462,10 @@ impl K8sParams {
     ///   `oci_password` to be set — a Secret named but given no credential
     ///   would authenticate nothing, exactly like no `imagePullSecrets` at
     ///   all, only silently.
+    /// - `ingress_host` / `ingress_class` / `ingress_tls_secret` /
+    ///   `ingress_cert_manager_issuer`: see [`ingress`]. Host required
+    ///   when any of the others is set; the two TLS answers are mutually
+    ///   exclusive; `ingress_tls_secret` must not equal `image_pull_secret`.
     /// - Any other key → `Err` (fail closed on wizard version skew or
     ///   typos).
     pub fn from_answers(
@@ -485,7 +498,9 @@ impl K8sParams {
             telemetry_answers::TELEMETRY_HEADERS_KEY,
         ];
         for key in obj.keys() {
-            if !KNOWN_KEYS.contains(&key.as_str()) {
+            if !KNOWN_KEYS.contains(&key.as_str())
+                && !ingress::INGRESS_ANSWER_KEYS.contains(&key.as_str())
+            {
                 return Err(format!("unknown answer key `{key}`"));
             }
         }
@@ -623,6 +638,22 @@ impl K8sParams {
             None => defaults.image_pull_secret,
         };
 
+        let ingress = ingress::parse(obj, RESERVED_OBJECT_NAMES)?;
+        if let (
+            Some(IngressConfig {
+                tls: IngressTls::Secret(tls),
+                ..
+            }),
+            Some(pull),
+        ) = (&ingress, &image_pull_secret)
+            && tls == pull
+        {
+            return Err(format!(
+                "ingress_tls_secret `{tls}` is also the image_pull_secret — a Secret's `type` \
+                 is immutable, so one name cannot be both a TLS and a registry Secret"
+            ));
+        }
+
         let telemetry = telemetry_answers::parse(
             obj.get(telemetry_answers::TELEMETRY_ENV_KEY),
             obj.get(telemetry_answers::TELEMETRY_HEADERS_KEY),
@@ -648,6 +679,7 @@ impl K8sParams {
             service_type,
             telemetry,
             image_pull_secret,
+            ingress,
         })
     }
 }
@@ -2026,6 +2058,11 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
     }
     if let Some(secret) = telemetry::render_headers_secret(env, params) {
         manifests.push(secret);
+    }
+    // Appended LAST so an env without `ingress_host` renders exactly the
+    // set (and indices) it rendered before the answer existed.
+    if let Some(ingress) = ingress::render(env, params) {
+        manifests.push(ingress);
     }
     manifests
 }

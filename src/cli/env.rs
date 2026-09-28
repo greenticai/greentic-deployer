@@ -892,17 +892,28 @@ pub fn reconcile(
         super::env_sor::record_applied(store, &env_id, prepared)?;
     }
 
-    Ok(OpOutcome::new(
-        NOUN,
-        "reconcile",
-        reconcile_result_json(
-            &env,
-            descriptor.as_str(),
-            &answers_ref_wire,
-            identity,
-            &report,
-        ),
-    ))
+    let mut result = reconcile_result_json(
+        &env,
+        descriptor.as_str(),
+        &answers_ref_wire,
+        identity,
+        &report,
+    );
+    attach_public_base_url(&mut result, &env, answers.as_ref());
+    Ok(OpOutcome::new(NOUN, "reconcile", result))
+}
+
+/// Add `public_base_url` beside `router_address` when the binding's answers
+/// configure a managed Ingress (`ingress_host`). Absent otherwise, so a
+/// reconcile that never answered it emits exactly the keys it emitted before.
+/// Derived from the answers, not read back from the cluster: the URL is the
+/// host the Ingress was rendered for, whatever the controller's status says.
+fn attach_public_base_url(result: &mut Value, env: &Environment, answers: Option<&Value>) {
+    if let Some(url) =
+        crate::env_packs::k8s::manifests::ingress::public_base_url_from_answers(env, answers)
+    {
+        result["public_base_url"] = json!(url);
+    }
 }
 
 /// The `op env reconcile` result object. `sor_units` appears only when the
@@ -5123,6 +5134,48 @@ mod tests {
             before, after,
             "declaring a SoR unit changes nothing `op env render` shows"
         );
+    }
+
+    #[test]
+    fn the_reconcile_envelope_reports_public_base_url_only_for_a_managed_ingress() {
+        let env = make_env("local");
+        let report = crate::env_packs::k8s::ReconcileReport::default();
+        let base = || {
+            reconcile_result_json(
+                &env,
+                "greentic.deployer.k8s@1.0.0",
+                &Value::Null,
+                "ambient",
+                &report,
+            )
+        };
+        let mut plain = base();
+        attach_public_base_url(&mut plain, &env, None);
+        assert_eq!(plain, base(), "no answers: envelope unchanged");
+        let mut unanswered = base();
+        attach_public_base_url(
+            &mut unanswered,
+            &env,
+            Some(&json!({"service_type": "NodePort"})),
+        );
+        assert!(unanswered.get("public_base_url").is_none());
+
+        let mut tls = base();
+        attach_public_base_url(
+            &mut tls,
+            &env,
+            Some(&json!({"ingress_host": "chat.example.com", "ingress_cert_manager_issuer": "le"})),
+        );
+        assert_eq!(tls["public_base_url"], "https://chat.example.com");
+        assert!(tls.get("router_address").is_some(), "beside router_address");
+
+        let mut http = base();
+        attach_public_base_url(
+            &mut http,
+            &env,
+            Some(&json!({"ingress_host": "chat.example.com"})),
+        );
+        assert_eq!(http["public_base_url"], "http://chat.example.com");
     }
 
     #[test]

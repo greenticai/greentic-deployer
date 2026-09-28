@@ -35,7 +35,9 @@ use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use serde_json::Value;
 
@@ -211,6 +213,8 @@ fn api_route_for(api_version: &str, kind: &str) -> Result<(ApiResource, Scope), 
         ("apps/v1", "Deployment") => ("deployments", Scope::Namespaced),
         ("policy/v1", "PodDisruptionBudget") => ("poddisruptionbudgets", Scope::Namespaced),
         ("networking.k8s.io/v1", "NetworkPolicy") => ("networkpolicies", Scope::Namespaced),
+        // Optional managed Ingress (`ingress_host` answer, `manifests::ingress`).
+        ("networking.k8s.io/v1", "Ingress") => ("ingresses", Scope::Namespaced),
         // RBAC kinds the bootstrap `--bind` path applies (via
         // `KubeBootstrapClient::apply_rbac` → `KubeCluster::apply`); the
         // steady-state reconcile renderer does not emit these.
@@ -351,6 +355,14 @@ impl K8sCluster for KubeCluster {
                     incoming_env: inc.to_string(),
                 });
             }
+            // Never adopt an operator's object of a never-adopted kind (the
+            // Ingress): the env-label check above passes an unlabeled one.
+            let existing_labels = existing
+                .metadata
+                .labels
+                .as_ref()
+                .map(|labels| serde_json::json!(labels));
+            super::cluster::refuse_adoption(manifest, existing_labels.as_ref())?;
         }
 
         // Server-side apply IS the trait's upsert contract: same manifest
@@ -372,6 +384,57 @@ impl K8sCluster for KubeCluster {
             Ok(_) => Ok(()),
             // Absent => Ok: the trait's retried-archive contract.
             Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+            Err(e) => Err(map_cluster_error(e)),
+        }
+    }
+
+    async fn delete_if_labeled(
+        &self,
+        object: &ObjectRef,
+        labels: &[(&str, &str)],
+    ) -> Result<bool, K8sClusterError> {
+        let (resource, scope) = api_route_for(&object.api_version, &object.kind)?;
+        let namespace = object.namespace.as_deref().unwrap_or_default();
+        let api = dynamic_api(&self.client, &resource, scope, namespace);
+        // 404 = absent; 403 = this identity may not read it (an env bound
+        // before these verbs existed), so it cannot prove ownership.
+        let existing = match api.get_opt(&object.name).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => return Ok(false),
+            Err(kube::Error::Api(status)) if status.code == 404 => return Ok(false),
+            Err(kube::Error::Api(status)) if status.code == 403 => {
+                tracing::warn!(
+                    object = %object,
+                    "cannot verify removal of a deployer-managed {}: this identity may not \
+                     read it (403). If one was rendered earlier it may still be serving; \
+                     re-bootstrap the env's credentials or delete it by hand",
+                    object.kind
+                );
+                return Ok(false);
+            }
+            Err(e) => return Err(map_cluster_error(e)),
+        };
+        let owned = labels.iter().all(|(key, value)| {
+            existing
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(*key))
+                .map(String::as_str)
+                == Some(*value)
+        });
+        if !owned {
+            return Ok(false);
+        }
+        // Pin the delete to the object whose labels were just read, so a
+        // replacement created in between is never removed.
+        let params = DeleteParams::default().preconditions(Preconditions {
+            uid: existing.metadata.uid.clone(),
+            resource_version: None,
+        });
+        match api.delete(&object.name, &params).await {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(status)) if matches!(status.code, 404 | 409) => Ok(false),
             Err(e) => Err(map_cluster_error(e)),
         }
     }
@@ -920,13 +983,13 @@ mod tests {
         let cluster = KubeCluster::new(client);
         let manifest = json!({
             "apiVersion": "networking.k8s.io/v1",
-            "kind": "Ingress",
+            "kind": "IngressClass",
             "metadata": {"name": "x", "namespace": "ns"},
         });
         let err = cluster.apply(&manifest).await.unwrap_err();
         assert!(
             matches!(err, K8sClusterError::InvalidManifest(ref msg)
-                if msg.contains("unsupported object `networking.k8s.io/v1/Ingress`")),
+                if msg.contains("unsupported object `networking.k8s.io/v1/IngressClass`")),
             "no request may be guessed for an unrendered kind, got {err:?}"
         );
     }
@@ -999,6 +1062,95 @@ mod tests {
             ),
         );
         result.unwrap();
+    }
+
+    fn ingress_ref() -> ObjectRef {
+        ObjectRef {
+            api_version: "networking.k8s.io/v1".into(),
+            kind: "Ingress".into(),
+            namespace: Some("gtc-zain".into()),
+            name: "gtc-router".into(),
+        }
+    }
+
+    const OWNER: &[(&str, &str)] = &[
+        ("app.kubernetes.io/managed-by", "greentic"),
+        ("greentic.ai/env", "zain"),
+    ];
+
+    fn ingress_body(labels: Value) -> Value {
+        json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "gtc-router", "namespace": "gtc-zain", "uid": "u-1", "labels": labels},
+        })
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_deletes_an_owned_object_pinned_to_its_uid() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let responder = async {
+            let get = respond_json(
+                &mut handle,
+                200,
+                ingress_body(
+                    json!({"app.kubernetes.io/managed-by": "greentic", "greentic.ai/env": "zain"}),
+                ),
+            )
+            .await;
+            assert_eq!(get.method(), "GET");
+            let delete = respond_json(
+                &mut handle,
+                200,
+                json!({"kind": "Status", "status": "Success"}),
+            )
+            .await;
+            assert_eq!(delete.method(), "DELETE");
+            assert_eq!(
+                delete.uri().path(),
+                "/apis/networking.k8s.io/v1/namespaces/gtc-zain/ingresses/gtc-router"
+            );
+            request_body_json(delete).await
+        };
+        let (result, body) = tokio::join!(cluster.delete_if_labeled(&object, OWNER), responder);
+        assert!(result.unwrap());
+        assert_eq!(body["preconditions"]["uid"], "u-1");
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_leaves_an_unlabeled_object_alone() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let (result, request) = tokio::join!(
+            cluster.delete_if_labeled(&object, OWNER),
+            respond_json(
+                &mut handle,
+                200,
+                ingress_body(json!({"greentic.ai/env": "zain"}))
+            ),
+        );
+        assert_eq!(request.method(), "GET");
+        assert!(!result.unwrap(), "no DELETE may follow");
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_treats_a_forbidden_read_as_nothing_to_remove() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let (result, _request) = tokio::join!(
+            cluster.delete_if_labeled(&object, OWNER),
+            respond_json(
+                &mut handle,
+                403,
+                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                       "message": "forbidden", "reason": "Forbidden", "code": 403}),
+            ),
+        );
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
@@ -1351,6 +1503,44 @@ mod tests {
     }
 
     // ── ownership guard ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn apply_refuses_to_adopt_an_operator_created_ingress() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let labels = json!({
+            "app.kubernetes.io/managed-by": "greentic",
+            "app.kubernetes.io/component": "router-ingress",
+            "greentic.ai/env": "zain",
+        });
+        let manifest = json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "gtc-router", "namespace": "gtc-zain", "labels": labels},
+        });
+        // Existing Ingress carries no env label, so the env guard passes it.
+        let (result, get) = tokio::join!(
+            cluster.apply(&manifest),
+            respond_json(&mut handle, 200, ingress_body(json!({"team": "ops"}))),
+        );
+        assert_eq!(get.method(), "GET");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, K8sClusterError::UnmanagedObject { kind, object, .. }
+                if kind == "Ingress" && object == "gtc-router"),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("ingress_host"), "{err}");
+
+        // Our own (fully labelled) Ingress re-applies normally.
+        let respond = async {
+            let _get = respond_json(&mut handle, 200, ingress_body(labels.clone())).await;
+            respond_json(&mut handle, 200, manifest.clone()).await
+        };
+        let (result, patch) = tokio::join!(cluster.apply(&manifest), respond);
+        result.unwrap();
+        assert_eq!(patch.method(), "PATCH");
+    }
 
     #[tokio::test]
     async fn apply_rejects_a_foreign_owned_object() {

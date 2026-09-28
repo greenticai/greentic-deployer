@@ -297,6 +297,15 @@ impl K8sDeployerHandler {
                 }
             }
         }
+        // Cleared `ingress_*` answers: remove the Ingress, but only the one
+        // this deployer rendered (owner labels) — never an operator's.
+        if let Some(object) =
+            super::ingress_prune::remove_unanswered(self.cluster.as_ref(), env, params)
+                .await
+                .map_err(provider)?
+        {
+            pruned.push(object);
+        }
         Ok(pruned)
     }
 
