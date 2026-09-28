@@ -81,7 +81,7 @@ fn no_shared_state_answers_keep_the_intent_byte_identical() {
 }
 
 /// The conformance fixture's first revision, default answers.
-const GOLDEN_FIXTURE_INTENT: &str = "PLACEHOLDER";
+const GOLDEN_FIXTURE_INTENT: &str = "b9af277c076a1fb76883b40bf8ccf931";
 
 #[tokio::test]
 async fn a_plain_warm_renders_no_vpc_no_redis_env() {
