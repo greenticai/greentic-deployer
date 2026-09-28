@@ -666,9 +666,12 @@ Retiring is a sequence, not a delete: move the revision's traffic weight away �
   and `greentic.ai/env=<env>`, and removes those whose `greentic.ai/revision` is
   absent from the store — the orphans `reconcile`'s prune cannot see. Dry-run by
   default; unlabeled objects are never listed, so never touched. Listing needs
-  `list` on `deployments` and `services`, which the bootstrap Role does **not**
-  grant (adding it would fail `op credentials requirements` for every env bound
-  before this) — run the sweep with an identity that can list.
+  `get`/`list` on `deployments` and `services`: the bootstrap Role grants them,
+  but `op credentials requirements` does **not** probe them, so an env bound
+  before they existed keeps validating. The sweep checks them itself first
+  (`SelfSubjectAccessReview`) and refuses with `permission-missing`, naming the
+  permission and `gtc op credentials bootstrap <env>`, when the identity lacks
+  them.
 - **`op env capabilities <env>`** (also under `deployer_capabilities` in
   `op env doctor`) reports the adapter's flags: K8s claims `drain`,
   `traffic_split`, `private_registry_auth`, `remove`; not `ingress_managed` (no

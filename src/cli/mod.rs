@@ -141,6 +141,10 @@ pub enum OpError {
          (`op env drain-revision`), or pass --force-drain to archive anyway"
     )]
     NotDrained { revision_id: String, reason: String },
+    /// The deployer identity lacks a Kubernetes permission a verb needs; the
+    /// message names it and the re-bootstrap that grants it.
+    #[error("{0}")]
+    PermissionMissing(String),
     /// A plan needs an adapter capability the bound deployer lacks (P5-R3).
     #[error("{0}")]
     CapabilityMissing(#[from] crate::env_packs::deployer::CapabilityMissing),
@@ -229,6 +233,7 @@ impl OpError {
             OpError::TrustRoot(_) => "trust-root",
             OpError::OperatorKey(_) => "operator-key",
             OpError::NotDrained { .. } => "not-drained",
+            OpError::PermissionMissing(_) => "permission-missing",
             OpError::CapabilityMissing(_) => "capability-missing",
         }
     }

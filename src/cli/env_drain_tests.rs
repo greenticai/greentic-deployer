@@ -138,3 +138,19 @@ async fn archive_gate_refuses_then_force_overrides() {
     assert!(matches!(err, OpError::NotDrained { .. }), "{err}");
     archive_drain_gate(&h, &env, r, None, true).await.unwrap();
 }
+
+#[test]
+fn sweep_preflight_refusal_is_a_typed_permission_error() {
+    use crate::env_packs::k8s::sweep::SweepPreflightError;
+    let err = preflight_error(SweepPreflightError::MissingPermission {
+        env_id: "zain".into(),
+        namespace: "gtc-zain".into(),
+        permissions: vec!["k8s.rbac.allow:apps/deployments:list".into()],
+    });
+    assert_eq!(err.kind(), "permission-missing");
+    let msg = err.to_string();
+    assert!(msg.contains("apps/deployments:list"), "{msg}");
+    assert!(msg.contains("gtc op credentials bootstrap zain"), "{msg}");
+    let err = preflight_error(SweepPreflightError::ReviewFailed("x".into()));
+    assert_eq!(err.kind(), "conflict");
+}

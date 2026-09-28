@@ -15,11 +15,11 @@
 //!   store is kept, whatever its lifecycle (`reconcile` owns those);
 //! - dry-run is the default; `apply` deletes.
 //!
-//! Listing needs `list` on `deployments` and `services`, which the bootstrap
-//! Role (derived from `VALIDATED_K8S_OPERATIONS`) does not grant — adding it
-//! there would fail `op credentials requirements` for every env bound before
-//! this. Run the sweep with an identity that can list (the ambient admin
-//! kubeconfig), or grant the two verbs to the deployer Role by hand.
+//! Listing needs `list` on `deployments` and `services`. The bootstrap Role
+//! grants it (`SWEEP_K8S_OPERATIONS`), but `op credentials requirements` does
+//! not probe it, so an env bound before it existed keeps validating. The sweep
+//! checks it itself first ([`require_sweep_access`]) and refuses, naming the
+//! permission and the re-bootstrap, when the identity lacks it.
 
 use std::collections::BTreeSet;
 
@@ -28,6 +28,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::K8sDeployerHandler;
+use super::credentials::{AccessDecision, K8sValidatorClient, SWEEP_K8S_OPERATIONS};
 use super::deployer::{params_from_answers, provider};
 use super::manifests::ENV_LABEL;
 use crate::env_packs::deployer::DeployerError;
@@ -35,6 +36,64 @@ use crate::env_packs::deployer::DeployerError;
 const MANAGED_BY: (&str, &str) = ("app.kubernetes.io/managed-by", "greentic");
 const COMPONENT: (&str, &str) = ("app.kubernetes.io/component", "worker");
 const REVISION_LABEL: &str = "greentic.ai/revision";
+
+/// Why `op env sweep` refused before listing anything.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SweepPreflightError {
+    /// The identity lacks a permission the sweep needs. A Role bootstrapped
+    /// before the sweep existed does not grant `list`.
+    #[error(
+        "`op env sweep` needs {permissions} in namespace `{namespace}`, which this identity \
+         lacks. Re-run `gtc op credentials bootstrap {env_id}` (with `bind: true`, or re-apply \
+         the rules pack it renders) to grant them, or run the sweep with an identity that can \
+         list deployments and services",
+        permissions = .permissions.join(", ")
+    )]
+    MissingPermission {
+        env_id: String,
+        namespace: String,
+        /// Capability ids, e.g. `k8s.rbac.allow:apps/deployments:list`.
+        permissions: Vec<String>,
+    },
+    /// The access review itself failed; refuse rather than guess.
+    #[error("cannot check the sweep's permissions: {0}")]
+    ReviewFailed(String),
+}
+
+/// Check up front (one `SelfSubjectAccessReview` per operation) that the
+/// identity can list the deployer's workers — before anything is listed.
+pub async fn require_sweep_access(
+    validator: &dyn K8sValidatorClient,
+    env_id: &str,
+    namespace: &str,
+) -> Result<(), SweepPreflightError> {
+    let decisions = validator
+        .review_access(namespace, SWEEP_K8S_OPERATIONS)
+        .await
+        .map_err(|e| SweepPreflightError::ReviewFailed(e.to_string()))?;
+    if decisions.len() != SWEEP_K8S_OPERATIONS.len() {
+        return Err(SweepPreflightError::ReviewFailed(format!(
+            "expected {} access decisions, got {}",
+            SWEEP_K8S_OPERATIONS.len(),
+            decisions.len()
+        )));
+    }
+    let permissions: Vec<String> = SWEEP_K8S_OPERATIONS
+        .iter()
+        .zip(&decisions)
+        .filter(|(op, d)| d.operation != **op || d.decision != AccessDecision::Allowed)
+        .map(|(op, _)| op.capability_id())
+        .collect();
+    if permissions.is_empty() {
+        Ok(())
+    } else {
+        Err(SweepPreflightError::MissingPermission {
+            env_id: env_id.to_string(),
+            namespace: namespace.to_string(),
+            permissions,
+        })
+    }
+}
 
 /// The label selector the sweep lists with.
 pub fn worker_selector(env: &Environment) -> String {
@@ -270,5 +329,103 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DeployerError::Provider(_)), "{err:?}");
+    }
+
+    /// Validator fake: denies every `list`, or fails the review outright.
+    #[derive(Debug)]
+    struct Reviewer {
+        deny_list: bool,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl K8sValidatorClient for Reviewer {
+        async fn who_am_i(
+            &self,
+        ) -> Result<
+            crate::env_packs::k8s::credentials::ClusterIdentity,
+            crate::env_packs::k8s::credentials::K8sClientError,
+        > {
+            Ok(crate::env_packs::k8s::credentials::ClusterIdentity { user: "t".into() })
+        }
+        async fn review_access<'a>(
+            &'a self,
+            _namespace: &'a str,
+            operations: &'a [crate::env_packs::k8s::credentials::K8sOperation],
+        ) -> Result<
+            Vec<crate::env_packs::k8s::credentials::OperationDecision>,
+            crate::env_packs::k8s::credentials::K8sClientError,
+        > {
+            if self.fail {
+                return Err(
+                    crate::env_packs::k8s::credentials::K8sClientError::ApiRejected("boom".into()),
+                );
+            }
+            Ok(operations
+                .iter()
+                .map(|op| crate::env_packs::k8s::credentials::OperationDecision {
+                    operation: *op,
+                    decision: if self.deny_list && op.verb == "list" {
+                        AccessDecision::Denied("rbac".into())
+                    } else {
+                        AccessDecision::Allowed
+                    },
+                })
+                .collect())
+        }
+        async fn review_cluster_access<'a>(
+            &'a self,
+            operations: &'a [crate::env_packs::k8s::credentials::K8sOperation],
+        ) -> Result<
+            Vec<crate::env_packs::k8s::credentials::OperationDecision>,
+            crate::env_packs::k8s::credentials::K8sClientError,
+        > {
+            self.review_access("", operations).await
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_passes_when_list_is_granted() {
+        let r = Reviewer {
+            deny_list: false,
+            fail: false,
+        };
+        require_sweep_access(&r, "zain", "gtc-zain").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_names_the_missing_permission_and_the_rebootstrap() {
+        let r = Reviewer {
+            deny_list: true,
+            fail: false,
+        };
+        let err = require_sweep_access(&r, "zain", "gtc-zain")
+            .await
+            .unwrap_err();
+        match &err {
+            SweepPreflightError::MissingPermission { permissions, .. } => assert_eq!(
+                permissions,
+                &vec![
+                    "k8s.rbac.allow:apps/deployments:list".to_string(),
+                    "k8s.rbac.allow:core/services:list".to_string()
+                ]
+            ),
+            other => panic!("expected MissingPermission, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("gtc op credentials bootstrap zain"), "{msg}");
+        assert!(msg.contains("apps/deployments:list"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn preflight_fails_closed_when_the_review_fails() {
+        let r = Reviewer {
+            deny_list: false,
+            fail: true,
+        };
+        assert!(matches!(
+            require_sweep_access(&r, "zain", "gtc-zain").await,
+            Err(SweepPreflightError::ReviewFailed(_))
+        ));
     }
 }

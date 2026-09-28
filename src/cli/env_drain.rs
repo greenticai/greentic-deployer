@@ -40,6 +40,18 @@ pub(crate) fn drain_error(err: DeployerError) -> OpError {
     }
 }
 
+/// Map a sweep preflight refusal onto the CLI error; a missing permission
+/// stays typed (`permission-missing`) and names the re-bootstrap.
+pub(crate) fn preflight_error(err: crate::env_packs::k8s::sweep::SweepPreflightError) -> OpError {
+    use crate::env_packs::k8s::sweep::SweepPreflightError;
+    match err {
+        e @ SweepPreflightError::MissingPermission { .. } => {
+            OpError::PermissionMissing(e.to_string())
+        }
+        e @ SweepPreflightError::ReviewFailed(_) => OpError::Conflict(e.to_string()),
+    }
+}
+
 /// The archive-time drain gate. `force` skips the check (loudly).
 pub(crate) async fn archive_drain_gate<D: Deployer + ?Sized>(
     deployer: &D,
@@ -253,15 +265,15 @@ mod live {
     async fn k8s_handler(
         kubeconfig_context: Option<String>,
         bound_token: Option<String>,
-    ) -> Result<crate::env_packs::k8s::K8sDeployerHandler, OpError> {
+    ) -> Result<(crate::env_packs::k8s::K8sDeployerHandler, kube::Client), OpError> {
         use crate::env_packs::k8s::kube_client::connect;
         use crate::env_packs::k8s::{K8sDeployerHandler, KubeCluster};
         let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
-        Ok(K8sDeployerHandler::with_cluster(std::sync::Arc::new(
-            KubeCluster::new(client),
-        )))
+        let handler =
+            K8sDeployerHandler::with_cluster(std::sync::Arc::new(KubeCluster::new(client.clone())));
+        Ok((handler, client))
     }
 
     #[cfg(feature = "k8s-client")]
@@ -287,7 +299,7 @@ mod live {
         use crate::env_packs::k8s::async_bridge::run_k8s_async;
         let (context, token) = k8s_inputs(store, env, env_id, answers.as_ref())?;
         run_k8s_async(async move {
-            let handler = k8s_handler(context, token).await?;
+            let (handler, _) = k8s_handler(context, token).await?;
             handler
                 .drain_revision(env, revision_id, answers.as_ref())
                 .await
@@ -323,18 +335,28 @@ mod live {
         apply: bool,
     ) -> Result<SweepReport, OpError> {
         use crate::env_packs::k8s::async_bridge::run_k8s_async;
+        use crate::env_packs::k8s::kube_client::KubeValidatorClient;
+        use crate::env_packs::k8s::manifests::K8sParams;
+        use crate::env_packs::k8s::sweep::require_sweep_access;
         let (context, token) = k8s_inputs(store, env, env_id, answers.as_ref())?;
+        let namespace = K8sParams::from_answers(env, answers.as_ref())
+            .map_err(|e| OpError::InvalidArgument(format!("invalid answers: {e}")))?
+            .namespace;
         run_k8s_async(async move {
-            let handler = k8s_handler(context, token).await?;
+            let (handler, client) = k8s_handler(context, token).await?;
+            // Check `list` BEFORE listing: a Role bootstrapped before the sweep
+            // existed lacks it, and `credentials requirements` does not probe it.
+            require_sweep_access(
+                &KubeValidatorClient::new(client),
+                env.environment_id.as_str(),
+                &namespace,
+            )
+            .await
+            .map_err(preflight_error)?;
             handler
                 .sweep(env, answers.as_ref(), apply)
                 .await
-                .map_err(|e| {
-                    OpError::Conflict(format!(
-                        "{e} (the sweep lists deployments/services by label; the bound \
-                         deployer Role does not grant `list` — run it with an identity that can)"
-                    ))
-                })
+                .map_err(|e| OpError::Conflict(e.to_string()))
         })
     }
 
