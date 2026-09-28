@@ -29,7 +29,8 @@ fn refusal(answers: Value) -> String {
 }
 
 /// Golden: SHA-256 of the env-level set rendered for the conformance fixture,
-/// measured on `develop` @ f13cf8d BEFORE the Ingress answers existed. An env
+/// measured on an unmodified `develop` @ f13cf8d (a scratch test run on that
+/// tree before any Ingress code existed), not on this branch. An env
 /// that answers none of them must render exactly those bytes.
 #[test]
 fn unanswered_ingress_keeps_the_rendered_set_byte_identical() {
@@ -145,6 +146,24 @@ fn a_class_or_tls_answer_without_a_host_is_refused() {
     ] {
         let err = refusal(answers.clone());
         assert!(err.contains("ingress_host is required"), "{answers}: {err}");
+    }
+}
+
+#[test]
+fn non_string_answers_are_refused_not_coerced() {
+    for (key, value) in [
+        ("ingress_class", json!(true)),
+        ("ingress_host", json!(42)),
+        ("ingress_tls_secret", json!(["t"])),
+        ("ingress_cert_manager_issuer", json!({"name": "le"})),
+    ] {
+        let mut answers = json!({"ingress_host": "a.example.com"});
+        answers[key] = value;
+        let err = refusal(answers);
+        assert!(
+            err.contains(key) && err.contains("must be a string"),
+            "{key}: {err}"
+        );
     }
 }
 

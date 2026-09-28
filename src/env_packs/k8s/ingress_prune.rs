@@ -18,8 +18,8 @@ use super::manifests::{K8sParams, ROUTER_NAME, ingress};
 
 /// When `params` configures no Ingress, delete the deployer-owned one if it
 /// exists. `Some` names the removed object for the reconcile's `pruned`
-/// list; `None` when there was nothing of ours to remove (or the answers
-/// still configure an Ingress).
+/// list; `None` when there was nothing of ours to remove, the answers still
+/// configure an Ingress, or the check itself failed (logged, never fatal).
 pub(super) async fn remove_unanswered(
     cluster: &dyn K8sCluster,
     env: &Environment,
@@ -35,10 +35,21 @@ pub(super) async fn remove_unanswered(
     }))?;
     let owner = ingress::owner_labels(env);
     let labels: Vec<(&str, &str)> = owner.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    Ok(cluster
-        .delete_if_labeled(&object, &labels)
-        .await?
-        .then_some(object))
+    // This runs on EVERY reconcile of an env without `ingress_*` answers,
+    // after everything else converged, so it must never fail one: any error
+    // is a warning, and the Ingress is re-checked on the next reconcile.
+    match cluster.delete_if_labeled(&object, &labels).await {
+        Ok(removed) => Ok(removed.then_some(object)),
+        Err(e) => {
+            tracing::warn!(
+                object = %object,
+                error = %e,
+                "could not check for a deployer-managed Ingress to remove; the reconcile \
+                 continues and the next one re-checks"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -96,7 +107,6 @@ mod tests {
     async fn an_operator_created_ingress_of_the_same_name_is_left_alone() {
         let env = build_fixture_env();
         let cleared = params(json!({}));
-        let cluster = InMemoryCluster::default();
         for labels in [
             json!({}),
             // Our env label alone is not ownership: managed-by + component too.
@@ -107,6 +117,7 @@ mod tests {
                 "greentic.ai/env": "another-env",
             }),
         ] {
+            let cluster = InMemoryCluster::default();
             cluster
                 .apply(&json!({
                     "apiVersion": "networking.k8s.io/v1",
@@ -157,6 +168,80 @@ mod tests {
             !third.pruned.contains(&ingress_ref(&namespace)),
             "reported once"
         );
+    }
+
+    /// M1: a pre-existing Ingress this deployer did not create is refused,
+    /// never adopted (and so never later deletable), and left unchanged.
+    #[tokio::test]
+    async fn reconcile_refuses_to_adopt_an_operator_ingress() {
+        use crate::env_packs::k8s::K8sDeployerHandler;
+        use std::sync::Arc;
+
+        let env = build_fixture_env();
+        let with = json!({"ingress_host": "a.example.com"});
+        let namespace = params(with.clone()).namespace;
+        let cluster = Arc::new(InMemoryCluster::default());
+        let operator = json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": ROUTER_NAME, "namespace": namespace},
+            "spec": {"rules": [{"host": "ops.example.com"}]},
+        });
+        cluster.apply(&operator).await.expect("seed");
+        let handler = K8sDeployerHandler::with_cluster(cluster.clone());
+        let err = handler
+            .reconcile(&env, Some(&with), true)
+            .await
+            .expect_err("must refuse");
+        assert!(err.to_string().contains(ROUTER_NAME), "{err}");
+        assert_eq!(
+            cluster.objects().get(&ingress_ref(&namespace)),
+            Some(&operator)
+        );
+    }
+
+    /// M2: a failed check never fails a reconcile that asked for no Ingress.
+    #[tokio::test]
+    async fn a_failed_check_is_a_warning_not_an_error() {
+        #[derive(Debug)]
+        struct FailingRead;
+        #[async_trait::async_trait]
+        impl K8sCluster for FailingRead {
+            async fn apply(&self, _: &serde_json::Value) -> Result<(), K8sClusterError> {
+                Ok(())
+            }
+            async fn delete(&self, _: &ObjectRef) -> Result<(), K8sClusterError> {
+                Ok(())
+            }
+            async fn get_rollout_status(
+                &self,
+                _: &ObjectRef,
+            ) -> Result<crate::env_packs::k8s::cluster::RolloutStatus, K8sClusterError>
+            {
+                Err(K8sClusterError::Api("unused".into()))
+            }
+            async fn get_service_status(
+                &self,
+                _: &ObjectRef,
+            ) -> Result<crate::env_packs::k8s::cluster::ServiceStatus, K8sClusterError>
+            {
+                Err(K8sClusterError::Api("unused".into()))
+            }
+            async fn delete_if_labeled(
+                &self,
+                _: &ObjectRef,
+                _: &[(&str, &str)],
+            ) -> Result<bool, K8sClusterError> {
+                Err(K8sClusterError::Api(
+                    "apiserver unavailable (status 503)".into(),
+                ))
+            }
+        }
+        let env = build_fixture_env();
+        let removed = remove_unanswered(&FailingRead, &env, &params(json!({})))
+            .await
+            .expect("never an error");
+        assert_eq!(removed, None);
     }
 
     #[tokio::test]

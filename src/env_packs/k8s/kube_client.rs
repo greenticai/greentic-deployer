@@ -355,6 +355,14 @@ impl K8sCluster for KubeCluster {
                     incoming_env: inc.to_string(),
                 });
             }
+            // Never adopt an operator's object of a never-adopted kind (the
+            // Ingress): the env-label check above passes an unlabeled one.
+            let existing_labels = existing
+                .metadata
+                .labels
+                .as_ref()
+                .map(|labels| serde_json::json!(labels));
+            super::cluster::refuse_adoption(manifest, existing_labels.as_ref())?;
         }
 
         // Server-side apply IS the trait's upsert contract: same manifest
@@ -393,7 +401,17 @@ impl K8sCluster for KubeCluster {
         let existing = match api.get_opt(&object.name).await {
             Ok(Some(existing)) => existing,
             Ok(None) => return Ok(false),
-            Err(kube::Error::Api(status)) if matches!(status.code, 403 | 404) => return Ok(false),
+            Err(kube::Error::Api(status)) if status.code == 404 => return Ok(false),
+            Err(kube::Error::Api(status)) if status.code == 403 => {
+                tracing::warn!(
+                    object = %object,
+                    "cannot verify removal of a deployer-managed {}: this identity may not \
+                     read it (403). If one was rendered earlier it may still be serving; \
+                     re-bootstrap the env's credentials or delete it by hand",
+                    object.kind
+                );
+                return Ok(false);
+            }
             Err(e) => return Err(map_cluster_error(e)),
         };
         let owned = labels.iter().all(|(key, value)| {
@@ -1485,6 +1503,44 @@ mod tests {
     }
 
     // ── ownership guard ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn apply_refuses_to_adopt_an_operator_created_ingress() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let labels = json!({
+            "app.kubernetes.io/managed-by": "greentic",
+            "app.kubernetes.io/component": "router-ingress",
+            "greentic.ai/env": "zain",
+        });
+        let manifest = json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "gtc-router", "namespace": "gtc-zain", "labels": labels},
+        });
+        // Existing Ingress carries no env label, so the env guard passes it.
+        let (result, get) = tokio::join!(
+            cluster.apply(&manifest),
+            respond_json(&mut handle, 200, ingress_body(json!({"team": "ops"}))),
+        );
+        assert_eq!(get.method(), "GET");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, K8sClusterError::UnmanagedObject { kind, object, .. }
+                if kind == "Ingress" && object == "gtc-router"),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("ingress_host"), "{err}");
+
+        // Our own (fully labelled) Ingress re-applies normally.
+        let respond = async {
+            let _get = respond_json(&mut handle, 200, ingress_body(labels.clone())).await;
+            respond_json(&mut handle, 200, manifest.clone()).await
+        };
+        let (result, patch) = tokio::join!(cluster.apply(&manifest), respond);
+        result.unwrap();
+        assert_eq!(patch.method(), "PATCH");
+    }
 
     #[tokio::test]
     async fn apply_rejects_a_foreign_owned_object() {

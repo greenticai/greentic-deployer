@@ -117,6 +117,70 @@ pub enum K8sClusterError {
         existing_env: String,
         incoming_env: String,
     },
+    /// Refusing to take over an object this deployer did not create (it lacks
+    /// the deployer's owner labels). Raised for kinds a forced apply must never
+    /// adopt (`refuse_adoption`).
+    #[error(
+        "refusing to apply {kind} `{object}` in namespace `{namespace}`: an object of that \
+         name already exists that this deployer did not create (it lacks the deployer's \
+         owner labels) — rename or remove it, or clear the answer that renders it \
+         (`ingress_host` for the Ingress)"
+    )]
+    UnmanagedObject {
+        kind: String,
+        object: String,
+        namespace: String,
+    },
+}
+
+/// Kinds a forced server-side apply must never adopt from someone else. The
+/// Ingress publishes the environment on a public hostname, and adopting an
+/// operator's `gtc-router` Ingress would replace their routing wholesale and
+/// stamp our owner labels on it — making it deletable by
+/// `ingress_prune` later.
+#[cfg(any(test, feature = "k8s-client"))]
+const NEVER_ADOPTED_KINDS: &[&str] = &["Ingress"];
+
+/// Refuse to apply `manifest` over an existing object of a never-adopted kind
+/// unless the existing object already carries every label `manifest` does
+/// (i.e. this deployer created it). `existing_labels` is the existing object's
+/// `metadata.labels` (`None`/`null` when it has none). Shared by every
+/// [`K8sCluster`] impl so the fake and the real client refuse identically.
+#[cfg(any(test, feature = "k8s-client"))]
+pub(crate) fn refuse_adoption(
+    manifest: &Value,
+    existing_labels: Option<&Value>,
+) -> Result<(), K8sClusterError> {
+    let kind = manifest
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !NEVER_ADOPTED_KINDS.contains(&kind) {
+        return Ok(());
+    }
+    let incoming = manifest
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object);
+    let owned = incoming.is_some_and(|incoming| {
+        incoming
+            .iter()
+            .all(|(key, value)| existing_labels.and_then(|labels| labels.get(key)) == Some(value))
+    });
+    if owned {
+        return Ok(());
+    }
+    let field = |pointer: &str| {
+        manifest
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Err(K8sClusterError::UnmanagedObject {
+        kind: kind.to_string(),
+        object: field("/metadata/name"),
+        namespace: field("/metadata/namespace"),
+    })
 }
 
 /// A worker Deployment's rollout progress, read for the warm readiness wait.
@@ -305,10 +369,11 @@ impl InMemoryCluster {
 impl K8sCluster for InMemoryCluster {
     async fn apply(&self, manifest: &Value) -> Result<(), K8sClusterError> {
         let object = ObjectRef::from_manifest(manifest)?;
-        self.objects
-            .lock()
-            .expect("mutex not poisoned")
-            .insert(object, manifest.clone());
+        let mut objects = self.objects.lock().expect("mutex not poisoned");
+        if let Some(existing) = objects.get(&object) {
+            refuse_adoption(manifest, existing.pointer("/metadata/labels"))?;
+        }
+        objects.insert(object, manifest.clone());
         Ok(())
     }
 

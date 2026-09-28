@@ -102,6 +102,17 @@ pub(super) fn parse(
     obj: &Map<String, Value>,
     reserved: &[&str],
 ) -> Result<Option<IngressConfig>, String> {
+    for key in INGRESS_ANSWER_KEYS {
+        match obj.get(*key) {
+            None | Some(Value::Null) | Some(Value::String(_)) => {}
+            Some(other) => {
+                return Err(format!(
+                    "{key} must be a string, got {other} — a non-string answer is refused \
+                     rather than coerced into a name"
+                ));
+            }
+        }
+    }
     let host = answer_string(obj, "ingress_host").map(|h| h.trim().to_ascii_lowercase());
     let class = answer_string(obj, "ingress_class");
     let tls_secret = answer_string(obj, "ingress_tls_secret");
