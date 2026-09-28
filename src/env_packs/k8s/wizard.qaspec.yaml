@@ -148,9 +148,10 @@ questions:
       labels; no wildcard, no IP address. Required when any other
       `ingress_*` answer is set. `op env reconcile` reports the resulting
       `public_base_url` (`https://<host>` with TLS, `http://<host>`
-      without). A bound deployer identity needs `networking.k8s.io`
-      `ingresses` get/create/patch in the namespace. Removing the answer
-      stops rendering the Ingress; it does not delete it.
+      without). A bound deployer identity needs the `networking.k8s.io`
+      `ingresses` verbs the bootstrap Role grants (re-run bootstrap for an
+      env bound before they existed). Clearing the answer makes the next
+      reconcile delete the deployer-owned Ingress (never an operator's).
     required: false
 
   - id: ingress_class

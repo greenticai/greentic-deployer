@@ -217,6 +217,21 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
     /// Delete one object; absent is `Ok`.
     async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError>;
 
+    /// Delete `object` ONLY if it exists and carries every `(key, value)` in
+    /// `labels`; `Ok(true)` when something was deleted. An absent object, one
+    /// missing any label (e.g. created by an operator), or one this identity
+    /// may not read is left alone and answers `Ok(false)`.
+    ///
+    /// The default never deletes: a cluster that cannot read labels must not
+    /// remove anything on their strength.
+    async fn delete_if_labeled(
+        &self,
+        _object: &ObjectRef,
+        _labels: &[(&str, &str)],
+    ) -> Result<bool, K8sClusterError> {
+        Ok(false)
+    }
+
     /// Read a worker Deployment's [`RolloutStatus`] for the warm readiness
     /// wait. Called only after [`apply`](Self::apply) has accepted the
     /// Deployment, so the object is expected to exist.
@@ -304,6 +319,27 @@ impl K8sCluster for InMemoryCluster {
             .expect("mutex not poisoned")
             .remove(object);
         Ok(())
+    }
+
+    async fn delete_if_labeled(
+        &self,
+        object: &ObjectRef,
+        labels: &[(&str, &str)],
+    ) -> Result<bool, K8sClusterError> {
+        let mut objects = self.objects.lock().expect("mutex not poisoned");
+        let owned = objects.get(object).is_some_and(|stored| {
+            labels.iter().all(|(key, value)| {
+                stored
+                    .pointer("/metadata/labels")
+                    .and_then(|l| l.get(*key))
+                    .and_then(Value::as_str)
+                    == Some(*value)
+            })
+        });
+        if owned {
+            objects.remove(object);
+        }
+        Ok(owned)
     }
 
     async fn get_rollout_status(

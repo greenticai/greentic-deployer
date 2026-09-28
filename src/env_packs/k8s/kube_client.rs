@@ -35,7 +35,9 @@ use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use serde_json::Value;
 
@@ -374,6 +376,47 @@ impl K8sCluster for KubeCluster {
             Ok(_) => Ok(()),
             // Absent => Ok: the trait's retried-archive contract.
             Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+            Err(e) => Err(map_cluster_error(e)),
+        }
+    }
+
+    async fn delete_if_labeled(
+        &self,
+        object: &ObjectRef,
+        labels: &[(&str, &str)],
+    ) -> Result<bool, K8sClusterError> {
+        let (resource, scope) = api_route_for(&object.api_version, &object.kind)?;
+        let namespace = object.namespace.as_deref().unwrap_or_default();
+        let api = dynamic_api(&self.client, &resource, scope, namespace);
+        // 404 = absent; 403 = this identity may not read it (an env bound
+        // before these verbs existed), so it cannot prove ownership.
+        let existing = match api.get_opt(&object.name).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => return Ok(false),
+            Err(kube::Error::Api(status)) if matches!(status.code, 403 | 404) => return Ok(false),
+            Err(e) => return Err(map_cluster_error(e)),
+        };
+        let owned = labels.iter().all(|(key, value)| {
+            existing
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(*key))
+                .map(String::as_str)
+                == Some(*value)
+        });
+        if !owned {
+            return Ok(false);
+        }
+        // Pin the delete to the object whose labels were just read, so a
+        // replacement created in between is never removed.
+        let params = DeleteParams::default().preconditions(Preconditions {
+            uid: existing.metadata.uid.clone(),
+            resource_version: None,
+        });
+        match api.delete(&object.name, &params).await {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(status)) if matches!(status.code, 404 | 409) => Ok(false),
             Err(e) => Err(map_cluster_error(e)),
         }
     }
@@ -1001,6 +1044,95 @@ mod tests {
             ),
         );
         result.unwrap();
+    }
+
+    fn ingress_ref() -> ObjectRef {
+        ObjectRef {
+            api_version: "networking.k8s.io/v1".into(),
+            kind: "Ingress".into(),
+            namespace: Some("gtc-zain".into()),
+            name: "gtc-router".into(),
+        }
+    }
+
+    const OWNER: &[(&str, &str)] = &[
+        ("app.kubernetes.io/managed-by", "greentic"),
+        ("greentic.ai/env", "zain"),
+    ];
+
+    fn ingress_body(labels: Value) -> Value {
+        json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "gtc-router", "namespace": "gtc-zain", "uid": "u-1", "labels": labels},
+        })
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_deletes_an_owned_object_pinned_to_its_uid() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let responder = async {
+            let get = respond_json(
+                &mut handle,
+                200,
+                ingress_body(
+                    json!({"app.kubernetes.io/managed-by": "greentic", "greentic.ai/env": "zain"}),
+                ),
+            )
+            .await;
+            assert_eq!(get.method(), "GET");
+            let delete = respond_json(
+                &mut handle,
+                200,
+                json!({"kind": "Status", "status": "Success"}),
+            )
+            .await;
+            assert_eq!(delete.method(), "DELETE");
+            assert_eq!(
+                delete.uri().path(),
+                "/apis/networking.k8s.io/v1/namespaces/gtc-zain/ingresses/gtc-router"
+            );
+            request_body_json(delete).await
+        };
+        let (result, body) = tokio::join!(cluster.delete_if_labeled(&object, OWNER), responder);
+        assert!(result.unwrap());
+        assert_eq!(body["preconditions"]["uid"], "u-1");
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_leaves_an_unlabeled_object_alone() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let (result, request) = tokio::join!(
+            cluster.delete_if_labeled(&object, OWNER),
+            respond_json(
+                &mut handle,
+                200,
+                ingress_body(json!({"greentic.ai/env": "zain"}))
+            ),
+        );
+        assert_eq!(request.method(), "GET");
+        assert!(!result.unwrap(), "no DELETE may follow");
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_treats_a_forbidden_read_as_nothing_to_remove() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let (result, _request) = tokio::join!(
+            cluster.delete_if_labeled(&object, OWNER),
+            respond_json(
+                &mut handle,
+                403,
+                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                       "message": "forbidden", "reason": "Forbidden", "code": 403}),
+            ),
+        );
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]

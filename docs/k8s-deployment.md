@@ -461,12 +461,20 @@ router enforces the traffic split:
 answers (the host the Ingress was rendered for), not read back from the
 controller, so DNS for the host must point at your ingress controller. Set
 `environment.public_base_url` to the same value so the worker registers
-webhooks against it (Telegram requires HTTPS). A bound deployer identity needs
-`networking.k8s.io` `ingresses` get/create/patch in the namespace — the
-bootstrap Role does not grant it yet, so add it (or reconcile with an ambient
-admin identity). Removing the answers stops rendering the Ingress but does not
-delete it (env-level objects are never pruned) — `kubectl delete ingress
-gtc-router` by hand.
+webhooks against it (Telegram requires HTTPS).
+
+- **RBAC.** The bootstrap Role grants `networking.k8s.io/ingresses`
+  get/create/patch/delete. `op credentials requirements` probes those verbs
+  ONLY when an `ingress_*` answer is set, so an env bootstrapped before they
+  existed and using no Ingress validates exactly as before; one that adds an
+  Ingress fails validation naming the missing verb until you re-run
+  `gtc op credentials bootstrap <env>` (or re-apply its rules pack).
+- **Removal.** Clearing the answers makes the next `op env reconcile` delete
+  the `gtc-router` Ingress and list it under `pruned` — but only if it carries
+  the deployer's owner labels (`app.kubernetes.io/managed-by: greentic`,
+  `app.kubernetes.io/component: router-ingress`, `greentic.ai/env: <env>`). An
+  operator-created Ingress of the same name is never deleted, and an identity
+  that may not read Ingresses deletes nothing.
 
 **B. Zero-infra cloudflared tunnel (demo / no Ingress).** Set
 `"tunnel": "cloudflared"` in `deployer-answers.json` and **remove**
@@ -558,7 +566,7 @@ are **rejected** (fail closed on version skew).
 | `oci_password` | string | *(unset)* | Registry password for the same `oci://` bundle pull. Real secret material: never rendered as a plain pod env value — carried into the cluster as the `gtc-oci-credentials` Secret and referenced by the worker/router via `secretKeyRef`. Must be set together with `oci_username`, or left unset. The Secret is env-scoped and is **never pruned** when both answers are removed later — clearing them only stops the pods referencing it; the Secret itself stays in the namespace, mirroring `gtc-telemetry-headers` and `image_pull_secret` below. |
 | `image_pull_secret` | string (RFC 1123 label) | *(unset)* | Name of a `kubernetes.io/dockerconfigjson` Secret to render (from the `oci_username` / `oci_password` credential) and reference as `imagePullSecrets` from the worker and router pods — for a private runtime/init image or an authenticated air-gapped registry. Requires both `oci_username` and `oci_password` to also be set, and must not collide with the name of an object this pack already renders (`gtc-router`, `gtc-runtime-config`, `gtc-env-store`, `gtc-dev-secrets`, `gtc-oci-credentials`, `gtc-telemetry-headers`, `gtc-worker`, `gtc-router-tls`) — a `Secret`'s `type` is immutable, so a colliding name applies once and then fails every later reconcile. Unset → no Secret, no `imagePullSecrets` key at all. **Never pruned**: removing the answer later drops `imagePullSecrets` from the worker/router pods on the next reconcile, but the Secret itself stays in the namespace indefinitely, still holding live registry credentials — env-level objects are not pruned by design ([§9](#9-known-gaps--production-caveats)). **The `auths` entry's host is derived, not answered**: one entry per distinct authority of `runtime_image` and `init_image` (Docker's own segment-before-`/` heuristic), falling back to the first `oci_insecure_registries` entry only when neither image names an authority, and to the literal `docker.io` when nothing does at all — getting this host right is what decides whether the credential authenticates anything (`pull_secret_registry_hosts` in `manifests.rs`). |
 | `service_type` | `"ClusterIP"` \| `"NodePort"` \| `"LoadBalancer"` (case-insensitive) | `ClusterIP` | How the router Service is exposed. `op env reconcile` reports the resulting `router_address` (a load balancer still being provisioned reads `pending`). Worker Services stay `ClusterIP`. |
-| `ingress_host` | string (lowercase DNS name, ≥ 2 labels, no wildcard / IP) | *(unset)* | Render a managed Ingress `gtc-router` routing `<host>/` to the router Service on `:8080`, and report `public_base_url` from `op env reconcile`. Required when any other `ingress_*` key is set. Unset → no Ingress, manifests byte-identical to before. Never pruned. See [§6 option C](#public-exposure-options). |
+| `ingress_host` | string (lowercase DNS name, ≥ 2 labels, no wildcard / IP) | *(unset)* | Render a managed Ingress `gtc-router` routing `<host>/` to the router Service on `:8080`, and report `public_base_url` from `op env reconcile`. Required when any other `ingress_*` key is set. Unset → no Ingress, manifests byte-identical to before; a deployer-owned Ingress left from earlier is deleted by the next reconcile and listed under `pruned`. See [§6 option C](#public-exposure-options). |
 | `ingress_class` | string (DNS-1123 subdomain) | cluster default | `spec.ingressClassName`. Requires `ingress_host`. |
 | `ingress_tls_secret` | string (DNS-1123 subdomain) | *(unset)* | Existing `kubernetes.io/tls` Secret to terminate TLS with → `public_base_url` is `https://`. Mutually exclusive with `ingress_cert_manager_issuer`; must not be a name this pack renders (incl. `gtc-router-tls`) or the `image_pull_secret`. |
 | `ingress_cert_manager_issuer` | string (DNS-1123 subdomain) | *(unset)* | cert-manager `ClusterIssuer` that issues the certificate into `gtc-router-tls` (annotation `cert-manager.io/cluster-issuer`) → `public_base_url` is `https://`. Mutually exclusive with `ingress_tls_secret`. |
@@ -593,8 +601,8 @@ limitation with a workaround.
   Ingress to the router (one host, path `/`, optional TLS); anything richer
   (multiple hosts, custom annotations, a namespaced cert-manager `Issuer`) is
   still BYO-Ingress ([§6](#6-deploying-to-a-new--real-cluster-eks-gke-aks-on-prem-k3s)
-  option A). The Ingress is never pruned, and the bootstrap Role does not yet
-  grant a bound identity the `ingresses` verbs.
+  option A). An env bootstrapped before the Ingress verbs existed must be
+  re-bootstrapped before it can use one.
 - **Vault is dev-mode only.** The `dev-in-cluster` path deploys an in-memory,
   auto-unsealed Vault (`-dev`) — suitable for kind / local dev, not production.
   For production, use `external` mode pointed at a managed Vault instance

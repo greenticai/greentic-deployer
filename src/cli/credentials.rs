@@ -568,9 +568,12 @@ fn connected_k8s_credentials(
     let kubeconfig_context = kubeconfig_context_from_answers(answers.as_ref());
     // Probe the SAME namespace reconcile / apply-revision deploy into — the
     // answers may override the env-derived default.
-    let namespace = K8sParams::from_answers(&env, answers.as_ref())
-        .map_err(|e| OpError::Conflict(format!("invalid K8s answers: {e}")))?
-        .namespace;
+    let params = K8sParams::from_answers(&env, answers.as_ref())
+        .map_err(|e| OpError::Conflict(format!("invalid K8s answers: {e}")))?;
+    let namespace = params.namespace;
+    // Probe the Ingress verbs only when the answers configure an Ingress, so
+    // an env without one validates exactly as before they existed.
+    let ingress = params.ingress.is_some();
     // Resolve the env's bound deployer credential to a ServiceAccount bearer so
     // the probe authenticates as the deployer's identity, not the ambient
     // admin. `None` → ambient (no bound credential); fail-closed if a ref is
@@ -592,7 +595,9 @@ fn connected_k8s_credentials(
         })
     });
     Ok(Some(
-        K8sDeployerCredentials::with_connector(connector).in_namespace(namespace),
+        K8sDeployerCredentials::with_connector(connector)
+            .in_namespace(namespace)
+            .with_ingress(ingress),
     ))
 }
 

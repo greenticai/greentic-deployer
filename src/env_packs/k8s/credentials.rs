@@ -161,6 +161,34 @@ pub const VALIDATED_K8S_OPERATIONS: &[K8sOperation] = &[
     op("networking.k8s.io", "networkpolicies", "patch"),
 ];
 
+/// Operations the optional managed Ingress (`ingress_*` answers,
+/// [`manifests::ingress`](super::manifests::ingress)) needs. `delete` lets a
+/// reconcile remove the deployer-owned Ingress once the answers are cleared.
+///
+/// Kept OUT of [`VALIDATED_K8S_OPERATIONS`] on purpose: the bootstrap Role
+/// always grants them ([`bootstrap_k8s_operations`]), but `validate` probes
+/// them only when an `ingress_*` answer is set
+/// ([`K8sDeployerCredentials::with_ingress`]). A bound environment
+/// bootstrapped before these existed, and using no Ingress, therefore
+/// validates exactly as it did before.
+pub const INGRESS_K8S_OPERATIONS: &[K8sOperation] = &[
+    op("networking.k8s.io", "ingresses", "get"),
+    op("networking.k8s.io", "ingresses", "create"),
+    op("networking.k8s.io", "ingresses", "patch"),
+    op("networking.k8s.io", "ingresses", "delete"),
+];
+
+/// Everything the bootstrap Role grants: the always-validated set plus the
+/// Ingress operations, so a freshly bootstrapped env can adopt an Ingress
+/// without a second bootstrap.
+pub fn bootstrap_k8s_operations() -> Vec<K8sOperation> {
+    VALIDATED_K8S_OPERATIONS
+        .iter()
+        .chain(INGRESS_K8S_OPERATIONS)
+        .copied()
+        .collect()
+}
+
 /// Identity the cluster resolved for the deployer's credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterIdentity {
@@ -348,6 +376,10 @@ pub struct K8sDeployerCredentials {
     /// of `connect` (the validator probe seam) — the two paths never run
     /// together.
     bind: Option<K8sBootstrapConnector>,
+    /// Whether the binding answers configure a managed Ingress. `true` adds
+    /// [`INGRESS_K8S_OPERATIONS`] to the probed set; `false` (default) probes
+    /// exactly [`VALIDATED_K8S_OPERATIONS`], as before the Ingress existed.
+    ingress: bool,
 }
 
 impl std::fmt::Debug for K8sDeployerCredentials {
@@ -358,6 +390,7 @@ impl std::fmt::Debug for K8sDeployerCredentials {
             .field("connect", &self.connect.is_some())
             .field("namespace", &self.namespace)
             .field("bind", &self.bind.is_some())
+            .field("ingress", &self.ingress)
             .finish()
     }
 }
@@ -380,6 +413,7 @@ impl K8sDeployerCredentials {
             connect: Some(connect),
             namespace: None,
             bind: None,
+            ingress: false,
         }
     }
 
@@ -393,6 +427,7 @@ impl K8sDeployerCredentials {
             connect: None,
             namespace: None,
             bind: Some(bind),
+            ingress: false,
         }
     }
 
@@ -401,6 +436,22 @@ impl K8sDeployerCredentials {
     pub fn in_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
         self
+    }
+
+    /// Probe the Ingress operations too — set when any `ingress_*` answer is.
+    pub fn with_ingress(mut self, ingress: bool) -> Self {
+        self.ingress = ingress;
+        self
+    }
+
+    /// The operations `validate` probes: [`VALIDATED_K8S_OPERATIONS`], plus
+    /// [`INGRESS_K8S_OPERATIONS`] when the answers configure an Ingress.
+    fn probed_operations(&self) -> Vec<K8sOperation> {
+        let mut ops = VALIDATED_K8S_OPERATIONS.to_vec();
+        if self.ingress {
+            ops.extend_from_slice(INGRESS_K8S_OPERATIONS);
+        }
+        ops
     }
 
     fn reachable_capability(&self) -> Capability {
@@ -425,12 +476,13 @@ impl K8sDeployerCredentials {
     /// reachable cap passes, every operation cap fails with the same
     /// reason (mirror of the AWS `sts_pass_verbs_failed` shape).
     fn reachable_pass_ops_failed(&self, reason: &str) -> RequirementsReport {
-        let mut checks = Vec::with_capacity(1 + VALIDATED_K8S_OPERATIONS.len());
+        let operations = self.probed_operations();
+        let mut checks = Vec::with_capacity(1 + operations.len());
         checks.push(CapabilityCheck {
             capability: self.reachable_capability(),
             status: CapabilityStatus::Pass,
         });
-        for operation in VALIDATED_K8S_OPERATIONS {
+        for operation in &operations {
             checks.push(CapabilityCheck {
                 capability: self.operation_capability(operation),
                 status: CapabilityStatus::Fail {
@@ -475,9 +527,10 @@ impl DeployerCredentials for K8sDeployerCredentials {
     }
 
     fn required_capabilities(&self) -> Vec<Capability> {
-        let mut caps = Vec::with_capacity(1 + VALIDATED_K8S_OPERATIONS.len());
+        let operations = self.probed_operations();
+        let mut caps = Vec::with_capacity(1 + operations.len());
         caps.push(self.reachable_capability());
-        for operation in VALIDATED_K8S_OPERATIONS {
+        for operation in &operations {
             caps.push(self.operation_capability(operation));
         }
         caps
@@ -524,12 +577,14 @@ impl DeployerCredentials for K8sDeployerCredentials {
         // connecting in a separate bridge call would hand us a dead worker
         // (`buffer's worker closed unexpectedly`). See `K8sValidatorConnector`.
         let connector = Arc::clone(connect);
+        let operations = self.probed_operations();
+        let probe_ops = operations.clone();
         let decisions = match run_k8s_async(async move {
             let connect_fn = connector.as_ref();
             let client = connect_fn().await.map_err(K8sProbeError::Connect)?;
             client.who_am_i().await.map_err(K8sProbeError::Identity)?;
             client
-                .review_access(&namespace, VALIDATED_K8S_OPERATIONS)
+                .review_access(&namespace, &probe_ops)
                 .await
                 .map_err(K8sProbeError::Access)
         }) {
@@ -554,18 +609,14 @@ impl DeployerCredentials for K8sDeployerCredentials {
 
         // Validate response shape BEFORE building per-op checks: a
         // partial or mis-ordered response must never authorize.
-        if decisions.len() != VALIDATED_K8S_OPERATIONS.len() {
+        if decisions.len() != operations.len() {
             return self.reachable_pass_ops_failed(&format!(
                 "SelfSubjectAccessReview returned {} decisions for {} operations",
                 decisions.len(),
-                VALIDATED_K8S_OPERATIONS.len()
+                operations.len()
             ));
         }
-        for (i, (expected, actual)) in VALIDATED_K8S_OPERATIONS
-            .iter()
-            .zip(decisions.iter())
-            .enumerate()
-        {
+        for (i, (expected, actual)) in operations.iter().zip(decisions.iter()).enumerate() {
             if actual.operation != *expected {
                 return self.reachable_pass_ops_failed(&format!(
                     "SelfSubjectAccessReview decision[{i}] operation mismatch: \
@@ -581,9 +632,14 @@ impl DeployerCredentials for K8sDeployerCredentials {
             capability: self.reachable_capability(),
             status: CapabilityStatus::Pass,
         });
-        for (operation, decision) in VALIDATED_K8S_OPERATIONS.iter().zip(decisions.iter()) {
+        for (operation, decision) in operations.iter().zip(decisions.iter()) {
             let status = match &decision.decision {
                 AccessDecision::Allowed => CapabilityStatus::Pass,
+                AccessDecision::Denied(reason) if INGRESS_K8S_OPERATIONS.contains(operation) => {
+                    CapabilityStatus::Fail {
+                        reason: ingress_denied_reason(operation, reason, ctx.env_id.as_str()),
+                    }
+                }
                 AccessDecision::Denied(reason) => CapabilityStatus::Fail {
                     reason: format!(
                         "RBAC denied `{}` on `{}` ({reason})",
@@ -627,7 +683,7 @@ impl DeployerCredentials for K8sDeployerCredentials {
             env_id: input.env_id.as_str(),
             namespace: &namespace,
             admin_context_hint: admin_context,
-            operations: VALIDATED_K8S_OPERATIONS,
+            operations: &bootstrap_k8s_operations(),
         });
 
         // Render-only (default): no live cluster calls. The admin reviews
@@ -749,6 +805,21 @@ enum K8sProbeError {
     Connect(K8sClientError),
     Identity(K8sClientError),
     Access(K8sClientError),
+}
+
+/// Denial reason for an Ingress operation: names the permission, why it is
+/// required, and the re-bootstrap that grants it (a Role bootstrapped before
+/// the Ingress operations existed lacks them).
+fn ingress_denied_reason(operation: &K8sOperation, reason: &str, env_id: &str) -> String {
+    format!(
+        "RBAC denied `{verb}` on `networking.k8s.io/{resource}` ({reason}) — required \
+         because an `ingress_*` answer is set. Re-run `gtc op credentials bootstrap \
+         {env_id}` (with `bind: true`, or re-apply the rules pack it renders) to grant \
+         `{id}`, or clear the `ingress_*` answers",
+        verb = operation.verb,
+        resource = operation.resource,
+        id = operation.capability_id(),
+    )
 }
 
 /// Every-capability-failed report with one shared reason.
@@ -1153,6 +1224,114 @@ mod tests {
             }
             other => panic!("expected AdminRejected, got {other:?}"),
         }
+    }
+
+    fn decisions_for(ops: &[K8sOperation], deny_ingress: bool) -> Vec<OperationDecision> {
+        ops.iter()
+            .map(|operation| OperationDecision {
+                operation: *operation,
+                decision: if deny_ingress && INGRESS_K8S_OPERATIONS.contains(operation) {
+                    AccessDecision::Denied("no RBAC rule matched".into())
+                } else {
+                    AccessDecision::Allowed
+                },
+            })
+            .collect()
+    }
+
+    /// No `ingress_*` answer: exactly the pre-Ingress probe set, so an env
+    /// bootstrapped before the Ingress verbs existed still passes.
+    #[test]
+    fn validate_without_ingress_answers_never_probes_ingress_verbs() {
+        let mock = Arc::new(
+            MockK8sClient::default()
+                .with_identity(Ok(identity()))
+                .with_review(Ok(all_allowed())),
+        );
+        let creds = K8sDeployerCredentials::with_client(mock.clone()).with_ingress(false);
+        assert!(
+            !creds
+                .required_capabilities()
+                .iter()
+                .any(|c| c.id.contains("ingresses"))
+        );
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let hc = default_host_config(&env_id);
+        let dir = tempdir().unwrap();
+        let report = creds.validate(&ctx(dir.path(), &env_id, &hc));
+        assert!(report.passed(), "report: {report:?}");
+        let calls = mock.review_calls.lock().unwrap();
+        assert_eq!(calls[0].1, VALIDATED_K8S_OPERATIONS.len());
+    }
+
+    #[test]
+    fn validate_with_ingress_answers_requires_and_names_the_ingress_verbs() {
+        let ops = bootstrap_k8s_operations();
+        let mock = Arc::new(
+            MockK8sClient::default()
+                .with_identity(Ok(identity()))
+                .with_review(Ok(decisions_for(&ops, true))),
+        );
+        let creds = K8sDeployerCredentials::with_client(mock.clone()).with_ingress(true);
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let hc = default_host_config(&env_id);
+        let dir = tempdir().unwrap();
+        let report = creds.validate(&ctx(dir.path(), &env_id, &hc));
+        assert!(!report.passed());
+        assert_eq!(mock.review_calls.lock().unwrap()[0].1, ops.len());
+        let missing = report.missing();
+        assert_eq!(missing.len(), INGRESS_K8S_OPERATIONS.len());
+        assert!(missing.contains(&"k8s.rbac.allow:networking.k8s.io/ingresses:create".to_string()));
+        let denied = report
+            .checks
+            .iter()
+            .find(|c| c.capability.id == "k8s.rbac.allow:networking.k8s.io/ingresses:create")
+            .unwrap();
+        match &denied.status {
+            CapabilityStatus::Fail { reason } => {
+                assert!(reason.contains("networking.k8s.io/ingresses"), "{reason}");
+                assert!(reason.contains("ingress_*"), "{reason}");
+                assert!(
+                    reason.contains("gtc op credentials bootstrap zain-prod"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+
+        // Granted → passes.
+        let granted = Arc::new(
+            MockK8sClient::default()
+                .with_identity(Ok(identity()))
+                .with_review(Ok(decisions_for(&ops, false))),
+        );
+        let creds = K8sDeployerCredentials::with_client(granted).with_ingress(true);
+        assert!(creds.validate(&ctx(dir.path(), &env_id, &hc)).passed());
+    }
+
+    #[test]
+    fn bootstrap_role_grants_the_ingress_verbs() {
+        let creds = K8sDeployerCredentials::default();
+        let env_id = EnvId::try_from("zain-prod").unwrap();
+        let dir = tempdir().unwrap();
+        let admin = ZeroizedAdmin::new("zain-admin@nonprod-cluster", String::new());
+        let outcome = creds
+            .bootstrap(&BootstrapInput {
+                env_id: &env_id,
+                env_root: dir.path(),
+                admin: &admin,
+            })
+            .expect("bootstrap renders");
+        let yaml = &outcome.rules_pack.entries[0].content;
+        let rule = yaml
+            .split("- apiGroups:")
+            .find(|s| s.contains("\"ingresses\""))
+            .expect("an ingresses rule");
+        assert!(rule.contains("networking.k8s.io"), "{rule}");
+        assert!(
+            rule.contains("verbs: [get, create, patch, delete]"),
+            "{rule}"
+        );
     }
 
     #[test]

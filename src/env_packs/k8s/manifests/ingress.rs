@@ -19,8 +19,9 @@
 //!   certificate into [`INGRESS_TLS_SECRET_NAME`] via the
 //!   `cert-manager.io/cluster-issuer` annotation.
 //!
-//! Like the other env-level objects, the Ingress is NEVER pruned: removing
-//! the answers stops rendering it, it does not delete the object.
+//! Unlike the other env-level objects, a deployer-owned Ingress IS removed
+//! once the answers are cleared ([`ingress_prune`](super::super::ingress_prune)),
+//! but only when it carries every [`owner_labels`] entry.
 
 use serde_json::{Map, Value, json};
 
@@ -39,6 +40,10 @@ pub(super) const INGRESS_ANSWER_KEYS: &[&str] = &[
 /// `ingress_cert_manager_issuer` is answered. Reserved: no other answer may
 /// name a Secret the same.
 pub const INGRESS_TLS_SECRET_NAME: &str = "gtc-router-tls";
+
+/// `app.kubernetes.io/component` of the rendered Ingress — one of the owner
+/// labels [`owner_labels`] requires before a reconcile may delete it.
+pub const INGRESS_COMPONENT: &str = "router-ingress";
 
 /// cert-manager's ingress-shim annotation naming a cluster-scoped issuer.
 const CERT_MANAGER_CLUSTER_ISSUER_ANNOTATION: &str = "cert-manager.io/cluster-issuer";
@@ -161,12 +166,12 @@ pub(super) fn parse(
 }
 
 /// The Ingress, or `None` when `ingress_host` was not answered.
-pub(super) fn render(env: &Environment, params: &K8sParams) -> Option<Value> {
+pub fn render(env: &Environment, params: &K8sParams) -> Option<Value> {
     let ingress = params.ingress.as_ref()?;
     let mut metadata = json!({
         "name": ROUTER_NAME,
         "namespace": params.namespace,
-        "labels": common_labels(env, "router-ingress"),
+        "labels": common_labels(env, INGRESS_COMPONENT),
     });
     if let IngressTls::CertManager(issuer) = &ingress.tls {
         metadata["annotations"] = json!({ CERT_MANAGER_CLUSTER_ISSUER_ANNOTATION: issuer });
@@ -211,6 +216,18 @@ pub fn public_base_url_from_answers(env: &Environment, answers: Option<&Value>) 
         .ok()?
         .ingress
         .map(|i| i.public_base_url())
+}
+
+/// The labels a deployer-rendered Ingress carries (the same
+/// `common_labels` [`render`] stamps). A reconcile removes an Ingress named
+/// [`ROUTER_NAME`] only when it carries ALL of them, so an operator-created
+/// Ingress of that name is never deleted.
+pub fn owner_labels(env: &Environment) -> Vec<(&'static str, String)> {
+    vec![
+        ("app.kubernetes.io/managed-by", "greentic".to_string()),
+        ("app.kubernetes.io/component", INGRESS_COMPONENT.to_string()),
+        (super::ENV_LABEL, env.environment_id.as_str().to_string()),
+    ]
 }
 
 /// DNS-1123 subdomain: dot-separated DNS-1123 labels, ≤ 253 chars.
