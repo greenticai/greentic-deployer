@@ -211,6 +211,8 @@ fn api_route_for(api_version: &str, kind: &str) -> Result<(ApiResource, Scope), 
         ("apps/v1", "Deployment") => ("deployments", Scope::Namespaced),
         ("policy/v1", "PodDisruptionBudget") => ("poddisruptionbudgets", Scope::Namespaced),
         ("networking.k8s.io/v1", "NetworkPolicy") => ("networkpolicies", Scope::Namespaced),
+        // Optional managed Ingress (`ingress_host` answer, `manifests::ingress`).
+        ("networking.k8s.io/v1", "Ingress") => ("ingresses", Scope::Namespaced),
         // RBAC kinds the bootstrap `--bind` path applies (via
         // `KubeBootstrapClient::apply_rbac` → `KubeCluster::apply`); the
         // steady-state reconcile renderer does not emit these.
@@ -920,13 +922,13 @@ mod tests {
         let cluster = KubeCluster::new(client);
         let manifest = json!({
             "apiVersion": "networking.k8s.io/v1",
-            "kind": "Ingress",
+            "kind": "IngressClass",
             "metadata": {"name": "x", "namespace": "ns"},
         });
         let err = cluster.apply(&manifest).await.unwrap_err();
         assert!(
             matches!(err, K8sClusterError::InvalidManifest(ref msg)
-                if msg.contains("unsupported object `networking.k8s.io/v1/Ingress`")),
+                if msg.contains("unsupported object `networking.k8s.io/v1/IngressClass`")),
             "no request may be guessed for an unrendered kind, got {err:?}"
         );
     }

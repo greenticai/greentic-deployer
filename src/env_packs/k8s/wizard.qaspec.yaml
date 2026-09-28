@@ -120,11 +120,10 @@ questions:
     type: enum
     title: Router service type
     description: >-
-      How the environment's stable router Service is exposed. The env-pack
-      renders NO Ingress — routing a hostname in is the operator's own
-      decision (controller class, cert issuer, DNS) — so this answer is
-      what decides whether the environment has an address reachable from
-      outside the cluster at all. `ClusterIP` (the default, and the only
+      How the environment's stable router Service is exposed. Unless
+      `ingress_host` is answered the env-pack renders NO Ingress, so this
+      answer is what decides whether the environment has an address
+      reachable from outside the cluster at all. `ClusterIP` (the default, and the only
       behaviour before this answer existed) is in-cluster only.
       `NodePort` is reachable at `<any-node-ip>:<allocated-port>`.
       `LoadBalancer` asks the cloud provider to provision one and assign an
@@ -137,3 +136,50 @@ questions:
     required: false
     default_value: "ClusterIP"
     choices: ["ClusterIP", "NodePort", "LoadBalancer"]
+
+  - id: ingress_host
+    type: string
+    title: Ingress host (optional)
+    description: >-
+      Public hostname (e.g. `chat.example.com`) for an optional managed
+      Ingress in front of the router Service (port 8080). Leave blank (the
+      default) to render no Ingress — exactly the manifests rendered before
+      this answer existed. Must be a lowercase DNS name with at least two
+      labels; no wildcard, no IP address. Required when any other
+      `ingress_*` answer is set. `op env reconcile` reports the resulting
+      `public_base_url` (`https://<host>` with TLS, `http://<host>`
+      without). A bound deployer identity needs `networking.k8s.io`
+      `ingresses` get/create/patch in the namespace. Removing the answer
+      stops rendering the Ingress; it does not delete it.
+    required: false
+
+  - id: ingress_class
+    type: string
+    title: Ingress class (optional)
+    description: >-
+      `spec.ingressClassName` for the managed Ingress (e.g. `nginx`,
+      `traefik`). Blank → the cluster's default IngressClass. Requires
+      `ingress_host`.
+    required: false
+
+  - id: ingress_tls_secret
+    type: string
+    title: Ingress TLS Secret (optional)
+    description: >-
+      Name of an existing `kubernetes.io/tls` Secret in the environment's
+      namespace to terminate TLS with. Mutually exclusive with
+      `ingress_cert_manager_issuer`; requires `ingress_host`. Must not
+      reuse the name of an object this pack renders or the
+      `image_pull_secret`.
+    required: false
+
+  - id: ingress_cert_manager_issuer
+    type: string
+    title: cert-manager ClusterIssuer (optional)
+    description: >-
+      Name of a cert-manager `ClusterIssuer` (e.g. `letsencrypt-prod`) that
+      issues the certificate into the `gtc-router-tls` Secret, via the
+      `cert-manager.io/cluster-issuer` annotation. cert-manager must already
+      be installed. Mutually exclusive with `ingress_tls_secret`; requires
+      `ingress_host`.
+    required: false
