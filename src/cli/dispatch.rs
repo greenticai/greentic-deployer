@@ -306,7 +306,8 @@ pub enum EnvVerb {
     /// The manifest arrives via `--answers`. Re-running is safe and
     /// idempotent.
     Up(super::env_up::EnvUpArgs),
-    /// Declarative, upsert-only environment apply. Reads a
+    /// Declarative environment apply, upsert-only unless `--prune
+    /// --confirm-prune` (see `docs/removal.md`). Reads a
     /// `greentic.env-manifest.v1` document via `--answers <PATH>` and
     /// reconciles the env toward it: validate → diff → plan → execute →
     /// verify. Re-running an unchanged manifest is a visible no-op.
@@ -521,6 +522,14 @@ pub struct EnvApplyArgs {
     /// mutations and stdin/stdout are a TTY. Non-TTY implies `--yes`.
     #[arg(long)]
     pub yes: bool,
+    /// Also remove what this environment's manifest owns but no longer
+    /// declares (deployments are retired; unrouted revisions archived).
+    /// Apply is upsert-only without it. Requires `--confirm-prune`.
+    #[arg(long)]
+    pub prune: bool,
+    /// Explicit confirmation for `--prune`.
+    #[arg(long = "confirm-prune", requires = "prune")]
+    pub confirm_prune: bool,
 }
 
 impl EnvApplyArgs {
@@ -540,6 +549,8 @@ impl EnvApplyArgs {
             updated_by: self.updated_by,
             yes: self.yes,
             non_interactive: self.non_interactive,
+            prune: self.prune,
+            confirm_prune: self.confirm_prune,
             // The CLI never pre-collects paste-sourced secrets; an unset value
             // is prompted (interactive) or reported missing (headless).
             ..Default::default()
@@ -1117,7 +1128,33 @@ pub enum BundlesVerb {
     Add,
     Update,
     Remove,
-    List { env_id: String },
+    /// Retire a deployment as a sequence: clear its traffic split, drain its
+    /// serving revisions, archive (and tear down) every revision, then remove
+    /// it. Idempotent and resumable: re-run after a partial failure to finish.
+    Retire(BundleRetireArgs),
+    List {
+        env_id: String,
+    },
+}
+
+/// Args for `op bundles retire <env_id> <bundle>`. Both positionals are
+/// optional at the clap layer so `--answers` / `--schema` keep working.
+#[derive(Args, Debug)]
+pub struct BundleRetireArgs {
+    /// Environment id, e.g. `local`.
+    pub env_id: Option<String>,
+    /// Deployment ULID, or a bundle id unique within the env.
+    pub bundle: Option<String>,
+    /// Disambiguates a bundle id deployed for several customers.
+    #[arg(long = "customer")]
+    pub customer: Option<String>,
+    /// Skip the provider drain / teardown hooks and act on the store only.
+    /// Anything still running provider-side is left for `op env sweep`.
+    #[arg(long = "store-only")]
+    pub store_only: bool,
+    /// Caller-supplied idempotency key (minted when absent).
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1156,6 +1193,25 @@ pub enum TrafficVerb {
     Show(TrafficTargetArgs),
     /// Roll back to the previously-saved split for one deployment.
     Rollback(TrafficTargetArgs),
+    /// Clear one deployment's split: with `--survivor <revision>` move 100 %
+    /// of the traffic to it; without, remove the split (only for a deployment
+    /// already retiring — see `op bundles retire`). Idempotent.
+    Clear(TrafficClearArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TrafficClearArgs {
+    /// Environment id, e.g. `local`.
+    pub env_id: Option<String>,
+    /// Deployment ULID.
+    #[arg(long)]
+    pub deployment: Option<String>,
+    /// Revision ULID that keeps 100 % of the traffic.
+    #[arg(long)]
+    pub survivor: Option<String>,
+    /// Caller-supplied idempotency key (derived from the target when absent).
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Args for `op traffic set`. All fields are optional at the clap layer so
@@ -1389,7 +1445,7 @@ pub fn dispatch_op_with_registry(
     let result = match cmd.noun {
         OpNoun::Env { verb } => dispatch_env(&store, registry, &flags, verb),
         OpNoun::EnvPacks { verb } => dispatch_env_packs(&store, &flags, verb),
-        OpNoun::Bundles { verb } => dispatch_bundles(&store, &flags, verb),
+        OpNoun::Bundles { verb } => dispatch_bundles(&store, registry, &flags, verb),
         OpNoun::Revisions { verb } => dispatch_revisions(&store, &flags, verb),
         OpNoun::Traffic { verb } => dispatch_traffic(&store, &flags, verb),
         OpNoun::Deploy(args) => dispatch_deploy(&store, &flags, args),
@@ -1448,6 +1504,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 BundlesVerb::Add => "add",
                 BundlesVerb::Update => "update",
                 BundlesVerb::Remove => "remove",
+                BundlesVerb::Retire(_) => "retire",
                 BundlesVerb::List { .. } => "list",
             },
         ),
@@ -1467,6 +1524,7 @@ pub fn noun_verb_labels(noun: &OpNoun) -> (&'static str, &'static str) {
                 TrafficVerb::Set(_) => "set",
                 TrafficVerb::Show(_) => "show",
                 TrafficVerb::Rollback(_) => "rollback",
+                TrafficVerb::Clear(_) => "clear",
             },
         ),
         OpNoun::Deploy(_) => ("deploy", "run"),
@@ -1673,6 +1731,7 @@ fn dispatch_extensions(
 
 fn dispatch_bundles(
     store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
     flags: &OpFlags,
     verb: BundlesVerb,
 ) -> Result<(), OpError> {
@@ -1680,6 +1739,10 @@ fn dispatch_bundles(
         BundlesVerb::Add => super::bundles::add(store, flags, None)?,
         BundlesVerb::Update => super::bundles::update(store, flags, None)?,
         BundlesVerb::Remove => super::bundles::remove(store, flags, None)?,
+        BundlesVerb::Retire(args) => {
+            let payload = super::bundles_retire::payload_from_retire_args(args)?;
+            super::bundles_retire::retire(store, registry, flags, payload)?
+        }
         BundlesVerb::List { env_id } => super::bundles::list(store, flags, &env_id)?,
     };
     print_outcome(&outcome)
@@ -1720,6 +1783,10 @@ fn dispatch_traffic(
         TrafficVerb::Rollback(args) => {
             let payload = super::traffic::payload_from_target_args(args)?;
             super::traffic::rollback(store, flags, payload)?
+        }
+        TrafficVerb::Clear(args) => {
+            let payload = super::traffic_clear::payload_from_clear_args(args)?;
+            super::traffic_clear::clear(store, flags, payload)?
         }
     };
     print_outcome(&outcome)

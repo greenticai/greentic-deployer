@@ -66,6 +66,12 @@ pub use bundles::*;
 pub mod messaging;
 pub use messaging::*;
 
+/// Explicit removal verbs (unified release Phase 5): `op traffic clear`,
+/// `op bundles retire`, and the `op env apply --prune` plan. Re-exported flat
+/// like the groups above.
+pub mod removal;
+pub use removal::*;
+
 /// Failures produced by pure verb transforms. Each backend maps these onto
 /// its own error surface: `LocalFsStore` → `StoreError`,
 /// the operator-store-server → [`crate::remote::RemoteStoreError`].

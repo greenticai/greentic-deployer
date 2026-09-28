@@ -48,16 +48,17 @@ pub use credentials::{
 };
 pub use engine::{
     ActiveSplitRef, AddBundlePayload, AddMessagingEndpointPayload, AddTrustedKeyPayload,
-    ApplyTrafficSplitOutcome, BindingError, BindingGenerationOutcome, BundleError,
-    BundleUpdateApplied, CreateEnvironmentPayload, EngineError, ExtensionBindingPayload,
-    ExtensionKey, ExtensionKeyedPayload, FieldUpdate, HealthCheckId, HealthGateFailure,
-    MergeReport, MessagingApplied, MessagingBundleLinkPayload, MessagingError, MigrateMergePayload,
-    MigrateSeedPayload, PackBindingPayload, RemoveBundleOutcome, RevisionLifecycleError,
-    RevisionTransition, RevisionTransitionOutcome, RollbackTrafficSplitOutcome,
-    RollbackTrafficSplitPayload, RotateWebhookSecretPayload, SetMessagingWelcomeFlowPayload,
-    SetTrafficSplitPayload, StageRevisionPayload, TrafficRollbackTransition, TrafficSplitError,
-    TrafficSplitTransition, TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed,
-    UpdateBundlePayload, UpdateEnvironmentPayload, WarmRevisionPayload,
+    ApplyTrafficSplitOutcome, BeginRetireOutcome, BindingError, BindingGenerationOutcome,
+    BundleError, BundleUpdateApplied, ClearTrafficOutcome, CreateEnvironmentPayload, EngineError,
+    ExtensionBindingPayload, ExtensionKey, ExtensionKeyedPayload, FieldUpdate, HealthCheckId,
+    HealthGateFailure, MergeReport, MessagingApplied, MessagingBundleLinkPayload, MessagingError,
+    MigrateMergePayload, MigrateSeedPayload, PackBindingPayload, PrunePlan, RemovalError,
+    RemoveBundleOutcome, RetireSteps, RevisionLifecycleError, RevisionTransition,
+    RevisionTransitionOutcome, RollbackTrafficSplitOutcome, RollbackTrafficSplitPayload,
+    RotateWebhookSecretPayload, SetMessagingWelcomeFlowPayload, SetTrafficSplitPayload,
+    StageRevisionPayload, TrafficRollbackTransition, TrafficSplitError, TrafficSplitTransition,
+    TrustRootAddOutcome, TrustRootRemoveOutcome, TrustRootSeed, UpdateBundlePayload,
+    UpdateEnvironmentPayload, WarmRevisionPayload,
 };
 pub use environment::{
     DEFAULT_LISTEN_ADDR, DefaultBundleReason, EnvPackBinding, Environment, EnvironmentHostConfig,

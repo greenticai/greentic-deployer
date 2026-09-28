@@ -170,6 +170,7 @@ fn route_remote(
             BundlesVerb::Add => remote_bundles_add(store, flags),
             BundlesVerb::Update => remote_bundles_update(store, flags),
             BundlesVerb::Remove => remote_bundles_remove(store, flags),
+            BundlesVerb::Retire(_) => Err(not_supported("bundles retire")),
             BundlesVerb::List { env_id } => super::bundles::list(store, flags, &env_id),
         },
 
@@ -187,6 +188,7 @@ fn route_remote(
                 let payload = super::traffic::payload_from_target_args(args)?;
                 remote_traffic_rollback(store, flags, payload)
             }
+            TrafficVerb::Clear(_) => Err(not_supported("traffic clear")),
         },
 
         // -- revisions ---------------------------------------------------------

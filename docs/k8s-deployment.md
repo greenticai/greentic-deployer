@@ -597,6 +597,12 @@ telemetry slot binding exists; the contract may move there.
 All verified in source. None silently broken — each is a deliberate current
 limitation with a workaround.
 
+- **Removal is explicit.** `op env apply` never deletes by omission. Retire a
+  deployment with `op bundles retire` (clears its split, drains, tears down its
+  workers, removes it), or opt into `op env apply --prune --confirm-prune` for
+  what the manifest owns — see [removal.md](removal.md). Then `op env reconcile`
+  to refresh the router's runtime config.
+
 - **Managed Ingress is opt-in and minimal.** `ingress_host` renders one
   Ingress to the router (one host, path `/`, optional TLS); anything richer
   (multiple hosts, custom annotations, a namespaced cert-manager `Issuer`) is
