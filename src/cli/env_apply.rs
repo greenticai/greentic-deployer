@@ -673,9 +673,17 @@ fn apply_with_lookups(
     )?;
     let steps = diff(store, &ctx)?;
     render_plan(&steps, &ctx.warnings, &ctx.missing);
+    // Ownership is keyed per manifest, so one manifest never prunes what
+    // another declared.
+    let owner = ownership::Owner::for_manifest(&manifest_path);
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let hooks = super::bundles_retire::ProviderHooks {
+        store,
+        registry: &registry,
+    };
     // `None` unless `--prune`: the default report carries no `prune` key.
     let prune_preview = if prune {
-        Some(prune::preview(store, &ctx)?)
+        Some(prune::preview(store, &ctx, &owner, &hooks)?)
     } else {
         None
     };
@@ -685,10 +693,8 @@ fn apply_with_lookups(
         }
         report
     };
-    let preview_json = prune_preview.as_ref().map(prune::plan_json);
-    let prune_pending = prune_preview
-        .as_ref()
-        .map_or(0, |p| p.retire.len() + p.archive_revisions.len());
+    let preview_json = prune_preview.as_ref().map(|p| prune::plan_json(p, &owner));
+    let prune_pending = prune_preview.as_ref().map_or(0, |p| p.retire.len());
 
     match mode {
         ApplyMode::DryRun => {
@@ -771,7 +777,7 @@ fn apply_with_lookups(
     // upsert-only one: its outcome must not depend on the removal feature.
     let applied = store.load(&ctx.env_id)?;
     let declared = prune::declared_ids(&applied, &ctx);
-    if let Err(err) = ownership::record(store, &ctx.env_id, &applied, &declared) {
+    if let Err(err) = ownership::record(store, &ctx.env_id, &applied, &owner, &declared) {
         if prune {
             return Err(err);
         }
@@ -783,12 +789,7 @@ fn apply_with_lookups(
         );
     }
     let pruned = if prune {
-        let registry = crate::env_packs::EnvPackRegistry::with_builtins();
-        let hooks = super::bundles_retire::ProviderHooks {
-            store,
-            registry: &registry,
-        };
-        Some(prune::execute(store, &ctx, &hooks)?)
+        Some(prune::execute(store, &ctx, &owner, &hooks)?)
     } else {
         None
     };

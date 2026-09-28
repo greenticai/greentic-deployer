@@ -249,25 +249,44 @@ fn prune_plan_touches_only_owned_deployments() {
 }
 
 #[test]
-fn prune_plan_archives_only_settled_unrouted_revisions() {
-    let (mut env, did, routed) = live();
+fn prune_plan_never_names_a_declared_deployment_or_its_revisions() {
+    let (mut env, did, _) = live();
     let dep = env.bundles[0].clone();
-    let stale = revision(&dep, RevisionLifecycle::Ready);
-    let in_flight = revision(&dep, RevisionLifecycle::Warming);
-    let stale_id = stale.revision_id;
-    env.revisions.push(stale);
-    env.revisions.push(in_flight);
+    // A warmed canary: Ready, unrouted.
+    env.revisions.push(revision(&dep, RevisionLifecycle::Ready));
     let set: BTreeSet<_> = [did].into();
-    let plan = prune_plan(&env, &set, &set);
-    assert!(plan.retire.is_empty());
-    assert_eq!(plan.archive_revisions, vec![stale_id]);
-    assert!(!plan.archive_revisions.contains(&routed));
+    assert!(prune_plan(&env, &set, &set).is_empty());
 }
 
 #[test]
-fn prune_plan_without_a_split_archives_nothing() {
+fn a_retire_set_cannot_vouch_for_itself_on_endpoint_links() {
+    let (mut env, first, _) = live();
+    let mut second = deployment("acme");
+    second.customer_id = CustomerId::new("other");
+    let second_id = second.deployment_id;
+    env.bundles.push(second);
+    env.messaging_endpoints.push(endpoint("legal-bot", "acme"));
+    // Each alone has a surviving sibling...
+    check_retire_links(&env, first).expect("sibling survives");
+    // ...but retiring both strands the endpoint.
+    let err = check_retire_set_links(&env, &BTreeSet::from([first, second_id])).unwrap_err();
+    assert!(
+        matches!(err, RemovalError::LinkedFromEndpoint { .. }),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_retiring_sibling_is_not_a_survivor() {
     let (mut env, did, _) = live();
-    env.traffic_splits.clear();
-    let set: BTreeSet<_> = [did].into();
-    assert!(prune_plan(&env, &set, &set).is_empty());
+    let mut sibling = deployment("acme");
+    sibling.customer_id = CustomerId::new("other");
+    sibling.status = BundleDeploymentStatus::Archived;
+    env.bundles.push(sibling);
+    env.messaging_endpoints.push(endpoint("legal-bot", "acme"));
+    let err = check_retire_links(&env, did).unwrap_err();
+    assert!(
+        matches!(err, RemovalError::LinkedFromEndpoint { .. }),
+        "{err}"
+    );
 }

@@ -2166,6 +2166,16 @@ fn remote_env_apply(
     flags: &OpFlags,
     opts: ApplyOptions,
 ) -> Result<OpOutcome, OpError> {
+    // Refused, never silently ignored: an upsert-only run reporting success
+    // would read as a prune that happened.
+    if opts.prune {
+        return Err(OpError::NotYetImplemented(
+            "prune is not supported on a remote store yet: `env apply --prune` needs the \
+             local ownership ledger; run it against the local store (without --store-url / \
+             GREENTIC_STORE_URL)"
+                .to_string(),
+        ));
+    }
     let manifest_path = flags.answers.clone().ok_or_else(|| {
         OpError::InvalidArgument(
             "env apply requires `--answers <manifest.json>` (a greentic.env-manifest.v1 \
@@ -4131,6 +4141,33 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|s| s["section"] == "environment")
+        );
+    }
+
+    #[test]
+    fn remote_apply_refuses_prune_before_any_request() {
+        // No mock responses: a request would hang `accept`.
+        let mock = start_mock(vec![], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"}
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let err = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Apply,
+                prune: true,
+                confirm_prune: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, OpError::NotYetImplemented(m) if m.contains("prune is not supported on a remote store yet")),
+            "{err}"
         );
     }
 

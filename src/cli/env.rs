@@ -1339,8 +1339,30 @@ pub(crate) enum ProviderStep {
     /// The env's bound deployer ran the verb (`kind` = its descriptor).
     Done { kind: String },
     /// Nothing provider-side exists to act on: the env has no deployer
-    /// binding, or its deployer kind has no live single-revision path.
+    /// binding at all.
     Unavailable(String),
+}
+
+/// Refuse up front when the env's BOUND deployer has no live single-revision
+/// teardown path (P5-R3 `remove` capability): removing a store record it
+/// cannot tear down could orphan a running workload. `Ok(false)` = no
+/// deployer bound (nothing provider-side to act on); `Ok(true)` = capable.
+pub(crate) fn deployer_supports_remove(env: &Environment) -> Result<bool, OpError> {
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
+        return Ok(false);
+    };
+    let descriptor = &binding.kind;
+    let is_k8s = descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if is_k8s || is_aws_ecs_kind(descriptor) || is_cloudrun_kind(descriptor) {
+        return Ok(true);
+    }
+    Err(OpError::Conflict(
+        greentic_deploy_spec::RemovalError::MissingCapability {
+            deployer: descriptor.path().to_string(),
+            capability: "remove".to_string(),
+        }
+        .to_string(),
+    ))
 }
 
 /// Drive ONE revision's provider-side `Deployer` verb through the env's
@@ -1356,7 +1378,7 @@ pub(crate) fn provider_revision_step(
     verb: RevisionVerb,
 ) -> Result<ProviderStep, OpError> {
     let env = store.load(env_id)?;
-    if env.pack_for_slot(CapabilitySlot::Deployer).is_none() {
+    if !deployer_supports_remove(&env)? {
         return Ok(ProviderStep::Unavailable(
             "env has no deployer binding".to_string(),
         ));
@@ -1366,12 +1388,6 @@ pub(crate) fn provider_revision_step(
         .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
         .map_err(|e| OpError::Conflict(e.to_string()))?;
     let is_k8s = descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
-    if !is_k8s && !is_aws_ecs_kind(&descriptor) && !is_cloudrun_kind(&descriptor) {
-        return Ok(ProviderStep::Unavailable(format!(
-            "deployer `{}` has no live single-revision path",
-            descriptor.path()
-        )));
-    }
     if !env.revisions.iter().any(|r| r.revision_id == revision_id) {
         return Err(OpError::NotFound(format!(
             "revision `{revision_id}` not found in env `{env_id}`"

@@ -2,11 +2,11 @@ use std::cell::{Cell, RefCell};
 
 use super::*;
 use crate::cli::tests_common::{
-    make_bundle_deployment, make_env, make_revision, make_traffic_split,
+    make_binding, make_bundle_deployment, make_env, make_revision, make_traffic_split,
 };
 use greentic_deploy_spec::{
-    BundleDeploymentStatus, BundleId, CustomerId, MessagingEndpoint, MessagingEndpointId,
-    RevisionLifecycle, SchemaVersion,
+    BundleDeploymentStatus, BundleId, CapabilitySlot, CustomerId, MessagingEndpoint,
+    MessagingEndpointId, RevisionLifecycle, SchemaVersion,
 };
 use tempfile::tempdir;
 
@@ -119,7 +119,8 @@ fn a_failed_teardown_stops_before_remove_and_a_rerun_finishes() {
     assert!(
         env.revisions
             .iter()
-            .all(|r| r.lifecycle == RevisionLifecycle::Archived)
+            .all(|r| r.lifecycle != RevisionLifecycle::Archived),
+        "a revision whose teardown did not happen is never archived"
     );
 
     hooks.calls.borrow_mut().clear();
@@ -128,10 +129,77 @@ fn a_failed_teardown_stops_before_remove_and_a_rerun_finishes() {
     assert_eq!(out.result["marked_retiring"], false);
     assert_eq!(
         *hooks.calls.borrow(),
-        vec![("teardown", ready), ("teardown", failed)],
-        "resume re-tears-down archived revisions and drains nothing"
+        vec![("drain", ready), ("teardown", ready), ("teardown", failed)],
+        "resume re-drains the still-draining revision and retries every teardown"
     );
     assert!(load(&store).bundles.is_empty());
+}
+
+#[test]
+fn only_revisions_whose_teardown_succeeded_are_archived() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    let (_, ready, failed) = seed(&store);
+    let hooks = FailSecondTeardown::default();
+    let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
+    assert!(err.to_string().contains(&failed.to_string()), "{err}");
+    let env = load(&store);
+    let lifecycle = |id| {
+        env.revisions
+            .iter()
+            .find(|r| r.revision_id == id)
+            .map(|r| r.lifecycle)
+    };
+    assert_eq!(lifecycle(ready), Some(RevisionLifecycle::Archived));
+    assert_eq!(lifecycle(failed), Some(RevisionLifecycle::Failed));
+    assert_eq!(env.bundles.len(), 1, "record kept");
+}
+
+#[derive(Default)]
+struct FailSecondTeardown {
+    seen: Cell<usize>,
+}
+
+impl RetireHooks for FailSecondTeardown {
+    fn drain(&self, _: &EnvId, _: RevisionId) -> Result<HookResult, OpError> {
+        Ok(HookResult::Done)
+    }
+    fn teardown(&self, _: &EnvId, _: RevisionId) -> Result<HookResult, OpError> {
+        self.seen.set(self.seen.get() + 1);
+        if self.seen.get() == 2 {
+            return Err(OpError::Conflict("cluster unreachable".to_string()));
+        }
+        Ok(HookResult::Done)
+    }
+}
+
+#[test]
+fn a_bound_deployer_that_cannot_tear_down_refuses_before_touching_anything() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    seed(&store);
+    let mut env = load(&store);
+    env.packs.push(make_binding(
+        CapabilitySlot::Deployer,
+        "greentic.deployer.local-process@0.1.0",
+    ));
+    store.save(&env).expect("save");
+    let before = load(&store);
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let hooks = ProviderHooks {
+        store: &store,
+        registry: &registry,
+    };
+    let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
+    assert_eq!(err.kind(), "conflict", "{err}");
+    assert!(err.to_string().contains("`remove` capability"), "{err}");
+    assert_eq!(load(&store), before, "nothing mutated");
+
+    let mut store_only = payload("acme");
+    store_only.store_only = true;
+    let out = retire(&store, &registry, &OpFlags::default(), Some(store_only))
+        .expect("--store-only accepts the risk explicitly");
+    assert_eq!(out.result["state"], "retired");
 }
 
 #[test]

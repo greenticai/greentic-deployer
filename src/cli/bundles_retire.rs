@@ -10,17 +10,18 @@
 //!    for every draining revision (the bound deployer's `drain_revision`;
 //!    PD2 makes that wait for in-flight work — until then it returns at once,
 //!    and an env without a live deployer reports the hook `unavailable`).
-//! 3. **archive** — archive every revision in the store, then tear each one
-//!    down provider-side (`archive_revision`). Teardown re-runs for revisions
-//!    a previous attempt already archived, because that attempt may have
-//!    failed between the two.
+//! 3. **teardown, then archive** — per revision, tear it down provider-side
+//!    (`archive_revision`) FIRST and archive it in the store only once that
+//!    succeeded. A failed teardown leaves the revision live in the store, so
+//!    the next attempt retries it. Teardown also re-runs for revisions already
+//!    archived (it is idempotent provider-side).
 //! 4. **remove** — drop the deployment (and its archived revisions).
 //!
-//! A teardown failure stops the retire before step 4: removing the
-//! deployment would drop the only record of the revisions whose provider
-//! resources are still running. `--store-only` skips both provider hooks,
-//! for an env whose provider is gone for good; whatever it left running is
-//! `op env sweep`'s to find.
+//! Before step 1 the retire refuses (`MissingCapability`, capability
+//! `remove`) when a deployer IS bound but cannot tear revisions down —
+//! removing the record could orphan a running workload. `--store-only` skips
+//! both provider hooks and that refusal, for an env whose provider is gone
+//! for good; whatever it left running is `op env sweep`'s to find.
 //!
 //! Data is not destroyed: retire removes serving resources, never tenant
 //! state (destroying data is its own workflow).
@@ -66,6 +67,11 @@ pub(crate) enum HookResult {
 /// Provider side of a retire. Tests inject fakes; the CLI uses
 /// [`ProviderHooks`] or [`StoreOnlyHooks`].
 pub(crate) trait RetireHooks {
+    /// Refuse before anything is mutated when these hooks could not tear the
+    /// env's revisions down.
+    fn preflight(&self, _env: &Environment) -> Result<(), OpError> {
+        Ok(())
+    }
     fn drain(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError>;
     fn teardown(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError>;
 }
@@ -91,6 +97,9 @@ impl ProviderHooks<'_> {
 }
 
 impl RetireHooks for ProviderHooks<'_> {
+    fn preflight(&self, env: &Environment) -> Result<(), OpError> {
+        super::env::deployer_supports_remove(env).map(|_| ())
+    }
     fn drain(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError> {
         self.run(env_id, revision_id, RevisionVerb::Drain)
     }
@@ -229,6 +238,7 @@ fn run_sequence(
     committed: &CommitMarker,
 ) -> Result<Value, OpError> {
     let map = map_store_err_preserving_noun;
+    hooks.preflight(&store.load(env_id)?)?;
     let begun = store.begin_retire(env_id, deployment_id).map_err(map)?;
     if begun.mutated() {
         committed.mark_committed();
@@ -240,13 +250,23 @@ fn run_sequence(
         committed.mark_committed();
     }
     let drain_hooks = run_hook(&steps.drain_hook, |r| hooks.drain(env_id, r))?;
-    for r in &steps.archive {
-        store
-            .archive_revision(env_id, *r, key.clone())
-            .map_err(map)?;
-        committed.mark_committed();
-    }
-    let teardown = run_hook(&steps.teardown, |r| hooks.teardown(env_id, r))?;
+    // Provider first, store second: a revision is archived only once its
+    // workload is gone, so a failed teardown leaves it live in the store.
+    let teardown = run_hook(&steps.teardown, |r| {
+        let result = hooks.teardown(env_id, r).map_err(|e| {
+            OpError::Conflict(format!(
+                "teardown of revision `{r}` failed; it stays un-archived and the next \
+                 retire retries it: {e}"
+            ))
+        })?;
+        if steps.archive.contains(&r) {
+            store
+                .archive_revision(env_id, r, key.clone())
+                .map_err(map)?;
+            committed.mark_committed();
+        }
+        Ok(result)
+    })?;
     let removed = store
         .remove_bundle(env_id, deployment_id, key)
         .map_err(map)?;

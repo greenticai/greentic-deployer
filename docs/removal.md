@@ -18,7 +18,7 @@ the work instead of repeating it; the environment store is the checkpoint.
 
 These verbs act on the local store (`--store-root`). Against a remote store
 (`--store-url`) they answer `not supported` until the A8 contract grows routes
-for them.
+for them — `env apply --prune` included (refused, never silently ignored).
 
 ## `op traffic clear`
 
@@ -54,20 +54,22 @@ Runs, in order:
    retiring (status `archived`) and removes its split.
 2. **drain** — stamps each `Ready` revision `Draining`, then calls the bound
    deployer's `drain_revision` for every draining revision.
-3. **archive** — archives every revision in the store, then tears each one down
-   through the bound deployer (`archive_revision` — the same path as
-   `op env apply-revision`). Teardown runs for already-archived revisions too:
-   an earlier attempt may have archived one and then failed to tear it down.
+3. **teardown, then archive** — per revision, tears it down through the bound
+   deployer (`archive_revision` — the same path as `op env apply-revision`)
+   FIRST, and archives it in the store only once that succeeded. Teardown also
+   re-runs for already-archived revisions (it is idempotent).
 4. **remove** — removes the deployment and its archived revisions.
 
-If a teardown fails, the retire stops **before** step 4, so the store keeps the
-record of what is still running. Fix the cause and run the same command again.
+If a teardown fails, that revision stays un-archived and the retire stops
+**before** step 4, so the store keeps the record of what may still be running.
+Fix the cause and run the same command again.
 
-An environment with no deployer binding, or a deployer with no live
-single-revision path (`local-process`), reports each hook as `"unavailable"`
-and the retire proceeds on the store alone. `--store-only` does the same on
-purpose — for an environment whose provider is gone for good; anything still
-running provider-side is left for an orphan sweep.
+A bound deployer that cannot tear revisions down (e.g. `local-process`) is
+refused up front, before anything changes (`conflict`, "lacks the `remove`
+capability"). An environment with no deployer binding at all reports each hook
+as `"unavailable"` and the retire proceeds on the store alone. `--store-only`
+skips the provider on purpose — for an environment whose provider is gone for
+good; anything still running provider-side is left for an orphan sweep.
 
 A bundle id deployed for several customers needs `--customer` (or pass the
 deployment ULID). Retiring something that is not there answers
@@ -84,30 +86,36 @@ done|unavailable, detail?}`), `pruned_revision_ids`.
 greentic-deployer op --answers env.json env apply --prune --confirm-prune --yes
 ```
 
-After the normal upsert apply has executed and verified, prune removes what
-this environment's manifest **owns** but no longer declares:
+After the normal upsert apply has executed and verified, prune retires, whole,
+each deployment this **manifest owns** but no longer declares (the sequence
+above, one audit event each). It never touches revisions inside a deployment
+the manifest still declares — an unrouted `Ready` revision there may be a
+warmed canary waiting for `op traffic set`.
 
-- an owned deployment missing from the manifest is retired whole (the sequence
-  above, one audit event each);
-- in an owned deployment that is still declared, a settled revision
-  (`Ready | Draining | Inactive | Failed`) that its split no longer routes to is
-  archived and torn down. `Staged` / `Warming` revisions are left alone — they
-  may be a rollout in flight.
+**Ownership** is recorded per manifest by every successful `op env apply` in
+`<env_dir>/env-apply-ownership.json` (captured by env snapshots). The owner key
+is a hash of the manifest file's canonical path, so:
 
-**Ownership** is recorded by every successful `op env apply` in
-`<env_dir>/env-apply-ownership.json`: the deployments its manifest declared. A
-deployment added by hand (`op bundles add`, `op deploy`), or applied before this
-ledger existed, is not in it and is never pruned until a manifest has declared
-it once.
+- a manifest only ever prunes what IT declared before — two manifests applied
+  to one environment never prune each other's bundles, and a deployment both
+  claim is never pruned;
+- moving or renaming the manifest starts a fresh, empty ownership;
+- a deployment the manifest matches by `(bundle_id, customer_id)` is adopted
+  and owned from then on;
+- a deployment added by hand (`op bundles add`, `op deploy`), or applied before
+  this ledger existed, is never pruned until a manifest has declared it once.
 
-Refusals, all before anything is mutated:
+Refusals, all before anything — the upsert half included — is mutated:
 
 - `--prune` without `--confirm-prune` → `invalid-argument`.
-- a retire that would strand a messaging endpoint → `conflict`, naming it.
+- a bound deployer without the `remove` capability → `conflict`.
+- a messaging endpoint the whole retire set would strand → `conflict`, naming
+  it (checked across the set, so two deployments of one bundle cannot vouch
+  for each other).
 
 `--dry-run` / `--check` with `--prune --confirm-prune` report the plan under
-`prune` (`planned: true`, `retire[]`, `archive_revisions[]`); `--check` counts
-pending prune items as drift. Without `--prune` the report carries no `prune`
+`prune` (`planned: true`, `owner`, `retire[]`); `--check` counts pending prune
+items as drift. Without `--prune` the report carries no `prune`
 key at all — default apply output is unchanged.
 
 After a prune on K8s, run `op env reconcile` so the router's runtime config

@@ -9,8 +9,8 @@
 //!   names deployments the store's own apply ledger says it OWNS.
 //! - **Retire is a sequence, not a delete.** A deployment leaves the
 //!   environment by: marking it retiring and clearing its split
-//!   ([`begin_retire`]) → draining its serving revisions → archiving every
-//!   revision → removing the deployment ([`super::remove_bundle`]). Each step
+//!   ([`begin_retire`]) → draining its serving revisions → tearing down and
+//!   then archiving every revision → removing the deployment ([`super::remove_bundle`]). Each step
 //!   is idempotent and the store is the checkpoint, so a retire interrupted
 //!   anywhere is finished by running it again.
 //!
@@ -68,6 +68,18 @@ pub enum RemovalError {
         bundle_id: BundleId,
         endpoints: Vec<String>,
     },
+    /// The env's bound deployer cannot tear a revision down, so removing the
+    /// store record could leave its workload running with nothing recording
+    /// it. Pass `--store-only` to accept that explicitly.
+    #[error(
+        "deployer `{deployer}` lacks the `{capability}` capability: it cannot tear revisions \
+         down, so removing them from the store could orphan a running workload. Pass \
+         `--store-only` to remove the store record anyway"
+    )]
+    MissingCapability {
+        deployer: String,
+        capability: String,
+    },
 }
 
 /// Outcome of [`clear_traffic_split`], and the wire body of
@@ -112,27 +124,31 @@ pub struct RetireSteps {
     /// Revisions that are (or are about to be) `Draining` — the provider
     /// drain hook runs for each. Includes every `drain_stamp` entry.
     pub drain_hook: Vec<RevisionId>,
-    /// Revisions not yet `Archived`.
+    /// Revisions not yet `Archived`. Each is archived in the store only AFTER
+    /// its provider teardown succeeded, so a failed teardown leaves the
+    /// revision live in the store and the next attempt retries it.
     pub archive: Vec<RevisionId>,
-    /// Every revision of the deployment: provider teardown is idempotent and
-    /// re-runs on resume, because a previous attempt may have archived a
-    /// revision in the store and then failed to tear it down.
+    /// Every revision of the deployment: provider teardown is idempotent, so
+    /// it also re-runs for revisions a previous attempt already archived.
     pub teardown: Vec<RevisionId>,
 }
 
-/// What `op env apply --prune` would remove.
+/// What `op env apply --prune` would remove: whole deployments only.
+///
+/// Revisions inside a deployment the manifest still declares are never
+/// pruned — an unrouted `Ready` revision is also what a warmed canary looks
+/// like before `op traffic set`, and tearing it down would be a removal
+/// nobody asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrunePlan {
-    /// Owned deployments the manifest no longer declares — retired whole.
+    /// Owned deployments the manifest no longer declares — retired whole,
+    /// through the same clear → drain → archive → remove sequence.
     pub retire: Vec<DeploymentId>,
-    /// Revisions of owned, still-declared deployments that no split routes
-    /// to and that are settled (`Ready | Draining | Inactive | Failed`).
-    pub archive_revisions: Vec<RevisionId>,
 }
 
 impl PrunePlan {
     pub fn is_empty(&self) -> bool {
-        self.retire.is_empty() && self.archive_revisions.is_empty()
+        self.retire.is_empty()
     }
 }
 
@@ -177,41 +193,60 @@ fn take_split(env: &mut Environment, deployment_id: DeploymentId) -> Option<Traf
 }
 
 /// Refuse a retire that would strand a messaging endpoint: an endpoint that
-/// links (or welcomes into) the bundle, when no OTHER deployment of the same
-/// bundle id survives.
+/// links (or welcomes into) the bundle, when no OTHER live deployment of the
+/// same bundle id survives.
 pub fn check_retire_links(
     env: &Environment,
     deployment_id: DeploymentId,
 ) -> Result<(), RemovalError> {
-    let idx = deployment_index(env, deployment_id)?;
-    let bundle_id = env.bundles[idx].bundle_id.clone();
-    let sibling_survives = env
-        .bundles
-        .iter()
-        .any(|b| b.bundle_id == bundle_id && b.deployment_id != deployment_id);
-    if sibling_survives {
-        return Ok(());
+    check_retire_set_links(env, &BTreeSet::from([deployment_id]))
+}
+
+/// [`check_retire_links`] for a whole retire set, evaluated before any of it
+/// runs. A sibling counts as a survivor only if it is outside the set and not
+/// itself retiring (status `archived`), so two deployments of one bundle in
+/// the same set cannot vouch for each other.
+pub fn check_retire_set_links(
+    env: &Environment,
+    retiring: &BTreeSet<DeploymentId>,
+) -> Result<(), RemovalError> {
+    let mut bundles: Vec<BundleId> = Vec::new();
+    for d in retiring {
+        let idx = deployment_index(env, *d)?;
+        let bundle_id = env.bundles[idx].bundle_id.clone();
+        if !bundles.contains(&bundle_id) {
+            bundles.push(bundle_id);
+        }
     }
-    let endpoints: Vec<String> = env
-        .messaging_endpoints
-        .iter()
-        .filter(|ep| {
-            ep.linked_bundles.contains(&bundle_id)
-                || ep
-                    .welcome_flow
-                    .as_ref()
-                    .is_some_and(|wf| wf.bundle_id == bundle_id)
-        })
-        .map(|ep| ep.display_name.clone())
-        .collect();
-    if endpoints.is_empty() {
-        Ok(())
-    } else {
-        Err(RemovalError::LinkedFromEndpoint {
-            bundle_id,
-            endpoints,
-        })
+    for bundle_id in bundles {
+        let sibling_survives = env.bundles.iter().any(|b| {
+            b.bundle_id == bundle_id
+                && !retiring.contains(&b.deployment_id)
+                && b.status != BundleDeploymentStatus::Archived
+        });
+        if sibling_survives {
+            continue;
+        }
+        let endpoints: Vec<String> = env
+            .messaging_endpoints
+            .iter()
+            .filter(|ep| {
+                ep.linked_bundles.contains(&bundle_id)
+                    || ep
+                        .welcome_flow
+                        .as_ref()
+                        .is_some_and(|wf| wf.bundle_id == bundle_id)
+            })
+            .map(|ep| ep.display_name.clone())
+            .collect();
+        if !endpoints.is_empty() {
+            return Err(RemovalError::LinkedFromEndpoint {
+                bundle_id,
+                endpoints,
+            });
+        }
     }
+    Ok(())
 }
 
 /// Step one of a retire: refuse if an endpoint would be stranded, mark the
@@ -259,55 +294,23 @@ pub fn retire_steps(
     Ok(steps)
 }
 
-/// Compute what `op env apply --prune` removes. `owned` is the store's
-/// apply ledger (deployments a previous apply created or adopted);
-/// `declared` is what the current manifest resolved to. A deployment the
-/// ledger does not name is never touched, whatever the manifest says.
+/// Compute what `op env apply --prune` removes. `owned` is what THIS
+/// manifest's ownership ledger records; `declared` is what the current
+/// manifest resolved to. A deployment `owned` does not name is never touched,
+/// whatever the manifest says.
 pub fn prune_plan(
     env: &Environment,
     owned: &BTreeSet<DeploymentId>,
     declared: &BTreeSet<DeploymentId>,
 ) -> PrunePlan {
-    let mut plan = PrunePlan::default();
-    for dep in env
-        .bundles
-        .iter()
-        .filter(|b| owned.contains(&b.deployment_id))
-    {
-        if !declared.contains(&dep.deployment_id) {
-            plan.retire.push(dep.deployment_id);
-            continue;
-        }
-        // Without a split nothing says which revision serves, so nothing is
-        // provably stale.
-        let Some(split) = env
-            .traffic_splits
+    PrunePlan {
+        retire: env
+            .bundles
             .iter()
-            .find(|s| s.deployment_id == dep.deployment_id)
-        else {
-            continue;
-        };
-        let routed: BTreeSet<RevisionId> = split.entries.iter().map(|e| e.revision_id).collect();
-        for r in env
-            .revisions
-            .iter()
-            .filter(|r| r.deployment_id == dep.deployment_id)
-        {
-            // `Staged` / `Warming` may be a rollout in flight elsewhere;
-            // `Archived` is already done.
-            let settled = matches!(
-                r.lifecycle,
-                RevisionLifecycle::Ready
-                    | RevisionLifecycle::Draining
-                    | RevisionLifecycle::Inactive
-                    | RevisionLifecycle::Failed
-            );
-            if settled && !routed.contains(&r.revision_id) {
-                plan.archive_revisions.push(r.revision_id);
-            }
-        }
+            .map(|b| b.deployment_id)
+            .filter(|d| owned.contains(d) && !declared.contains(d))
+            .collect(),
     }
-    plan
 }
 
 #[cfg(test)]

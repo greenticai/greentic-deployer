@@ -18,9 +18,9 @@ use super::store::{LocalFsStore, Locked, StoreError};
 pub(crate) fn map_removal_err(err: RemovalError) -> StoreError {
     match err {
         RemovalError::DeploymentNotFound { .. } => StoreError::DependentNotFound(err.to_string()),
-        RemovalError::NotRetiring { .. } | RemovalError::LinkedFromEndpoint { .. } => {
-            StoreError::Conflict(err.to_string())
-        }
+        RemovalError::NotRetiring { .. }
+        | RemovalError::LinkedFromEndpoint { .. }
+        | RemovalError::MissingCapability { .. } => StoreError::Conflict(err.to_string()),
     }
 }
 

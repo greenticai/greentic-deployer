@@ -119,7 +119,14 @@ fn snapshot_locked(store: &LocalFsStore, env_id: &EnvId) -> Result<SnapshotId, S
     // for the same DID key is a no-op, so there is nothing to roll back.
     // Capturing it would let a rollback silently resurrect a signing key
     // that `op trust-root remove` revoked between snapshot and restore.
-    let top_level = &["environment.json", "runtime.json", "runtime-config.json"];
+    // `env-apply-ownership.json` rides along so a restored env and its prune
+    // ownership never disagree.
+    let top_level = &[
+        "environment.json",
+        "runtime.json",
+        "runtime-config.json",
+        "env-apply-ownership.json",
+    ];
     for rel in top_level {
         capture_file(&env_dir, rel, &snap_dir, &mut manifest_files)?;
     }
