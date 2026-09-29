@@ -8,6 +8,7 @@ use serde_json::json;
 use super::*;
 use crate::env_packs::deployer::conformance::build_fixture_env;
 use crate::env_packs::gcp_cloudrun::deploy_target::InMemoryCloudRun;
+use crate::env_packs::gcp_cloudrun::redis_secret::redis_url_secret_name;
 use crate::env_packs::gcp_cloudrun::shared_state::{
     GeneratedSecretSeed, SESSION_BACKEND_ENV, STATE_BACKEND_ENV, VpcEgress,
 };
@@ -120,15 +121,30 @@ async fn redis_is_selected_and_its_url_staged_as_one_secret_version() {
     let secret_env = target.service_secret_env_for(dep).expect("service");
     let names: Vec<&str> = secret_env.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, REDIS_URL_ENV_NAMES.to_vec());
-    let secret_name = environment_secret_name(&GcpCloudRunParams::for_env(&env).secret_prefix);
-    assert!(secret_env.iter().all(|s| s.secret_name == secret_name));
+    // Its OWN env-owned secret, never the seed secret (so a superseded
+    // password can be destroyed without touching live seed versions).
+    let prefix = GcpCloudRunParams::for_env(&env).secret_prefix;
+    let redis_secret = redis_url_secret_name(&prefix);
+    assert!(secret_env.iter().all(|s| s.secret_name == redis_secret));
     let versions: std::collections::BTreeSet<&str> =
         secret_env.iter().map(|s| s.version.as_str()).collect();
     assert_eq!(versions.len(), 1, "both names read ONE pinned version");
+    assert_eq!(target.secrets()[&redis_secret].payload, URL.as_bytes());
     assert_eq!(
-        target.secrets()[&secret_name].payload,
+        target.secrets()[&redis_secret].owner,
+        Some(env_owner_stamp(env.environment_id.as_str()))
+    );
+    let runtime_sa =
+        GcpCloudRunParams::for_env(&env).runtime_service_account(env.environment_id.as_str());
+    assert_eq!(
+        target.secret_accessors_for(&redis_secret),
+        Some(vec![runtime_sa])
+    );
+    let seed = environment_secret_name(&prefix);
+    assert_ne!(
+        target.secrets()[&seed].payload,
         URL.as_bytes(),
-        "the last staged version is the URL"
+        "the seed secret never carries the URL"
     );
 
     assert_eq!(
@@ -226,4 +242,136 @@ async fn multi_instance_warms_with_the_store_and_a_complete_seed() {
         .await
         .expect("warm");
     assert_eq!(target.services().len(), 1);
+}
+
+/// Warm `revisions[i]` of the fixture with `url` (single instance).
+async fn warm_with(
+    handler: &GcpCloudRunDeployerHandler,
+    env: &Environment,
+    i: usize,
+    url: &str,
+) -> Result<WarmOutcome, DeployerError> {
+    let answers = json!({"redis_url": url, "vpc_connector": "c"});
+    handler
+        .warm_revision(env, env.revisions[i].revision_id, Some(&answers))
+        .await
+}
+
+/// `(enabled, destroyed)` per version of the env's Redis URL secret.
+fn redis_states(target: &InMemoryCloudRun, env: &Environment) -> Vec<(bool, bool)> {
+    let name = redis_url_secret_name(&GcpCloudRunParams::for_env(env).secret_prefix);
+    target
+        .secret_versions_of(&name)
+        .iter()
+        .map(|v| (v.enabled, v.destroyed))
+        .collect()
+}
+
+const URL_B: &str = "redis://:rotated-once@10.0.0.3:6379";
+const URL_C: &str = "redis://:rotated-twice@10.0.0.3:6379";
+
+#[tokio::test]
+async fn an_unchanged_url_reuses_its_version_and_prunes_nothing() {
+    let (handler, target) = handler();
+    let env = build_fixture_env();
+    warm_with(&handler, &env, 0, URL).await.expect("warm 0");
+    warm_with(&handler, &env, 1, URL).await.expect("warm 1");
+    warm_with(&handler, &env, 2, URL).await.expect("warm 2");
+    assert_eq!(redis_states(&target, &env), vec![(true, false)]);
+    let pinned: std::collections::BTreeSet<String> = env
+        .bundles
+        .iter()
+        .take(2)
+        .flat_map(|b| target.service_secret_env_for(b.deployment_id).expect("svc"))
+        .map(|s| s.version)
+        .collect();
+    assert_eq!(pinned.len(), 1, "every deployment shares the one version");
+}
+
+#[tokio::test]
+async fn a_changed_url_keeps_the_previous_version_and_destroys_older_ones() {
+    let (handler, target) = handler();
+    let env = build_fixture_env();
+    let seed = environment_secret_name(&GcpCloudRunParams::for_env(&env).secret_prefix);
+    warm_with(&handler, &env, 0, URL).await.expect("warm A");
+    warm_with(&handler, &env, 1, URL_B).await.expect("warm B");
+    // B is new: A is the immediately previous version and must survive.
+    assert_eq!(
+        redis_states(&target, &env),
+        vec![(true, false), (true, false)]
+    );
+    let seed_versions = target.secret_versions_of(&seed);
+
+    warm_with(&handler, &env, 2, URL_C).await.expect("warm C");
+    // C is new: B stays (previous), A (older) is disabled + destroyed.
+    assert_eq!(
+        redis_states(&target, &env),
+        vec![(false, true), (true, false), (true, false)]
+    );
+    // The seed secret is never pruned.
+    assert!(
+        target
+            .secret_versions_of(&seed)
+            .iter()
+            .all(|v| v.enabled && !v.destroyed)
+    );
+    assert!(target.secret_versions_of(&seed).len() > seed_versions.len());
+
+    // Reverting to B reuses B: nothing minted, nothing destroyed.
+    let mut env2 = env.clone();
+    env2.revisions[0].revision_id = greentic_deploy_spec::RevisionId::new();
+    warm_with(&handler, &env2, 0, URL_B)
+        .await
+        .expect("revert to B");
+    assert_eq!(
+        redis_states(&target, &env),
+        vec![(false, true), (true, false), (true, false)]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_prune_leaves_the_versions_and_the_deploy_succeeds() {
+    let (handler, target) = handler();
+    let env = build_fixture_env();
+    target.deny_version_destroy();
+    warm_with(&handler, &env, 0, URL).await.expect("warm A");
+    warm_with(&handler, &env, 1, URL_B).await.expect("warm B");
+    warm_with(&handler, &env, 2, URL_C)
+        .await
+        .expect("deploy still succeeds");
+    assert_eq!(redis_states(&target, &env), vec![(true, false); 3]);
+}
+
+#[tokio::test]
+async fn without_versions_list_reuse_falls_back_to_latest_and_nothing_is_pruned() {
+    let (handler, target) = handler();
+    let env = build_fixture_env();
+    target.deny_version_list();
+    warm_with(&handler, &env, 0, URL).await.expect("warm A");
+    warm_with(&handler, &env, 1, URL)
+        .await
+        .expect("same URL reuses latest");
+    assert_eq!(redis_states(&target, &env), vec![(true, false)]);
+    warm_with(&handler, &env, 2, URL_B).await.expect("warm B");
+    assert_eq!(
+        redis_states(&target, &env),
+        vec![(true, false), (true, false)]
+    );
+}
+
+#[tokio::test]
+async fn a_redis_secret_this_env_did_not_stamp_is_never_written() {
+    for owner in [Some("someone-else"), None] {
+        let (handler, target) = handler();
+        let env = build_fixture_env();
+        let name = redis_url_secret_name(&GcpCloudRunParams::for_env(&env).secret_prefix);
+        target.seed_secret(&name, owner);
+        let err = warm_with(&handler, &env, 0, URL)
+            .await
+            .expect_err("refused");
+        assert!(err.to_string().contains(&name), "{err}");
+        assert!(!err.to_string().contains("s3cret-auth"), "{err}");
+        assert_eq!(target.secrets()[&name].versions, 1, "nothing added");
+        assert!(target.secret_accessors_for(&name).is_none(), "no grant");
+    }
 }

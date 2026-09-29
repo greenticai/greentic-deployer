@@ -24,6 +24,7 @@ failure.
 | `bootstrap.rs` | 414 | Renders the minimum-privilege Terraform module (deployer SA, runtime SA, custom role). |
 | `bound_session.rs` | 261 | Resolves the env's bound credential material into live `Credentials`. |
 | `shared_state.rs` | ~450 | Redis + VPC answers, the `multi_instance_safe` capability and the multi-instance `gate`. |
+| `redis_secret.rs` | ~230 | The Redis URL's own env-owned secret: reuse an unchanged value, prune superseded versions after a ready warm. |
 | `sor/` | ~1100 | SoR units (SoRLa phase 3E): the SorServiceTarget seam + fake, pure builders, bring-up/retire, the real target. |
 
 Feature gating is two-tier and deliberate:
@@ -293,7 +294,21 @@ Not gaps to fix casually — each has a reason:
   - **Sessions + flow state** — `redis_url` makes `runtime_boot_env` add
     `GREENTIC_RUNNER_SESSION_BACKEND=redis` / `GREENTIC_RUNNER_STATE_BACKEND=redis`,
     and the URL rides as `GREENTIC_RUNNER_REDIS_URL` from one pinned version of
-    the env secret (owner-guarded, accessor-granted like the telemetry header).
+    its OWN env-owned secret, `<secret_prefix>-redis-url` (owner-guarded — an
+    existing one stamped by another env or by nobody is refused —
+    accessor-granted). An unchanged URL reuses the newest enabled version that
+    already holds it, so all deployments share one version. A NEW value mints
+    a version, and once that warm's revision is ready (after the invoker grant)
+    every enabled version older than the immediately previous one is disabled
+    and destroyed: the previous one stays because the revisions still serving
+    (a warm adds its revision at 0 %) and a rollback pin it. Destroy/list are
+    optional permissions (`SECRET_VERSION_PRUNE_PERMISSIONS`, granted by the
+    bootstrap role, not preflighted); without them the old versions stay and
+    the warm only warns. A deployment not re-warmed across two URL changes pins
+    a destroyed version — accepted, since that value was superseded twice. The
+    seed secret is never pruned; URL versions PD4 staged there before this
+    stay until `op env destroy`, which also deletes the Redis URL secret (only
+    when this env stamped it).
   - **Revision pins** — the same version also feeds
     `GREENTIC_REVISION_PIN_REDIS_URL`.
   - **Generated secrets** — greentic-start's `revision_secrets` mints a missing
