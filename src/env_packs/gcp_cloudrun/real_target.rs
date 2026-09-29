@@ -626,13 +626,17 @@ fn build_env_vars(spec: &ServiceSpec) -> Vec<run::EnvVar> {
 
 /// Scale-to-zero rendered explicitly (plan D5): `min_instance_count = 0`,
 /// `cpu_idle = true` (request-based billing), `startup_cpu_boost = true`.
+///
+/// `cpu_always_allocated` (the answer of the same name) flips `cpu_idle` to
+/// `false` — instance-based billing — so in-process background work such as
+/// greentic-start's cron loop keeps CPU between requests.
 fn build_resources(spec: &ServiceSpec) -> run::ResourceRequirements {
     run::ResourceRequirements::new()
         .set_limits([
             ("cpu".to_string(), spec.scaling.cpu.clone()),
             ("memory".to_string(), spec.scaling.memory.clone()),
         ])
-        .set_cpu_idle(true)
+        .set_cpu_idle(!spec.scaling.cpu_always_allocated)
         .set_startup_cpu_boost(true)
 }
 
@@ -964,6 +968,7 @@ mod tests {
                 min_instances: 0,
                 max_instances: 1,
                 concurrency: 80,
+                cpu_always_allocated: false,
             },
             access_mode: AccessMode::Public,
             session_affinity: true,
@@ -1100,6 +1105,40 @@ mod tests {
             msg.labels.get(MANAGED_LABEL_KEY).map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn cpu_always_allocated_flips_cpu_idle_and_nothing_else() {
+        let default = build_service_message(&spec(Vec::new(), Vec::new()), None);
+        let mut on_spec = spec(Vec::new(), Vec::new());
+        on_spec.scaling.cpu_always_allocated = true;
+        let on = build_service_message(&on_spec, None);
+
+        let resources = |svc: &run::Service| {
+            svc.template.as_ref().expect("template").containers[0]
+                .resources
+                .clone()
+                .expect("resources set")
+        };
+        assert!(
+            resources(&default).cpu_idle,
+            "default keeps request-based billing"
+        );
+        assert!(!resources(&on).cpu_idle, "answer keeps CPU allocated");
+        assert!(resources(&on).startup_cpu_boost);
+
+        // Everything but `cpu_idle` renders identically.
+        let mut on_normalised = on.clone();
+        on_normalised
+            .template
+            .as_mut()
+            .expect("template")
+            .containers[0]
+            .resources
+            .as_mut()
+            .expect("resources")
+            .cpu_idle = true;
+        assert_eq!(on_normalised, default);
     }
 
     #[test]

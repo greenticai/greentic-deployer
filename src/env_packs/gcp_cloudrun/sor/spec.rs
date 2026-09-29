@@ -61,6 +61,9 @@ pub fn sor_scaling() -> ScalingSpec {
         min_instances: 0,
         max_instances: 1,
         concurrency: 80,
+        // SoR services keep request-based billing; `sor/real.rs` renders
+        // `cpu_idle = true` itself and never reads this field.
+        cpu_always_allocated: false,
     }
 }
 

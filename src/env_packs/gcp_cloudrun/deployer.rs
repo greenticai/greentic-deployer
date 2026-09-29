@@ -141,6 +141,13 @@ pub struct GcpCloudRunParams {
     pub max_instances: u32,
     pub min_instances: u32,
     pub concurrency: u32,
+    /// `cpu_always_allocated`: keep CPU allocated between requests
+    /// (`cpu_idle = false`, instance-based billing). Default `false` renders
+    /// the Service and the revision intent byte for byte as before the answer
+    /// existed. Needed for a cron-triggered worker, together with
+    /// `min_instances >= 1`: greentic-start's cron loop runs in-process and is
+    /// starved while CPU is throttled.
+    pub cpu_always_allocated: bool,
     /// Telemetry profile (`telemetry_env` / `telemetry_headers`). Empty by
     /// default, which leaves the boot env and the revision intent unchanged.
     pub telemetry: TelemetryAnswers,
@@ -178,6 +185,7 @@ impl GcpCloudRunParams {
             max_instances: 1,
             min_instances: 0,
             concurrency: 80,
+            cpu_always_allocated: false,
             telemetry: TelemetryAnswers::default(),
             shared_state: SharedState::default(),
         }
@@ -221,6 +229,7 @@ impl GcpCloudRunParams {
                 "max_instances" => params.max_instances = parse_u32(key, value)?,
                 "min_instances" => params.min_instances = parse_u32(key, value)?,
                 "concurrency" => params.concurrency = parse_u32(key, value)?,
+                "cpu_always_allocated" => params.cpu_always_allocated = parse_bool(key, value)?,
                 telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
                 telemetry_answers::TELEMETRY_HEADERS_KEY => telemetry_headers = Some(value),
                 other => return Err(GcpCloudRunParamsError::UnknownKey(other.to_string())),
@@ -259,6 +268,7 @@ impl GcpCloudRunParams {
             min_instances: self.min_instances,
             max_instances: self.max_instances,
             concurrency: self.concurrency,
+            cpu_always_allocated: self.cpu_always_allocated,
         }
     }
 
@@ -536,6 +546,27 @@ fn parse_u32(key: &str, value: &Value) -> Result<u32, GcpCloudRunParamsError> {
         })
 }
 
+fn parse_bool(key: &str, value: &Value) -> Result<bool, GcpCloudRunParamsError> {
+    // Accept a JSON bool and the flat-string form qa-spec answers arrive in.
+    if let Some(b) = value.as_bool() {
+        return Ok(b);
+    }
+    let s = value
+        .as_str()
+        .ok_or_else(|| GcpCloudRunParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{value}` is not a boolean (`true` | `false`)"),
+        })?;
+    match s.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(GcpCloudRunParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{other}` is not one of `true` | `false`"),
+        }),
+    }
+}
+
 fn parse_access_mode(key: &str, value: &Value) -> Result<AccessMode, GcpCloudRunParamsError> {
     match answer_string(key, value)?.as_str() {
         "public" => Ok(AccessMode::Public),
@@ -636,6 +667,12 @@ fn revision_intent(
     field(&scaling.min_instances.to_le_bytes());
     field(&scaling.max_instances.to_le_bytes());
     field(&scaling.concurrency.to_le_bytes());
+    // Hashed ONLY when set: an env that never answers `cpu_always_allocated`
+    // (or answers `false`) keeps the fingerprint its revisions were stamped
+    // with, so the new answer rolls no existing deployment.
+    if scaling.cpu_always_allocated {
+        field(b"cpu-always-allocated");
+    }
     field(&[u8::from(session_affinity)]);
     field(secret_name.as_bytes());
     for (key, value) in boot_env {
@@ -1315,6 +1352,10 @@ impl GcpCloudRunDeployerHandler {
 #[cfg(test)]
 #[path = "deployer_shared_state_tests.rs"]
 mod shared_state_warm_tests;
+
+#[cfg(test)]
+#[path = "deployer_cpu_tests.rs"]
+mod cpu_always_allocated_tests;
 
 #[cfg(test)]
 mod tests {

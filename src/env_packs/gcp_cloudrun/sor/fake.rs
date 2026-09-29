@@ -252,6 +252,7 @@ mod tests {
                 min_instances: 0,
                 max_instances: 1,
                 concurrency: 80,
+                cpu_always_allocated: false,
             },
             health_path: "/healthz".into(),
             labels: SorServiceLabels {

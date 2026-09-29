@@ -182,6 +182,22 @@ questions:
     constraint:
       pattern: '^[0-9]+$'
 
+  - id: cpu_always_allocated
+    type: string
+    title: Keep CPU allocated between requests
+    description: >-
+      `false` (the default) throttles CPU outside request handling
+      (request-based billing). `true` keeps CPU allocated for the instance's
+      whole lifetime (instance-based billing) and COSTS MONEY while an
+      instance is up. Required for a worker with cron triggers, together with
+      `min_instances` of at least 1: greentic-start runs its cron loop
+      in-process, and a throttled instance never fires it. Changing it rolls a
+      new revision.
+    required: false
+    default_value: "false"
+    constraint:
+      pattern: '^(true|false)$'
+
   - id: redis_url
     type: string
     title: Shared session store (Redis URL, optional)
