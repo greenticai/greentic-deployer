@@ -11,9 +11,10 @@
 //! `op traffic set`.
 //!
 //! Everything that can refuse does so before any mutation, the upsert half
-//! included: `--prune` without `--confirm-prune`, a bound deployer without
-//! the `remove` capability, and a messaging endpoint that the WHOLE retire
-//! set would strand. Prune itself runs only after the upsert half executed
+//! included: `--prune` without `--confirm-prune`, a bound deployer whose
+//! adapter capabilities lack `remove` or `drain` (typed `capability-missing`;
+//! prune never forces past a drain), and a messaging endpoint that the WHOLE
+//! retire set would strand. Prune itself runs only after the upsert half executed
 //! and verified.
 
 use std::collections::BTreeSet;

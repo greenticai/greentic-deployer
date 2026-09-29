@@ -19,11 +19,16 @@
 //!    archived (it is idempotent provider-side).
 //! 4. **remove** — drop the deployment (and its archived revisions).
 //!
-//! Before step 1 the retire refuses (`MissingCapability`, capability
-//! `remove`) when a deployer IS bound but cannot tear revisions down —
-//! removing the record could orphan a running workload. `--store-only` skips
-//! both provider hooks and that refusal, for an env whose provider is gone
-//! for good; whatever it left running is `op env sweep`'s to find.
+//! Before step 1 — before the store is touched — the retire refuses with the
+//! typed `capability-missing` error when a deployer IS bound but its
+//! [`AdapterCapabilities`] lack `remove` (removing the record could orphan a
+//! running workload), or lack `drain` without `--force-drain`. The flags are
+//! the adapter's own (P5-R3), so AWS-ECS, which declares none, is refused by
+//! name. `--store-only` skips both provider hooks and that refusal, for an env
+//! whose provider is gone for good; whatever it left running is
+//! `op env sweep`'s to find.
+//!
+//! [`AdapterCapabilities`]: crate::env_packs::deployer::AdapterCapabilities
 //!
 //! Data is not destroyed: retire removes serving resources, never tenant
 //! state (destroying data is its own workflow).
@@ -33,6 +38,7 @@ use greentic_deploy_spec::{DeploymentId, EnvId, Environment, IdempotencyKey, Rev
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::env_packs::deployer::Capability;
 use crate::environment::{EnvironmentStore, LocalFsStore};
 
 use super::env::{ProviderStep, RevisionVerb, provider_revision_step};
@@ -121,6 +127,15 @@ impl ProviderHooks<'_> {
             Err(OpError::NotDrained { reason, .. }) if self.force_drain => Ok(
                 HookResult::Unavailable(format!("not drained, forced past: {reason}")),
             ),
+            // `--force-drain` on an adapter that cannot confirm a drain at
+            // all: the same "cannot confirm, forced past" as `NotDrained`.
+            Err(OpError::CapabilityMissing(missing))
+                if self.force_drain && missing.capability == Capability::Drain =>
+            {
+                Ok(HookResult::Unavailable(format!(
+                    "not drained, forced past: {missing}"
+                )))
+            }
             Err(e) => Err(e),
         }
     }
@@ -128,7 +143,9 @@ impl ProviderHooks<'_> {
 
 impl RetireHooks for ProviderHooks<'_> {
     fn preflight(&self, env: &Environment) -> Result<(), OpError> {
-        super::env::deployer_supports_remove(env).map(|_| ())
+        // `remove` always; `drain` unless `--force-drain` accepts a teardown
+        // the adapter cannot confirm drained.
+        super::env::deployer_supports_remove(env, self.registry, !self.force_drain).map(|_| ())
     }
     fn drain(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError> {
         self.run(env_id, revision_id, RevisionVerb::Drain)

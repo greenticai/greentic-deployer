@@ -1371,26 +1371,35 @@ pub(crate) enum ProviderStep {
     Unavailable(String),
 }
 
-/// Refuse up front when the env's BOUND deployer has no live single-revision
-/// teardown path (P5-R3 `remove` capability): removing a store record it
-/// cannot tear down could orphan a running workload. `Ok(false)` = no
-/// deployer bound (nothing provider-side to act on); `Ok(true)` = capable.
-pub(crate) fn deployer_supports_remove(env: &Environment) -> Result<bool, OpError> {
+/// Refuse up front when the env's BOUND deployer lacks a capability a
+/// provider-side removal needs (P5-R3): `remove` always — removing a store
+/// record the adapter cannot tear down could orphan a running workload — and
+/// `drain` when `needs_drain` (the removal confirms each revision drained
+/// before tearing it down). The refusal is the typed
+/// [`OpError::CapabilityMissing`], naming the adapter and the capability, and
+/// is read off the adapter's own [`Deployer::capabilities`] rather than a
+/// list of kinds here.
+///
+/// `Ok(false)` = no deployer bound (nothing provider-side to act on);
+/// `Ok(true)` = capable.
+///
+/// [`Deployer::capabilities`]: crate::env_packs::deployer::Deployer::capabilities
+pub(crate) fn deployer_supports_remove(
+    env: &Environment,
+    registry: &crate::env_packs::EnvPackRegistry,
+    needs_drain: bool,
+) -> Result<bool, OpError> {
+    use crate::env_packs::deployer::Capability;
     let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
         return Ok(false);
     };
     let descriptor = &binding.kind;
-    let is_k8s = descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
-    if is_k8s || is_aws_ecs_kind(descriptor) || is_cloudrun_kind(descriptor) {
-        return Ok(true);
+    let capabilities = super::env_drain::deployer_of(registry, descriptor)?.capabilities();
+    capabilities.require(descriptor.path(), Capability::Remove)?;
+    if needs_drain {
+        capabilities.require(descriptor.path(), Capability::Drain)?;
     }
-    Err(OpError::Conflict(
-        greentic_deploy_spec::RemovalError::MissingCapability {
-            deployer: descriptor.path().to_string(),
-            capability: "remove".to_string(),
-        }
-        .to_string(),
-    ))
+    Ok(true)
 }
 
 /// Drive ONE revision's provider-side `Deployer` verb through the env's
@@ -1407,7 +1416,7 @@ pub(crate) fn provider_revision_step(
     force_drain: bool,
 ) -> Result<ProviderStep, OpError> {
     let env = store.load(env_id)?;
-    if !deployer_supports_remove(&env)? {
+    if !deployer_supports_remove(&env, registry, verb == RevisionVerb::Drain)? {
         return Ok(ProviderStep::Unavailable(
             "env has no deployer binding".to_string(),
         ));

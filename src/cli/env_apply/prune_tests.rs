@@ -308,3 +308,43 @@ fn a_stranded_endpoint_refuses_the_whole_prune_before_the_upsert() {
         "nothing applied"
     );
 }
+
+/// P5-R3: a bound deployer whose adapter lacks `remove` (local-process
+/// declares no capabilities) refuses the prune by capability name before the
+/// upsert half runs — the store is untouched.
+#[test]
+fn a_deployer_without_remove_refuses_the_prune_before_anything_runs() {
+    let (dir, store) = seeded();
+    run(
+        &store,
+        &manifest(dir.path(), &["alpha", "beta"]),
+        ApplyMode::Apply,
+        false,
+        false,
+    )
+    .expect("apply");
+    let mut env = store.load(&env_id()).expect("load");
+    env.packs.push(crate::cli::tests_common::make_binding(
+        greentic_deploy_spec::CapabilitySlot::Deployer,
+        "greentic.deployer.local-process@0.1.0",
+    ));
+    store.save(&env).expect("save");
+    let before = store.load(&env_id()).expect("load");
+    let err = run(
+        &store,
+        &manifest(dir.path(), &["alpha", "delta"]),
+        ApplyMode::Apply,
+        true,
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), "capability-missing", "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("greentic.deployer.local-process"), "{msg}");
+    assert!(msg.contains("lacks capability `remove`"), "{msg}");
+    assert_eq!(
+        store.load(&env_id()).expect("load"),
+        before,
+        "nothing applied, nothing pruned"
+    );
+}
