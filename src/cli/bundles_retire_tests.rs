@@ -193,8 +193,10 @@ fn a_bound_deployer_that_cannot_tear_down_refuses_before_touching_anything() {
         force_drain: false,
     };
     let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
-    assert_eq!(err.kind(), "conflict", "{err}");
-    assert!(err.to_string().contains("`remove` capability"), "{err}");
+    assert_eq!(err.kind(), "capability-missing", "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("greentic.deployer.local-process"), "{msg}");
+    assert!(msg.contains("lacks capability `remove`"), "{msg}");
     assert_eq!(load(&store), before, "nothing mutated");
 
     let mut store_only = payload("acme");
@@ -202,6 +204,88 @@ fn a_bound_deployer_that_cannot_tear_down_refuses_before_touching_anything() {
     let out = retire(&store, &registry, &OpFlags::default(), Some(store_only))
         .expect("--store-only accepts the risk explicitly");
     assert_eq!(out.result["state"], "retired");
+}
+
+/// Bind `kind` as the env's deployer.
+fn bind_deployer(store: &LocalFsStore, kind: &str) {
+    let mut env = load(store);
+    env.packs.push(make_binding(CapabilitySlot::Deployer, kind));
+    store.save(&env).expect("save");
+}
+
+/// P5-R3: AWS-ECS declares no capabilities, so a retire is refused by the
+/// capability's name before anything moves — `--force-drain` included, since
+/// it relaxes the drain confirmation, never the teardown.
+#[cfg(feature = "creds-aws")]
+#[test]
+fn an_aws_ecs_env_is_refused_by_capability_name_before_touching_anything() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    seed(&store);
+    bind_deployer(&store, "greentic.deployer.aws-ecs@1.0.0");
+    let before = load(&store);
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    for force_drain in [false, true] {
+        let hooks = ProviderHooks {
+            store: &store,
+            registry: &registry,
+            force_drain,
+        };
+        let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
+        assert_eq!(err.kind(), "capability-missing", "{err}");
+        match &err {
+            OpError::CapabilityMissing(missing) => {
+                assert_eq!(missing.adapter, "greentic.deployer.aws-ecs");
+                assert_eq!(missing.capability, Capability::Remove);
+            }
+            other => panic!("expected CapabilityMissing, got {other:?}"),
+        }
+        assert_eq!(
+            load(&store),
+            before,
+            "nothing mutated (force_drain={force_drain})"
+        );
+    }
+}
+
+/// K8s and Cloud Run declare `remove` and `drain`: the preflight lets them
+/// through, with or without `--force-drain`, and leaves the store alone.
+#[test]
+fn adapters_declaring_remove_and_drain_pass_the_preflight() {
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let mut kinds = vec!["greentic.deployer.k8s@1.0.0"];
+    if cfg!(feature = "creds-gcp") {
+        kinds.push("greentic.deployer.gcp-cloudrun@1.0.0");
+    }
+    for kind in kinds {
+        let dir = tempdir().expect("tempdir");
+        let store = LocalFsStore::new(dir.path());
+        seed(&store);
+        bind_deployer(&store, kind);
+        let env = load(&store);
+        for force_drain in [false, true] {
+            let hooks = ProviderHooks {
+                store: &store,
+                registry: &registry,
+                force_drain,
+            };
+            hooks
+                .preflight(&env)
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert!(
+                crate::cli::env::deployer_supports_remove(&env, &registry, !force_drain)
+                    .unwrap_or_else(|e| panic!("{kind}: {e}"))
+            );
+        }
+        assert_eq!(load(&store), env, "{kind}: preflight mutates nothing");
+    }
+}
+
+#[test]
+fn no_deployer_binding_is_not_a_capability_refusal() {
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let env = make_env("local");
+    assert!(!crate::cli::env::deployer_supports_remove(&env, &registry, true).expect("ok"));
 }
 
 #[test]

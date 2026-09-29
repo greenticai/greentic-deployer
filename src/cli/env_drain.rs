@@ -85,7 +85,7 @@ fn load_env(store: &LocalFsStore, env_id: &str) -> Result<(EnvId, Environment), 
     Ok((env_id, env))
 }
 
-fn deployer_of<'r>(
+pub(crate) fn deployer_of<'r>(
     registry: &'r EnvPackRegistry,
     descriptor: &PackDescriptor,
 ) -> Result<&'r dyn Deployer, OpError> {
