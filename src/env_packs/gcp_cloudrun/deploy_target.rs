@@ -61,6 +61,13 @@ pub struct ScalingSpec {
     pub min_instances: u32,
     pub max_instances: u32,
     pub concurrency: u32,
+    /// Keep CPU allocated outside request handling (Cloud Run "instance-based
+    /// billing", `cpu_idle = false`). `false` — the default — renders
+    /// `cpu_idle = true`, i.e. request-based billing with CPU throttled
+    /// between requests. greentic-start runs cron triggers in an in-process
+    /// tokio loop, which never gets CPU while throttled, so a cron-triggered
+    /// worker needs this `true` AND `min_instances >= 1` to fire.
+    pub cpu_always_allocated: bool,
 }
 
 /// Identity of a Cloud Run Service for reads/deletes (no desired state).
@@ -1001,6 +1008,7 @@ mod tests {
                 min_instances: 0,
                 max_instances: 1,
                 concurrency: 80,
+                cpu_always_allocated: false,
             },
             access_mode: AccessMode::Public,
             session_affinity: true,

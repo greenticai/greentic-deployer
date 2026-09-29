@@ -622,6 +622,12 @@ re-copies the seed from the mounted secret. Set `min_instances: 1` to trade the
 cold start for a standing compute bill — that is a deliberate choice against the
 reason you are here.
 
+**Cron triggers need more than a warm instance.** CPU is throttled outside
+request handling by default, and greentic-start runs cron triggers in an
+in-process loop, so a warm-but-idle instance never fires them. A worker with
+cron triggers needs `min_instances: 1` **and** `cpu_always_allocated: true`
+(§9), which bills compute around the clock.
+
 ---
 
 ## 9. Configuration reference
@@ -644,6 +650,7 @@ in the manifest or via `answers_ref`:
 | `max_instances` | no | `"1"` | Anything but `1` (including `0`, Cloud Run's default ceiling) is **refused** unless `redis_url` + a VPC route are answered and the env stages a dev-store seed — see §10. |
 | `min_instances` | no | `"0"` | `0` = scale to zero. Raising it forfeits zero idle cost. |
 | `concurrency` | no | `"80"` | Requests per instance. |
+| `cpu_always_allocated` | no | `"false"` | `false` renders `cpu_idle = true` (request-based billing, CPU throttled between requests). `true` renders `cpu_idle = false` (instance-based billing) and bills for every second an instance is up. **Required for cron triggers**, together with `min_instances: 1`: greentic-start runs cron in an in-process tokio loop that never gets CPU while throttled, so `min_instances` alone does not make a cron fire. Accepts a JSON bool or `"true"`/`"false"`. Hashed into `revision_intent` only when `true`, so leaving it unset (or `false`) rolls no existing deployment. |
 | `telemetry_env` | no | *(unset)* | Plain telemetry env vars (`OTLP_ENDPOINT`, `OTEL_*`, `GREENTIC_TELEMETRY_*`, …), exact-name allow-listed, appended to the boot env sorted with `greentic.role=worker` set on `OTEL_RESOURCE_ATTRIBUTES`. Boot env and `revision_intent` are unchanged from before this key existed only when **neither** `telemetry_env` nor `telemetry_headers` is answered — answering either one on its own still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=worker` to the boot env (and so to `revision_intent`'s boot-env hash). |
 | `telemetry_headers` | no | *(unset)* | The OTLP header credential. Staged as another version of the environment secret and referenced as `OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS` via `secretKeyRef` — never a literal. `revision_intent` hashes only the secret-sourced env var NAMES, never the secret version or value; a header change is a deployer-answers change, which `op env apply` (#603) rolls into a new revision. Answering this alone (with `telemetry_env` unset) still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=worker` to the boot env — see `telemetry_env` above. |
 | `redis_url` | no | *(unset)* | Memorystore for Redis with AUTH over the private VPC, `redis://:<auth>@<private-ip>:6379`. Selects `GREENTIC_RUNNER_SESSION_BACKEND=redis` + `GREENTIC_RUNNER_STATE_BACKEND=redis`; the URL itself is staged as another version of the environment secret and referenced as `GREENTIC_RUNNER_REDIS_URL` / `GREENTIC_REVISION_PIN_REDIS_URL` via `secretKeyRef` — never a literal, never logged. **`rediss://` is refused** (greentic-start trusts public web roots only; Memorystore TLS uses a Google-private CA). Requires a VPC route. Changing it (a rotated AUTH string) is a deployer-answers change, which `op env apply` rolls into a new revision — the intent hashes the env-var NAMES only, so re-warming the SAME revision id keeps the old URL. Superseded secret versions are not destroyed. |
