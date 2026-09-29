@@ -1926,6 +1926,9 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
         // The env-level seed secrets warm staged (plan D6) are per-env, not
         // per-deployment — delete them once, after the Services.
         let secret_name = environment_secret_name(&params.secret_prefix);
+        let redis_secret = crate::env_packs::gcp_cloudrun::redis_secret::redis_url_secret_name(
+            &params.secret_prefix,
+        );
         let env_id = ctx.env_id.as_str().to_string();
         let sor_credentials = credentials.clone();
 
@@ -1960,7 +1963,7 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
                 .await
                 .map_err(|e| StoreError::ProviderTeardown(e.to_string()))?;
             // Deleted or skipped, never both.
-            let (deleted_secrets, skipped_secrets) = match ownership {
+            let (mut deleted_secrets, mut skipped_secrets) = match ownership {
                 SecretOwnership::Conflict { owner } => (
                     vec![],
                     vec![json!({
@@ -1978,6 +1981,32 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
                     (vec![secret_name], vec![])
                 }
             };
+            // The Redis URL's own secret: deleted only when THIS env stamped
+            // it (it post-dates ownership stamping, so an unstamped one is not
+            // ours); absent — the env never answered `redis_url` — adds nothing.
+            match secret_ownership(&target, &redis_secret, &env_id)
+                .await
+                .map_err(|e| StoreError::ProviderTeardown(e.to_string()))?
+            {
+                SecretOwnership::Absent => {}
+                SecretOwnership::Ours => {
+                    target.delete_secret(&redis_secret).await.map_err(|e| {
+                        StoreError::ProviderTeardown(format!(
+                            "deleting Secret Manager secret `{redis_secret}`: {e}"
+                        ))
+                    })?;
+                    deleted_secrets.push(redis_secret);
+                }
+                SecretOwnership::Conflict { owner } => skipped_secrets.push(json!({
+                    "secret": redis_secret,
+                    "owned_by": owner,
+                    "reason": "belongs to another environment; left intact",
+                })),
+                SecretOwnership::Legacy => skipped_secrets.push(json!({
+                    "secret": redis_secret,
+                    "reason": "carries no owner stamp, so this deployer did not create it; left intact",
+                })),
+            }
             Ok::<_, StoreError>((deleted, deleted_secrets, skipped_secrets))
         })?;
 

@@ -54,7 +54,7 @@ use ulid::Ulid;
 use super::bound_session::{GcpCredentialMaterial, ambient_adc_credentials};
 use super::deploy_target::{
     AccessMode, CloudRunTarget, CloudRunTargetError, EnsuredSecret, RevisionRef, RevisionStatus,
-    SecretVersion, ServiceRef, ServiceSpec, ServiceStatus, TrafficTarget,
+    SecretVersion, SecretVersionInfo, ServiceRef, ServiceSpec, ServiceStatus, TrafficTarget,
 };
 use super::deployer::{revision_name, service_name};
 use super::shared_state::{VpcAccess, VpcEgress, VpcTarget};
@@ -83,6 +83,8 @@ pub const REAL_CLOUDRUN_TARGET_IAM_PERMISSIONS: &[&str] = &[
     "secretmanager.secrets.get",
     "secretmanager.secrets.create",
     "secretmanager.versions.add",
+    // Read a staged Redis URL back to reuse an unchanged value (validated).
+    "secretmanager.versions.access",
     // Grant the runtime SA secretAccessor on each staged secret (get→set RMW),
     // and delete secrets on `op env destroy` teardown (D6).
     "secretmanager.secrets.getIamPolicy",
@@ -469,6 +471,91 @@ impl CloudRunTarget for RealCloudRunTarget {
             // Idempotent against an already-gone secret.
             Err(e) if is_not_found(&e) => Ok(()),
             Err(e) => Err(classify("delete_secret", &e)),
+        }
+    }
+
+    async fn list_secret_versions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<SecretVersionInfo>, CloudRunTargetError> {
+        let parent = self.secret_resource(name);
+        let mut out = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let page = self
+                .secrets
+                .list_secret_versions()
+                .set_parent(parent.clone())
+                .set_page_token(page_token)
+                .send()
+                .await
+                .map_err(|e| classify("list_secret_versions", &e))?;
+            out.extend(page.versions.iter().map(|v| SecretVersionInfo {
+                version: numeric_version_from(&v.name),
+                enabled: v.state == sm::secret_version::State::Enabled,
+            }));
+            if page.next_page_token.is_empty() {
+                return Ok(out);
+            }
+            page_token = page.next_page_token;
+        }
+    }
+
+    async fn access_secret_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(SecretVersion, Vec<u8>), CloudRunTargetError> {
+        let response = self
+            .secrets
+            .access_secret_version()
+            .set_name(format!("{}/versions/{version}", self.secret_resource(name)))
+            .send()
+            .await
+            .map_err(|e| classify("access_secret_version", &e))?;
+        let payload = response
+            .payload
+            .map(|p| p.data.to_vec())
+            .unwrap_or_default();
+        Ok((
+            SecretVersion {
+                version: numeric_version_from(&response.name),
+            },
+            payload,
+        ))
+    }
+
+    async fn destroy_secret_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(), CloudRunTargetError> {
+        let resource = format!("{}/versions/{version}", self.secret_resource(name));
+        // Disable first, so a destroy the credential may not hold still leaves
+        // the old credential unreadable. Already disabled/destroyed answers
+        // FAILED_PRECONDITION, and a gone version NOT_FOUND: both are done.
+        match self
+            .secrets
+            .disable_secret_version()
+            .set_name(resource.clone())
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if is_not_found(&e) => return Ok(()),
+            Err(e) if is_precondition(&e) => {}
+            Err(e) => return Err(classify("disable_secret_version", &e)),
+        }
+        match self
+            .secrets
+            .destroy_secret_version()
+            .set_name(resource)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if is_not_found(&e) || is_precondition(&e) => Ok(()),
+            Err(e) => Err(classify("destroy_secret_version", &e)),
         }
     }
 }

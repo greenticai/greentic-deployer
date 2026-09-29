@@ -100,12 +100,27 @@ pub const VALIDATED_GCP_PERMISSIONS: &[&str] = &[
 pub const VPC_EGRESS_PERMISSIONS: &[&str] =
     &["vpcaccess.connectors.use", "compute.subnetworks.use"];
 
+/// Permissions the Redis URL secret's reuse and prune use to list, disable and
+/// destroy superseded versions (the previous AUTH strings). Deliberately NOT in
+/// [`VALIDATED_GCP_PERMISSIONS`], for the same reason as
+/// [`VPC_EGRESS_PERMISSIONS`]: a credential bootstrapped before this existed
+/// must keep passing its preflight, and a deploy without them still succeeds —
+/// the stale versions are then left in place and the deploy warns. The
+/// bootstrap custom role always grants them ([`bootstrap_permissions`]).
+pub const SECRET_VERSION_PRUNE_PERMISSIONS: &[&str] = &[
+    "secretmanager.versions.list",
+    "secretmanager.versions.disable",
+    "secretmanager.versions.destroy",
+];
+
 /// Every permission the rendered bootstrap custom role grants: the validated
-/// surface plus [`VPC_EGRESS_PERMISSIONS`].
+/// surface plus [`VPC_EGRESS_PERMISSIONS`] and
+/// [`SECRET_VERSION_PRUNE_PERMISSIONS`].
 pub fn bootstrap_permissions() -> Vec<&'static str> {
     VALIDATED_GCP_PERMISSIONS
         .iter()
         .chain(VPC_EGRESS_PERMISSIONS)
+        .chain(SECRET_VERSION_PRUNE_PERMISSIONS)
         .copied()
         .collect()
 }

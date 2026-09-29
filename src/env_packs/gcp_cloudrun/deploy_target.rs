@@ -304,6 +304,25 @@ pub enum EnsuredSecret {
     Existed { owner: Option<String> },
 }
 
+/// One version of a Secret Manager secret, as
+/// [`CloudRunTarget::list_secret_versions`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretVersionInfo {
+    /// The numeric version id (never an alias).
+    pub version: String,
+    /// `true` for an ENABLED version; disabled and destroyed ones are `false`.
+    pub enabled: bool,
+}
+
+/// One version as [`InMemoryCloudRun`] keeps it (the fake's per-version view,
+/// beside [`StoredSecret`]'s latest-payload summary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeSecretVersion {
+    pub payload: Vec<u8>,
+    pub enabled: bool,
+    pub destroyed: bool,
+}
+
 /// One staged secret as [`InMemoryCloudRun`] holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSecret {
@@ -444,6 +463,31 @@ pub trait CloudRunTarget: std::fmt::Debug + Send + Sync {
     /// Delete a Secret Manager secret and all its versions. Idempotent against
     /// an absent secret. Used by the `op env destroy` teardown.
     async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError>;
+
+    /// Every version of `name` (all states), numeric ids. Needs
+    /// `secretmanager.versions.list`, which is OPTIONAL (not validated): the
+    /// only caller, the Redis URL secret's reuse/prune, degrades without it.
+    async fn list_secret_versions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<SecretVersionInfo>, CloudRunTargetError>;
+
+    /// The payload of `name`'s `version` (a numeric id, or `latest`), with the
+    /// numeric version it resolved to. Needs `secretmanager.versions.access`.
+    async fn access_secret_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(SecretVersion, Vec<u8>), CloudRunTargetError>;
+
+    /// Disable, then destroy, one version of `name`. Irreversible. Idempotent
+    /// against an already-destroyed or absent version. Needs
+    /// `secretmanager.versions.disable` + `.destroy`, both OPTIONAL.
+    async fn destroy_secret_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(), CloudRunTargetError>;
 }
 
 /// Default target: every verb fails with [`CloudRunTargetError::Unconfigured`]
@@ -526,6 +570,26 @@ impl CloudRunTarget for UnconfiguredCloudRunTarget {
     async fn delete_secret(&self, _name: &str) -> Result<(), CloudRunTargetError> {
         Err(CloudRunTargetError::Unconfigured)
     }
+    async fn list_secret_versions(
+        &self,
+        _name: &str,
+    ) -> Result<Vec<SecretVersionInfo>, CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
+    async fn access_secret_version(
+        &self,
+        _name: &str,
+        _version: &str,
+    ) -> Result<(SecretVersion, Vec<u8>), CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
+    async fn destroy_secret_version(
+        &self,
+        _name: &str,
+        _version: &str,
+    ) -> Result<(), CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
 }
 
 /// In-memory fake modelling Cloud Run's single-resource + etag semantics.
@@ -563,6 +627,14 @@ pub struct InMemoryCloudRun {
     /// deployer projects both seed files under one `/seed` volume.
     service_secrets: Mutex<BTreeMap<DeploymentId, Vec<SecretMount>>>,
     etag_counter: Mutex<u64>,
+    /// Every version of every secret, in order (version `n` at index `n - 1`).
+    secret_versions: Mutex<BTreeMap<String, Vec<FakeSecretVersion>>>,
+    /// When set, `list_secret_versions` fails — models a credential without
+    /// the optional `secretmanager.versions.list`.
+    deny_version_list: Mutex<bool>,
+    /// When set, `destroy_secret_version` fails — models a credential without
+    /// the optional `secretmanager.versions.disable` / `.destroy`.
+    deny_version_destroy: Mutex<bool>,
 }
 
 impl InMemoryCloudRun {
@@ -615,6 +687,31 @@ impl InMemoryCloudRun {
                 owner: owner.map(str::to_string),
             },
         );
+    }
+
+    /// Every version of `name`, oldest first (version `n` at index `n - 1`).
+    pub fn secret_versions_of(&self, name: &str) -> Vec<FakeSecretVersion> {
+        self.secret_versions
+            .lock()
+            .expect("secret-versions mutex")
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Make `list_secret_versions` fail (a credential lacking the optional
+    /// `secretmanager.versions.list`).
+    pub fn deny_version_list(&self) {
+        *self.deny_version_list.lock().expect("deny-list mutex") = true;
+    }
+
+    /// Make `destroy_secret_version` fail (a credential lacking the optional
+    /// `secretmanager.versions.disable` / `.destroy`).
+    pub fn deny_version_destroy(&self) {
+        *self
+            .deny_version_destroy
+            .lock()
+            .expect("deny-destroy mutex") = true;
     }
 
     /// Service accounts granted `secretAccessor` on `secret_name`, if any.
@@ -938,6 +1035,22 @@ impl CloudRunTarget for InMemoryCloudRun {
             .ok_or_else(|| CloudRunTargetError::NotFound(format!("secret `{name}`")))?;
         entry.payload = payload.to_vec();
         entry.versions += 1;
+        let mut log = self.secret_versions.lock().expect("secret-versions mutex");
+        let versions = log.entry(name.to_string()).or_default();
+        // A seeded secret carries versions the log never saw; pad so version
+        // `n` stays at index `n - 1`.
+        while (versions.len() as u64) + 1 < entry.versions {
+            versions.push(FakeSecretVersion {
+                payload: b"pre-existing".to_vec(),
+                enabled: true,
+                destroyed: false,
+            });
+        }
+        versions.push(FakeSecretVersion {
+            payload: payload.to_vec(),
+            enabled: true,
+            destroyed: false,
+        });
         Ok(SecretVersion {
             version: entry.versions.to_string(),
         })
@@ -961,10 +1074,107 @@ impl CloudRunTarget for InMemoryCloudRun {
 
     async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError> {
         self.secrets.lock().expect("secrets mutex").remove(name);
+        self.secret_versions
+            .lock()
+            .expect("secret-versions mutex")
+            .remove(name);
         self.secret_accessors
             .lock()
             .expect("secret-accessors mutex")
             .remove(name);
+        Ok(())
+    }
+
+    async fn list_secret_versions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<SecretVersionInfo>, CloudRunTargetError> {
+        if *self.deny_version_list.lock().expect("deny-list mutex") {
+            return Err(CloudRunTargetError::Api(
+                "permission denied: secretmanager.versions.list".to_string(),
+            ));
+        }
+        if !self
+            .secrets
+            .lock()
+            .expect("secrets mutex")
+            .contains_key(name)
+        {
+            return Err(CloudRunTargetError::NotFound(format!("secret `{name}`")));
+        }
+        Ok(self
+            .secret_versions_of(name)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| SecretVersionInfo {
+                version: (i + 1).to_string(),
+                enabled: v.enabled,
+            })
+            .collect())
+    }
+
+    async fn access_secret_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(SecretVersion, Vec<u8>), CloudRunTargetError> {
+        let versions = self.secret_versions_of(name);
+        let index = if version == "latest" {
+            // `latest` = the newest ENABLED version, as Secret Manager resolves it.
+            versions
+                .iter()
+                .rposition(|v| v.enabled)
+                .ok_or_else(|| CloudRunTargetError::NotFound(format!("{name}/latest")))?
+        } else {
+            version
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .filter(|i| *i < versions.len())
+                .ok_or_else(|| CloudRunTargetError::NotFound(format!("{name}/{version}")))?
+        };
+        let v = &versions[index];
+        if !v.enabled {
+            return Err(CloudRunTargetError::Api(format!(
+                "{name}/{} is not enabled",
+                index + 1
+            )));
+        }
+        Ok((
+            SecretVersion {
+                version: (index + 1).to_string(),
+            },
+            v.payload.clone(),
+        ))
+    }
+
+    async fn destroy_secret_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(), CloudRunTargetError> {
+        if *self
+            .deny_version_destroy
+            .lock()
+            .expect("deny-destroy mutex")
+        {
+            return Err(CloudRunTargetError::Api(
+                "permission denied: secretmanager.versions.destroy".to_string(),
+            ));
+        }
+        let mut log = self.secret_versions.lock().expect("secret-versions mutex");
+        let Some(v) = log.get_mut(name).and_then(|versions| {
+            version
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| versions.get_mut(i))
+        }) else {
+            return Ok(());
+        };
+        v.enabled = false;
+        v.destroyed = true;
+        v.payload.clear();
         Ok(())
     }
 }

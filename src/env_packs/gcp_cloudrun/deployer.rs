@@ -49,6 +49,7 @@ use super::deploy_target::{
     AccessMode, CloudRunTargetError, EnsuredSecret, RevisionRef, ScalingSpec, SecretEnvVar,
     SecretMount, SecretMountItem, ServiceRef, ServiceSpec, TrafficTarget,
 };
+use super::redis_secret::{self, redis_url_secret_name};
 use super::shared_state::{
     self, REDIS_URL_ENV_NAMES, RawSharedStateAnswers, SharedState, SharedStateAnswerError,
     VpcAccess, VpcTarget,
@@ -923,13 +924,17 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // material. New material means a NEW revision, and the same goes for
         // changed answers: see `live_revision` for why existence alone is not
         // convergence.
-        let endpoint_url = match live_revision(self.target.as_ref(), &revision_ref, &intent).await?
-        {
-            LiveRevision::SameIntent => self
-                .target
-                .get_service_url(&service_ref)
-                .await
-                .map_err(provider)?,
+        let created = match live_revision(self.target.as_ref(), &revision_ref, &intent).await? {
+            LiveRevision::SameIntent => CreatedRevision {
+                endpoint_url: self
+                    .target
+                    .get_service_url(&service_ref)
+                    .await
+                    .map_err(provider)?,
+                // A live revision staged nothing this time, so there is no
+                // freshly minted Redis URL version to prune against.
+                staged_redis: None,
+            },
             LiveRevision::Conflict { live } => {
                 return Err(revision_conflict(revision_id, &intent, live));
             }
@@ -976,7 +981,17 @@ impl Deployer for GcpCloudRunDeployerHandler {
             .set_invoker_policy(&service_ref, params.access_mode)
             .await
             .map_err(provider)?;
-        Ok(WarmOutcome { endpoint_url })
+        // The deploy succeeded: only now destroy Redis URL versions superseded
+        // by a NEW value (keeping the immediately previous one). Best effort.
+        if let Some((redis_secret, staged)) = &created.staged_redis
+            && staged.minted
+        {
+            redis_secret::prune_after_ready(self.target.as_ref(), redis_secret, &staged.version)
+                .await;
+        }
+        Ok(WarmOutcome {
+            endpoint_url: created.endpoint_url,
+        })
     }
 
     async fn drain_revision(
@@ -1137,7 +1152,7 @@ impl GcpCloudRunDeployerHandler {
         service_ref: &ServiceRef,
         revision_ref: &RevisionRef,
         spec: CreateRevisionSpec<'_>,
-    ) -> Result<Option<String>, DeployerError> {
+    ) -> Result<CreatedRevision, DeployerError> {
         let CreateRevisionSpec {
             runtime_service_account,
             secret_name,
@@ -1230,22 +1245,30 @@ impl GcpCloudRunDeployerHandler {
                 });
             }
         }
-        // The Redis URL (it carries the AUTH string): likewise one more version
-        // of the SAME env-owned secret, rendered into both names from that ONE
-        // pinned version — never a literal in the template, never logged.
+        // The Redis URL (it carries the AUTH string): its OWN env-owned secret,
+        // so a superseded password can be destroyed without touching seed
+        // versions live revisions mount (see `redis_secret`). An unchanged URL
+        // reuses its version; both names read that ONE pinned version — never
+        // a literal in the template, never logged.
+        let mut staged_redis = None;
         if let Some(redis_url) = &params.shared_state.redis_url {
-            let v = self
-                .target
-                .add_secret_version(secret_name, redis_url.expose().as_bytes())
-                .await
-                .map_err(provider)?;
+            let redis_secret = redis_url_secret_name(&params.secret_prefix);
+            let staged = redis_secret::stage(
+                self.target.as_ref(),
+                &redis_secret,
+                env_id,
+                redis_url.expose().as_bytes(),
+                runtime_service_account,
+            )
+            .await?;
             for name in REDIS_URL_ENV_NAMES {
                 secret_env.push(SecretEnvVar {
                     name: name.to_string(),
-                    secret_name: secret_name.to_string(),
-                    version: v.version.clone(),
+                    secret_name: redis_secret.clone(),
+                    version: staged.version.clone(),
                 });
             }
+            staged_redis = Some((redis_secret, staged));
         }
         // Grant the runtime SA read on the secret (covers every version) —
         // load-bearing: Cloud Run rejects a revision whose SA cannot read a
@@ -1345,8 +1368,19 @@ impl GcpCloudRunDeployerHandler {
                 Err(e) => return Err(provider(e)),
             }
         };
-        Ok(endpoint_url)
+        Ok(CreatedRevision {
+            endpoint_url,
+            staged_redis,
+        })
     }
+}
+
+/// What [`GcpCloudRunDeployerHandler::create_revision`] produced: the
+/// Service URL, and the Redis URL secret version it staged (with its secret
+/// name), so the warm can prune superseded versions once the revision is ready.
+struct CreatedRevision {
+    endpoint_url: Option<String>,
+    staged_redis: Option<(String, redis_secret::StagedRedisUrl)>,
 }
 
 #[cfg(test)]
@@ -1428,7 +1462,8 @@ mod tests {
     use crate::env_packs::deployer::conformance::build_fixture_env;
     use crate::env_packs::deployer::run_conformance;
     use crate::env_packs::gcp_cloudrun::deploy_target::{
-        CloudRunTarget, InMemoryCloudRun, RevisionStatus, SecretVersion, ServiceStatus,
+        CloudRunTarget, InMemoryCloudRun, RevisionStatus, SecretVersion, SecretVersionInfo,
+        ServiceStatus,
     };
 
     fn handler_with_fake() -> (GcpCloudRunDeployerHandler, Arc<InMemoryCloudRun>) {
@@ -1608,6 +1643,26 @@ mod tests {
         }
         async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError> {
             self.inner.delete_secret(name).await
+        }
+        async fn list_secret_versions(
+            &self,
+            name: &str,
+        ) -> Result<Vec<SecretVersionInfo>, CloudRunTargetError> {
+            self.inner.list_secret_versions(name).await
+        }
+        async fn access_secret_version(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<(SecretVersion, Vec<u8>), CloudRunTargetError> {
+            self.inner.access_secret_version(name, version).await
+        }
+        async fn destroy_secret_version(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<(), CloudRunTargetError> {
+            self.inner.destroy_secret_version(name, version).await
         }
     }
 
