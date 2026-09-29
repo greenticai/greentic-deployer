@@ -28,6 +28,15 @@
 //! whose provider is gone for good; whatever it left running is
 //! `op env sweep`'s to find.
 //!
+//! `--drain-seconds <n>` (payload `drain_seconds`) replaces every revision's
+//! own drain window for this retire, on the K8s and Cloud Run drain paths
+//! alike. It is an explicit per-call request, so the operator's
+//! `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS` default cap does not shorten it; it
+//! is refused above [`MAX_DRAIN_SECONDS`] (24 h, the drain ceiling) rather
+//! than clamped. Absent, every revision drains by its own window exactly as
+//! before. The designer probes for it through `--schema-only` (the
+//! `drain_seconds` property).
+//!
 //! [`AdapterCapabilities`]: crate::env_packs::deployer::AdapterCapabilities
 //!
 //! Data is not destroyed: retire removes serving resources, never tenant
@@ -50,6 +59,10 @@ use super::{
 const NOUN: &str = "bundles";
 const VERB: &str = "retire";
 
+/// Largest `--drain-seconds` a retire accepts: the drain ceiling (24 h).
+pub const MAX_DRAIN_SECONDS: u64 =
+    crate::env_packs::deployer::drain::DRAIN_DURATION_CEILING.as_secs();
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleRetirePayload {
     pub environment_id: String,
@@ -64,6 +77,10 @@ pub struct BundleRetirePayload {
     /// Tear down revisions the deployer cannot confirm drained (P5-R2).
     #[serde(default)]
     pub force_drain: bool,
+    /// Replace every revision's drain window for this retire (seconds,
+    /// at most [`MAX_DRAIN_SECONDS`]). Absent = each revision's own window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
@@ -95,6 +112,11 @@ pub(crate) trait RetireHooks {
         revisions.iter().map(|r| self.drain(env_id, *r)).collect()
     }
     fn teardown(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError>;
+    /// The `--drain-seconds` window these hooks drain by, when one was given;
+    /// echoed in the result so a caller can see it was applied.
+    fn drain_seconds(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Drives the env's bound deployer (`op env apply-revision`'s resolution).
@@ -104,6 +126,9 @@ pub(crate) struct ProviderHooks<'a> {
     /// `--force-drain`: an undrained revision is reported, not fatal, and its
     /// teardown skips the drain gate.
     pub force_drain: bool,
+    /// `--drain-seconds`: replaces every revision's drain window. `None` =
+    /// each revision's own window (the pre-flag behaviour).
+    pub drain_seconds: Option<u64>,
 }
 
 impl ProviderHooks<'_> {
@@ -120,6 +145,7 @@ impl ProviderHooks<'_> {
             revision_id,
             verb,
             self.force_drain,
+            self.drain_seconds.map(std::time::Duration::from_secs),
         );
         match step {
             Ok(ProviderStep::Done { .. }) => Ok(HookResult::Done),
@@ -160,6 +186,9 @@ impl RetireHooks for ProviderHooks<'_> {
     fn teardown(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError> {
         self.run(env_id, revision_id, RevisionVerb::Archive)
     }
+    fn drain_seconds(&self) -> Option<u64> {
+        self.drain_seconds
+    }
 }
 
 /// `--store-only`: no provider call at all.
@@ -185,6 +214,7 @@ pub fn payload_from_retire_args(
         customer,
         store_only,
         force_drain,
+        drain_seconds,
         idempotency_key,
     } = args;
     if env_id.is_none() && bundle.is_none() {
@@ -202,6 +232,7 @@ pub fn payload_from_retire_args(
         customer_id: customer,
         store_only,
         force_drain,
+        drain_seconds,
         idempotency_key,
     }))
 }
@@ -226,6 +257,7 @@ pub fn retire(
             }
         },
     };
+    check_drain_seconds(payload.drain_seconds)?;
     if payload.store_only {
         retire_with_hooks(store, &StoreOnlyHooks, payload)
     } else {
@@ -233,8 +265,21 @@ pub fn retire(
             store,
             registry,
             force_drain: payload.force_drain,
+            drain_seconds: payload.drain_seconds,
         };
         retire_with_hooks(store, &hooks, payload)
+    }
+}
+
+/// Refuse a `drain_seconds` above [`MAX_DRAIN_SECONDS`] before anything is
+/// touched. Refused, not clamped: silently draining for less than the caller
+/// asked would report a drain it did not perform.
+fn check_drain_seconds(drain_seconds: Option<u64>) -> Result<(), OpError> {
+    match drain_seconds {
+        Some(secs) if secs > MAX_DRAIN_SECONDS => Err(OpError::InvalidArgument(format!(
+            "--drain-seconds {secs} exceeds the {MAX_DRAIN_SECONDS}s (24h) drain ceiling"
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -337,7 +382,7 @@ fn run_sequence(
     let removed = store
         .remove_bundle(env_id, deployment_id, key)
         .map_err(map)?;
-    Ok(json!({
+    let mut result = json!({
         "environment_id": env_id.as_str(),
         "deployment_id": deployment_id.to_string(),
         "bundle_id": removed.deployment.bundle_id.as_str(),
@@ -350,7 +395,12 @@ fn run_sequence(
         "archived": ids(&steps.archive),
         "teardown": teardown,
         "pruned_revision_ids": ids(&removed.pruned_revision_ids),
-    }))
+    });
+    // Only when given: a retire without the flag reports exactly as before.
+    if let Some(secs) = hooks.drain_seconds() {
+        result["drain_seconds"] = json!(secs);
+    }
+    Ok(result)
 }
 
 /// How many revisions a retire drains at once.
@@ -458,6 +508,13 @@ fn retire_schema() -> Value {
             "customer_id": {"type": "string"},
             "store_only": {"type": "boolean", "default": false},
             "force_drain": {"type": "boolean", "default": false},
+            "drain_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_DRAIN_SECONDS,
+                "description": "Replace every revision's drain window for this retire (seconds). \
+                    Absent = each revision's own drain_seconds."
+            },
             "idempotency_key": {"type": "string"}
         },
         "additionalProperties": false

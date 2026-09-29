@@ -682,6 +682,7 @@ fn apply_with_lookups(
         store,
         registry: &registry,
         force_drain: false,
+        drain_seconds: None,
     };
     // `None` unless `--prune`: the default report carries no `prune` key.
     let prune_preview = if prune {

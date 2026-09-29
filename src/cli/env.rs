@@ -1311,6 +1311,7 @@ pub fn apply_revision(
             bound_token,
             secrets_backend,
             args.force_drain,
+            None,
             super::env_drain::k8s_store_label(store, &env_id),
         )?;
         (identity, worker_name, None)
@@ -1324,6 +1325,7 @@ pub fn apply_revision(
             answers.as_ref(),
             &descriptor,
             args.force_drain,
+            None,
         )?
     };
 
@@ -1414,6 +1416,7 @@ pub(crate) fn provider_revision_step(
     revision_id: RevisionId,
     verb: RevisionVerb,
     force_drain: bool,
+    drain_window: Option<std::time::Duration>,
 ) -> Result<ProviderStep, OpError> {
     let env = store.load(env_id)?;
     if !deployer_supports_remove(&env, registry, verb == RevisionVerb::Drain)? {
@@ -1444,6 +1447,7 @@ pub(crate) fn provider_revision_step(
             bound_token,
             secrets_backend,
             force_drain,
+            drain_window,
             super::env_drain::k8s_store_label(store, env_id),
         )?;
     } else {
@@ -1456,6 +1460,7 @@ pub(crate) fn provider_revision_step(
             answers.as_ref(),
             &descriptor,
             force_drain,
+            drain_window,
         )?;
     }
     Ok(ProviderStep::Done {
@@ -1476,6 +1481,7 @@ fn apply_revision_k8s_cluster(
     bound_token: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     force_drain: bool,
+    drain_window: Option<std::time::Duration>,
     store_label: Option<String>,
 ) -> Result<(), OpError> {
     use crate::env_packs::deployer::Deployer;
@@ -1492,9 +1498,15 @@ fn apply_revision_k8s_cluster(
         let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
-        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
+        let mut handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
             .with_secrets_backend(secrets_backend)
             .with_store_label(store_label);
+        // `op bundles retire --drain-seconds`: replace every revision's own
+        // window for this drain. Absent = the env-derived policy, unchanged.
+        if drain_window.is_some() {
+            let policy = handler.drain_policy.with_window_override(drain_window);
+            handler = handler.with_drain_policy(policy);
+        }
         match verb {
             RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
@@ -1538,6 +1550,7 @@ fn apply_revision_k8s_cluster(
     _bound_token: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     _force_drain: bool,
+    _drain_window: Option<std::time::Duration>,
     _store_label: Option<String>,
 ) -> Result<(), OpError> {
     Err(OpError::Conflict(
@@ -1603,9 +1616,10 @@ fn apply_revision_non_k8s(
     answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
     force_drain: bool,
+    drain_window: Option<std::time::Duration>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     // AWS-ECS has no drain capability, so its archive is not gated.
-    let _ = force_drain;
+    let _ = (force_drain, drain_window);
     #[cfg(feature = "creds-aws")]
     {
         if is_aws_ecs_kind(descriptor) {
@@ -1623,6 +1637,7 @@ fn apply_revision_non_k8s(
                 verb,
                 answers,
                 force_drain,
+                drain_window,
             );
         }
     }
@@ -1640,6 +1655,7 @@ fn apply_revision_non_k8s(
     _answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
     _force_drain: bool,
+    _drain_window: Option<std::time::Duration>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(unsupported_apply_kind(descriptor))
 }
@@ -2005,6 +2021,7 @@ fn cloudrun_stages_dev_secrets(env: &Environment) -> bool {
 /// live `*.run.app` URL is discovered after a successful warm (`None` on
 /// archive). Requires the `deploy-gcp-cloudrun` feature.
 #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+#[allow(clippy::too_many_arguments)]
 fn apply_revision_cloudrun(
     store: &LocalFsStore,
     env: &Environment,
@@ -2013,6 +2030,7 @@ fn apply_revision_cloudrun(
     verb: RevisionVerb,
     answers: Option<&Value>,
     force_drain: bool,
+    drain_window: Option<std::time::Duration>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     use crate::env_packs::deployer::Deployer;
     use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
@@ -2046,10 +2064,16 @@ fn apply_revision_cloudrun(
     )?;
 
     let endpoint_url = run_gcp_async(async move {
-        let handler =
+        let mut handler =
             resolve_cloudrun_handler(&params.project, &params.region, credentials, dev_secrets)
                 .await?
                 .with_generated_secret_seed(generated_secret_seed);
+        // `op bundles retire --drain-seconds`: replace every revision's own
+        // window for this drain. Absent = the env-derived policy, unchanged.
+        if drain_window.is_some() {
+            let policy = handler.drain_policy.with_window_override(drain_window);
+            handler = handler.with_drain_policy(policy);
+        }
         if verb == RevisionVerb::Warm {
             // The Service's live `*.run.app` URL rides back on the warm outcome
             // (read from the upsert response — no extra round-trip): the "one
@@ -2154,6 +2178,7 @@ fn cloudrun_seed_material(
 /// arm is `creds-gcp`-gated) but cannot talk to Cloud Run — the analogue of the
 /// AWS `#[cfg(not(deploy-aws-ecs))]` "compiled without the cloud feature" stub.
 #[cfg(all(feature = "creds-gcp", not(feature = "deploy-gcp-cloudrun")))]
+#[allow(clippy::too_many_arguments)]
 fn apply_revision_cloudrun(
     _store: &LocalFsStore,
     _env: &Environment,
@@ -2162,6 +2187,7 @@ fn apply_revision_cloudrun(
     _verb: RevisionVerb,
     _answers: Option<&Value>,
     _force_drain: bool,
+    _drain_window: Option<std::time::Duration>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `deploy-gcp-cloudrun` feature; \
@@ -2403,6 +2429,7 @@ pub(crate) fn cloudrun_env_up(
             answers.as_ref(),
             &descriptor,
             false,
+            None,
         )?;
         if let Some(url) = url {
             endpoints.insert(revision.deployment_id.to_string(), url);

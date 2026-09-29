@@ -56,6 +56,7 @@ fn payload(bundle: &str) -> BundleRetirePayload {
         customer_id: None,
         store_only: false,
         force_drain: false,
+        drain_seconds: None,
         idempotency_key: None,
     }
 }
@@ -191,6 +192,7 @@ fn a_bound_deployer_that_cannot_tear_down_refuses_before_touching_anything() {
         store: &store,
         registry: &registry,
         force_drain: false,
+        drain_seconds: None,
     };
     let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
     assert_eq!(err.kind(), "capability-missing", "{err}");
@@ -230,6 +232,7 @@ fn an_aws_ecs_env_is_refused_by_capability_name_before_touching_anything() {
             store: &store,
             registry: &registry,
             force_drain,
+            drain_seconds: None,
         };
         let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
         assert_eq!(err.kind(), "capability-missing", "{err}");
@@ -268,6 +271,7 @@ fn adapters_declaring_remove_and_drain_pass_the_preflight() {
                 store: &store,
                 registry: &registry,
                 force_drain,
+                drain_seconds: None,
             };
             hooks
                 .preflight(&env)
@@ -352,6 +356,7 @@ fn provider_hooks_report_unavailable_without_a_deployer_binding() {
         store: &store,
         registry: &registry,
         force_drain: false,
+        drain_seconds: None,
     };
     let out = retire_with_hooks(&store, &hooks, payload("acme")).expect("retires");
     let teardown = out.result["teardown"]
@@ -387,4 +392,90 @@ fn retire_drains_revisions_concurrently_and_keeps_input_order() {
     assert_eq!(results.len(), 6);
     assert!(results[4].is_err());
     assert!(results.iter().enumerate().all(|(i, r)| i == 4 || r.is_ok()));
+}
+
+/// Hooks that report a `--drain-seconds` window.
+struct WindowHooks(Option<u64>);
+
+impl RetireHooks for WindowHooks {
+    fn drain(&self, _: &EnvId, _: RevisionId) -> Result<HookResult, OpError> {
+        Ok(HookResult::Done)
+    }
+    fn teardown(&self, _: &EnvId, _: RevisionId) -> Result<HookResult, OpError> {
+        Ok(HookResult::Done)
+    }
+    fn drain_seconds(&self) -> Option<u64> {
+        self.0
+    }
+}
+
+#[test]
+fn a_drain_seconds_override_is_echoed_and_its_absence_leaves_the_result_unchanged() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    seed(&store);
+    let out = retire_with_hooks(&store, &WindowHooks(Some(900)), payload("acme")).expect("retires");
+    assert_eq!(out.result["drain_seconds"], 900);
+
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    seed(&store);
+    let out = retire_with_hooks(&store, &WindowHooks(None), payload("acme")).expect("retires");
+    assert!(out.result.get("drain_seconds").is_none(), "{}", out.result);
+}
+
+#[test]
+fn drain_seconds_over_the_24h_ceiling_is_refused_before_touching_the_store() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    seed(&store);
+    let before = load(&store);
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let mut p = payload("acme");
+    p.drain_seconds = Some(MAX_DRAIN_SECONDS + 1);
+    let err = retire(&store, &registry, &OpFlags::default(), Some(p)).unwrap_err();
+    assert_eq!(err.kind(), "invalid-argument", "{err}");
+    assert!(err.to_string().contains("86400"), "{err}");
+    assert_eq!(load(&store), before, "nothing mutated");
+
+    // Exactly the ceiling is accepted (no deployer bound: hooks unavailable).
+    let mut p = payload("acme");
+    p.drain_seconds = Some(MAX_DRAIN_SECONDS);
+    let out = retire(&store, &registry, &OpFlags::default(), Some(p)).expect("retires");
+    assert_eq!(out.result["drain_seconds"], MAX_DRAIN_SECONDS);
+}
+
+#[test]
+fn the_schema_advertises_drain_seconds_for_the_designer_to_probe() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    let flags = OpFlags {
+        schema_only: true,
+        answers: None,
+    };
+    let out = retire(&store, &registry, &flags, None).expect("schema");
+    let prop = &out.result["properties"]["drain_seconds"];
+    assert_eq!(prop["type"], "integer");
+    assert_eq!(prop["maximum"], 86_400);
+}
+
+#[test]
+fn the_cli_flag_reaches_the_payload() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: crate::cli::dispatch::BundleRetireArgs,
+    }
+    let cli = Cli::parse_from(["retire", "local", "acme", "--drain-seconds", "120"]);
+    let p = payload_from_retire_args(cli.args)
+        .expect("ok")
+        .expect("payload");
+    assert_eq!(p.drain_seconds, Some(120));
+    let cli = Cli::parse_from(["retire", "local", "acme"]);
+    let p = payload_from_retire_args(cli.args)
+        .expect("ok")
+        .expect("payload");
+    assert_eq!(p.drain_seconds, None);
 }

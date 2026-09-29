@@ -325,6 +325,10 @@ drained. Only after that does it wait the revision's `drain_seconds` (capped by
 cut, then confirms again. Cloud Run then scales the revision to zero itself.
 The archive branch of `op env apply-revision` runs the same check without
 waiting and refuses (`not-drained`) unless `--force-drain`.
+`op bundles retire --drain-seconds <n>` replaces the recorded window for every
+revision that retire drains, on both this path and the whole-bundle one below
+(bounded by the 24 h drain ceiling, refused above it, and not capped by
+`GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`).
 
 **A whole-bundle retire is different.** One Service per deployment, and its
 `traffic[]` always sums to 100 %, so the Service's last revision can never

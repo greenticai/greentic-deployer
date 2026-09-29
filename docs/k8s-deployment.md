@@ -668,6 +668,11 @@ Retiring is a sequence, not a delete: move the revision's traffic weight away â†
   with `not-drained` naming the revision otherwise. `--force-drain` archives
   anyway (logged, evidence `forced`). `op bundles retire` drains its revisions
   concurrently (at most 4 at a time), so a retire waits about one window.
+  `op bundles retire --drain-seconds <n>` replaces every revision's
+  `drain_seconds` for that retire (not shortened by
+  `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`; above 86400 it is refused, not
+  clamped); absent, each revision drains by its own window. The retire result
+  echoes it as `drain_seconds`; `--schema-only` lists it as a property.
 - **`op env sweep <env> [--apply]`** lists worker Deployments/Services carrying
   `app.kubernetes.io/managed-by=greentic`, `app.kubernetes.io/component=worker`
   and `greentic.ai/env=<env>`. The env id is not unique across stores (every
