@@ -1209,6 +1209,11 @@ pub struct BundleRetireArgs {
     /// drained (P5-R2). Without it an undrained revision stops the retire.
     #[arg(long = "force-drain")]
     pub force_drain: bool,
+    /// Drain every revision for this many seconds instead of its own recorded
+    /// window (at most 86400 = 24 h; a larger value is refused). Not shortened
+    /// by `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`.
+    #[arg(long = "drain-seconds", value_name = "SECONDS")]
+    pub drain_seconds: Option<u64>,
     /// Caller-supplied idempotency key (minted when absent).
     #[arg(long = "idempotency-key")]
     pub idempotency_key: Option<String>,

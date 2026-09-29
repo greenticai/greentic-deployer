@@ -85,6 +85,35 @@ async fn drain_waits_the_capped_window_before_confirming() {
     assert!(started.elapsed() >= Duration::from_secs(12));
 }
 
+/// `op bundles retire --drain-seconds`: the override replaces the revision's
+/// own 30 s (and is not capped by `max_wait`), on both the per-revision and
+/// the whole-bundle drain paths.
+#[tokio::test(start_paused = true)]
+async fn drain_waits_the_override_window_instead_of_the_recorded_one() {
+    let policy = DrainPolicy {
+        max_wait: Duration::from_secs(12),
+        ..DrainPolicy::immediate()
+    };
+    for (override_secs, expected) in [(Some(40), 40), (Some(1), 1), (None, 12)] {
+        let (h, _) = handler(policy.with_window_override(override_secs.map(Duration::from_secs)));
+        let env = build_fixture_env(); // drain_seconds = 30
+        let started = tokio::time::Instant::now();
+        let out = h
+            .drain_revision(&env, env.revisions[1].revision_id, None)
+            .await
+            .unwrap();
+        assert_eq!(out.waited_seconds, expected, "{override_secs:?}");
+        assert!(started.elapsed() >= Duration::from_secs(expected));
+
+        let (env, r) = retiring_single_revision_env();
+        let out = h.drain_revision(&env, r, None).await.unwrap();
+        assert_eq!(
+            out.waited_seconds, expected,
+            "whole bundle {override_secs:?}"
+        );
+    }
+}
+
 /// The fixture's single-revision deployment (`dep_b`, revision 2), marked
 /// retiring as `op bundles retire` leaves it.
 fn retiring_single_revision_env() -> (Environment, RevisionId) {

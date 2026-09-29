@@ -439,6 +439,7 @@ mod tests {
             max_wait: Duration::from_secs(10),
             confirm_timeout: Duration::from_secs(6),
             poll_interval: Duration::from_secs(2),
+            window_override: None,
         };
         let h = K8sDeployerHandler::with_cluster(Arc::new(StuckPods::default()))
             .with_drain_policy(policy);
@@ -455,5 +456,29 @@ mod tests {
             "window + confirm"
         );
         assert!(started.elapsed() < Duration::from_secs(30), "window capped");
+    }
+
+    /// `op bundles retire --drain-seconds`: the override replaces the
+    /// revision's own 30 s (and is not capped by `max_wait`).
+    #[tokio::test(start_paused = true)]
+    async fn drain_waits_the_override_window_instead_of_the_recorded_one() {
+        let policy = DrainPolicy {
+            max_wait: Duration::from_secs(10),
+            ..DrainPolicy::immediate()
+        };
+        for (override_secs, expected) in [(Some(45), 45), (Some(2), 2), (None, 10)] {
+            let h = K8sDeployerHandler::with_cluster(Arc::new(InMemoryCluster::default()))
+                .with_drain_policy(
+                    policy.with_window_override(override_secs.map(Duration::from_secs)),
+                );
+            let env = unrouted_env(); // revision drain_seconds = 30
+            let started = tokio::time::Instant::now();
+            let out = h
+                .drain_revision(&env, env.revisions[1].revision_id, None)
+                .await
+                .unwrap();
+            assert_eq!(out.waited_seconds, expected, "{override_secs:?}");
+            assert!(started.elapsed() >= Duration::from_secs(expected));
+        }
     }
 }

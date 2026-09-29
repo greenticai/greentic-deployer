@@ -58,6 +58,14 @@ pub struct DrainPolicy {
     pub confirm_timeout: Duration,
     /// Delay between confirmation probes.
     pub poll_interval: Duration,
+    /// Caller-supplied drain window (`op bundles retire --drain-seconds`).
+    /// When set it REPLACES every revision's own `drain_seconds` for this
+    /// drain and is not capped by [`Self::max_wait`] — it is an explicit,
+    /// per-call request (the designer's execution authorisation names it),
+    /// where `max_wait` is the operator's default guard against a recorded
+    /// window nobody chose. Still bounded by [`DRAIN_DURATION_CEILING`]; the
+    /// CLI refuses a larger value rather than clamping it.
+    pub window_override: Option<Duration>,
 }
 
 impl Default for DrainPolicy {
@@ -66,6 +74,7 @@ impl Default for DrainPolicy {
             max_wait: DEFAULT_DRAIN_MAX_WAIT,
             confirm_timeout: DEFAULT_DRAIN_CONFIRM_TIMEOUT,
             poll_interval: DEFAULT_DRAIN_POLL_INTERVAL,
+            window_override: None,
         }
     }
 }
@@ -87,6 +96,7 @@ impl DrainPolicy {
             max_wait: read(DRAIN_MAX_WAIT_ENV).unwrap_or(default.max_wait),
             confirm_timeout: read(DRAIN_CONFIRM_TIMEOUT_ENV).unwrap_or(default.confirm_timeout),
             poll_interval: default.poll_interval,
+            window_override: None,
         }
     }
 
@@ -97,15 +107,27 @@ impl DrainPolicy {
             max_wait: Duration::ZERO,
             confirm_timeout: Duration::ZERO,
             poll_interval: Duration::ZERO,
+            window_override: None,
         }
     }
 
-    /// The drain window for `revision`: its recorded `drain_seconds`, capped at
-    /// [`Self::max_wait`].
+    /// This policy with every revision's drain window replaced by `window`
+    /// (see [`Self::window_override`]). `None` leaves the policy unchanged.
+    pub fn with_window_override(mut self, window: Option<Duration>) -> Self {
+        self.window_override = window;
+        self
+    }
+
+    /// The drain window for `revision`: [`Self::window_override`] when set,
+    /// else its recorded `drain_seconds` capped at [`Self::max_wait`]. Never
+    /// longer than [`DRAIN_DURATION_CEILING`].
     pub fn window(&self, revision: &Revision) -> Duration {
-        Duration::from_secs(u64::from(revision.drain_seconds))
-            .min(self.max_wait)
-            .min(DRAIN_DURATION_CEILING)
+        match self.window_override {
+            Some(window) => window.min(DRAIN_DURATION_CEILING),
+            None => Duration::from_secs(u64::from(revision.drain_seconds))
+                .min(self.max_wait)
+                .min(DRAIN_DURATION_CEILING),
+        }
     }
 }
 
@@ -230,6 +252,24 @@ mod tests {
         rev.drain_seconds = 5;
         assert_eq!(policy.window(&rev), Duration::from_secs(5));
         assert_eq!(DrainPolicy::immediate().window(&rev), Duration::ZERO);
+    }
+
+    #[test]
+    fn an_override_replaces_the_recorded_window_and_ignores_max_wait() {
+        let env = build_fixture_env();
+        let mut rev = env.revisions[1].clone();
+        rev.drain_seconds = 30;
+        let policy = DrainPolicy {
+            max_wait: Duration::from_secs(60),
+            ..DrainPolicy::default()
+        };
+        let longer = policy.with_window_override(Some(Duration::from_secs(900)));
+        assert_eq!(longer.window(&rev), Duration::from_secs(900));
+        let shorter = policy.with_window_override(Some(Duration::from_secs(3)));
+        assert_eq!(shorter.window(&rev), Duration::from_secs(3));
+        let huge = policy.with_window_override(Some(Duration::from_secs(10 * 24 * 3600)));
+        assert_eq!(huge.window(&rev), DRAIN_DURATION_CEILING);
+        assert_eq!(policy.with_window_override(None), policy);
     }
 
     #[test]
