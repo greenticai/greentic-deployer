@@ -7,9 +7,11 @@
 //! 1. **clear** — refuse if a messaging endpoint would be stranded, mark the
 //!    deployment retiring (status `archived`) and remove its split.
 //! 2. **drain** — stamp `Ready` revisions `Draining`, then run the drain hook
-//!    for every draining revision (the bound deployer's `drain_revision`;
-//!    PD2 makes that wait for in-flight work — until then it returns at once,
-//!    and an env without a live deployer reports the hook `unavailable`).
+//!    for every draining revision (the bound deployer's enforced
+//!    `drain_revision`: wait the drain window, then confirm it serves nothing;
+//!    an env without a live deployer reports the hook `unavailable`). An
+//!    undrained revision stops the retire unless `--force-drain`, which records
+//!    it and lets the teardown skip the drain gate.
 //! 3. **teardown, then archive** — per revision, tear it down provider-side
 //!    (`archive_revision`) FIRST and archive it in the store only once that
 //!    succeeded. A failed teardown leaves the revision live in the store, so
@@ -53,6 +55,9 @@ pub struct BundleRetirePayload {
     /// Skip the provider drain / teardown hooks.
     #[serde(default)]
     pub store_only: bool,
+    /// Tear down revisions the deployer cannot confirm drained (P5-R2).
+    #[serde(default)]
+    pub force_drain: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
@@ -73,6 +78,16 @@ pub(crate) trait RetireHooks {
         Ok(())
     }
     fn drain(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError>;
+    /// Drain every revision; results in input order. Default: one after
+    /// another. [`ProviderHooks`] drains concurrently (bounded), so a retire
+    /// of N revisions waits about one drain window, not N.
+    fn drain_all(
+        &self,
+        env_id: &EnvId,
+        revisions: &[RevisionId],
+    ) -> Vec<Result<HookResult, OpError>> {
+        revisions.iter().map(|r| self.drain(env_id, *r)).collect()
+    }
     fn teardown(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError>;
 }
 
@@ -80,6 +95,9 @@ pub(crate) trait RetireHooks {
 pub(crate) struct ProviderHooks<'a> {
     pub store: &'a LocalFsStore,
     pub registry: &'a crate::env_packs::EnvPackRegistry,
+    /// `--force-drain`: an undrained revision is reported, not fatal, and its
+    /// teardown skips the drain gate.
+    pub force_drain: bool,
 }
 
 impl ProviderHooks<'_> {
@@ -89,9 +107,21 @@ impl ProviderHooks<'_> {
         revision_id: RevisionId,
         verb: RevisionVerb,
     ) -> Result<HookResult, OpError> {
-        match provider_revision_step(self.store, self.registry, env_id, revision_id, verb)? {
-            ProviderStep::Done { .. } => Ok(HookResult::Done),
-            ProviderStep::Unavailable(why) => Ok(HookResult::Unavailable(why)),
+        let step = provider_revision_step(
+            self.store,
+            self.registry,
+            env_id,
+            revision_id,
+            verb,
+            self.force_drain,
+        );
+        match step {
+            Ok(ProviderStep::Done { .. }) => Ok(HookResult::Done),
+            Ok(ProviderStep::Unavailable(why)) => Ok(HookResult::Unavailable(why)),
+            Err(OpError::NotDrained { reason, .. }) if self.force_drain => Ok(
+                HookResult::Unavailable(format!("not drained, forced past: {reason}")),
+            ),
+            Err(e) => Err(e),
         }
     }
 }
@@ -102,6 +132,13 @@ impl RetireHooks for ProviderHooks<'_> {
     }
     fn drain(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError> {
         self.run(env_id, revision_id, RevisionVerb::Drain)
+    }
+    fn drain_all(
+        &self,
+        env_id: &EnvId,
+        revisions: &[RevisionId],
+    ) -> Vec<Result<HookResult, OpError>> {
+        drain_concurrently(revisions, |r| self.drain(env_id, r))
     }
     fn teardown(&self, env_id: &EnvId, revision_id: RevisionId) -> Result<HookResult, OpError> {
         self.run(env_id, revision_id, RevisionVerb::Archive)
@@ -130,6 +167,7 @@ pub fn payload_from_retire_args(
         bundle,
         customer,
         store_only,
+        force_drain,
         idempotency_key,
     } = args;
     if env_id.is_none() && bundle.is_none() {
@@ -146,6 +184,7 @@ pub fn payload_from_retire_args(
         bundle,
         customer_id: customer,
         store_only,
+        force_drain,
         idempotency_key,
     }))
 }
@@ -173,7 +212,12 @@ pub fn retire(
     if payload.store_only {
         retire_with_hooks(store, &StoreOnlyHooks, payload)
     } else {
-        retire_with_hooks(store, &ProviderHooks { store, registry }, payload)
+        let hooks = ProviderHooks {
+            store,
+            registry,
+            force_drain: payload.force_drain,
+        };
+        retire_with_hooks(store, &hooks, payload)
     }
 }
 
@@ -249,7 +293,13 @@ fn run_sequence(
         store.drain_revision(env_id, *r, key.clone()).map_err(map)?;
         committed.mark_committed();
     }
-    let drain_hooks = run_hook(&steps.drain_hook, |r| hooks.drain(env_id, r))?;
+    let drained = hooks.drain_all(env_id, &steps.drain_hook);
+    let mut drained = drained.into_iter();
+    let drain_hooks = run_hook(&steps.drain_hook, |_| {
+        drained
+            .next()
+            .unwrap_or_else(|| Err(OpError::Conflict("drain produced no result".to_string())))
+    })?;
     // Provider first, store second: a revision is archived only once its
     // workload is gone, so a failed teardown leaves it live in the store.
     let teardown = run_hook(&steps.teardown, |r| {
@@ -284,6 +334,40 @@ fn run_sequence(
         "teardown": teardown,
         "pruned_revision_ids": ids(&removed.pruned_revision_ids),
     }))
+}
+
+/// How many revisions a retire drains at once.
+pub(crate) const DRAIN_CONCURRENCY: usize = 4;
+
+/// Run `drain` over `revisions` on at most [`DRAIN_CONCURRENCY`] threads at a
+/// time; results in input order. Each drain waits its own window, so a batch
+/// costs about one window rather than one per revision.
+pub(crate) fn drain_concurrently<F>(
+    revisions: &[RevisionId],
+    drain: F,
+) -> Vec<Result<HookResult, OpError>>
+where
+    F: Fn(RevisionId) -> Result<HookResult, OpError> + Sync,
+{
+    let mut out = Vec::with_capacity(revisions.len());
+    for batch in revisions.chunks(DRAIN_CONCURRENCY) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|r| {
+                    let drain = &drain;
+                    let r = *r;
+                    scope.spawn(move || drain(r))
+                })
+                .collect();
+            for handle in handles {
+                out.push(handle.join().unwrap_or_else(|_| {
+                    Err(OpError::Conflict("a drain thread panicked".to_string()))
+                }));
+            }
+        });
+    }
+    out
 }
 
 fn run_hook(
@@ -356,6 +440,7 @@ fn retire_schema() -> Value {
             "bundle": {"type": "string", "description": "Deployment ULID or bundle id"},
             "customer_id": {"type": "string"},
             "store_only": {"type": "boolean", "default": false},
+            "force_drain": {"type": "boolean", "default": false},
             "idempotency_key": {"type": "string"}
         },
         "additionalProperties": false

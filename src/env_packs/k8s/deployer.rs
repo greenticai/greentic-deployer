@@ -18,7 +18,7 @@
 //! |---|---|
 //! | `stage_revision` | None today. The bundle artifact is delivered to the pod at warm time (delivery mechanism is a PR-5.3 decision); there is no per-revision registry upload step yet. |
 //! | `warm_revision` | Apply the revision's worker Deployment + ClusterIP Service. |
-//! | `drain_revision` | None — drain semantics are routing-side. The router stops dispatching NEW sessions when the `TrafficSplit` changes (`apply_traffic_split`); provider resources stay up through the drain window so in-flight sessions finish. Teardown is `archive_revision`'s job. |
+//! | `drain_revision` | Enforced (P5-R2, `super::drain`): refuse a still-routed revision, wait the drain window, scale the worker to 0, confirm zero ready endpoints. Teardown stays `archive_revision`'s job. |
 //! | `archive_revision` | Delete the worker Deployment + Service (idempotent against absent). |
 //! | `apply_traffic_split` | Upsert the runtime-config ConfigMap — the router reloads it and enforces the split in-process. Never a `kubectl rollout`. |
 //!
@@ -44,8 +44,8 @@ use super::manifests::{
     render_worker_manifests,
 };
 use crate::env_packs::deployer::{
-    ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
-    WarmOutcome, enforce_split_invariants, require_revision,
+    AdapterCapabilities, ArchiveOutcome, Deployer, DeployerError, DrainEvidence, DrainOutcome,
+    StageOutcome, TrafficSplitOutcome, WarmOutcome, enforce_split_invariants, require_revision,
 };
 use crate::env_packs::render::ManifestRenderer;
 
@@ -223,8 +223,8 @@ impl K8sDeployerHandler {
     ///   adoption in a customer-provided namespace rides the real-cluster slice.
     /// - **Prune scope.** Pruning iterates `env.revisions`, so the workers of a
     ///   revision already compacted out of the Vec (`remove_bundle` after
-    ///   archive) are not reachable here — reclaiming those orphans needs
-    ///   label-based GC via a future `K8sCluster::list` seam.
+    ///   archive) are not reachable here — `op env sweep` reclaims those
+    ///   orphans through the label-scoped `K8sCluster::list` seam.
     pub async fn reconcile(
         &self,
         env: &Environment,
@@ -529,6 +529,7 @@ impl Deployer for K8sDeployerHandler {
         // `with_secrets_backend`), matching `reconcile` / `op env render` —
         // otherwise a Vault env's warm would emit a DevStore-shaped worker.
         params.secrets_backend = self.secrets_backend.clone();
+        params.store_label = self.store_label.clone();
         let manifests = render_worker_manifests(env, revision, &params);
         self.apply_all(&manifests).await?;
 
@@ -568,11 +569,44 @@ impl Deployer for K8sDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        answers: Option<&Value>,
     ) -> Result<DrainOutcome, DeployerError> {
-        require_revision(env, revision_id)?;
-        // Routing-side only — see the module table. Worker resources stay
-        // up so in-flight sessions complete; archive tears them down.
-        Ok(DrainOutcome::default())
+        // Enforced drain (P5-R2) — see `super::drain` for the sequence and
+        // why "zero ready endpoints" is the confirmation signal.
+        self.drain_enforced(env, revision_id, answers).await
+    }
+
+    async fn confirm_drained(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<DrainEvidence, DeployerError> {
+        self.confirm_drained_now(env, revision_id, answers).await
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            drain: true,
+            traffic_split: true,
+            ingress_managed: false,
+            private_registry_auth: true,
+            multi_instance_safe: false,
+            remove: true,
+        }
+    }
+
+    fn capability_notes(&self) -> &'static [&'static str] {
+        &[
+            "drain: confirmed by zero ready endpoints (the worker runs no pod) — the router \
+             exposes no per-revision in-flight count",
+            "ingress_managed: the router Service can be a LoadBalancer/NodePort, but no Ingress \
+             is rendered",
+            "private_registry_auth: oci_username/oci_password answers + image_pull_secret",
+            "multi_instance_safe: not claimed — session state is per worker pod with no shared \
+             session store",
+            "remove: archive deletes the worker pair; `op env sweep --apply` reclaims orphans",
+        ]
     }
 
     async fn archive_revision(

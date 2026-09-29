@@ -677,9 +677,11 @@ fn apply_with_lookups(
     // another declared.
     let owner = ownership::Owner::for_manifest(&manifest_path);
     let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+    // Prune never forces past an undrained revision (P5-R2).
     let hooks = super::bundles_retire::ProviderHooks {
         store,
         registry: &registry,
+        force_drain: false,
     };
     // `None` unless `--prune`: the default report carries no `prune` key.
     let prune_preview = if prune {

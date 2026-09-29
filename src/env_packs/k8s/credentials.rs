@@ -178,13 +178,28 @@ pub const INGRESS_K8S_OPERATIONS: &[K8sOperation] = &[
     op("networking.k8s.io", "ingresses", "delete"),
 ];
 
+/// Operations `op env sweep` needs to find orphaned workers by label.
+///
+/// Same pattern as [`INGRESS_K8S_OPERATIONS`]: the bootstrap Role grants them
+/// ([`bootstrap_k8s_operations`]), but `validate` never probes them, so an env
+/// bound before they existed keeps passing `op credentials requirements`.
+/// The sweep checks them itself, up front
+/// ([`require_sweep_access`](super::sweep::require_sweep_access)).
+pub const SWEEP_K8S_OPERATIONS: &[K8sOperation] = &[
+    op("apps", "deployments", "get"),
+    op("apps", "deployments", "list"),
+    op("", "services", "get"),
+    op("", "services", "list"),
+];
+
 /// Everything the bootstrap Role grants: the always-validated set plus the
-/// Ingress operations, so a freshly bootstrapped env can adopt an Ingress
-/// without a second bootstrap.
+/// Ingress and sweep operations, so a freshly bootstrapped env can adopt an
+/// Ingress or run `op env sweep` without a second bootstrap.
 pub fn bootstrap_k8s_operations() -> Vec<K8sOperation> {
     VALIDATED_K8S_OPERATIONS
         .iter()
         .chain(INGRESS_K8S_OPERATIONS)
+        .chain(SWEEP_K8S_OPERATIONS)
         .copied()
         .collect()
 }
@@ -1265,8 +1280,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_with_ingress_answers_requires_and_names_the_ingress_verbs() {
+    fn bootstrap_grants_the_sweep_list_verbs_that_validate_never_probes() {
         let ops = bootstrap_k8s_operations();
+        for op in SWEEP_K8S_OPERATIONS {
+            assert!(ops.contains(op), "bootstrap Role grants {op:?}");
+        }
+        for list in SWEEP_K8S_OPERATIONS.iter().filter(|o| o.verb == "list") {
+            assert!(
+                !VALIDATED_K8S_OPERATIONS.contains(list),
+                "{list:?} must stay out of validate so existing envs keep passing"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_with_ingress_answers_requires_and_names_the_ingress_verbs() {
+        // The probed set: validated + Ingress (never the sweep verbs).
+        let ops: Vec<K8sOperation> = VALIDATED_K8S_OPERATIONS
+            .iter()
+            .chain(INGRESS_K8S_OPERATIONS)
+            .copied()
+            .collect();
         let mock = Arc::new(
             MockK8sClient::default()
                 .with_identity(Ok(identity()))

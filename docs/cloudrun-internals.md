@@ -286,6 +286,32 @@ Not gaps to fix casually — each has a reason:
 - **Secret versions accumulate.** Each warm adds versions; nothing GCs them.
   `op env destroy` deletes the whole secret.
 
+### Drain and capabilities (P5-R2 / P5-R3)
+
+`drain_revision` first reads the live Service and confirms its `traffic[]`
+gives the revision **0 %** — the live traffic, not the recorded split, because
+a split recorded but never pushed still routes requests. Traffic pinned to
+`LATEST` (or any entry not attributable to a named revision) is never read as
+drained. Only after that does it wait the revision's `drain_seconds` (capped by
+`GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`) as grace for requests in flight at the
+cut, then confirms again. Cloud Run then scales the revision to zero itself.
+The archive branch of `op env apply-revision` runs the same check without
+waiting and refuses (`not-drained`) unless `--force-drain`.
+
+**A whole-bundle retire is different.** One Service per deployment, and its
+`traffic[]` always sums to 100 %, so the Service's last revision can never
+reach 0 %. When the deployment is retiring (`op bundles retire` marked it
+`archived`), drain confirmation is "no messaging endpoint still routes to the
+bundle" plus the drain window, and the archive step deletes the whole Service.
+The 0 % check applies only to retiring one revision while others of the same
+Service keep serving; a revision that is the Service's only one is told to
+retire the bundle, not to push a split.
+
+The adapter claims `drain`,
+`traffic_split`, `ingress_managed`, `remove`; it does **not** claim
+`multi_instance_safe` (the session store is `/tmp`, see above) or
+`private_registry_auth`.
+
 ---
 
 ## 10. SoR units (SoRLa phase 3E)

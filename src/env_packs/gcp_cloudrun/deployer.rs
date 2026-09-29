@@ -18,8 +18,9 @@
 //!   (Cloud Run's `percent` is an integer 0..=100 and cannot represent basis
 //!   points faithfully — plan D1), converts the rest to integer percent, and
 //!   sets the Service traffic under `etag` optimistic concurrency.
-//! - **`stage`/`drain`** are guarded no-ops; **`archive`** is an idempotent
-//!   revision delete.
+//! - **`stage`** is a guarded no-op; **`drain`** waits the drain window then
+//!   confirms the live Service gives the revision 0 % (P5-R2, `super::drain`);
+//!   **`archive`** is an idempotent revision delete.
 //!
 //! Pure-spec preconditions (`require_revision`, `enforce_split_invariants`, the
 //! bps-granularity check) run BEFORE any provider call. The bps-granularity
@@ -36,8 +37,8 @@ use serde_json::Value;
 
 use crate::cli::secrets::DEV_STORE_RELATIVE;
 use crate::env_packs::deployer::{
-    ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
-    WarmOutcome, enforce_split_invariants, require_revision,
+    AdapterCapabilities, ArchiveOutcome, Deployer, DeployerError, DrainEvidence, DrainOutcome,
+    StageOutcome, TrafficSplitOutcome, WarmOutcome, enforce_split_invariants, require_revision,
 };
 use crate::env_packs::telemetry::{
     self as telemetry_answers, HEADER_ENV_NAMES, TelemetryAnswerError, TelemetryAnswers,
@@ -532,7 +533,7 @@ pub(crate) fn provider(err: CloudRunTargetError) -> DeployerError {
 
 /// Wrap answer-parse failures as a pre-provider [`DeployerError::Provider`]
 /// (mirrors the AWS `params_from_answers` precedent).
-fn params_from_answers(
+pub(super) fn params_from_answers(
     env: &Environment,
     answers: Option<&Value>,
 ) -> Result<GcpCloudRunParams, DeployerError> {
@@ -566,7 +567,7 @@ fn split_to_traffic_targets(
     Ok(targets)
 }
 
-fn find_revision(env: &Environment, revision_id: RevisionId) -> Option<&Revision> {
+pub(super) fn find_revision(env: &Environment, revision_id: RevisionId) -> Option<&Revision> {
     env.revisions.iter().find(|r| r.revision_id == revision_id)
 }
 
@@ -875,11 +876,44 @@ impl Deployer for GcpCloudRunDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        answers: Option<&Value>,
     ) -> Result<DrainOutcome, DeployerError> {
-        // Traffic shifts via `apply_traffic_split`; Cloud Run scales the
-        // drained revision to zero on its own once it stops receiving traffic.
-        require_revision(env, revision_id)?;
-        Ok(DrainOutcome::default())
+        // Enforced drain (P5-R2) — wait the window, then confirm the live
+        // Service gives the revision 0 %. See `super::drain`.
+        self.drain_enforced(env, revision_id, answers).await
+    }
+
+    async fn confirm_drained(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<DrainEvidence, DeployerError> {
+        self.confirm_drained_now(env, revision_id, answers).await
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            drain: true,
+            traffic_split: true,
+            ingress_managed: true,
+            private_registry_auth: false,
+            multi_instance_safe: false,
+            remove: true,
+        }
+    }
+
+    fn capability_notes(&self) -> &'static [&'static str] {
+        &[
+            "drain: confirmed by the Service's live traffic giving the revision 0%",
+            "traffic_split: whole-percent granularity only (multiples of 100 bps)",
+            "ingress_managed: Cloud Run assigns the *.run.app URL; the invoker policy sets access",
+            "private_registry_auth: not claimed — bundles and the image are pulled from public \
+             registries (or a pre-provisioned Artifact Registry remote repo)",
+            "multi_instance_safe: false — the environment/session store is per-instance in-memory \
+             /tmp, so max_instances must stay 1 (docs/cloudrun-deployment.md §10)",
+            "remove: archive deletes the revision; env destroy deletes the Service",
+        ]
     }
 
     async fn archive_revision(
@@ -892,6 +926,20 @@ impl Deployer for GcpCloudRunDeployerHandler {
         let revision = find_revision(env, revision_id).expect("require_revision passed");
         let deployment_id = revision.deployment_id;
         let params = params_from_answers(env, answers)?;
+        // A whole-bundle retire tears down the Service: its last revision is
+        // always routed (traffic sums to 100 %), so it cannot be deleted
+        // on its own. Idempotent against an absent Service.
+        if super::drain::whole_bundle_retiring(env, revision_id) {
+            self.target
+                .delete_service(&ServiceRef {
+                    deployment_id,
+                    project: params.project,
+                    region: params.region,
+                })
+                .await
+                .map_err(provider)?;
+            return Ok(ArchiveOutcome::default());
+        }
         self.target
             .delete_revision(&RevisionRef {
                 deployment_id,

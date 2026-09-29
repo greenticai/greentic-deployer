@@ -141,6 +141,9 @@ fn route_remote(
             EnvVerb::Render(_) => Err(not_supported("env render")),
             EnvVerb::Reconcile(args) => remote_reconcile(store, flags, args),
             EnvVerb::ApplyRevision(_) => Err(not_supported("env apply-revision")),
+            EnvVerb::DrainRevision(_) => Err(not_supported("env drain-revision")),
+            EnvVerb::Sweep(_) => Err(not_supported("env sweep")),
+            EnvVerb::Capabilities { .. } => Err(not_supported("env capabilities")),
             EnvVerb::ApplyTraffic(_) => Err(not_supported("env apply-traffic")),
             EnvVerb::Destroy { .. } => Err(not_supported("env destroy")),
             EnvVerb::MigrateDev { .. } => Err(not_supported("env migrate-dev")),
@@ -1499,6 +1502,8 @@ fn remote_reconcile(
         secrets_backend,
         false,
         // A remote store carries no sor-units.json sidecar (amendment 6).
+        None,
+        // No local store identity: workers stay unattributed, never swept.
         None,
     )?;
 

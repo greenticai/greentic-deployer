@@ -262,6 +262,13 @@ pub struct ServiceStatus {
     pub ingress_ip: Option<String>,
 }
 
+/// One object [`K8sCluster::list`] returned, with the labels it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabeledObject {
+    pub object: ObjectRef,
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
 /// Declarative mutation surface against one cluster.
 ///
 /// ## Idempotency contract
@@ -317,6 +324,52 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
         &self,
         service: &ObjectRef,
     ) -> Result<ServiceStatus, K8sClusterError>;
+
+    /// List the worker `Deployment`s and `Service`s in `namespace` matching
+    /// `label_selector` (a Kubernetes equality selector, `k=v,k2=v2`). The
+    /// orphan sweep's read: it only ever asks for the deployer's own labels,
+    /// so an unlabeled object can never be returned. Needs `list` on
+    /// `deployments` / `services`, which the bootstrap Role does not grant —
+    /// see `op env sweep`. Default: unconfigured.
+    async fn list(
+        &self,
+        namespace: &str,
+        label_selector: &str,
+    ) -> Result<Vec<LabeledObject>, K8sClusterError> {
+        let _ = (namespace, label_selector);
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    /// Set a Deployment's `spec.replicas` (the drain's stop step). `Ok(false)`
+    /// when the Deployment does not exist — nothing to stop. Default:
+    /// unconfigured.
+    async fn scale_deployment(
+        &self,
+        deployment: &ObjectRef,
+        replicas: i32,
+    ) -> Result<bool, K8sClusterError> {
+        let _ = (deployment, replicas);
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    /// Read one object back as JSON; `None` when absent. The drain reads the
+    /// router's runtime-config ConfigMap through it (`configmaps get` is in
+    /// the bound Role). Default: unconfigured.
+    async fn get_object(&self, object: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+        let _ = object;
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    /// [`Self::get_rollout_status`] that reports an absent Deployment as
+    /// `None` rather than an error — the drain probe, where "gone" is a
+    /// drained answer. Default: unconfigured.
+    async fn get_rollout_status_opt(
+        &self,
+        deployment: &ObjectRef,
+    ) -> Result<Option<RolloutStatus>, K8sClusterError> {
+        let _ = deployment;
+        Err(K8sClusterError::Unconfigured)
+    }
 }
 
 /// The scaffold default: no client wired, every call fails honestly.
@@ -348,111 +401,8 @@ impl K8sCluster for UnconfiguredCluster {
     }
 }
 
-/// In-memory fake honoring the [`K8sCluster`] idempotency contract.
-/// Backs the conformance run and the verb-behavior tests; integration
-/// against a real cluster is the PR-5.3 kind E2E.
 #[cfg(test)]
-#[derive(Debug, Default)]
-pub struct InMemoryCluster {
-    objects: std::sync::Mutex<std::collections::BTreeMap<ObjectRef, Value>>,
-}
-
-#[cfg(test)]
-impl InMemoryCluster {
-    pub fn objects(&self) -> std::collections::BTreeMap<ObjectRef, Value> {
-        self.objects.lock().expect("mutex not poisoned").clone()
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl K8sCluster for InMemoryCluster {
-    async fn apply(&self, manifest: &Value) -> Result<(), K8sClusterError> {
-        let object = ObjectRef::from_manifest(manifest)?;
-        let mut objects = self.objects.lock().expect("mutex not poisoned");
-        if let Some(existing) = objects.get(&object) {
-            refuse_adoption(manifest, existing.pointer("/metadata/labels"))?;
-        }
-        objects.insert(object, manifest.clone());
-        Ok(())
-    }
-
-    async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError> {
-        // Absent => Ok: deleting twice is the retried-archive path.
-        self.objects
-            .lock()
-            .expect("mutex not poisoned")
-            .remove(object);
-        Ok(())
-    }
-
-    async fn delete_if_labeled(
-        &self,
-        object: &ObjectRef,
-        labels: &[(&str, &str)],
-    ) -> Result<bool, K8sClusterError> {
-        let mut objects = self.objects.lock().expect("mutex not poisoned");
-        let owned = objects.get(object).is_some_and(|stored| {
-            labels.iter().all(|(key, value)| {
-                stored
-                    .pointer("/metadata/labels")
-                    .and_then(|l| l.get(*key))
-                    .and_then(Value::as_str)
-                    == Some(*value)
-            })
-        });
-        if owned {
-            objects.remove(object);
-        }
-        Ok(owned)
-    }
-
-    async fn get_rollout_status(
-        &self,
-        _deployment: &ObjectRef,
-    ) -> Result<RolloutStatus, K8sClusterError> {
-        // The fake has no rollout controller; report a fully-rolled-out
-        // Deployment (all replicas updated and available, none lingering) so
-        // warm's readiness wait resolves on the first poll for any desired
-        // count.
-        Ok(RolloutStatus {
-            generation: 0,
-            observed_generation: Some(0),
-            replicas: i32::MAX,
-            updated_replicas: i32::MAX,
-            available_replicas: i32::MAX,
-        })
-    }
-
-    async fn get_service_status(
-        &self,
-        service: &ObjectRef,
-    ) -> Result<ServiceStatus, K8sClusterError> {
-        let stored = self
-            .objects
-            .lock()
-            .expect("mutex not poisoned")
-            .get(service)
-            .cloned()
-            .ok_or_else(|| K8sClusterError::Api(format!("`{service}` not found")))?;
-        // The fake has no API server and no cloud controller, so it reports
-        // exactly what an apply would have persisted and nothing either of them
-        // would have assigned: no allocated nodePort, no LB ingress. A
-        // `LoadBalancer` therefore reads as PENDING here, which is the honest
-        // fake of a load balancer that has been requested and not yet
-        // provisioned — and the state a caller most needs to be able to see.
-        Ok(ServiceStatus {
-            service_type: stored
-                .pointer("/spec/type")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            node_port: None,
-            ingress_hostname: None,
-            ingress_ip: None,
-        })
-    }
-}
+pub use super::cluster_fake::InMemoryCluster;
 
 #[cfg(test)]
 mod tests {
@@ -604,49 +554,5 @@ mod tests {
             c.get_service_status(&r).await.unwrap_err(),
             K8sClusterError::Unconfigured
         ));
-    }
-
-    #[tokio::test]
-    async fn in_memory_service_status_reports_the_applied_type_and_no_assigned_address() {
-        let c = InMemoryCluster::default();
-        let lb = json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {"name": "svc-a", "namespace": "ns-a"},
-            "spec": {"type": "LoadBalancer"},
-        });
-        c.apply(&lb).await.unwrap();
-        let status = c
-            .get_service_status(&ObjectRef::from_manifest(&lb).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(status.service_type, "LoadBalancer");
-        // The fake has no cloud controller, so it assigns nothing — the honest
-        // fake of a load balancer that has been requested and not provisioned.
-        assert_eq!(status.node_port, None);
-        assert_eq!(status.ingress_hostname, None);
-        assert_eq!(status.ingress_ip, None);
-    }
-
-    #[tokio::test]
-    async fn in_memory_service_status_of_an_absent_object_is_an_error() {
-        // Never a default-shaped `ServiceStatus`: a Service that is not there
-        // and a Service with no address assigned are different answers, and
-        // only one of them means "keep waiting".
-        let c = InMemoryCluster::default();
-        let r = ObjectRef::from_manifest(&manifest()).unwrap();
-        assert!(c.get_service_status(&r).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn in_memory_cluster_upserts_and_deletes_idempotently() {
-        let c = InMemoryCluster::default();
-        c.apply(&manifest()).await.unwrap();
-        c.apply(&manifest()).await.unwrap();
-        assert_eq!(c.objects().len(), 1, "apply is an upsert");
-        let r = ObjectRef::from_manifest(&manifest()).unwrap();
-        c.delete(&r).await.unwrap();
-        c.delete(&r).await.unwrap();
-        assert!(c.objects().is_empty(), "delete of absent is Ok");
     }
 }

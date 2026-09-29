@@ -35,6 +35,7 @@ pub mod bound_session;
 pub mod credentials;
 pub mod deploy_target;
 pub mod deployer;
+mod drain;
 #[cfg(feature = "deploy-gcp-cloudrun")]
 pub mod real_target;
 pub mod sor;
@@ -42,6 +43,7 @@ pub mod sor;
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
 
+use super::deployer::DrainPolicy;
 use super::slot::EnvPackHandler;
 use crate::tool_check::ToolCheck;
 
@@ -63,6 +65,9 @@ pub struct GcpCloudRunDeployerHandler {
     /// `Secrets`-slot pack (and for the registry/default handler, which never
     /// runs a live deploy).
     pub(crate) dev_secrets: Option<Vec<u8>>,
+    /// How `drain_revision` waits and confirms (P5-R2). Defaults to
+    /// [`DrainPolicy::from_env`]; tests inject [`DrainPolicy::immediate`].
+    pub(crate) drain_policy: DrainPolicy,
 }
 
 impl Default for GcpCloudRunDeployerHandler {
@@ -71,6 +76,7 @@ impl Default for GcpCloudRunDeployerHandler {
             creds: GcpDeployerCredentials::default(),
             target: std::sync::Arc::new(deploy_target::UnconfiguredCloudRunTarget),
             dev_secrets: None,
+            drain_policy: DrainPolicy::from_env(),
         }
     }
 }
@@ -92,6 +98,7 @@ impl GcpCloudRunDeployerHandler {
             creds: GcpDeployerCredentials::with_client(client),
             target: std::sync::Arc::new(deploy_target::UnconfiguredCloudRunTarget),
             dev_secrets: None,
+            drain_policy: DrainPolicy::from_env(),
         }
     }
 
@@ -115,7 +122,14 @@ impl GcpCloudRunDeployerHandler {
             creds: GcpDeployerCredentials::default(),
             target,
             dev_secrets,
+            drain_policy: DrainPolicy::from_env(),
         }
+    }
+
+    /// Override the drain wait/confirm policy (builder-style).
+    pub fn with_drain_policy(mut self, drain_policy: DrainPolicy) -> Self {
+        self.drain_policy = drain_policy;
+        self
     }
 }
 

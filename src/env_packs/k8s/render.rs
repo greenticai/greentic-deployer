@@ -38,6 +38,7 @@ impl K8sDeployerHandler {
         // injects it; render/reconcile both set it, so the rendered worker
         // identity (dev-store Secret vs. Vault SA) matches the env's binding.
         params.secrets_backend = self.secrets_backend.clone();
+        params.store_label = self.store_label.clone();
         let mut objects = manifests::render_environment_manifests(env, &params);
         for revision in &env.revisions {
             if has_cluster_presence(revision.lifecycle) {

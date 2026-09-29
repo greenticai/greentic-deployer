@@ -9,6 +9,8 @@ use greentic_deploy_spec::{DeploymentId, Environment, RevisionId, RuntimeConfig}
 use serde_json::Value;
 use thiserror::Error;
 
+use super::capabilities::AdapterCapabilities;
+use super::drain::DrainEvidence;
 use crate::environment::runtime_config::materialize_runtime_config;
 
 /// Side-effect outcome of [`Deployer::stage_revision`].
@@ -32,8 +34,16 @@ pub struct WarmOutcome {
 }
 
 /// Side-effect outcome of [`Deployer::drain_revision`].
+///
+/// `evidence` is what the provider showed that proves the drain;
+/// [`DrainEvidence::Unsupported`] (the default) means the adapter did not
+/// confirm anything — its `drain` capability is false.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DrainOutcome {}
+pub struct DrainOutcome {
+    /// Seconds the drain window actually waited (after the policy cap).
+    pub waited_seconds: u64,
+    pub evidence: DrainEvidence,
+}
 
 /// Side-effect outcome of [`Deployer::archive_revision`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -87,6 +97,15 @@ pub enum DeployerError {
     InvalidSplit {
         deployment_id: DeploymentId,
         sum: u64,
+    },
+
+    /// The revision is still serving: its drain did not confirm (or it was
+    /// never drained) and archiving it now would cut live sessions. Pass
+    /// `--force-drain` to archive anyway.
+    #[error("revision `{revision_id}` is not drained: {reason}")]
+    NotDrained {
+        revision_id: RevisionId,
+        reason: String,
     },
 
     /// Provider-side failure. The trait does not constrain the message
@@ -177,9 +196,11 @@ pub fn enforce_split_invariants(
 /// id, the qa-spec convention). `None` means "use the env-pack's sandbox
 /// defaults". K8s reads namespace / image / replica overrides from it so an
 /// operator's custom binding lands the same objects `op env render` /
-/// `op env reconcile` show. `stage_revision` / `drain_revision` are no-ops that
-/// render nothing, so they carry no answers; a future provider whose stage
+/// `op env reconcile` show. `stage_revision` is a no-op that
+/// renders nothing, so it carries no answers; a future provider whose stage
 /// uploads to an answer-derived registry adds the param when it grows a body.
+/// `drain_revision` takes answers because its probe must address the live
+/// objects (K8s namespace, Cloud Run project/region).
 #[async_trait]
 pub trait Deployer: std::fmt::Debug + Send + Sync {
     /// Stage-time side effects: upload bundle to registry/storage,
@@ -207,15 +228,46 @@ pub trait Deployer: std::fmt::Debug + Send + Sync {
         answers: Option<&Value>,
     ) -> Result<WarmOutcome, DeployerError>;
 
-    /// Drain-time side effects: stop accepting new sessions and wait up
-    /// to `drain_seconds` for existing sessions to complete.
+    /// Drain-time side effects (P5-R2): wait the revision's `drain_seconds`
+    /// (capped by the adapter's drain policy) for existing sessions to
+    /// complete, then CONFIRM the revision serves nothing. An adapter that
+    /// cannot confirm returns [`DrainEvidence::Unsupported`]; one that can
+    /// but finds the revision still serving returns
+    /// [`DeployerError::NotDrained`] naming the revision.
     ///
     /// Returns once the revision can transition `Ready → Draining → Inactive`.
     async fn drain_revision(
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        answers: Option<&Value>,
     ) -> Result<DrainOutcome, DeployerError>;
+
+    /// Point-in-time drain check with no wait — the archive gate. `Ok` with
+    /// evidence when the revision serves nothing; [`DeployerError::NotDrained`]
+    /// when it still does. The default reports
+    /// [`DrainEvidence::Unsupported`]: an adapter without the `drain`
+    /// capability cannot gate, and says so rather than claiming a drain.
+    async fn confirm_drained(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<DrainEvidence, DeployerError> {
+        require_revision(env, revision_id)?;
+        let _ = answers;
+        Ok(DrainEvidence::Unsupported)
+    }
+
+    /// What this adapter can do (P5-R3). Default: nothing claimed.
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::NONE
+    }
+
+    /// Caveats behind [`Self::capabilities`], for report output.
+    fn capability_notes(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Archive-time side effects: tear down the provider resources for
     /// this revision (delete the K8s Deployment, deregister the ECS task-

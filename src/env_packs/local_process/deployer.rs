@@ -48,6 +48,7 @@ impl Deployer for LocalProcessDeployerHandler {
         &self,
         env: &Environment,
         revision_id: RevisionId,
+        _answers: Option<&serde_json::Value>,
     ) -> Result<DrainOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         Ok(DrainOutcome::default())
