@@ -1156,18 +1156,53 @@ pub(super) fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), O
 /// [`put_credential_material`] from the credentials bootstrap/rotate sink.
 /// Runtime material must never use this.
 pub(super) fn dev_store_put_credential(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+    let _write_lock = DevStoreWriteLock::acquire(path)?;
+    dev_store_write_unlocked(path, uri, value)
+}
+
+/// The dev store's writer flock, held across a whole read-check-write cycle.
+///
+/// [`dev_store_put`] holds the lock around ONE write, which is not enough when
+/// the value written depends on what was read — two writers can both read
+/// "absent" and both write. Holding this guard serialises the cycle; writes
+/// made while it is held go through [`Self::put`], never `dev_store_put`, since
+/// the flock is not re-entrant.
+pub(super) struct DevStoreWriteLock {
+    _flock: EnvFlock,
+}
+
+impl DevStoreWriteLock {
+    /// Take the writer flock for the store at `path` (creating its directory).
+    pub(super) fn acquire(path: &Path) -> Result<Self, OpError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let flock = EnvFlock::acquire(&dev_store_lock_path(path))
+            .map_err(|source| OpError::Store(source.into()))?;
+        Ok(Self { _flock: flock })
+    }
+
+    /// [`dev_store_put`] under the already-held lock: the same reserved
+    /// credential-namespace refusal, without re-taking the flock.
+    pub(super) fn put(&self, path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+        if let Some(rel) =
+            crate::credentials::store_paths::split_store_uri(uri).map(|(_env, rel)| rel)
+        {
+            reject_reserved_credential_rel_path(&rel)?;
+        }
+        dev_store_write_unlocked(path, uri, value)
+    }
+}
+
+/// One dev-store write. The caller holds [`DevStoreWriteLock`].
+fn dev_store_write_unlocked(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
     let io_err = |message: String| OpError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(message),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let _write_lock = EnvFlock::acquire(&dev_store_lock_path(path))
-        .map_err(|source| OpError::Store(source.into()))?;
     let store = DevStore::with_path(path.to_path_buf())
         .map_err(|e| io_err(format!("open dev store: {e}")))?;
     std::thread::scope(|scope| {
@@ -1240,7 +1275,7 @@ fn dev_store_contains(path: &Path, uri: &str) -> Result<bool, OpError> {
 /// error — the only hard failure is being unable to open the store file). Same
 /// dedicated-thread runtime hop as [`dev_store_put`] (the caller may sit on a
 /// current-thread runtime where `block_in_place` panics).
-fn dev_store_get_value(path: &Path, uri: &str) -> Result<Option<String>, OpError> {
+pub(super) fn dev_store_get_value(path: &Path, uri: &str) -> Result<Option<String>, OpError> {
     let io_err = |message: String| OpError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(message),

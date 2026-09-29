@@ -38,6 +38,7 @@ pub mod deployer;
 mod drain;
 #[cfg(feature = "deploy-gcp-cloudrun")]
 pub mod real_target;
+pub mod shared_state;
 pub mod sor;
 
 use greentic_deploy_spec::CapabilitySlot;
@@ -68,6 +69,12 @@ pub struct GcpCloudRunDeployerHandler {
     /// How `drain_revision` waits and confirms (P5-R2). Defaults to
     /// [`DrainPolicy::from_env`]; tests inject [`DrainPolicy::immediate`].
     pub(crate) drain_policy: DrainPolicy,
+    /// Whether the staged seed carries every `generated` secret the revision's
+    /// packs declare — decided by the CLI (it owns the dev store) and consulted
+    /// only by the multi-instance gate (`shared_state::gate`). Defaults to
+    /// [`Unverified`](shared_state::GeneratedSecretSeed::Unverified), which
+    /// refuses a multi-instance shape and changes nothing for a single instance.
+    pub(crate) generated_secret_seed: shared_state::GeneratedSecretSeed,
 }
 
 impl Default for GcpCloudRunDeployerHandler {
@@ -77,6 +84,7 @@ impl Default for GcpCloudRunDeployerHandler {
             target: std::sync::Arc::new(deploy_target::UnconfiguredCloudRunTarget),
             dev_secrets: None,
             drain_policy: DrainPolicy::from_env(),
+            generated_secret_seed: shared_state::GeneratedSecretSeed::default(),
         }
     }
 }
@@ -99,6 +107,7 @@ impl GcpCloudRunDeployerHandler {
             target: std::sync::Arc::new(deploy_target::UnconfiguredCloudRunTarget),
             dev_secrets: None,
             drain_policy: DrainPolicy::from_env(),
+            generated_secret_seed: shared_state::GeneratedSecretSeed::default(),
         }
     }
 
@@ -123,12 +132,20 @@ impl GcpCloudRunDeployerHandler {
             target,
             dev_secrets,
             drain_policy: DrainPolicy::from_env(),
+            generated_secret_seed: shared_state::GeneratedSecretSeed::default(),
         }
     }
 
     /// Override the drain wait/confirm policy (builder-style).
     pub fn with_drain_policy(mut self, drain_policy: DrainPolicy) -> Self {
         self.drain_policy = drain_policy;
+        self
+    }
+
+    /// Record what the CLI established about generated secrets in the staged
+    /// seed, for the multi-instance gate (`shared_state::gate`).
+    pub fn with_generated_secret_seed(mut self, seed: shared_state::GeneratedSecretSeed) -> Self {
+        self.generated_secret_seed = seed;
         self
     }
 }

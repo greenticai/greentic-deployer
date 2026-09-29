@@ -1121,6 +1121,15 @@ fn staging_excluded_uris(env: &Environment) -> Vec<String> {
 /// an `&Environment`. MUST NOT be called from within an open `transact` for the
 /// same env (the flock is not re-entrant); all current callers pass an unlocked
 /// env.
+/// The dev-store file a runtime seed is staged FROM. One resolution for every
+/// reader and writer of the seed (staging, and the Cloud Run generated-secret
+/// pre-mint), so they can never disagree about which file that is. It
+/// deliberately ignores `GREENTIC_DEV_SECRETS_PATH`: the seed is the env's own
+/// store, not whatever an operator's shell points the CLI at.
+pub(crate) fn staged_dev_store_path(env_dir: &std::path::Path) -> std::path::PathBuf {
+    super::secrets::resolve_dev_store_path(env_dir, None)
+}
+
 pub(crate) fn read_dev_secrets_bytes(
     store: &LocalFsStore,
     env_id: &EnvId,
@@ -1128,7 +1137,7 @@ pub(crate) fn read_dev_secrets_bytes(
     let env_dir = store
         .env_dir(env_id)
         .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
-    let src = super::secrets::resolve_dev_store_path(&env_dir, None);
+    let src = staged_dev_store_path(&env_dir);
 
     store.transact(env_id, |locked| -> Result<Option<Vec<u8>>, OpError> {
         let env = locked
@@ -2013,16 +2022,25 @@ fn apply_revision_cloudrun(
     // resolves `secret://` against the dev-store backend, never Vault, and only
     // on the warm path (`present`). Keeps operator-local Vault material and any
     // bound deployer credentials in the dev-store out of the runtime seed.
-    let dev_secrets = if verb == RevisionVerb::Warm && cloudrun_stages_dev_secrets(env) {
-        read_dev_secrets_bytes(store, env_id)?
-    } else {
-        None
-    };
+    //
+    // A multi-instance warm additionally pre-mints every generated secret the
+    // revision's packs declare into the dev store BEFORE staging, and checks the
+    // staged bytes carry them (`shared_state::gate` refuses otherwise). A
+    // single-instance warm stages exactly as before.
+    let (dev_secrets, generated_secret_seed) = cloudrun_seed_material(
+        store,
+        env,
+        env_id,
+        revision,
+        verb == RevisionVerb::Warm,
+        &params,
+    )?;
 
     let endpoint_url = run_gcp_async(async move {
         let handler =
             resolve_cloudrun_handler(&params.project, &params.region, credentials, dev_secrets)
-                .await?;
+                .await?
+                .with_generated_secret_seed(generated_secret_seed);
         if verb == RevisionVerb::Warm {
             // The Service's live `*.run.app` URL rides back on the warm outcome
             // (read from the upsert response — no extra round-trip): the "one
@@ -2051,6 +2069,76 @@ fn apply_revision_cloudrun(
         }
     })?;
     Ok((identity, worker_name, endpoint_url))
+}
+
+/// The dev-store bytes a Cloud Run warm stages, and what is known about the
+/// generated secrets in them (for the multi-instance gate).
+///
+/// Pre-minting runs only for a warm whose scaling can run several instances
+/// (`shared_state::runs_multiple_instances` — the EFFECTIVE ceiling, so
+/// `max_instances = 0` counts) AND whose answers could pass the gate at all
+/// (`multi_instance_safe`): a deploy the gate is certain to refuse must not
+/// write into the operator's dev store first. Everything else stages exactly as
+/// before. For a pre-minting warm, an env with no staged dev-store seed has
+/// nowhere to pre-mint into, so the gate refuses rather than let each instance
+/// mint its own.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn cloudrun_seed_material(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision: &greentic_deploy_spec::Revision,
+    warm: bool,
+    params: &crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams,
+) -> Result<
+    (
+        Option<Vec<u8>>,
+        crate::env_packs::gcp_cloudrun::shared_state::GeneratedSecretSeed,
+    ),
+    OpError,
+> {
+    use crate::env_packs::gcp_cloudrun::shared_state::{
+        GeneratedSecretSeed, multi_instance_safe, runs_multiple_instances,
+    };
+
+    if !warm {
+        return Ok((None, GeneratedSecretSeed::Unverified));
+    }
+    let stages = cloudrun_stages_dev_secrets(env);
+    if !(runs_multiple_instances(params) && multi_instance_safe(params)) {
+        let bytes = if stages {
+            read_dev_secrets_bytes(store, env_id)?
+        } else {
+            None
+        };
+        return Ok((bytes, GeneratedSecretSeed::Unverified));
+    }
+    if stages {
+        let env_dir = store
+            .env_dir(env_id)
+            .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
+        let dev_path = staged_dev_store_path(&env_dir);
+        let (seed, staged) = super::cloudrun_generated_secrets::premint_and_stage(
+            store,
+            env,
+            revision,
+            &dev_path,
+            || read_dev_secrets_bytes(store, env_id),
+        )?;
+        return Ok((staged, seed));
+    }
+    // Cloud Run renders no `GREENTIC_SECRETS_BACKEND`, so the runtime always
+    // resolves (and mints into) its per-instance dev store. Without a staged
+    // dev-store seed there is nowhere to pre-mint into.
+    Ok((
+        None,
+        GeneratedSecretSeed::Unestablished(
+            "the environment does not stage a dev-store seed (no dev-store Secrets pack is \
+             bound), so generated secrets cannot be pre-minted and each Cloud Run instance \
+             would mint its own at boot; bind `greentic.secrets.dev-store`"
+                .to_string(),
+        ),
+    ))
 }
 
 /// `deploy-gcp-cloudrun`-less builds recognize the cloudrun kind (the dispatch

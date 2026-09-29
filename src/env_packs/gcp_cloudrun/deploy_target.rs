@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use super::shared_state::VpcAccess;
 use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, RevisionId};
 
@@ -45,8 +46,13 @@ pub enum AccessMode {
 /// Scaling + sizing knobs rendered onto the Service (plan D5/D6).
 ///
 /// `min_instances = 0` + request-based billing is what makes an idle env cost
-/// nothing; `max_instances = 1` keeps a single writer for the ephemeral,
-/// per-instance seeded dev store (plan D6). Carried on [`ServiceSpec`] so the
+/// nothing. `max_instances = 1` (the default) keeps a single writer for the
+/// ephemeral, per-instance seeded dev store (plan D6); any other shape — a
+/// higher value, `0` (an unset `maxInstanceCount`, i.e. Cloud Run's default
+/// ceiling of up to 100) or `min_instances > 1` — is refused by
+/// `shared_state::gate` unless the env answers a Redis session store, a VPC
+/// route to it, and its generated secrets are pre-minted into the staged seed
+/// (see `docs/cloudrun-internals.md` §9). Carried on [`ServiceSpec`] so the
 /// real target consumes it without a spec change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScalingSpec {
@@ -164,8 +170,13 @@ pub struct ServiceSpec {
     /// Order-preserving so the rendered Service is deterministic.
     pub env: Vec<(String, String)>,
     /// Env vars sourced from a pinned Secret Manager version — the telemetry
-    /// header credential. Revision-scoped, like `secrets`. Never a value.
+    /// header credential and the Redis URL. Revision-scoped, like `secrets`.
+    /// Never a value.
     pub secret_env: Vec<SecretEnvVar>,
+    /// The revision's `vpcAccess` (connector or Direct VPC egress), when the
+    /// env answers one. Revision-scoped: it lands in the immutable template and
+    /// is folded into `revision_intent`. `None` renders no `vpcAccess` at all.
+    pub vpc_access: Option<VpcAccess>,
 }
 
 /// The subset of [`ServiceSpec`] Cloud Run renders into the **immutable**
@@ -187,6 +198,7 @@ struct RevisionTemplate {
     secrets: Vec<SecretMount>,
     env: Vec<(String, String)>,
     secret_env: Vec<SecretEnvVar>,
+    vpc_access: Option<VpcAccess>,
 }
 
 impl RevisionTemplate {
@@ -207,6 +219,7 @@ impl RevisionTemplate {
             secrets,
             env,
             secret_env,
+            vpc_access,
             // Service-level or non-Service: mutable without a new revision.
             deployment_id: _,
             revision_id: _,
@@ -224,6 +237,7 @@ impl RevisionTemplate {
             secrets: secrets.clone(),
             env: env.clone(),
             secret_env: secret_env.clone(),
+            vpc_access: vpc_access.clone(),
         }
     }
 }
@@ -661,6 +675,20 @@ impl InMemoryCloudRun {
             .cloned()
     }
 
+    /// The `vpcAccess` the named revision was created with (`None` inside when
+    /// it has none); outer `None` when the revision does not exist.
+    pub fn revision_vpc_access_for(
+        &self,
+        deployment_id: DeploymentId,
+        revision_id: RevisionId,
+    ) -> Option<Option<VpcAccess>> {
+        self.revisions
+            .lock()
+            .expect("revisions mutex")
+            .get(&(deployment_id, revision_id))
+            .map(|(_status, template)| template.vpc_access.clone())
+    }
+
     /// Secret mounts the last upsert projected onto `deployment_id`'s container.
     pub fn service_secrets_for(&self, deployment_id: DeploymentId) -> Option<Vec<SecretMount>> {
         self.service_secrets
@@ -980,6 +1008,7 @@ mod tests {
             secrets: Vec::new(),
             env: Vec::new(),
             secret_env: Vec::new(),
+            vpc_access: None,
         }
     }
 

@@ -23,6 +23,7 @@ failure.
 | `credentials.rs` | 1145 | `DeployerCredentials`: ADC principal resolution + the `testIamPermissions` preflight. |
 | `bootstrap.rs` | 414 | Renders the minimum-privilege Terraform module (deployer SA, runtime SA, custom role). |
 | `bound_session.rs` | 261 | Resolves the env's bound credential material into live `Credentials`. |
+| `shared_state.rs` | ~450 | Redis + VPC answers, the `multi_instance_safe` capability and the multi-instance `gate`. |
 | `sor/` | ~1100 | SoR units (SoRLa phase 3E): the SorServiceTarget seam + fake, pure builders, bring-up/retire, the real target. |
 
 Feature gating is two-tier and deliberate:
@@ -152,6 +153,11 @@ A test (`real_target.rs:1362`) asserts **`REAL_… ⊆ VALIDATED_…`**.
 > bootstrap Terraform. That chain is why a missing permission fails CI rather
 > than a customer's first `op env up`. Do not weaken the test to get green.
 
+`VPC_EGRESS_PERMISSIONS` (`vpcaccess.connectors.use`, `compute.subnetworks.use`)
+is deliberately outside `VALIDATED_…`: it is probed only when the binding answers
+a VPC (`with_vpc_egress`), so a credential bootstrapped before VPC egress keeps
+passing, while `bootstrap_permissions()` always grants it.
+
 The preflight itself asks Google rather than inferring from role names:
 `projects:testIamPermissions` (Cloud Resource Manager) and
 `{sa}:testIamPermissions` (IAM), over plain REST via `reqwest`.
@@ -276,10 +282,32 @@ Not gaps to fix casually — each has a reason:
 
 - **No `op env reconcile` / `op env render`.** Cloud Run is imperative; there is
   no cluster to diff against and no prune step.
-- **`max_instances = 1` is a correctness constraint**, not cost tuning. The
-  environment/session store is per-instance in in-memory `/tmp`. A second
-  instance gets its own store and sees none of the first's state. Lifting this
-  needs a durable shared store first.
+- **Multi-instance is gated, not free** (`shared_state::gate`, run in
+  `warm_revision` before any provider call). "Multi-instance" is the EFFECTIVE
+  ceiling (`multi_instance_shape`): `max_instances = 0` renders an unset
+  `maxInstanceCount`, which Cloud Run reads as its default (up to 100), and
+  `min_instances > 1` keeps several warm. Only `max_instances == 1` with
+  `min_instances <= 1` (the default) is single. A second instance gets its own
+  in-memory store, so three things must be shared first, and the gate refuses
+  unless all hold:
+  - **Sessions + flow state** — `redis_url` makes `runtime_boot_env` add
+    `GREENTIC_RUNNER_SESSION_BACKEND=redis` / `GREENTIC_RUNNER_STATE_BACKEND=redis`,
+    and the URL rides as `GREENTIC_RUNNER_REDIS_URL` from one pinned version of
+    the env secret (owner-guarded, accessor-granted like the telemetry header).
+  - **Revision pins** — the same version also feeds
+    `GREENTIC_REVISION_PIN_REDIS_URL`.
+  - **Generated secrets** — greentic-start's `revision_secrets` mints a missing
+    declared `generated` secret at boot, per instance. The CLI
+    (`cli::cloudrun_generated_secrets`) pre-mints each one into the env dev store
+    (never re-minting an existing one), stages, and checks the staged bytes; the
+    handler carries the verdict as `GeneratedSecretSeed` and only `Complete`
+    passes.
+
+  A VPC route is also required (the URL carries AUTH and v1 has no TLS —
+  `rediss://` is refused, P5-R5). `shared_state::multi_instance_safe(&params)` is
+  the adapter capability (Redis + VPC answered); the gate adds the seed check.
+  Redis/VPC answers move `revision_intent` (secret-env NAMES, boot selectors, and
+  `revision_intent_with_vpc`); their absence leaves it byte-identical.
 - **Traffic splits must be whole percents.** Cloud Run works in whole integer
   percents summing to 100; non-multiples of 100 bps are rejected, never silently
   rounded.
