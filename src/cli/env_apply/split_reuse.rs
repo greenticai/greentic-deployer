@@ -7,8 +7,9 @@
 //! Cloud Run a new store revision is a new cloud revision (the deployer only
 //! skips creating one when the store `RevisionId` already exists).
 //!
-//! [`reusable_revisions`] finds, per desired entry, an already-staged revision
-//! of the same deployment that serves the same artifact, so the executor can
+//! [`reusable_revisions_with_answer`] finds, per desired entry, an already-staged
+//! revision of the same deployment that serves the same artifact on the same
+//! effective runtime, so the executor can
 //! route traffic to it instead of re-staging. A weight-only change then
 //! becomes a pure `traffic set`.
 
@@ -17,6 +18,8 @@ use std::path::Path;
 
 use greentic_deploy_spec::{DeploymentId, Environment, RevisionId, RevisionLifecycle};
 
+use super::runtime_pin::effective_runtime;
+
 /// What one desired split entry must match to reuse an existing revision.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WantedRevision<'a> {
@@ -24,6 +27,9 @@ pub(super) struct WantedRevision<'a> {
     pub source_uri: Option<&'a str>,
     /// The drain window the manifest declares (its default when unset).
     pub drain_seconds: u32,
+    /// The entry's EFFECTIVE runtime: its pin, else the Cloud Run deployer
+    /// answer (`runtime_pin::effective_runtime`). Computed by the caller.
+    pub runtime: Option<&'a str>,
 }
 
 /// For each `wanted` entry (in order), the id of an existing revision that can
@@ -46,6 +52,10 @@ pub(super) struct WantedRevision<'a> {
 /// - its `drain_seconds` equals the manifest's. A reused revision keeps the
 ///   value it was staged with, so a changed drain window re-stages instead of
 ///   being silently dropped;
+/// - its effective runtime (its own `runtime_image_digest`, else `answer`)
+///   equals the wanted one. A revision staged before runtime pins existed
+///   carries `None` and so runs the answer: it keeps being reused while the
+///   answer is unchanged, and a pin that names a different image stages fresh;
 /// - its pack list is complete when that can be judged locally — reusing a
 ///   short-locked revision would make the heal re-stage a no-op forever;
 /// - no earlier entry in `wanted` already claimed it (two entries naming the
@@ -54,11 +64,16 @@ pub(super) struct WantedRevision<'a> {
 /// Among several candidates the one currently carrying traffic wins, then the
 /// newest (highest per-deployment `sequence`), so a retained 0 % baseline is
 /// preferred over an older idle copy of the same artifact.
-pub(super) fn reusable_revisions(
+///
+/// `answer` is the Cloud Run deployer binding's `runtime_image_digest` answer
+/// in effect for this apply (`None` for any other deployer — k8s has no such
+/// answer, and every revision there is `None`-stamped).
+pub(super) fn reusable_revisions_with_answer(
     env: &Environment,
     deployment_id: DeploymentId,
     wanted: &[WantedRevision<'_>],
     env_dir: Option<&Path>,
+    answer: Option<&str>,
 ) -> Vec<Option<RevisionId>> {
     let split_entries = env
         .traffic_splits
@@ -87,6 +102,7 @@ pub(super) fn reusable_revisions(
                         && r.bundle_digest == w.digest
                         && r.bundle_source_uri.as_deref() == w.source_uri
                         && r.drain_seconds == w.drain_seconds
+                        && effective_runtime(r.runtime_image_digest.as_deref(), answer) == w.runtime
                         && !claimed.contains(&r.revision_id)
                         && env_dir.is_none_or(|dir| {
                             super::super::bundle_stage::pack_list_is_complete(
@@ -121,6 +137,7 @@ mod tests {
             digest,
             source_uri: None,
             drain_seconds: DRAIN,
+            runtime: None,
         }
     }
 
@@ -160,7 +177,7 @@ mod tests {
     #[test]
     fn prefers_the_revision_carrying_traffic_then_the_newest() {
         let (env, dep_id, [r1, r2, r3]) = env_with_revisions();
-        let got = reusable_revisions(
+        let got = reusable_revisions_with_answer(
             &env,
             dep_id,
             &[
@@ -168,6 +185,7 @@ mod tests {
                 wanted("sha256:bb"),
                 wanted("sha256:aa"),
             ],
+            None,
             None,
         );
         // First `aa` takes the live one; the duplicate falls back to the idle
@@ -183,7 +201,7 @@ mod tests {
                 r.lifecycle = RevisionLifecycle::Draining;
             }
         }
-        let got = reusable_revisions(
+        let got = reusable_revisions_with_answer(
             &env,
             dep_id,
             &[
@@ -193,8 +211,10 @@ mod tests {
                     digest: "sha256:aa",
                     source_uri: Some("oci://x/b:1"),
                     drain_seconds: DRAIN,
+                    runtime: None,
                 },
             ],
+            None,
             None,
         );
         assert_eq!(got, vec![None, None, None]);
@@ -206,7 +226,7 @@ mod tests {
         for r in &mut env.revisions {
             r.bundle_digest = "sha256:00".into();
         }
-        let got = reusable_revisions(&env, dep_id, &[wanted("sha256:00")], None);
+        let got = reusable_revisions_with_answer(&env, dep_id, &[wanted("sha256:00")], None, None);
         assert_eq!(got, vec![None]);
     }
 
@@ -217,7 +237,7 @@ mod tests {
         env.traffic_splits[0]
             .entries
             .retain(|e| e.weight_bps == 1_000);
-        let got = reusable_revisions(&env, dep_id, &[wanted("sha256:aa")], None);
+        let got = reusable_revisions_with_answer(&env, dep_id, &[wanted("sha256:aa")], None, None);
         assert_eq!(got, vec![None]);
         assert!(env.revisions.iter().any(|r| r.revision_id == r3));
     }
@@ -225,14 +245,16 @@ mod tests {
     #[test]
     fn a_changed_drain_window_is_staged_fresh() {
         let (env, dep_id, _) = env_with_revisions();
-        let got = reusable_revisions(
+        let got = reusable_revisions_with_answer(
             &env,
             dep_id,
             &[WantedRevision {
                 digest: "sha256:bb",
                 source_uri: None,
                 drain_seconds: DRAIN + 1,
+                runtime: None,
             }],
+            None,
             None,
         );
         assert_eq!(got, vec![None]);

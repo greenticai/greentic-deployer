@@ -1960,6 +1960,12 @@ struct DesiredRevision {
 /// a retained `[baseline@0, candidate@100]` split is converged for the
 /// candidate, and the baseline is left in place for the rollback window. A
 /// multi-revision manifest stays an exact multiset, zeros included.
+///
+/// The runtime pin is part of the identity (unified update L2): a pin change
+/// is a new revision, never a silent no-op. The control-plane store keeps no
+/// deployer answers, so this is `effective_runtime` with no answer — the raw
+/// pins compare, and a revision staged before pins existed (`None`) stays
+/// converged for an unpinned entry.
 fn deployment_converged_remote(
     env: &greentic_deploy_spec::Environment,
     deployment_id: DeploymentId,
@@ -1985,7 +1991,8 @@ fn deployment_converged_remote(
     if entries.len() != desired.len() {
         return false;
     }
-    let mut live: Vec<(u32, Option<&str>, &str)> = Vec::with_capacity(entries.len());
+    type Key<'k> = (u32, Option<&'k str>, &'k str, Option<&'k str>);
+    let mut live: Vec<Key<'_>> = Vec::with_capacity(entries.len());
     for entry in entries {
         let Some(rev) = env
             .revisions
@@ -2001,11 +2008,19 @@ fn deployment_converged_remote(
             entry.weight_bps,
             rev.bundle_source_uri.as_deref(),
             rev.bundle_digest.as_str(),
+            rev.runtime_image_digest.as_deref(),
         ));
     }
-    let mut want: Vec<(u32, Option<&str>, &str)> = desired
+    let mut want: Vec<Key<'_>> = desired
         .iter()
-        .map(|d| (d.weight_bps, Some(d.source_uri.as_str()), d.digest.as_str()))
+        .map(|d| {
+            (
+                d.weight_bps,
+                Some(d.source_uri.as_str()),
+                d.digest.as_str(),
+                d.runtime_image_digest.as_deref(),
+            )
+        })
         .collect();
     live.sort_unstable();
     want.sort_unstable();
@@ -4589,6 +4604,31 @@ mod tests {
             &[desired(10000, "oci://r/app:2", "sha256:abc123")],
             true,
         ));
+    }
+
+    #[test]
+    fn convergence_compares_the_runtime_pin() {
+        const PIN: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut env = env_of(converged_env_json("sha256:abc123", "oci://r/app:1", 10000));
+        let pinned = DesiredRevision {
+            runtime_image_digest: Some(PIN.to_string()),
+            ..desired(10000, "oci://r/app:1", "sha256:abc123")
+        };
+        // Unstamped live revision: an unpinned entry converges, a pin is owed.
+        assert!(deployment_converged_remote(
+            &env,
+            dep_id(),
+            &[desired(10000, "oci://r/app:1", "sha256:abc123")],
+            true,
+        ));
+        assert!(!deployment_converged_remote(
+            &env,
+            dep_id(),
+            std::slice::from_ref(&pinned),
+            true
+        ));
+        env.revisions[0].runtime_image_digest = Some(PIN.to_string());
+        assert!(deployment_converged_remote(&env, dep_id(), &[pinned], true));
     }
 
     #[test]

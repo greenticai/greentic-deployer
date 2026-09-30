@@ -5,8 +5,11 @@
 //! compares: the pin when present, else the environment answer.
 
 /// `pinned.or(answer)` — a pin wins over the deployer binding's answer.
-// Consumed by the convergence/reuse comparison (DP3).
-#[allow(dead_code)]
+///
+/// Applied to BOTH sides of every comparison (a staged revision's own
+/// `runtime_image_digest`, and a manifest entry's pin), so a revision staged
+/// before pins existed (`None`) keeps matching an unpinned entry — and an entry
+/// pinned to the answer — for as long as the answer is unchanged.
 pub(super) fn effective_runtime<'a>(
     pinned: Option<&'a str>,
     answer: Option<&'a str>,
