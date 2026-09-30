@@ -1977,7 +1977,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2142,7 +2142,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3079,9 +3079,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-api"
-version = "1.2.0-dev.36694168453"
+version = "1.2.0-dev.36760998317"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c7da64dbbdfa03e06f905218fc09dd14c2ca36b22a14ee39b165c1d159e844d"
+checksum = "4fd30417f98b701b5fcb05c179a8ccf5d04a13a943ea055641aa297302298814"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3090,9 +3090,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-core"
-version = "1.2.0-dev.36694168453"
+version = "1.2.0-dev.36760998317"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0bc48f3349276b543996b55e404cb421cc57318cbd09229cb8d323faa2d88e9"
+checksum = "80419785ec8765c4fa7d0c52ed41f1f409f7405a0ba4d177998c170e62b520b4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3118,9 +3118,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-lib"
-version = "1.2.0-dev.36694168453"
+version = "1.2.0-dev.36760998317"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "569b6e343f7130e97b643bd64e2fc7a61a6fe06f0f71253282fb1cd861d5a9fd"
+checksum = "857b06094f3728bec9cc9d994c528f64b67e456b1044ca5cb8764c974b1a427a"
 dependencies = [
  "async-trait",
  "greentic-secrets-api",
@@ -3133,9 +3133,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-dev"
-version = "1.2.0-dev.36694168453"
+version = "1.2.0-dev.36760998317"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6c11aae4f711d15ad57b5bc126162883b87794fd4b45768924946bf27bbeb94"
+checksum = "4b677c09ffc4c399f9fd08ceb98ec40f2a68ca23ef21bdbe0584542062f71261"
 dependencies = [
  "async-trait",
  "base64",
@@ -3151,9 +3151,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-provider-vault-kv"
-version = "1.2.0-dev.36694168453"
+version = "1.2.0-dev.36760998317"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e9260017d69cf227c20f3453a4b73c9674a35d38424254de8ec21250a99d7a"
+checksum = "fa2bb2951492a8588688378ce42f14fdc4569b2d7df4035815d2be95856a0ba9"
 dependencies = [
  "anyhow",
  "base64",
@@ -3166,9 +3166,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets-spec"
-version = "1.2.0-dev.36694168453"
+version = "1.2.0-dev.36760998317"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a68520a57b91a9eeaf5a47020130312b51038351dcf9eab473cf9b402aeab491"
+checksum = "58a779f6f4465b3139a3c967c6c5c1a7da0f41b6b3c03c124ce4b8da182a6400"
 dependencies = [
  "async-trait",
  "greentic-types",
@@ -4382,7 +4382,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5161,7 +5161,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5615,7 +5615,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5683,7 +5683,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6624,7 +6624,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7888,7 +7888,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
