@@ -124,10 +124,26 @@ fn is_verbatim_category_rel_path(rel_path: &str) -> bool {
 /// segment away from the read and the agent ran with no key at all.
 const LLM_CATEGORY: &str = "llm";
 
-/// Whether `rel_path` names the `llm` category (pack position only, like
+/// The `knowledge` category: the shared Chronicle knowledge index's two
+/// credentials (`chronicle_index_key`, `embedding_key`), staged by
+/// greentic-designer's `knowledge_stage`.
+///
+/// greentic-runner-host's `ChronicleIndexKnowledge` reads them through
+/// `greentic_aw_runtime::scoped_secrets`, whose env segment is the hardcoded
+/// `default` — the same shape as [`LLM_CATEGORY`], and the same defect when it
+/// was missing here: the write landed under the environment id, and an
+/// index-bound worker deployed green and answered with no knowledge at all.
+/// The name is canonical, so the ordinary name validation still applies.
+const KNOWLEDGE_CATEGORY: &str = "knowledge";
+
+/// Whether `rel_path` names a category read at the `default` env segment with
+/// a canonical name — `llm` or `knowledge` (pack position only, like
 /// [`is_verbatim_category_rel_path`]).
-fn is_llm_category_rel_path(rel_path: &str) -> bool {
-    rel_path.split('/').nth(2) == Some(LLM_CATEGORY)
+fn is_default_segment_category_rel_path(rel_path: &str) -> bool {
+    matches!(
+        rel_path.split('/').nth(2),
+        Some(LLM_CATEGORY | KNOWLEDGE_CATEGORY)
+    )
 }
 
 /// The dev store's native key for `rel_path` in `env_id`.
@@ -136,7 +152,7 @@ fn is_llm_category_rel_path(rel_path: &str) -> bool {
 /// [`dev_store_has`] so a write, the read that checks it and the presence
 /// probe `env apply` gates on cannot land on different keys.
 pub(super) fn dev_store_key(env_id: &EnvId, rel_path: &str) -> String {
-    if is_verbatim_category_rel_path(rel_path) || is_llm_category_rel_path(rel_path) {
+    if is_verbatim_category_rel_path(rel_path) || is_default_segment_category_rel_path(rel_path) {
         format!("secrets://{MCP_ENV_SEGMENT}/{rel_path}")
     } else {
         format!("secrets://{}/{rel_path}", env_id.as_str())
@@ -2067,6 +2083,33 @@ mod tests {
             dev_store_key(&env_id, "default/_/llm/ff308b9c_951a_40b8"),
             "secrets://default/default/_/llm/ff308b9c_951a_40b8"
         );
+    }
+
+    #[test]
+    fn a_knowledge_key_is_written_under_the_default_env_segment() {
+        // greentic-runner-host's `ChronicleIndexKnowledge` reads the shared
+        // knowledge index's two credentials through
+        // `greentic_aw_runtime::scoped_secrets`, whose env segment is the
+        // hardcoded `default`. Keyed by the environment id, both keys sat one
+        // segment from the read: the index-bound worker deployed green and
+        // answered every turn with no retrieved knowledge.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "default/_/knowledge/chronicle_index_key"),
+            "secrets://default/default/_/knowledge/chronicle_index_key"
+        );
+        assert_eq!(
+            dev_store_key(&env_id, "default/general/knowledge/embedding_key"),
+            "secrets://default/default/general/knowledge/embedding_key"
+        );
+    }
+
+    #[test]
+    fn a_knowledge_name_must_still_be_canonical() {
+        // Not a verbatim category: greentic-start canonicalizes the name
+        // before lookup, exactly as it does for `llm`.
+        assert!(validate_dev_store_secret_path("default/_/knowledge/embedding-key").is_err());
+        assert!(validate_dev_store_secret_path("default/_/knowledge/embedding_key").is_ok());
     }
 
     #[test]
