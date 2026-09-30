@@ -959,7 +959,8 @@ fn resolve_and_validate(
             }
         }
     }
-    let runtime_answer = binding_runtime_answer(&manifest, manifest_dir, env.as_ref(), &env_dir)?;
+    let runtime_answer = binding_runtime_answer(store, &manifest, manifest_dir, env.as_ref())?;
+    runtime_pin::refuse_unpinnable_runtime(&manifest, env.as_ref())?;
 
     // Bundle artifacts: existence + digest, plus the B10 billing-principal
     // rule, all before any mutation. The principal rule stays fail-fast
@@ -1965,6 +1966,19 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     let detail = if converged {
                         format!(
                             "deployer answers changed → new revision ({})",
+                            short_digest(&primary_digest())
+                        )
+                    } else if let Some((from, to)) = live_runtime_change(
+                        env,
+                        dep.deployment_id,
+                        &primary_digest(),
+                        rb.revisions[0].runtime_image_digest.as_deref(),
+                        ctx.runtime_answer.as_deref(),
+                    ) {
+                        format!(
+                            "runtime {} → {} (blue-green re-stage, digest {} unchanged)",
+                            short_digest(from),
+                            short_digest(to),
                             short_digest(&primary_digest())
                         )
                     } else if live.is_some_and(digest_is_real) {
@@ -3042,12 +3056,25 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 rb.revisions[0].runtime_image_digest.as_deref(),
                 ctx.runtime_answer.as_deref(),
             ) {
-                failures.push(format!(
-                    "bundle `{}`: live revision digest is `{}`, expected `{}`",
-                    rb.spec.bundle_id,
-                    live_revision_digest(&env, dep.deployment_id).unwrap_or("none"),
-                    primary_digest
-                ));
+                let runtime = live_runtime_change(
+                    &env,
+                    dep.deployment_id,
+                    primary_digest,
+                    rb.revisions[0].runtime_image_digest.as_deref(),
+                    ctx.runtime_answer.as_deref(),
+                );
+                failures.push(match runtime {
+                    Some((live, expected)) => format!(
+                        "bundle `{}`: live revision runtime is `{live}`, expected `{expected}`",
+                        rb.spec.bundle_id,
+                    ),
+                    None => format!(
+                        "bundle `{}`: live revision digest is `{}`, expected `{}`",
+                        rb.spec.bundle_id,
+                        live_revision_digest(&env, dep.deployment_id).unwrap_or("none"),
+                        primary_digest
+                    ),
+                });
             }
         }
         // Post-condition, both shapes: a served revision must pin every runtime
@@ -3327,10 +3354,10 @@ fn cloudrun_answers_differ(
 /// `None` when the deployer is not Cloud Run (k8s has no digest answer and
 /// every revision there is `None`-stamped) or the answers pin no digest.
 fn binding_runtime_answer(
+    store: &LocalFsStore,
     manifest: &EnvManifest,
     manifest_dir: &Path,
     env: Option<&Environment>,
-    env_dir: &Path,
 ) -> Result<Option<String>, OpError> {
     let manifest_pack = manifest
         .packs
@@ -3348,47 +3375,49 @@ fn binding_runtime_answer(
             if !src.is_file() {
                 return Ok(None);
             }
-            return runtime_answer_in(&src);
+            let bytes = std::fs::read(&src).map_err(|source| OpError::Io {
+                path: src.clone(),
+                source,
+            })?;
+            let answers: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "deployer answers `{}` are not valid JSON: {e}",
+                    src.display()
+                ))
+            })?;
+            return runtime_answer_of(&answers, &src.display().to_string());
         }
     }
-    let Some(binding) = env.and_then(|e| e.pack_for_slot(CapabilitySlot::Deployer)) else {
+    // The manifest leaves the deployer answers alone: the binding's staged
+    // answers stay in force. Read them through the one binding-answers reader
+    // (containment under the env dir, and a missing file names the binding
+    // wizard as the fix).
+    let Some(env) = env else {
+        return Ok(None);
+    };
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
         return Ok(None);
     };
     if !super::env::is_cloudrun_kind(&binding.kind) {
         return Ok(None);
     }
-    let Some(staged) = &binding.answers_ref else {
-        return Ok(None);
-    };
-    let path = if staged.is_absolute() {
-        staged.clone()
-    } else {
-        env_dir.join(staged)
-    };
-    runtime_answer_in(&path)
+    let (answers, _) = super::env::load_render_answers(store, env, &binding.kind)?;
+    match answers {
+        Some(answers) => runtime_answer_of(&answers, "the deployer binding's answers"),
+        None => Ok(None),
+    }
 }
 
-/// `runtime_image_digest` out of one deployer answers file (`None` when absent
-/// or `null`). Unreadable or malformed answers fail the apply: the deployer
-/// would refuse the same file at execute time, and guessing "no answer" here
+/// `runtime_image_digest` out of one deployer answers document (`None` when
+/// absent or `null`). A non-string value fails the apply: the deployer would
+/// refuse the same document at execute time, and guessing "no answer" here
 /// could re-stage or skip a revision on a value nobody declared.
-fn runtime_answer_in(path: &Path) -> Result<Option<String>, OpError> {
-    let bytes = std::fs::read(path).map_err(|source| OpError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let answers: Value = serde_json::from_slice(&bytes).map_err(|e| {
-        OpError::InvalidArgument(format!(
-            "deployer answers `{}` are not valid JSON: {e}",
-            path.display()
-        ))
-    })?;
+fn runtime_answer_of(answers: &Value, origin: &str) -> Result<Option<String>, OpError> {
     match answers.get("runtime_image_digest") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(digest)) => Ok(Some(digest.clone())),
         Some(other) => Err(OpError::InvalidArgument(format!(
-            "deployer answers `{}`: runtime_image_digest must be a string, got `{other}`",
-            path.display()
+            "{origin}: runtime_image_digest must be a string, got `{other}`"
         ))),
     }
 }
@@ -3883,6 +3912,34 @@ fn live_revision_digest(env: &Environment, deployment_id: DeploymentId) -> Optio
         .iter()
         .find(|r| r.revision_id == entry.revision_id)
         .map(|r| r.bundle_digest.as_str())
+}
+
+/// `(live, wanted)` effective runtimes when the served revision already runs
+/// `digest` but on a different runtime — the pin-only change, so plan and
+/// verify can say "runtime A → B" instead of "digest X → X". `unset` stands
+/// for "no pin and no answer" (the deployer's default tag).
+fn live_runtime_change<'a>(
+    env: &'a Environment,
+    deployment_id: DeploymentId,
+    digest: &str,
+    wanted_pin: Option<&'a str>,
+    answer: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    let split = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)?;
+    let entry = split.entries.iter().max_by_key(|e| e.weight_bps)?;
+    let live = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == entry.revision_id)?;
+    if !digest_is_real(&live.bundle_digest) || live.bundle_digest != digest {
+        return None;
+    }
+    let from = runtime_pin::effective_runtime(live.runtime_image_digest.as_deref(), answer);
+    let to = runtime_pin::effective_runtime(wanted_pin, answer);
+    (from != to).then(|| (from.unwrap_or("unset"), to.unwrap_or("unset")))
 }
 
 /// A digest the diff can trust: real `sha256:` material, not the
@@ -5292,12 +5349,19 @@ mod tests {
         assert_eq!(run_dry(&store, &p).expect("dry").result["changed"], 0);
     }
 
+    /// A pin needs a deployer declaring `runtime_pin` (Cloud Run); the local
+    /// deployer refuses one (`runtime_pin_tests`).
+    #[cfg(feature = "creds-gcp")]
     #[test]
     fn a_manifest_runtime_pin_is_stamped_on_the_staged_revision() {
         const PIN: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let (dir, store) = seeded_store();
         let mut manifest = plain_bundle_manifest();
         manifest["bundles"][0]["runtime_image_digest"] = json!(PIN);
+        manifest["packs"] = json!([{
+            "slot": "deployer", "kind": "greentic.deployer.gcp-cloudrun@1.0.0",
+            "pack_ref": "builtin", "answers": {"project": "p", "region": "europe-west1"}
+        }]);
         let p = write_manifest(dir.path(), &manifest);
         run_apply(&store, &p).expect("apply");
         let env = load_local(&store);

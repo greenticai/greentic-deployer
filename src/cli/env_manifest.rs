@@ -3427,7 +3427,9 @@ mod tests {
     #[test]
     fn a_malformed_runtime_pin_is_refused() {
         let m: EnvManifest = serde_json::from_value(runtime_split(Some("develop"), None)).unwrap();
-        assert!(m.validate_shape().is_err());
+        let msg = m.validate_shape().expect_err("malformed pin").to_string();
+        assert!(msg.contains("runtime_image_digest"), "{msg}");
+        assert!(msg.contains("`develop`"), "{msg}");
     }
 
     #[test]
@@ -3446,7 +3448,12 @@ mod tests {
         let mut v = runtime_split(None, None);
         v["bundles"][0]["runtime_image_digest"] = RT_A.into();
         let split: EnvManifest = serde_json::from_value(v).unwrap();
-        assert!(split.validate_shape().is_err());
+        let msg = split
+            .validate_shape()
+            .expect_err("bundle-level pin on a split")
+            .to_string();
+        assert!(msg.contains("runtime_image_digest"), "{msg}");
+        assert!(msg.contains("single-revision form"), "{msg}");
     }
 
     #[test]

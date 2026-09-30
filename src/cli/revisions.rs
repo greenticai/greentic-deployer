@@ -197,6 +197,13 @@ pub fn stage(
         return Ok(OpOutcome::new(NOUN, "stage", stage_schema()));
     }
     let payload = resolve_payload::<RevisionStagePayload>(flags, payload)?;
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "revisions stage payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
     // Pre-parse the pack list outside the lock so a payload error doesn't

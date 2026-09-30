@@ -244,6 +244,7 @@ fn single_bundle(pin: Option<&str>) -> Value {
     m
 }
 
+#[cfg(feature = "creds-gcp")]
 #[test]
 fn an_unstamped_store_converges_on_the_next_identical_deploy() {
     let (dir, store) = seeded_store();
@@ -293,6 +294,7 @@ fn an_unstamped_store_converges_on_the_next_identical_deploy() {
     );
 }
 
+#[cfg(feature = "creds-gcp")]
 fn split_with_pins(pins: [Option<&str>; 2]) -> Value {
     let mut m = two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]);
     for (i, pin) in pins.iter().enumerate() {
@@ -303,6 +305,7 @@ fn split_with_pins(pins: [Option<&str>; 2]) -> Value {
     m
 }
 
+#[cfg(feature = "creds-gcp")]
 #[test]
 fn an_unstamped_split_is_reused_and_only_a_repinned_member_is_restaged() {
     let (dir, store) = seeded_store();
@@ -398,25 +401,221 @@ fn execute_deploy_split_stages_a_pinned_revision_instead_of_reusing_an_unpinned_
 #[test]
 fn the_answer_comes_from_the_cloudrun_deployer_pack_of_the_manifest() {
     let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
     let parse = |v: Value| -> EnvManifest { serde_json::from_value(v).expect("manifest") };
     let mut manifest = parse(with_cloudrun_answer(single_bundle(None), Some(RUNTIME_A)));
     let _tmp = materialize_inline_pack_answers(&mut manifest).expect("materialize");
     assert_eq!(
-        binding_runtime_answer(&manifest, dir.path(), None, dir.path()).expect("answer"),
+        binding_runtime_answer(&store, &manifest, dir.path(), None).expect("answer"),
         Some(RUNTIME_A.to_string())
     );
 
     let mut unset = parse(with_cloudrun_answer(single_bundle(None), None));
     let _tmp = materialize_inline_pack_answers(&mut unset).expect("materialize");
     assert_eq!(
-        binding_runtime_answer(&unset, dir.path(), None, dir.path()).expect("answer"),
+        binding_runtime_answer(&store, &unset, dir.path(), None).expect("answer"),
         None
     );
 
     // No deployer pack and no existing binding: nothing to read.
     let bare = parse(single_bundle(None));
     assert_eq!(
-        binding_runtime_answer(&bare, dir.path(), None, dir.path()).expect("answer"),
+        binding_runtime_answer(&store, &bare, dir.path(), None).expect("answer"),
         None
     );
+}
+
+#[test]
+fn a_non_string_runtime_answer_is_invalid_argument() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    let mut manifest: EnvManifest =
+        serde_json::from_value(with_cloudrun_answer(single_bundle(None), None)).expect("manifest");
+    manifest.packs[0].answers = Some(json!({"project": "p", "runtime_image_digest": 5}));
+    let _tmp = materialize_inline_pack_answers(&mut manifest).expect("materialize");
+    let err = binding_runtime_answer(&store, &manifest, dir.path(), None).unwrap_err();
+    assert!(
+        matches!(&err, OpError::InvalidArgument(m) if m.contains("runtime_image_digest")),
+        "{err:?}"
+    );
+}
+
+/// The manifest carries NO deployer pack: the Cloud Run binding a previous
+/// apply staged (answer A) stays in force, and its answer is read through the
+/// binding-answers reader.
+#[cfg(feature = "creds-gcp")]
+#[test]
+fn a_staged_binding_answer_is_used_when_the_manifest_has_no_deployer_pack() {
+    let (dir, store) = seeded_store();
+    apply_value(
+        &store,
+        dir.path(),
+        "m1.json",
+        &with_cloudrun_answer(single_bundle(None), Some(RUNTIME_A)),
+    );
+    let count = load_local(&store).revisions.len();
+
+    // Unpinned, no packs[]: converged under the staged answer.
+    let bare = write_manifest(dir.path(), &single_bundle(None));
+    assert_eq!(run_dry(&store, &bare).expect("dry").result["changed"], 0);
+    run_apply(&store, &bare).expect("re-apply");
+    assert_eq!(load_local(&store).revisions.len(), count);
+
+    // Pinned to the staged answer: still converged.
+    apply_value(
+        &store,
+        dir.path(),
+        "m2.json",
+        &single_bundle(Some(RUNTIME_A)),
+    );
+    assert_eq!(load_local(&store).revisions.len(), count);
+
+    // Pinned to B: exactly one new revision, stamped B.
+    apply_value(
+        &store,
+        dir.path(),
+        "m3.json",
+        &single_bundle(Some(RUNTIME_B)),
+    );
+    let env = load_local(&store);
+    assert_eq!(env.revisions.len(), count + 1);
+    assert!(
+        env.revisions
+            .iter()
+            .any(|r| r.runtime_image_digest.as_deref() == Some(RUNTIME_B))
+    );
+}
+
+// --- the runtime_pin capability gate ---------------------------------------------
+
+fn assert_refused_for_runtime_pin(err: OpError, adapter: &str) {
+    let msg = err.to_string();
+    assert!(matches!(err, OpError::InvalidArgument(_)), "{msg}");
+    assert!(msg.contains("runtime_pin"), "{msg}");
+    assert!(msg.contains(adapter), "{msg}");
+}
+
+#[test]
+fn a_pin_is_refused_on_the_local_deployer() {
+    let (dir, store) = seeded_store();
+    let path = write_manifest(dir.path(), &single_bundle(Some(RUNTIME_A)));
+    let err = run_dry(&store, &path).expect_err("local deployer cannot pin");
+    assert_refused_for_runtime_pin(err, "local-process");
+    assert!(load_local(&store).revisions.is_empty(), "nothing staged");
+}
+
+#[test]
+fn a_revision_pin_is_refused_on_k8s() {
+    let (dir, store) = seeded_store();
+    let mut manifest =
+        two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]);
+    manifest["bundles"][0]["revisions"][1]["runtime_image_digest"] = json!(RUNTIME_B);
+    manifest["packs"] = json!([{
+        "slot": "deployer", "kind": "greentic.deployer.k8s@1.0.0", "pack_ref": "builtin"
+    }]);
+    let path = write_manifest(dir.path(), &manifest);
+    let err = run_dry(&store, &path).expect_err("k8s cannot pin");
+    assert_refused_for_runtime_pin(err, "greentic.deployer.k8s");
+}
+
+#[test]
+fn an_unpinned_manifest_is_not_gated_on_the_capability() {
+    let (dir, store) = seeded_store();
+    let path = write_manifest(dir.path(), &single_bundle(None));
+    run_dry(&store, &path).expect("no pin, no capability needed");
+}
+
+// --- hand-written stage / deploy payloads ------------------------------------------
+
+#[test]
+fn hand_written_stage_and_deploy_payloads_refuse_a_malformed_pin() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    let stage = crate::cli::revisions::RevisionStagePayload {
+        environment_id: "local".into(),
+        deployment_id: "01JABC000000000000000000ZZ".into(),
+        revision_id: None,
+        idempotency_key: None,
+        bundle_path: None,
+        bundle_digest: crate::cli::revisions::default_bundle_digest(),
+        bundle_source_uri: None,
+        pack_list: Vec::new(),
+        pack_list_lock_ref: PathBuf::new(),
+        config_digest: crate::cli::revisions::default_config_digest(),
+        signature_sidecar_ref: crate::cli::revisions::default_signature_sidecar_ref(),
+        drain_seconds: 30,
+        runtime_image_digest: Some("develop".into()),
+    };
+    let err = crate::cli::revisions::stage(&store, &OpFlags::default(), Some(stage))
+        .expect_err("malformed pin");
+    assert!(
+        matches!(&err, OpError::InvalidArgument(m) if m.contains("runtime_image_digest")),
+        "{err:?}"
+    );
+
+    let deploy = BundleDeployPayload {
+        environment_id: "local".into(),
+        bundle_id: "b".into(),
+        customer_id: None,
+        bundle_path: Some(fixture()),
+        bundle_source_uri: None,
+        remote_pins: None,
+        idempotency_key: None,
+        config_overrides: None,
+        route_binding: None,
+        revenue_share: None,
+        runtime_image_digest: Some("sha256:ABC".into()),
+    };
+    let err = crate::cli::deploy::deploy(&store, &OpFlags::default(), Some(deploy))
+        .expect_err("malformed pin");
+    assert!(
+        matches!(&err, OpError::InvalidArgument(m) if m.contains("runtime_image_digest")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_pin_only_change_is_described_as_a_runtime_change() {
+    let (env, dep) = env_with_one_ready_revision(DIGEST, None, Some(RUNTIME_A));
+    assert_eq!(
+        live_runtime_change(&env, dep, DIGEST, Some(RUNTIME_B), None),
+        Some((RUNTIME_A, RUNTIME_B))
+    );
+    // Same effective runtime, or a different digest: not a runtime change.
+    assert_eq!(
+        live_runtime_change(&env, dep, DIGEST, None, Some(RUNTIME_A)),
+        None
+    );
+    let other = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    assert_eq!(
+        live_runtime_change(&env, dep, other, Some(RUNTIME_B), None),
+        None
+    );
+}
+
+#[cfg(feature = "creds-gcp")]
+#[test]
+fn the_plan_names_a_pin_only_change_as_a_runtime_change() {
+    let (dir, store) = seeded_store();
+    apply_value(
+        &store,
+        dir.path(),
+        "m1.json",
+        &with_cloudrun_answer(single_bundle(None), Some(RUNTIME_A)),
+    );
+    let path = write_manifest(
+        dir.path(),
+        &with_cloudrun_answer(single_bundle(Some(RUNTIME_B)), Some(RUNTIME_A)),
+    );
+    let plan = run_dry(&store, &path).expect("dry");
+    let detail = plan.result["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .find(|s| s["kind"] == "deploy-bundle")
+        .and_then(|s| s["detail"].as_str())
+        .expect("deploy-bundle step")
+        .to_string();
+    assert!(detail.starts_with("runtime "), "{detail}");
+    assert!(detail.contains(&RUNTIME_B[..15]), "{detail}");
 }

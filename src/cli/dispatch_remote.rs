@@ -910,6 +910,13 @@ fn remote_revision_stage(
         ));
     }
     let payload = resolve_payload::<super::revisions::RevisionStagePayload>(flags, None)?;
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "revisions stage payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
     if payload.bundle_path.is_some() {
         return Err(OpError::InvalidArgument(
             "remote `revisions stage` needs pinned pointers, not a local `bundle_path`: push the \
@@ -978,9 +985,11 @@ fn remote_revision_stage(
         drain_seconds: payload.drain_seconds,
         runtime_image_digest: payload.runtime_image_digest,
     };
+    let requested_runtime = store_payload.runtime_image_digest.clone();
     let revision = store
         .stage_revision(&env_id, store_payload, idempotency_key)
         .map_err(map_store_err_preserving_noun)?;
+    ensure_runtime_pin_kept(requested_runtime.as_deref(), &revision)?;
     Ok(OpOutcome::new(
         "revisions",
         "stage",
@@ -1083,6 +1092,13 @@ fn remote_deploy(
     payload: Option<super::deploy::BundleDeployPayload>,
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::deploy::BundleDeployPayload>(flags, payload)?;
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "deploy payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
 
     // A remote store can't extract a local artifact server-side.
     if payload.bundle_path.is_some() {
@@ -1247,6 +1263,7 @@ fn remote_deploy(
             sub_key("stage")?,
         )
         .map_err(map_store_err_preserving_noun)?;
+    ensure_runtime_pin_kept(payload.runtime_image_digest.as_deref(), &revision)?;
     let revision_id = revision.revision_id;
 
     // Warm it to Ready behind the no-op gate (deploy has no health producers).
@@ -1951,6 +1968,32 @@ struct DesiredRevision {
     runtime_image_digest: Option<String>,
 }
 
+/// Refuse when a requested runtime pin did not survive the store round trip.
+///
+/// `StageRevisionPayload` is not `deny_unknown_fields`, so a control-plane
+/// store built before runtime pins accepts the field and silently drops it.
+/// The revision then runs the environment's answer instead of the pin, and
+/// [`deployment_converged_remote`] never matches it, so every later apply
+/// re-stages it again. Failing here names the cause once, before the warm.
+fn ensure_runtime_pin_kept(
+    requested: Option<&str>,
+    revision: &greentic_deploy_spec::Revision,
+) -> Result<(), OpError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if revision.runtime_image_digest.as_deref() == Some(requested) {
+        return Ok(());
+    }
+    Err(OpError::Conflict(format!(
+        "control-plane store predates runtime pins; upgrade the store: revision `{}` was \
+         staged with runtime_image_digest `{}` but the store recorded `{}`",
+        revision.revision_id,
+        requested,
+        revision.runtime_image_digest.as_deref().unwrap_or("none")
+    )))
+}
+
 /// True when the deployment's live traffic split already equals the desired
 /// revision set — the convergence skip that makes apply re-runnable without
 /// relying on the bounded server replay ledger.
@@ -2438,6 +2481,7 @@ fn remote_env_apply(
                 // collide (`DuplicateRevision`) on re-apply once the server
                 // replay ledger evicts the original key.
                 let revision_id = crate::environment::mint_revision_id();
+                let requested_runtime = rev.runtime_image_digest.clone();
                 let staged = store
                     .stage_revision(
                         &env_id,
@@ -2462,6 +2506,7 @@ fn remote_env_apply(
                         super::mint_idempotency_key(),
                     )
                     .map_err(map_store_err_preserving_noun)?;
+                ensure_runtime_pin_kept(requested_runtime.as_deref(), &staged)?;
                 store
                     .warm_revision(
                         &env_id,
@@ -4604,6 +4649,82 @@ mod tests {
             &[desired(10000, "oci://r/app:2", "sha256:abc123")],
             true,
         ));
+    }
+
+    const RUNTIME_PIN: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn pinned_stage_flags() -> (tempfile::NamedTempFile, OpFlags) {
+        answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "bundle_digest": "sha256:abc",
+            "bundle_source_uri": "oci://registry.example/bundle@sha256:abc",
+            "pack_list": [],
+            "pack_list_lock_ref": "revisions/r/pack-list.lock",
+            "runtime_image_digest": RUNTIME_PIN
+        }))
+    }
+
+    fn stage_args() -> super::super::dispatch::RevisionStageArgs {
+        super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        }
+    }
+
+    /// An older control-plane store accepts `runtime_image_digest` and drops
+    /// it: the response revision carries no pin. That must fail loudly, or
+    /// every later apply re-stages the revision forever.
+    #[test]
+    fn a_store_that_drops_the_runtime_pin_is_refused_on_stage() {
+        let body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        let mock = start_mock(vec![(201, &body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = pinned_stage_flags();
+        let err = remote_revision_stage(&store, &flags, stage_args()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("predates runtime pins"), "{msg}");
+        assert!(msg.contains(RUNTIME_PIN), "{msg}");
+    }
+
+    #[test]
+    fn a_store_that_keeps_the_runtime_pin_stages_normally() {
+        let mut rev = revision_json(TEST_REV_ID, "staged");
+        rev["runtime_image_digest"] = serde_json::json!(RUNTIME_PIN);
+        let body = wrap_mutation(rev);
+        let mock = start_mock(vec![(201, &body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = pinned_stage_flags();
+        remote_revision_stage(&store, &flags, stage_args()).expect("pin kept");
+    }
+
+    #[test]
+    fn a_store_that_drops_the_runtime_pin_is_refused_on_deploy_before_warm() {
+        let get_body = serde_json::json!({
+            "environment": env_json(),
+            "etag": "sha256:test",
+            "generation": 1
+        })
+        .to_string();
+        let add_body = wrap_mutation(deploy_bundle_json());
+        let stage_body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        // Only three responses: a warm call after the stage would hang.
+        let mock = start_mock(
+            vec![(200, &get_body), (201, &add_body), (201, &stage_body)],
+            None,
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "remote_pins": {"bundle_digest": "sha256:deadbeef"},
+            "runtime_image_digest": RUNTIME_PIN
+        }));
+        let err = remote_deploy(&store, &flags, None).unwrap_err();
+        assert!(err.to_string().contains("predates runtime pins"), "{err}");
     }
 
     #[test]

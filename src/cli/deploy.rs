@@ -329,6 +329,13 @@ pub fn deploy(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let bundle_id = payload.bundle_id.trim().to_string();
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "deploy payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
     if bundle_id.is_empty() {
         return Err(OpError::InvalidArgument(
             "bundle_id must not be empty".to_string(),
