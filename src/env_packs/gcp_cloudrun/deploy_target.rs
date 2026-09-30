@@ -793,6 +793,19 @@ impl InMemoryCloudRun {
             .map(|(_status, template)| template.vpc_access.clone())
     }
 
+    /// The image the named revision was created with; `None` when absent.
+    pub fn revision_image_for(
+        &self,
+        deployment_id: DeploymentId,
+        revision_id: RevisionId,
+    ) -> Option<String> {
+        self.revisions
+            .lock()
+            .expect("revisions mutex")
+            .get(&(deployment_id, revision_id))
+            .map(|(_status, template)| template.image.clone())
+    }
+
     /// Secret mounts the last upsert projected onto `deployment_id`'s container.
     pub fn service_secrets_for(&self, deployment_id: DeploymentId) -> Option<Vec<SecretMount>> {
         self.service_secrets

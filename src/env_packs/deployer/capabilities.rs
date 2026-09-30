@@ -27,17 +27,21 @@ pub enum Capability {
     MultiInstanceSafe,
     /// The adapter can tear its provider resources down (archive / sweep).
     Remove,
+    /// Each revision runs the runtime image its own manifest pinned
+    /// (unified update L2), not just the environment-wide answer.
+    RuntimePin,
 }
 
 impl Capability {
     /// Every capability, in report order.
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 7] = [
         Capability::Drain,
         Capability::TrafficSplit,
         Capability::IngressManaged,
         Capability::PrivateRegistryAuth,
         Capability::MultiInstanceSafe,
         Capability::Remove,
+        Capability::RuntimePin,
     ];
 
     /// Wire name (matches the serde spelling).
@@ -49,6 +53,7 @@ impl Capability {
             Capability::PrivateRegistryAuth => "private_registry_auth",
             Capability::MultiInstanceSafe => "multi_instance_safe",
             Capability::Remove => "remove",
+            Capability::RuntimePin => "runtime_pin",
         }
     }
 }
@@ -76,6 +81,7 @@ pub struct AdapterCapabilities {
     pub private_registry_auth: bool,
     pub multi_instance_safe: bool,
     pub remove: bool,
+    pub runtime_pin: bool,
 }
 
 impl AdapterCapabilities {
@@ -87,6 +93,7 @@ impl AdapterCapabilities {
         private_registry_auth: false,
         multi_instance_safe: false,
         remove: false,
+        runtime_pin: false,
     };
 
     /// Whether `capability` is present.
@@ -98,6 +105,7 @@ impl AdapterCapabilities {
             Capability::PrivateRegistryAuth => self.private_registry_auth,
             Capability::MultiInstanceSafe => self.multi_instance_safe,
             Capability::Remove => self.remove,
+            Capability::RuntimePin => self.runtime_pin,
         }
     }
 
@@ -184,7 +192,8 @@ mod tests {
                 "traffic_split",
                 "ingress_managed",
                 "private_registry_auth",
-                "multi_instance_safe"
+                "multi_instance_safe",
+                "runtime_pin"
             ])
         );
         for c in Capability::ALL {
