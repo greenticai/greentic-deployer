@@ -3615,6 +3615,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
             drain_seconds: rev
                 .drain_seconds
                 .unwrap_or_else(super::revisions::default_drain_seconds),
+            runtime_image_digest: None,
         };
         let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
         let staged: RevisionSummary =

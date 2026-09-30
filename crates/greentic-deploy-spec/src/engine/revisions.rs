@@ -212,6 +212,12 @@ pub struct StageRevisionPayload {
     pub config_digest: String,
     pub signature_sidecar_ref: PathBuf,
     pub drain_seconds: u32,
+    /// The runtime image (`sha256:` digest of greentic-start-distroless) this
+    /// revision runs, when the manifest pinned one for it (unified update L2).
+    /// `None` = the environment's deployer answer, which is every revision
+    /// staged before L2 (ruling L2-R3: `effective_runtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image_digest: Option<String>,
 }
 
 /// Inputs to `EnvironmentMutations::warm_revision`, and the A8
@@ -535,6 +541,7 @@ pub fn stage_revision(
         staged_at: Some(now),
         warmed_at: None,
         drain_seconds: payload.drain_seconds,
+        runtime_image_digest: payload.runtime_image_digest.clone(),
         abort_metrics: Vec::new(),
     };
     env.revisions.push(revision.clone());
@@ -712,6 +719,7 @@ mod tests {
             config_digest: "sha256:00".to_string(),
             signature_sidecar_ref: PathBuf::from("rev.sig"),
             drain_seconds: 30,
+            runtime_image_digest: None,
         }
     }
 
@@ -760,6 +768,22 @@ mod tests {
             staged.bundle_source_uri.as_deref(),
             Some("oci://ghcr.io/greenticai/bundles/demo@sha256:abc")
         );
+    }
+
+    #[test]
+    fn staging_stamps_the_payload_runtime_pin() {
+        let deployment_id = DeploymentId::new();
+        let mut env = env_with_deployment(deployment_id);
+        let unpinned = stage_revision(&mut env, stage_payload(deployment_id), fixed_now()).unwrap();
+        assert_eq!(unpinned.runtime_image_digest, None);
+
+        let pin = format!("sha256:{}", "f".repeat(64));
+        let payload = StageRevisionPayload {
+            runtime_image_digest: Some(pin.clone()),
+            ..stage_payload(deployment_id)
+        };
+        let staged = stage_revision(&mut env, payload, fixed_now()).unwrap();
+        assert_eq!(staged.runtime_image_digest, Some(pin));
     }
 
     #[test]
@@ -979,6 +1003,19 @@ mod tests {
         );
         let back: StageRevisionPayload = serde_json::from_value(value).unwrap();
         assert_eq!(back.revision_id, payload.revision_id);
+    }
+
+    #[test]
+    fn stage_payload_wire_format_carries_the_runtime_pin_only_when_set() {
+        let pin = format!("sha256:{}", "f".repeat(64));
+        let payload = StageRevisionPayload {
+            runtime_image_digest: Some(pin.clone()),
+            ..stage_payload(DeploymentId::new())
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["runtime_image_digest"], json!(pin));
+        let back: StageRevisionPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(back.runtime_image_digest, Some(pin));
     }
 
     #[test]

@@ -448,6 +448,7 @@ pub fn deploy(
         config_digest: super::revisions::default_config_digest(),
         signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(),
         drain_seconds: super::revisions::default_drain_seconds(),
+        runtime_image_digest: None,
     };
     let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
     let staged: RevisionSummary = parse_summary(stage_outcome, "revision")?;

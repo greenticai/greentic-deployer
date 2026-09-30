@@ -136,6 +136,12 @@ pub struct Revision {
     pub warmed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub drain_seconds: u32,
+    /// The runtime image (`sha256:` digest of greentic-start-distroless) this
+    /// revision runs, when the manifest pinned one for it (unified update L2).
+    /// `None` = the environment's deployer answer, which is every revision
+    /// staged before L2 (ruling L2-R3: `effective_runtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image_digest: Option<String>,
     #[serde(default)]
     pub abort_metrics: Vec<String>,
 }
@@ -184,7 +190,31 @@ mod tests {
             warmed_at: None,
             drain_seconds: 0,
             abort_metrics: Vec::new(),
+            runtime_image_digest: None,
         }
+    }
+
+    #[test]
+    fn a_revision_serialised_before_l2_reads_no_runtime_pin() {
+        let mut v = serde_json::to_value(minimal()).expect("ser");
+        v.as_object_mut()
+            .expect("object")
+            .remove("runtime_image_digest");
+        let r: Revision = serde_json::from_value(v).expect("an old revision still parses");
+        assert_eq!(r.runtime_image_digest, None);
+    }
+
+    #[test]
+    fn an_unpinned_revision_serialises_byte_identically() {
+        let json = serde_json::to_string(&minimal()).expect("ser");
+        assert!(!json.contains("runtime_image_digest"));
+        let pinned = Revision {
+            runtime_image_digest: Some(format!("sha256:{}", "f".repeat(64))),
+            ..minimal()
+        };
+        let back: Revision =
+            serde_json::from_str(&serde_json::to_string(&pinned).expect("ser")).expect("de");
+        assert_eq!(back, pinned);
     }
 
     /// `bundle_source_uri` is `skip_serializing_if = "Option::is_none"`, so a

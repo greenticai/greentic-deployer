@@ -976,6 +976,7 @@ fn remote_revision_stage(
         config_digest: payload.config_digest,
         signature_sidecar_ref: payload.signature_sidecar_ref,
         drain_seconds: payload.drain_seconds,
+        runtime_image_digest: payload.runtime_image_digest,
     };
     let revision = store
         .stage_revision(&env_id, store_payload, idempotency_key)
@@ -1241,6 +1242,7 @@ fn remote_deploy(
                 drain_seconds: pins
                     .drain_seconds
                     .unwrap_or_else(super::revisions::default_drain_seconds),
+                runtime_image_digest: None,
             },
             sub_key("stage")?,
         )
@@ -2436,6 +2438,7 @@ fn remote_env_apply(
                             signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(
                             ),
                             drain_seconds: rev.drain_seconds,
+                            runtime_image_digest: None,
                         },
                         super::mint_idempotency_key(),
                     )
