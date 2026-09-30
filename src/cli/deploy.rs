@@ -98,6 +98,10 @@ pub struct RemoteBundlePins {
 /// its filename stem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleDeployPayload {
+    /// Runtime pin (`sha256:<hex>`) stamped on the staged revision; `None` =
+    /// the deployer binding's answer. Set by the env-manifest apply path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image_digest: Option<String>,
     #[serde(default = "default_environment_id")]
     pub environment_id: String,
     pub bundle_id: String,
@@ -448,7 +452,7 @@ pub fn deploy(
         config_digest: super::revisions::default_config_digest(),
         signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(),
         drain_seconds: super::revisions::default_drain_seconds(),
-        runtime_image_digest: None,
+        runtime_image_digest: payload.runtime_image_digest.clone(),
     };
     let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
     let staged: RevisionSummary = parse_summary(stage_outcome, "revision")?;
@@ -611,6 +615,7 @@ pub fn payload_from_deploy_args(
         // `op deploy` CLI has no revenue-share flag; defaults stay in
         // `bundles add`. The env-manifest apply path sets this directly.
         revenue_share: None,
+        runtime_image_digest: None,
     }))
 }
 
@@ -904,6 +909,7 @@ mod tests {
             config_overrides: None,
             route_binding: None,
             revenue_share: None,
+            runtime_image_digest: None,
         }
     }
 

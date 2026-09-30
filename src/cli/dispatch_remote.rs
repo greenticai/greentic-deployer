@@ -1242,7 +1242,7 @@ fn remote_deploy(
                 drain_seconds: pins
                     .drain_seconds
                     .unwrap_or_else(super::revisions::default_drain_seconds),
-                runtime_image_digest: None,
+                runtime_image_digest: payload.runtime_image_digest.clone(),
             },
             sub_key("stage")?,
         )
@@ -1947,6 +1947,8 @@ struct DesiredRevision {
     source_uri: String,
     digest: String,
     drain_seconds: u32,
+    /// Manifest runtime pin stamped on the staged revision (`None` = answer).
+    runtime_image_digest: Option<String>,
 }
 
 /// True when the deployment's live traffic split already equals the desired
@@ -2320,6 +2322,7 @@ fn remote_env_apply(
                         drain_seconds: r
                             .drain_seconds
                             .unwrap_or_else(super::revisions::default_drain_seconds),
+                        runtime_image_digest: r.runtime_image_digest.clone(),
                     })
                     .collect()
             }
@@ -2329,6 +2332,7 @@ fn remote_env_apply(
                 source_uri: b.bundle_source_uri.clone().unwrap_or_default(),
                 digest: b.bundle_digest.clone().unwrap_or_default(),
                 drain_seconds: super::revisions::default_drain_seconds(),
+                runtime_image_digest: b.runtime_image_digest.clone(),
             }],
         };
 
@@ -2438,7 +2442,7 @@ fn remote_env_apply(
                             signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(
                             ),
                             drain_seconds: rev.drain_seconds,
-                            runtime_image_digest: None,
+                            runtime_image_digest: rev.runtime_image_digest,
                         },
                         super::mint_idempotency_key(),
                     )
@@ -4532,6 +4536,7 @@ mod tests {
             source_uri: source_uri.to_string(),
             digest: digest.to_string(),
             drain_seconds: 30,
+            runtime_image_digest: None,
         }
     }
 

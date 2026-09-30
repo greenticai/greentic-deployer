@@ -68,6 +68,7 @@
 
 mod ownership;
 mod prune;
+pub(super) mod runtime_pin;
 mod split_reuse;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -211,6 +212,8 @@ struct SplitRevisionEntry {
     /// OCI/repo/store pull ref for the staged revision (K8s boot pull);
     /// `None` = local-serve only.
     bundle_source_uri: Option<String>,
+    /// Manifest runtime pin, stamped on the staged revision (`None` = answer).
+    runtime_image_digest: Option<String>,
 }
 
 /// Reference to an endpoint that may not exist yet at plan time. `Created`
@@ -340,6 +343,9 @@ struct ResolvedRevision {
     /// already serves unchanged: reuse routes to it without a pull.
     resolved_path: Option<PathBuf>,
     digest: String,
+    /// The manifest's runtime pin for this revision (`sha256:<hex>`); `None`
+    /// = the deployer binding's answer. Compared by DP3's convergence/reuse.
+    runtime_image_digest: Option<String>,
     /// Effective weight in basis points, computed by
     /// [`compute_effective_weights_bps`].
     weight_bps: u32,
@@ -998,9 +1004,11 @@ fn resolve_and_validate(
                         // (`rb.spec.bundle_source_uri`, read by `deploy_payload`).
                         bundle_source_uri: None,
                         bundle_digest: None,
+                        runtime_image_digest: b.runtime_image_digest.clone(),
                     },
                     resolved_path: Some(fetched),
                     digest,
+                    runtime_image_digest: b.runtime_image_digest.clone(),
                     weight_bps: super::deploy::FULL_TRAFFIC_BPS,
                 }],
             });
@@ -1052,6 +1060,7 @@ fn resolve_and_validate(
                     // not on this synthetic revision.
                     bundle_source_uri: None,
                     bundle_digest: None,
+                    runtime_image_digest: b.runtime_image_digest.clone(),
                 }
             });
             let Some(artifact_path) = artifact_path else {
@@ -1066,6 +1075,7 @@ fn resolve_and_validate(
                     ))
                 })?;
                 resolved_revs.push(ResolvedRevision {
+                    runtime_image_digest: spec.runtime_image_digest.clone(),
                     spec,
                     resolved_path: None,
                     digest,
@@ -1097,6 +1107,7 @@ fn resolve_and_validate(
             };
             let digest = resolved_artifact_digest(&resolved_path, declared_digest, &location)?;
             resolved_revs.push(ResolvedRevision {
+                runtime_image_digest: spec.runtime_image_digest.clone(),
                 spec,
                 resolved_path: Some(resolved_path),
                 digest,
@@ -3386,6 +3397,8 @@ fn deploy_payload(
         // Threaded into the FRESH-add path; ignored by `deploy` on a
         // re-deploy (the existing split is reconciled via `bundles update`).
         revenue_share: rb.spec.revenue_share.clone(),
+        // Single-revision bundle-level runtime pin (`None` = binding answer).
+        runtime_image_digest: rb.revisions[0].runtime_image_digest.clone(),
     }
 }
 
@@ -3461,6 +3474,7 @@ fn deploy_split_op(env_id: &str, rb: &ResolvedBundle, reuse_ready: bool) -> Step
                 weight_bps: rr.weight_bps,
                 drain_seconds: rr.spec.drain_seconds,
                 bundle_source_uri: rr.spec.bundle_source_uri.clone(),
+                runtime_image_digest: rr.runtime_image_digest.clone(),
             })
             .collect(),
         reuse_ready,
@@ -3615,7 +3629,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
             drain_seconds: rev
                 .drain_seconds
                 .unwrap_or_else(super::revisions::default_drain_seconds),
-            runtime_image_digest: None,
+            runtime_image_digest: rev.runtime_image_digest.clone(),
         };
         let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
         let staged: RevisionSummary =
@@ -5114,6 +5128,25 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_runtime_pin_is_stamped_on_the_staged_revision() {
+        const PIN: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let (dir, store) = seeded_store();
+        let mut manifest = plain_bundle_manifest();
+        manifest["bundles"][0]["runtime_image_digest"] = json!(PIN);
+        let p = write_manifest(dir.path(), &manifest);
+        run_apply(&store, &p).expect("apply");
+        let env = load_local(&store);
+        assert!(!env.revisions.is_empty());
+        assert!(
+            env.revisions
+                .iter()
+                .all(|r| r.runtime_image_digest.as_deref() == Some(PIN)),
+            "{:?}",
+            env.revisions
+        );
+    }
+
+    #[test]
     fn status_on_fresh_create_defers_one_apply_without_failing_verify() {
         let (dir, store) = seeded_store();
         let mut manifest = plain_bundle_manifest();
@@ -5375,6 +5408,7 @@ mod tests {
                 config_overrides: None,
                 route_binding: None,
                 revenue_share: None,
+                runtime_image_digest: None,
             }),
         )
         .expect("imperative deploy");
@@ -5533,9 +5567,11 @@ mod tests {
                 abort_metrics: Vec::new(),
                 bundle_source_uri: None,
                 bundle_digest: None,
+                runtime_image_digest: None,
             },
             resolved_path: Some(PathBuf::from(format!("{name}.gtbundle"))),
             digest: digest.to_string(),
+            runtime_image_digest: None,
             weight_bps,
         }
     }
@@ -6035,6 +6071,7 @@ mod tests {
                 weight_bps: 10_000,
                 drain_seconds: None,
                 bundle_source_uri: Some("oci://test/a:1".into()),
+                runtime_image_digest: None,
             }],
             reuse_ready: false,
         };
@@ -6135,6 +6172,7 @@ mod tests {
                     weight_bps: bps,
                     drain_seconds: None,
                     bundle_source_uri: None,
+                    runtime_image_digest: None,
                 })
                 .collect(),
             reuse_ready: false,
@@ -6916,6 +6954,7 @@ mod tests {
                 tenant_selector: None,
             }),
             revenue_share: None,
+            runtime_image_digest: None,
         };
         super::super::deploy::deploy(&store, &OpFlags::default(), Some(p.clone()))
             .expect("first deploy");
