@@ -168,6 +168,7 @@ mod tests {
             warmed_at: None,
             drain_seconds: 30,
             abort_metrics: Vec::new(),
+            runtime_image_digest: None,
         }
     }
 

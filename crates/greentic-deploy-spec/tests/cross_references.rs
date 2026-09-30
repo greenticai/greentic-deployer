@@ -83,6 +83,7 @@ fn revision(
         warmed_at: None,
         drain_seconds: 60,
         abort_metrics: vec![],
+        runtime_image_digest: None,
     }
 }
 

@@ -593,6 +593,7 @@ impl Deployer for K8sDeployerHandler {
             private_registry_auth: true,
             multi_instance_safe: false,
             remove: true,
+            runtime_pin: false,
         }
     }
 
@@ -606,6 +607,7 @@ impl Deployer for K8sDeployerHandler {
             "multi_instance_safe: not claimed — session state is per worker pod with no shared \
              session store",
             "remove: archive deletes the worker pair; `op env sweep --apply` reclaims orphans",
+            "runtime_pin: not claimed — workers render the environment's runtime_image answer (L2b)",
         ]
     }
 

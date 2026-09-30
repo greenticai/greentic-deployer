@@ -98,6 +98,10 @@ pub struct RemoteBundlePins {
 /// its filename stem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleDeployPayload {
+    /// Runtime pin (`sha256:<hex>`) stamped on the staged revision; `None` =
+    /// the deployer binding's answer. Set by the env-manifest apply path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image_digest: Option<String>,
     #[serde(default = "default_environment_id")]
     pub environment_id: String,
     pub bundle_id: String,
@@ -325,6 +329,13 @@ pub fn deploy(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let bundle_id = payload.bundle_id.trim().to_string();
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "deploy payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
     if bundle_id.is_empty() {
         return Err(OpError::InvalidArgument(
             "bundle_id must not be empty".to_string(),
@@ -448,6 +459,7 @@ pub fn deploy(
         config_digest: super::revisions::default_config_digest(),
         signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(),
         drain_seconds: super::revisions::default_drain_seconds(),
+        runtime_image_digest: payload.runtime_image_digest.clone(),
     };
     let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
     let staged: RevisionSummary = parse_summary(stage_outcome, "revision")?;
@@ -610,6 +622,7 @@ pub fn payload_from_deploy_args(
         // `op deploy` CLI has no revenue-share flag; defaults stay in
         // `bundles add`. The env-manifest apply path sets this directly.
         revenue_share: None,
+        runtime_image_digest: None,
     }))
 }
 
@@ -903,6 +916,7 @@ mod tests {
             config_overrides: None,
             route_binding: None,
             revenue_share: None,
+            runtime_image_digest: None,
         }
     }
 

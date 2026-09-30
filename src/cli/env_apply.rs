@@ -68,6 +68,7 @@
 
 mod ownership;
 mod prune;
+pub(super) mod runtime_pin;
 mod split_reuse;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -211,6 +212,8 @@ struct SplitRevisionEntry {
     /// OCI/repo/store pull ref for the staged revision (K8s boot pull);
     /// `None` = local-serve only.
     bundle_source_uri: Option<String>,
+    /// Manifest runtime pin, stamped on the staged revision (`None` = answer).
+    runtime_image_digest: Option<String>,
 }
 
 /// Reference to an endpoint that may not exist yet at plan time. `Created`
@@ -255,7 +258,7 @@ enum StepOp {
     },
     /// Multi-revision traffic-split deploy: reuse each revision that is
     /// already staged and ready for the same artifact (see
-    /// [`split_reuse::reusable_revisions`]), stage + warm the rest, then set
+    /// [`split_reuse::reusable_revisions_with_answer`]), stage + warm the rest, then set
     /// the combined traffic split. Each entry carries its own artifact path
     /// and digest for TOCTOU re-verification.
     DeploySplit {
@@ -274,6 +277,10 @@ enum StepOp {
         /// answers changed, which is the one reason an unchanged artifact
         /// still needs a new revision.
         reuse_ready: bool,
+        /// The deployer's `runtime_image_digest` answer the plan was made
+        /// under ([`ApplyContext::runtime_answer`]): reuse compares each
+        /// revision's EFFECTIVE runtime, so the executor needs it too.
+        runtime_answer: Option<String>,
     },
     UpdateHostConfig(Box<ConfigSetPayload>),
     /// Write `<env_dir>/update-channel.json` through `op updates config-set`,
@@ -340,6 +347,12 @@ struct ResolvedRevision {
     /// already serves unchanged: reuse routes to it without a pull.
     resolved_path: Option<PathBuf>,
     digest: String,
+    /// The manifest's runtime pin for this revision (`sha256:<hex>`); `None`
+    /// = the deployer binding's answer. AUTHORITATIVE: `spec` carries the same
+    /// value (it is copied from there, or from the bundle-level pin for a
+    /// single-revision entry), but every consumer — staging, convergence and
+    /// reuse — reads this field, never `spec.runtime_image_digest`.
+    runtime_image_digest: Option<String>,
     /// Effective weight in basis points, computed by
     /// [`compute_effective_weights_bps`].
     weight_bps: u32,
@@ -398,6 +411,10 @@ struct ApplyContext {
     /// then re-staged fresh, so resolution must NOT skip fetching a remote-only
     /// split revision on the strength of a reuse that will not happen.
     cloudrun_deployer_answers_changed: bool,
+    /// The Cloud Run deployer binding's `runtime_image_digest` answer in
+    /// effect for this apply ([`binding_runtime_answer`]); `None` for any
+    /// other deployer. The "answer" half of every effective-runtime compare.
+    runtime_answer: Option<String>,
     updated_by: String,
     /// Directory of the manifest file. Pack-binding `answers_ref`s resolve
     /// against it, and apply stages them into the env store so reconcile
@@ -942,6 +959,8 @@ fn resolve_and_validate(
             }
         }
     }
+    let runtime_answer = binding_runtime_answer(store, &manifest, manifest_dir, env.as_ref())?;
+    runtime_pin::refuse_unpinnable_runtime(&manifest, env.as_ref())?;
 
     // Bundle artifacts: existence + digest, plus the B10 billing-principal
     // rule, all before any mutation. The principal rule stays fail-fast
@@ -998,9 +1017,11 @@ fn resolve_and_validate(
                         // (`rb.spec.bundle_source_uri`, read by `deploy_payload`).
                         bundle_source_uri: None,
                         bundle_digest: None,
+                        runtime_image_digest: b.runtime_image_digest.clone(),
                     },
                     resolved_path: Some(fetched),
                     digest,
+                    runtime_image_digest: b.runtime_image_digest.clone(),
                     weight_bps: super::deploy::FULL_TRAFFIC_BPS,
                 }],
             });
@@ -1052,6 +1073,7 @@ fn resolve_and_validate(
                     // not on this synthetic revision.
                     bundle_source_uri: None,
                     bundle_digest: None,
+                    runtime_image_digest: b.runtime_image_digest.clone(),
                 }
             });
             let Some(artifact_path) = artifact_path else {
@@ -1066,6 +1088,7 @@ fn resolve_and_validate(
                     ))
                 })?;
                 resolved_revs.push(ResolvedRevision {
+                    runtime_image_digest: spec.runtime_image_digest.clone(),
                     spec,
                     resolved_path: None,
                     digest,
@@ -1097,6 +1120,7 @@ fn resolve_and_validate(
             };
             let digest = resolved_artifact_digest(&resolved_path, declared_digest, &location)?;
             resolved_revs.push(ResolvedRevision {
+                runtime_image_digest: spec.runtime_image_digest.clone(),
                 spec,
                 resolved_path: Some(resolved_path),
                 digest,
@@ -1110,7 +1134,7 @@ fn resolve_and_validate(
 
         // Remote-only revisions: reuse first, fetch only what reuse cannot
         // serve. The match is the same one the executor makes
-        // (`split_reuse::reusable_revisions` over the whole split, so
+        // (`split_reuse::reusable_revisions_with_answer` over the whole split, so
         // duplicate artifacts claim distinct revisions); a revision matched
         // here is routed to without any pull.
         //
@@ -1129,13 +1153,16 @@ fn resolve_and_validate(
                             d.bundle_id.as_str() == b.bundle_id && d.customer_id == customer_id
                         })
                         .map(|dep| {
-                            let wanted: Vec<split_reuse::WantedRevision<'_>> =
-                                resolved_revs.iter().map(wanted_revision).collect();
-                            split_reuse::reusable_revisions(
+                            let wanted: Vec<split_reuse::WantedRevision<'_>> = resolved_revs
+                                .iter()
+                                .map(|rr| wanted_revision(rr, runtime_answer.as_deref()))
+                                .collect();
+                            split_reuse::reusable_revisions_with_answer(
                                 env,
                                 dep.deployment_id,
                                 &wanted,
                                 Some(env_dir.as_path()),
+                                runtime_answer.as_deref(),
                             )
                         })
                 })
@@ -1328,6 +1355,7 @@ fn resolve_and_validate(
         canonical_public_base_url,
         missing,
         cloudrun_deployer_answers_changed,
+        runtime_answer,
         warnings,
         updated_by,
         manifest_dir: manifest_dir.to_path_buf(),
@@ -1746,7 +1774,7 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     action: ApplyAction::Create,
                     detail,
                     idempotency_key: None,
-                    op: deploy_split_op(&env_id_str, rb, true),
+                    op: deploy_split_op(&env_id_str, rb, true, ctx.runtime_answer.as_deref()),
                 });
             }
             None => {
@@ -1773,8 +1801,16 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
             }
             Some(dep) if is_multi => {
                 let env = ctx.env.as_ref().expect("existing deployment implies env");
-                let converged = split_converged(env, dep.deployment_id, &rb.revisions)
-                    && live_pack_lists_are_complete(ctx.env_dir.as_deref(), env, dep.deployment_id);
+                let converged = split_converged(
+                    env,
+                    dep.deployment_id,
+                    &rb.revisions,
+                    ctx.runtime_answer.as_deref(),
+                ) && live_pack_lists_are_complete(
+                    ctx.env_dir.as_deref(),
+                    env,
+                    dep.deployment_id,
+                );
                 let desired_binding: Option<RouteBinding> =
                     rb.spec.route_binding.clone().map(into_route_binding);
                 let binding_differs = desired_binding
@@ -1795,12 +1831,13 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                 if restage {
                     let reuse_ready = !cloudrun_deployer_answers_changed;
                     let reused = if reuse_ready {
-                        let wanted = wanted_revisions(rb);
-                        split_reuse::reusable_revisions(
+                        let wanted = wanted_revisions(rb, ctx.runtime_answer.as_deref());
+                        split_reuse::reusable_revisions_with_answer(
                             env,
                             dep.deployment_id,
                             &wanted,
                             ctx.env_dir.as_deref(),
+                            ctx.runtime_answer.as_deref(),
                         )
                         .iter()
                         .filter(|r| r.is_some())
@@ -1843,7 +1880,12 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                         action: ApplyAction::Update,
                         detail,
                         idempotency_key: None,
-                        op: deploy_split_op(&env_id_str, rb, reuse_ready),
+                        op: deploy_split_op(
+                            &env_id_str,
+                            rb,
+                            reuse_ready,
+                            ctx.runtime_answer.as_deref(),
+                        ),
                     });
                 }
 
@@ -1905,6 +1947,8 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     dep.deployment_id,
                     &primary_digest(),
                     rb.spec.bundle_source_uri.as_deref(),
+                    rb.revisions[0].runtime_image_digest.as_deref(),
+                    ctx.runtime_answer.as_deref(),
                 ) && live_pack_lists_are_complete(
                     ctx.env_dir.as_deref(),
                     env,
@@ -1922,6 +1966,19 @@ fn diff(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Vec<ApplyStep>, OpEr
                     let detail = if converged {
                         format!(
                             "deployer answers changed → new revision ({})",
+                            short_digest(&primary_digest())
+                        )
+                    } else if let Some((from, to)) = live_runtime_change(
+                        env,
+                        dep.deployment_id,
+                        &primary_digest(),
+                        rb.revisions[0].runtime_image_digest.as_deref(),
+                        ctx.runtime_answer.as_deref(),
+                    ) {
+                        format!(
+                            "runtime {} → {} (blue-green re-stage, digest {} unchanged)",
+                            short_digest(from),
+                            short_digest(to),
                             short_digest(&primary_digest())
                         )
                     } else if live.is_some_and(digest_is_real) {
@@ -2977,7 +3034,12 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
         };
         let is_multi = rb.spec.revisions.is_some();
         if is_multi {
-            if !split_converged(&env, dep.deployment_id, &rb.revisions) {
+            if !split_converged(
+                &env,
+                dep.deployment_id,
+                &rb.revisions,
+                ctx.runtime_answer.as_deref(),
+            ) {
                 failures.push(format!(
                     "bundle `{}`: traffic split not converged ({} revision(s) expected)",
                     rb.spec.bundle_id,
@@ -2991,13 +3053,28 @@ fn verify(store: &LocalFsStore, ctx: &ApplyContext) -> Result<Value, OpError> {
                 dep.deployment_id,
                 primary_digest,
                 rb.spec.bundle_source_uri.as_deref(),
+                rb.revisions[0].runtime_image_digest.as_deref(),
+                ctx.runtime_answer.as_deref(),
             ) {
-                failures.push(format!(
-                    "bundle `{}`: live revision digest is `{}`, expected `{}`",
-                    rb.spec.bundle_id,
-                    live_revision_digest(&env, dep.deployment_id).unwrap_or("none"),
-                    primary_digest
-                ));
+                let runtime = live_runtime_change(
+                    &env,
+                    dep.deployment_id,
+                    primary_digest,
+                    rb.revisions[0].runtime_image_digest.as_deref(),
+                    ctx.runtime_answer.as_deref(),
+                );
+                failures.push(match runtime {
+                    Some((live, expected)) => format!(
+                        "bundle `{}`: live revision runtime is `{live}`, expected `{expected}`",
+                        rb.spec.bundle_id,
+                    ),
+                    None => format!(
+                        "bundle `{}`: live revision digest is `{}`, expected `{}`",
+                        rb.spec.bundle_id,
+                        live_revision_digest(&env, dep.deployment_id).unwrap_or("none"),
+                        primary_digest
+                    ),
+                });
             }
         }
         // Post-condition, both shapes: a served revision must pin every runtime
@@ -3262,6 +3339,89 @@ fn cloudrun_answers_differ(
     Ok(content_outdated || ref_wrong)
 }
 
+/// The Cloud Run deployer's `runtime_image_digest` answer in effect for this
+/// apply — the "answer" half of every effective-runtime comparison
+/// (`runtime_pin::effective_runtime`).
+///
+/// Read from the manifest being applied: when it binds the deployer slot with
+/// an `answers_ref` (inline `answers` are materialized into one before this
+/// runs), that file is what the binding will hold after apply. A changed answer
+/// already re-stages every deployment through `cloudrun_deployer_answers_changed`;
+/// this only has to name the value. When the manifest leaves the slot or its
+/// answers untouched, the existing binding's staged answers stay in force and
+/// are read instead.
+///
+/// `None` when the deployer is not Cloud Run (k8s has no digest answer and
+/// every revision there is `None`-stamped) or the answers pin no digest.
+fn binding_runtime_answer(
+    store: &LocalFsStore,
+    manifest: &EnvManifest,
+    manifest_dir: &Path,
+    env: Option<&Environment>,
+) -> Result<Option<String>, OpError> {
+    let manifest_pack = manifest
+        .packs
+        .iter()
+        .find(|mp| mp.slot == CapabilitySlot::Deployer);
+    if let Some(mp) = manifest_pack {
+        if !is_cloudrun_deployer_pack(mp) {
+            return Ok(None);
+        }
+        if let Some(ar) = &mp.answers_ref {
+            let src = resolve_answers_src(manifest_dir, ar);
+            // A missing file is refused later in `resolve_and_validate` with
+            // its own `answers_ref ... does not exist` message; the apply
+            // never proceeds on this `None`.
+            if !src.is_file() {
+                return Ok(None);
+            }
+            let bytes = std::fs::read(&src).map_err(|source| OpError::Io {
+                path: src.clone(),
+                source,
+            })?;
+            let answers: Value = serde_json::from_slice(&bytes).map_err(|e| {
+                OpError::InvalidArgument(format!(
+                    "deployer answers `{}` are not valid JSON: {e}",
+                    src.display()
+                ))
+            })?;
+            return runtime_answer_of(&answers, &src.display().to_string());
+        }
+    }
+    // The manifest leaves the deployer answers alone: the binding's staged
+    // answers stay in force. Read them through the one binding-answers reader
+    // (containment under the env dir, and a missing file names the binding
+    // wizard as the fix).
+    let Some(env) = env else {
+        return Ok(None);
+    };
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
+        return Ok(None);
+    };
+    if !super::env::is_cloudrun_kind(&binding.kind) {
+        return Ok(None);
+    }
+    let (answers, _) = super::env::load_render_answers(store, env, &binding.kind)?;
+    match answers {
+        Some(answers) => runtime_answer_of(&answers, "the deployer binding's answers"),
+        None => Ok(None),
+    }
+}
+
+/// `runtime_image_digest` out of one deployer answers document (`None` when
+/// absent or `null`). A non-string value fails the apply: the deployer would
+/// refuse the same document at execute time, and guessing "no answer" here
+/// could re-stage or skip a revision on a value nobody declared.
+fn runtime_answer_of(answers: &Value, origin: &str) -> Result<Option<String>, OpError> {
+    match answers.get("runtime_image_digest") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(digest)) => Ok(Some(digest.clone())),
+        Some(other) => Err(OpError::InvalidArgument(format!(
+            "{origin}: runtime_image_digest must be a string, got `{other}`"
+        ))),
+    }
+}
+
 /// True when the staged answers file is missing or its content differs from
 /// the manifest source — i.e. apply must (re)stage it. Identical content
 /// re-applies as a no-op, so apply stays idempotent.
@@ -3386,17 +3546,28 @@ fn deploy_payload(
         // Threaded into the FRESH-add path; ignored by `deploy` on a
         // re-deploy (the existing split is reconciled via `bundles update`).
         revenue_share: rb.spec.revenue_share.clone(),
+        // Single-revision bundle-level runtime pin (`None` = binding answer).
+        runtime_image_digest: rb.revisions[0].runtime_image_digest.clone(),
     }
 }
 
 /// The reuse key of every revision a multi-revision bundle declares, in
-/// manifest order.
-fn wanted_revisions(rb: &ResolvedBundle) -> Vec<split_reuse::WantedRevision<'_>> {
-    rb.revisions.iter().map(wanted_revision).collect()
+/// manifest order. `answer` is [`ApplyContext::runtime_answer`].
+fn wanted_revisions<'a>(
+    rb: &'a ResolvedBundle,
+    answer: Option<&'a str>,
+) -> Vec<split_reuse::WantedRevision<'a>> {
+    rb.revisions
+        .iter()
+        .map(|rr| wanted_revision(rr, answer))
+        .collect()
 }
 
-/// The reuse key of one resolved revision.
-fn wanted_revision(rr: &ResolvedRevision) -> split_reuse::WantedRevision<'_> {
+/// The reuse key of one resolved revision, its runtime already effective.
+fn wanted_revision<'a>(
+    rr: &'a ResolvedRevision,
+    answer: Option<&'a str>,
+) -> split_reuse::WantedRevision<'a> {
     split_reuse::WantedRevision {
         digest: rr.digest.as_str(),
         source_uri: rr.spec.bundle_source_uri.as_deref(),
@@ -3404,6 +3575,7 @@ fn wanted_revision(rr: &ResolvedRevision) -> split_reuse::WantedRevision<'_> {
             .spec
             .drain_seconds
             .unwrap_or_else(super::revisions::default_drain_seconds),
+        runtime: runtime_pin::effective_runtime(rr.runtime_image_digest.as_deref(), answer),
     }
 }
 
@@ -3443,7 +3615,12 @@ fn fetch_remote_revision(
 }
 
 /// Build a [`StepOp::DeploySplit`] from a resolved multi-revision bundle.
-fn deploy_split_op(env_id: &str, rb: &ResolvedBundle, reuse_ready: bool) -> StepOp {
+fn deploy_split_op(
+    env_id: &str,
+    rb: &ResolvedBundle,
+    reuse_ready: bool,
+    runtime_answer: Option<&str>,
+) -> StepOp {
     StepOp::DeploySplit {
         env_id: env_id.to_string(),
         bundle_id: rb.spec.bundle_id.clone(),
@@ -3461,9 +3638,11 @@ fn deploy_split_op(env_id: &str, rb: &ResolvedBundle, reuse_ready: bool) -> Step
                 weight_bps: rr.weight_bps,
                 drain_seconds: rr.spec.drain_seconds,
                 bundle_source_uri: rr.spec.bundle_source_uri.clone(),
+                runtime_image_digest: rr.runtime_image_digest.clone(),
             })
             .collect(),
         reuse_ready,
+        runtime_answer: runtime_answer.map(str::to_string),
     }
 }
 
@@ -3485,6 +3664,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
         revenue_share,
         revisions: split_revs,
         reuse_ready,
+        runtime_answer,
     } = op
     else {
         unreachable!("execute_deploy_split called with non-DeploySplit op");
@@ -3505,6 +3685,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
     // below has no revisions yet, so nothing is reusable for it.
     let reuse: Vec<Option<RevisionId>> = match existing {
         Some(b) if *reuse_ready => {
+            let answer = runtime_answer.as_deref();
             let wanted: Vec<split_reuse::WantedRevision<'_>> = split_revs
                 .iter()
                 .map(|r| split_reuse::WantedRevision {
@@ -3513,10 +3694,20 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
                     drain_seconds: r
                         .drain_seconds
                         .unwrap_or_else(super::revisions::default_drain_seconds),
+                    runtime: runtime_pin::effective_runtime(
+                        r.runtime_image_digest.as_deref(),
+                        answer,
+                    ),
                 })
                 .collect();
             let env_dir = store.env_dir(&env_id_parsed).ok();
-            split_reuse::reusable_revisions(&env, b.deployment_id, &wanted, env_dir.as_deref())
+            split_reuse::reusable_revisions_with_answer(
+                &env,
+                b.deployment_id,
+                &wanted,
+                env_dir.as_deref(),
+                answer,
+            )
         }
         _ => vec![None; split_revs.len()],
     };
@@ -3615,6 +3806,7 @@ fn execute_deploy_split(store: &LocalFsStore, flags: &OpFlags, op: &StepOp) -> R
             drain_seconds: rev
                 .drain_seconds
                 .unwrap_or_else(super::revisions::default_drain_seconds),
+            runtime_image_digest: rev.runtime_image_digest.clone(),
         };
         let stage_outcome = super::revisions::stage(store, flags, Some(stage_payload))?;
         let staged: RevisionSummary =
@@ -3722,6 +3914,34 @@ fn live_revision_digest(env: &Environment, deployment_id: DeploymentId) -> Optio
         .map(|r| r.bundle_digest.as_str())
 }
 
+/// `(live, wanted)` effective runtimes when the served revision already runs
+/// `digest` but on a different runtime — the pin-only change, so plan and
+/// verify can say "runtime A → B" instead of "digest X → X". `unset` stands
+/// for "no pin and no answer" (the deployer's default tag).
+fn live_runtime_change<'a>(
+    env: &'a Environment,
+    deployment_id: DeploymentId,
+    digest: &str,
+    wanted_pin: Option<&'a str>,
+    answer: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    let split = env
+        .traffic_splits
+        .iter()
+        .find(|s| s.deployment_id == deployment_id)?;
+    let entry = split.entries.iter().max_by_key(|e| e.weight_bps)?;
+    let live = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == entry.revision_id)?;
+    if !digest_is_real(&live.bundle_digest) || live.bundle_digest != digest {
+        return None;
+    }
+    let from = runtime_pin::effective_runtime(live.runtime_image_digest.as_deref(), answer);
+    let to = runtime_pin::effective_runtime(wanted_pin, answer);
+    (from != to).then(|| (from.unwrap_or("unset"), to.unwrap_or("unset")))
+}
+
 /// A digest the diff can trust: real `sha256:` material, not the
 /// `sha256:00` placeholder pre-digest revisions carry.
 pub(super) fn digest_is_real(digest: &str) -> bool {
@@ -3769,10 +3989,17 @@ fn live_pack_lists_are_complete(
 
 /// Strict convergence: the deployment's traffic split has EXACTLY ONE
 /// NONZERO entry and it is at full weight (10,000 bps), that entry's revision
-/// exists, carries a real digest, the digest matches `expected_digest`, and
+/// exists, carries a real digest, the digest matches `expected_digest`,
 /// `bundle_source_uri` matches (`None` vs `Some` counts as a difference — a
-/// K8s worker needs the pull ref to boot). A mixed split (e.g. 60/40
-/// blue-green) or a degenerate placeholder digest is NOT converged.
+/// K8s worker needs the pull ref to boot), and the revision's EFFECTIVE
+/// runtime (its own pin, else `answer`) equals the wanted one
+/// (`wanted_runtime`, else `answer`). A mixed split (e.g. 60/40 blue-green) or
+/// a degenerate placeholder digest is NOT converged.
+///
+/// A revision staged before runtime pins existed carries `None`, so under an
+/// unchanged answer it stays converged for an unpinned entry and for one
+/// pinned to that answer — no re-stage, no new Cloud Run revision. `answer` is
+/// [`ApplyContext::runtime_answer`] (`None` off Cloud Run).
 ///
 /// Zero-weight entries are ignored and left in place: a staged rollout
 /// finishes at `[baseline@0, candidate@100]` and keeps the baseline for the
@@ -3786,6 +4013,8 @@ fn deployment_converged(
     deployment_id: DeploymentId,
     expected_digest: &str,
     expected_source_uri: Option<&str>,
+    wanted_runtime: Option<&str>,
+    answer: Option<&str>,
 ) -> bool {
     let Some(split) = env
         .traffic_splits
@@ -3808,13 +4037,17 @@ fn deployment_converged(
             digest_is_real(&r.bundle_digest)
                 && r.bundle_digest == expected_digest
                 && r.bundle_source_uri.as_deref() == expected_source_uri
+                && runtime_pin::effective_runtime(r.runtime_image_digest.as_deref(), answer)
+                    == runtime_pin::effective_runtime(wanted_runtime, answer)
         })
 }
 
 /// Multi-revision convergence: the deployment's traffic split is the exact
-/// `(digest, weight_bps, bundle_source_uri)` multiset declared by `expected`
-/// — every live entry resolves to a real-digest revision, and the live
-/// `(digest, weight, source_uri)` bag equals the expected bag.
+/// `(digest, weight_bps, bundle_source_uri, effective runtime)` multiset
+/// declared by `expected` — every live entry resolves to a real-digest
+/// revision, and the live bag equals the expected bag. The runtime on both
+/// sides is effective (pin, else `answer`), so a `None`-stamped revision
+/// matches an unpinned entry or one pinned to the answer.
 /// Order-independent (both bags are sorted before comparison) and
 /// duplicate-safe: two expected revisions that share the same artifact AND
 /// weight require two matching live entries, not one. A false "converged" is
@@ -3824,6 +4057,7 @@ fn split_converged(
     env: &Environment,
     deployment_id: DeploymentId,
     expected: &[ResolvedRevision],
+    answer: Option<&str>,
 ) -> bool {
     let Some(split) = env
         .traffic_splits
@@ -3835,9 +4069,10 @@ fn split_converged(
     if split.entries.len() != expected.len() {
         return false;
     }
-    // Live `(digest, weight_bps, source_uri)` bag. Any entry pointing at a
-    // missing or placeholder-digest revision fails convergence outright.
-    let mut live_bag: Vec<(&str, u32, Option<&str>)> = Vec::with_capacity(split.entries.len());
+    // Live `(digest, weight_bps, source_uri, runtime)` bag. Any entry pointing
+    // at a missing or placeholder-digest revision fails convergence outright.
+    type Key<'k> = (&'k str, u32, Option<&'k str>, Option<&'k str>);
+    let mut live_bag: Vec<Key<'_>> = Vec::with_capacity(split.entries.len());
     for entry in &split.entries {
         let Some(rev) = env
             .revisions
@@ -3853,16 +4088,18 @@ fn split_converged(
             rev.bundle_digest.as_str(),
             entry.weight_bps,
             rev.bundle_source_uri.as_deref(),
+            runtime_pin::effective_runtime(rev.runtime_image_digest.as_deref(), answer),
         ));
     }
-    // Expected `(digest, weight_bps, source_uri)` bag.
-    let mut expected_bag: Vec<(&str, u32, Option<&str>)> = expected
+    // Expected `(digest, weight_bps, source_uri, runtime)` bag.
+    let mut expected_bag: Vec<Key<'_>> = expected
         .iter()
         .map(|rr| {
             (
                 rr.digest.as_str(),
                 rr.weight_bps,
                 rr.spec.bundle_source_uri.as_deref(),
+                runtime_pin::effective_runtime(rr.runtime_image_digest.as_deref(), answer),
             )
         })
         .collect();
@@ -5112,6 +5349,32 @@ mod tests {
         assert_eq!(run_dry(&store, &p).expect("dry").result["changed"], 0);
     }
 
+    /// A pin needs a deployer declaring `runtime_pin` (Cloud Run); the local
+    /// deployer refuses one (`runtime_pin_tests`).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn a_manifest_runtime_pin_is_stamped_on_the_staged_revision() {
+        const PIN: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let (dir, store) = seeded_store();
+        let mut manifest = plain_bundle_manifest();
+        manifest["bundles"][0]["runtime_image_digest"] = json!(PIN);
+        manifest["packs"] = json!([{
+            "slot": "deployer", "kind": "greentic.deployer.gcp-cloudrun@1.0.0",
+            "pack_ref": "builtin", "answers": {"project": "p", "region": "europe-west1"}
+        }]);
+        let p = write_manifest(dir.path(), &manifest);
+        run_apply(&store, &p).expect("apply");
+        let env = load_local(&store);
+        assert!(!env.revisions.is_empty());
+        assert!(
+            env.revisions
+                .iter()
+                .all(|r| r.runtime_image_digest.as_deref() == Some(PIN)),
+            "{:?}",
+            env.revisions
+        );
+    }
+
     #[test]
     fn status_on_fresh_create_defers_one_apply_without_failing_verify() {
         let (dir, store) = seeded_store();
@@ -5374,6 +5637,7 @@ mod tests {
                 config_overrides: None,
                 route_binding: None,
                 revenue_share: None,
+                runtime_image_digest: None,
             }),
         )
         .expect("imperative deploy");
@@ -5532,9 +5796,11 @@ mod tests {
                 abort_metrics: Vec::new(),
                 bundle_source_uri: None,
                 bundle_digest: None,
+                runtime_image_digest: None,
             },
             resolved_path: Some(PathBuf::from(format!("{name}.gtbundle"))),
             digest: digest.to_string(),
+            runtime_image_digest: None,
             weight_bps,
         }
     }
@@ -5574,7 +5840,7 @@ mod tests {
             resolved_rev("b", "sha256:bbbb22", 5_000),
         ];
         assert!(
-            split_converged(&env, dep_id, &expected),
+            split_converged(&env, dep_id, &expected, None),
             "identical (digest, weight) bag must converge"
         );
         // Order-independence: same bag, swapped expected order.
@@ -5582,7 +5848,7 @@ mod tests {
             resolved_rev("b", "sha256:bbbb22", 5_000),
             resolved_rev("a", "sha256:aaaa11", 5_000),
         ];
-        assert!(split_converged(&env, dep_id, &swapped));
+        assert!(split_converged(&env, dep_id, &swapped, None));
     }
 
     #[test]
@@ -5598,7 +5864,7 @@ mod tests {
             resolved_rev("a-dup", "sha256:aaaa11", 5_000),
         ];
         assert!(
-            !split_converged(&env, dep_id, &expected),
+            !split_converged(&env, dep_id, &expected, None),
             "duplicate-digest expected bag must NOT match a two-distinct-digest live split"
         );
     }
@@ -5612,7 +5878,7 @@ mod tests {
             resolved_rev("b", "sha256:bbbb22", 5_000),
         ];
         assert!(
-            !split_converged(&env, dep_id, &expected),
+            !split_converged(&env, dep_id, &expected, None),
             "same digests but different weights must not converge"
         );
     }
@@ -5628,7 +5894,7 @@ mod tests {
             resolved_rev("b", "sha256:bbbb22", 5_000),
         ];
         assert!(
-            !split_converged(&env, dep_id, &expected),
+            !split_converged(&env, dep_id, &expected, None),
             "placeholder live digest must not be treated as converged"
         );
     }
@@ -6034,8 +6300,10 @@ mod tests {
                 weight_bps: 10_000,
                 drain_seconds: None,
                 bundle_source_uri: Some("oci://test/a:1".into()),
+                runtime_image_digest: None,
             }],
             reuse_ready: false,
+            runtime_answer: None,
         };
         execute_deploy_split(&store, &OpFlags::default(), &op).expect("execute");
         assert_eq!(test_seam::fetched(), ["oci://test/a:1"]);
@@ -6134,9 +6402,11 @@ mod tests {
                     weight_bps: bps,
                     drain_seconds: None,
                     bundle_source_uri: None,
+                    runtime_image_digest: None,
                 })
                 .collect(),
             reuse_ready: false,
+            runtime_answer: None,
         };
         execute_deploy_split(&store, &OpFlags::default(), &op).expect("execute");
         assert_eq!(load_local(&store).revisions.len(), 4, "both re-staged");
@@ -6915,6 +7185,7 @@ mod tests {
                 tenant_selector: None,
             }),
             revenue_share: None,
+            runtime_image_digest: None,
         };
         super::super::deploy::deploy(&store, &OpFlags::default(), Some(p.clone()))
             .expect("first deploy");
@@ -7744,6 +8015,7 @@ mod tests {
             missing: Vec::new(),
             warnings: Vec::new(),
             cloudrun_deployer_answers_changed: false,
+            runtime_answer: None,
             updated_by: "test".to_string(),
             manifest_dir: PathBuf::from("."),
             env_dir: None,
@@ -7949,4 +8221,6 @@ mod tests {
             "opting out must plan no trust-root change at all"
         );
     }
+
+    mod runtime_pin_tests;
 }

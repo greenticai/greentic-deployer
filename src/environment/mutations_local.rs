@@ -1697,6 +1697,7 @@ mod warm_revision_tests {
                 warmed_at: None,
                 drain_seconds: 30,
                 abort_metrics: Vec::new(),
+                runtime_image_digest: None,
             }],
             traffic_splits: Vec::new(),
             messaging_endpoints: Vec::new(),

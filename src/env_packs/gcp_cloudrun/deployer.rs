@@ -248,6 +248,14 @@ impl GcpCloudRunParams {
     /// remote repo when `ar_repo` is set, else the direct public GHCR ref
     /// (plan D3).
     pub fn image_ref(&self) -> String {
+        self.image_ref_for(None)
+    }
+
+    /// The runtime image ref for one specific revision (unified update L2).
+    /// A revision's own `pin` (an image index digest) wins over the binding's
+    /// `runtime_image_digest` answer / tag, but the repository (direct GHCR or
+    /// the Artifact Registry remote repo) is always the binding's.
+    pub fn image_ref_for(&self, pin: Option<&str>) -> String {
         let base = match &self.ar_repo {
             Some(repo) => format!(
                 "{region}-docker.pkg.dev/{project}/{repo}/greenticai/greentic-start-distroless",
@@ -256,7 +264,7 @@ impl GcpCloudRunParams {
             ),
             None => DEFAULT_RUNTIME_IMAGE.to_string(),
         };
-        match &self.runtime_image_digest {
+        match pin.or(self.runtime_image_digest.as_deref()) {
             Some(digest) => format!("{base}@{digest}"),
             None => format!("{base}:{tag}", tag = self.runtime_image_tag),
         }
@@ -895,9 +903,10 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // revision carry a secret-sourced env var at all — mirrors the staging
         // in `create_revision`, below.
         let secret_env_names = secret_env_names(&params);
+        let image = params.image_ref_for(revision.runtime_image_digest.as_deref());
         let intent = revision_intent_with_vpc(
             revision_intent(
-                &params.image_ref(),
+                &image,
                 &runtime_service_account,
                 &params.scaling(),
                 SESSION_AFFINITY,
@@ -949,6 +958,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
                         secret_name: &secret_name,
                         boot_env: &boot_env,
                         intent: &intent,
+                        image: &image,
                     },
                 )
                 .await?
@@ -1022,6 +1032,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
             private_registry_auth: false,
             multi_instance_safe: false,
             remove: true,
+            runtime_pin: true,
         }
     }
 
@@ -1035,6 +1046,8 @@ impl Deployer for GcpCloudRunDeployerHandler {
             "multi_instance_safe: false — the environment/session store is per-instance in-memory \
              /tmp, so max_instances must stay 1 (docs/cloudrun-deployment.md §10)",
             "remove: archive deletes the revision; env destroy deletes the Service",
+            "runtime_pin: each revision runs the runtime image its manifest pinned (unified \
+             update L2); unpinned revisions run the binding answer",
         ]
     }
 
@@ -1139,6 +1152,8 @@ struct CreateRevisionSpec<'a> {
     secret_name: &'a str,
     boot_env: &'a [(String, String)],
     intent: &'a str,
+    /// The image this revision runs (its own pin, else the binding's answer).
+    image: &'a str,
 }
 
 impl GcpCloudRunDeployerHandler {
@@ -1158,6 +1173,7 @@ impl GcpCloudRunDeployerHandler {
             secret_name,
             boot_env,
             intent,
+            image,
         } = spec;
         let deployment_id = revision_ref.deployment_id;
         let revision_id = revision_ref.revision_id;
@@ -1323,7 +1339,7 @@ impl GcpCloudRunDeployerHandler {
                 deployment_id,
                 project: params.project.clone(),
                 region: params.region.clone(),
-                image: params.image_ref(),
+                image: image.to_string(),
                 revision_id,
                 runtime_service_account: runtime_service_account.to_string(),
                 traffic,
@@ -1386,6 +1402,10 @@ struct CreatedRevision {
 #[cfg(test)]
 #[path = "deployer_shared_state_tests.rs"]
 mod shared_state_warm_tests;
+
+#[cfg(test)]
+#[path = "deployer_runtime_pin_tests.rs"]
+mod runtime_pin_tests;
 
 #[cfg(test)]
 #[path = "deployer_cpu_tests.rs"]
