@@ -415,6 +415,29 @@ pub struct K8sParams {
 }
 
 impl K8sParams {
+    /// The runtime image a worker runs for one revision (unified update L2b).
+    ///
+    /// `None` is the environment's `runtime_image` answer, verbatim. A pin
+    /// (an image INDEX digest, `sha256:<hex>`) replaces only the tag/digest
+    /// part: the repository (registry host, port and path) is always the
+    /// answer's, so a pin can never move a worker to another registry and an
+    /// air-gapped mirror repository survives. A pin carrying anything other
+    /// than a bare digest (`/`, `@`, `:tag`) is ignored in favour of the
+    /// answer — manifest validation refuses such a pin long before render.
+    /// The router never calls this: it always runs `runtime_image`.
+    pub fn image_for(&self, pin: Option<&str>) -> String {
+        let Some(pin) = pin else {
+            return self.runtime_image.clone();
+        };
+        let bare_digest = pin
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_alphanumeric()));
+        match image_repository(&self.runtime_image) {
+            Some(repo) if bare_digest => format!("{repo}@{pin}"),
+            _ => self.runtime_image.clone(),
+        }
+    }
+
     /// Sandbox defaults: namespace `gtc-<env-id>`, the S1 default image,
     /// two router replicas.
     pub fn for_env(env: &Environment) -> Self {
@@ -1380,7 +1403,7 @@ pub fn render_worker_deployment(
                     "initContainers": Value::Array(init_containers),
                     "containers": [{
                         "name": "worker",
-                        "image": params.runtime_image,
+                        "image": params.image_for(revision.runtime_image_digest.as_deref()),
                         "args": worker_boot_args(env, params),
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
@@ -1739,6 +1762,20 @@ fn render_oci_credentials_secret(env: &Environment, params: &K8sParams) -> Value
 /// bare repository name with a tag, implicitly `docker.io/library/myapp`, so
 /// the `:` there is a tag separator, not a port separator, and must not be
 /// read as one. `None` when the reference names no authority at all.
+/// The repository part of an image reference: everything before a trailing
+/// `@digest` or `:tag`. A `:` only counts as a tag separator when it sits in
+/// the last path segment, so `host:5000/x` keeps its port. `None` for an
+/// empty repository.
+fn image_repository(image: &str) -> Option<&str> {
+    let without_digest = image.split_once('@').map_or(image, |(repo, _)| repo);
+    let last_segment_start = without_digest.rfind('/').map_or(0, |i| i + 1);
+    let repo = match without_digest[last_segment_start..].find(':') {
+        Some(i) => &without_digest[..last_segment_start + i],
+        None => without_digest,
+    };
+    (!repo.is_empty()).then_some(repo)
+}
+
 fn image_registry_host(image: &str) -> Option<String> {
     let (first_segment, has_slash) = match image.split_once('/') {
         Some((first, _)) => (first, true),
@@ -2092,6 +2129,10 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
     }
     manifests
 }
+
+#[cfg(test)]
+#[path = "manifests_runtime_pin_tests.rs"]
+mod runtime_pin_tests;
 
 #[cfg(test)]
 mod tests {
