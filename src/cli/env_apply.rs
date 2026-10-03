@@ -411,9 +411,10 @@ struct ApplyContext {
     /// then re-staged fresh, so resolution must NOT skip fetching a remote-only
     /// split revision on the strength of a reuse that will not happen.
     cloudrun_deployer_answers_changed: bool,
-    /// The Cloud Run deployer binding's `runtime_image_digest` answer in
-    /// effect for this apply ([`binding_runtime_answer`]); `None` for any
-    /// other deployer. The "answer" half of every effective-runtime compare.
+    /// The Cloud Run `runtime_image_digest` answer (or the digest of a k8s
+    /// `runtime_image` answer) in effect for this apply
+    /// ([`binding_runtime_answer`]); `None` for any other deployer, or for a
+    /// k8s tag ref. The "answer" half of every effective-runtime compare.
     runtime_answer: Option<String>,
     updated_by: String,
     /// Directory of the manifest file. Pack-binding `answers_ref`s resolve
@@ -3364,9 +3365,9 @@ fn binding_runtime_answer(
         .iter()
         .find(|mp| mp.slot == CapabilitySlot::Deployer);
     if let Some(mp) = manifest_pack {
-        if !is_cloudrun_deployer_pack(mp) {
+        let Some(kind) = runtime_answer_kind_of_pack(mp) else {
             return Ok(None);
-        }
+        };
         if let Some(ar) = &mp.answers_ref {
             let src = resolve_answers_src(manifest_dir, ar);
             // A missing file is refused later in `resolve_and_validate` with
@@ -3385,7 +3386,7 @@ fn binding_runtime_answer(
                     src.display()
                 ))
             })?;
-            return runtime_answer_of(&answers, &src.display().to_string());
+            return runtime_answer_of(kind, &answers, &src.display().to_string());
         }
     }
     // The manifest leaves the deployer answers alone: the binding's staged
@@ -3398,26 +3399,73 @@ fn binding_runtime_answer(
     let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
         return Ok(None);
     };
-    if !super::env::is_cloudrun_kind(&binding.kind) {
+    let Some(kind) = runtime_answer_kind(&binding.kind) else {
         return Ok(None);
-    }
+    };
     let (answers, _) = super::env::load_render_answers(store, env, &binding.kind)?;
     match answers {
-        Some(answers) => runtime_answer_of(&answers, "the deployer binding's answers"),
+        Some(answers) => runtime_answer_of(kind, &answers, "the deployer binding's answers"),
         None => Ok(None),
     }
 }
 
-/// `runtime_image_digest` out of one deployer answers document (`None` when
-/// absent or `null`). A non-string value fails the apply: the deployer would
-/// refuse the same document at execute time, and guessing "no answer" here
-/// could re-stage or skip a revision on a value nobody declared.
-fn runtime_answer_of(answers: &Value, origin: &str) -> Result<Option<String>, OpError> {
-    match answers.get("runtime_image_digest") {
+/// Which deployer answer carries the environment's runtime image.
+#[derive(Clone, Copy)]
+enum RuntimeAnswerKind {
+    /// Cloud Run: a bare `runtime_image_digest` answer.
+    CloudRun,
+    /// k8s: a full `runtime_image` reference; only a digest-pinned one names
+    /// a runtime identity (a tag ref is "unknown", never equal to any pin).
+    K8s,
+}
+
+fn runtime_answer_kind(
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Option<RuntimeAnswerKind> {
+    if super::env::is_cloudrun_kind(descriptor) {
+        Some(RuntimeAnswerKind::CloudRun)
+    } else if descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH {
+        Some(RuntimeAnswerKind::K8s)
+    } else {
+        None
+    }
+}
+
+fn runtime_answer_kind_of_pack(mp: &ManifestPack) -> Option<RuntimeAnswerKind> {
+    if mp.slot != CapabilitySlot::Deployer {
+        return None;
+    }
+    greentic_deploy_spec::PackDescriptor::try_new(&mp.kind)
+        .ok()
+        .and_then(|d| runtime_answer_kind(&d))
+}
+
+/// The runtime identity out of one deployer answers document (`None` when
+/// absent, `null`, or — on k8s — a tag ref with no digest). A non-string value
+/// fails the apply: the deployer would refuse the same document at execute
+/// time, and guessing "no answer" here could re-stage or skip a revision on a
+/// value nobody declared.
+fn runtime_answer_of(
+    kind: RuntimeAnswerKind,
+    answers: &Value,
+    origin: &str,
+) -> Result<Option<String>, OpError> {
+    let key = match kind {
+        RuntimeAnswerKind::CloudRun => "runtime_image_digest",
+        RuntimeAnswerKind::K8s => "runtime_image",
+    };
+    match answers.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(digest)) => Ok(Some(digest.clone())),
+        Some(Value::String(value)) => Ok(match kind {
+            RuntimeAnswerKind::CloudRun => Some(value.clone()),
+            // `repo[:tag]@sha256:<hex>` -> `sha256:<hex>`; a tag ref has none.
+            RuntimeAnswerKind::K8s => value
+                .split_once('@')
+                .map(|(_, digest)| digest.to_string())
+                .filter(|d| d.starts_with("sha256:")),
+        }),
         Some(other) => Err(OpError::InvalidArgument(format!(
-            "{origin}: runtime_image_digest must be a string, got `{other}`"
+            "{origin}: {key} must be a string, got `{other}`"
         ))),
     }
 }

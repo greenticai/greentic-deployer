@@ -505,7 +505,9 @@ fn a_pin_is_refused_on_the_local_deployer() {
 }
 
 #[test]
-fn a_revision_pin_is_refused_on_k8s() {
+fn a_revision_pin_is_accepted_on_k8s() {
+    // Unified update L2b: the k8s deployer declares `runtime_pin`, so the
+    // capability gate no longer refuses a manifest pin.
     let (dir, store) = seeded_store();
     let mut manifest =
         two_revision_manifest([("a", fixture(), 9_000), ("b", provider_fixture(), 1_000)]);
@@ -514,8 +516,21 @@ fn a_revision_pin_is_refused_on_k8s() {
         "slot": "deployer", "kind": "greentic.deployer.k8s@1.0.0", "pack_ref": "builtin"
     }]);
     let path = write_manifest(dir.path(), &manifest);
-    let err = run_dry(&store, &path).expect_err("k8s cannot pin");
-    assert_refused_for_runtime_pin(err, "greentic.deployer.k8s");
+    run_dry(&store, &path).expect("k8s can pin");
+}
+
+#[test]
+fn a_pin_is_still_refused_on_an_adapter_without_the_capability() {
+    // The refusal survives for adapters that do not declare `runtime_pin`
+    // (an OLD deployer never gets a pin it would ignore).
+    let (dir, store) = seeded_store();
+    let mut manifest = single_bundle(Some(RUNTIME_A));
+    manifest["packs"] = json!([{
+        "slot": "deployer", "kind": crate::defaults::LOCAL_DEPLOYER_PACK, "pack_ref": "builtin"
+    }]);
+    let path = write_manifest(dir.path(), &manifest);
+    let err = run_dry(&store, &path).expect_err("local cannot pin");
+    assert_refused_for_runtime_pin(err, "local-process");
 }
 
 #[test]
@@ -618,4 +633,141 @@ fn the_plan_names_a_pin_only_change_as_a_runtime_change() {
         .to_string();
     assert!(detail.starts_with("runtime "), "{detail}");
     assert!(detail.contains(&RUNTIME_B[..15]), "{detail}");
+}
+
+// --- k8s: the answer is the digest part of `runtime_image` --------------------------
+
+const K8S: &str = "greentic.deployer.k8s@1.0.0";
+
+fn k8s_manifest_with_image(image: Option<&str>) -> (EnvManifest, Option<tempfile::TempDir>) {
+    let mut answers = json!({});
+    if let Some(i) = image {
+        answers["runtime_image"] = json!(i);
+    }
+    let mut manifest: EnvManifest = serde_json::from_value({
+        let mut m = single_bundle(None);
+        m["packs"] = json!([{
+            "slot": "deployer", "kind": K8S, "pack_ref": "builtin", "answers": answers
+        }]);
+        m
+    })
+    .expect("manifest");
+    let tmp = materialize_inline_pack_answers(&mut manifest).expect("materialize");
+    (manifest, tmp)
+}
+
+#[test]
+fn the_k8s_answer_is_the_digest_of_a_digest_pinned_runtime_image() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    let (pinned, _pinned_tmp) =
+        k8s_manifest_with_image(Some(&format!("ghcr.io/acme/rt@{RUNTIME_A}")));
+    assert_eq!(
+        binding_runtime_answer(&store, &pinned, dir.path(), None).expect("answer"),
+        Some(RUNTIME_A.to_string())
+    );
+    // A tag ref names no runtime identity: unknown, never equal to a pin.
+    let (tag, _tag_tmp) = k8s_manifest_with_image(Some("ghcr.io/acme/rt:develop"));
+    assert_eq!(
+        binding_runtime_answer(&store, &tag, dir.path(), None).expect("answer"),
+        None
+    );
+    // `repo:tag@sha256:..` still yields the digest.
+    let (both, _both_tmp) =
+        k8s_manifest_with_image(Some(&format!("ghcr.io/acme/rt:1.2@{RUNTIME_B}")));
+    assert_eq!(
+        binding_runtime_answer(&store, &both, dir.path(), None).expect("answer"),
+        Some(RUNTIME_B.to_string())
+    );
+    let (unset, _unset_tmp) = k8s_manifest_with_image(None);
+    assert_eq!(
+        binding_runtime_answer(&store, &unset, dir.path(), None).expect("answer"),
+        None
+    );
+}
+
+#[test]
+fn a_non_string_k8s_runtime_image_is_invalid_argument() {
+    let dir = tempdir().expect("tempdir");
+    let store = LocalFsStore::new(dir.path());
+    let mut manifest: EnvManifest = serde_json::from_value({
+        let mut m = single_bundle(None);
+        m["packs"] = json!([{
+            "slot": "deployer", "kind": K8S, "pack_ref": "builtin", "answers": {}
+        }]);
+        m
+    })
+    .expect("manifest");
+    manifest.packs[0].answers = Some(json!({"runtime_image": 5}));
+    let _tmp = materialize_inline_pack_answers(&mut manifest).expect("materialize");
+    let err = binding_runtime_answer(&store, &manifest, dir.path(), None).unwrap_err();
+    assert!(
+        matches!(&err, OpError::InvalidArgument(m) if m.contains("runtime_image")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn tag_answer_is_not_equal_to_any_pin() {
+    // Tag-ref environment (answer unknown): an unpinned entry is "unknown",
+    // and a pinned entry never converges with an unpinned revision.
+    assert_eq!(runtime_pin::effective_runtime(None, None), None);
+    assert_ne!(
+        runtime_pin::effective_runtime(None, None),
+        runtime_pin::effective_runtime(Some(RUNTIME_A), None)
+    );
+    let (env, dep) = env_with_one_ready_revision(DIGEST, None, None);
+    assert!(!deployment_converged(
+        &env,
+        dep,
+        DIGEST,
+        None,
+        Some(RUNTIME_A),
+        None
+    ));
+}
+
+#[test]
+fn legacy_none_revision_with_tag_answer_reconciles_unchanged() {
+    // Review Focus: a legacy k8s revision (`None` stamp) under a tag-ref
+    // answer, with no pin in the manifest, is converged — no restage.
+    let (env, dep) = env_with_one_ready_revision(DIGEST, None, None);
+    assert!(deployment_converged(&env, dep, DIGEST, None, None, None));
+}
+
+#[test]
+fn pinned_revision_is_not_restaged_when_answer_unchanged() {
+    let (env, dep) = env_with_one_ready_revision(DIGEST, None, Some(RUNTIME_A));
+    // Same pin, tag answer: converged.
+    assert!(deployment_converged(
+        &env,
+        dep,
+        DIGEST,
+        None,
+        Some(RUNTIME_A),
+        None
+    ));
+    // Pin equal to a digest-pinned answer, unpinned entry: converged too.
+    assert!(deployment_converged(
+        &env,
+        dep,
+        DIGEST,
+        None,
+        None,
+        Some(RUNTIME_A)
+    ));
+}
+
+#[test]
+fn split_between_pinned_and_unpinned_revision_is_accepted() {
+    let (env, dep) = env_with_split(
+        &[(DIGEST, None, 10_000), (DIGEST, Some(RUNTIME_B), 0)],
+        None,
+    );
+    let wanted = [
+        resolved(DIGEST, 10_000, None),
+        resolved(DIGEST, 0, Some(RUNTIME_B)),
+    ];
+    // Tag-ref answer (None): baseline unknown, candidate pinned.
+    assert!(split_converged(&env, dep, &wanted, None));
 }

@@ -55,9 +55,9 @@ fn capabilities_is_honest_about_cloud_run_multi_instance() {
 }
 
 /// k8s builds without `creds-gcp`, so its half of the runtime_pin claim is
-/// asserted ungated.
+/// asserted ungated (unified update L2b: it declares it, like Cloud Run).
 #[test]
-fn k8s_does_not_declare_runtime_pin() {
+fn k8s_declares_runtime_pin() {
     let (_d, store) = store_with("greentic.deployer.k8s@1.0.0");
     let out = capabilities(
         &store,
@@ -67,7 +67,7 @@ fn k8s_does_not_declare_runtime_pin() {
         None,
     )
     .unwrap();
-    assert_eq!(out.result["capabilities"]["runtime_pin"], false);
+    assert_eq!(out.result["capabilities"]["runtime_pin"], true);
 }
 
 #[cfg(feature = "creds-gcp")]

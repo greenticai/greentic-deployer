@@ -593,7 +593,7 @@ impl Deployer for K8sDeployerHandler {
             private_registry_auth: true,
             multi_instance_safe: false,
             remove: true,
-            runtime_pin: false,
+            runtime_pin: true,
         }
     }
 
@@ -607,7 +607,10 @@ impl Deployer for K8sDeployerHandler {
             "multi_instance_safe: not claimed — session state is per worker pod with no shared \
              session store",
             "remove: archive deletes the worker pair; `op env sweep --apply` reclaims orphans",
-            "runtime_pin: not claimed — workers render the environment's runtime_image answer (L2b)",
+            "runtime_pin: a revision's pin (image index digest) replaces the tag/digest of its OWN \
+             worker image and keeps the runtime_image answer's repository; the shared router \
+             always runs the runtime_image answer and moves only when that answer is edited \
+             (after every unit is on the new worker)",
         ]
     }
 
@@ -643,6 +646,10 @@ impl Deployer for K8sDeployerHandler {
         Ok(outcome)
     }
 }
+
+#[cfg(test)]
+#[path = "deployer_runtime_pin_tests.rs"]
+mod runtime_pin_tests;
 
 #[cfg(test)]
 mod tests {

@@ -557,7 +557,7 @@ are **rejected** (fail closed on version skew).
 |-----|------|---------|--------|
 | `kubeconfig_context` | string | current context | Which kubeconfig context `reconcile` targets. Client-targeting only — not a manifest knob. When the manifest carries a `cluster` block, `env up` derives this (`kind-<name>`) for its own reconcile; setting it to a *different* value here is an error. |
 | `namespace` | string (RFC 1123 label) | `gtc-<env-id>` | Override the namespace every object lands in. |
-| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:latest` | Container image for router + worker pods. Pin to a digest in production. (The `develop` lane defaults to the `:develop` tag.) |
+| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:latest` | Container image for router + worker pods. Pin to a digest in production. (The `develop` lane defaults to the `:develop` tag.) A revision's `runtime_image_digest` pin overrides the tag/digest of its **worker** image only — see [Per-revision runtime pin](#per-revision-runtime-pin-governed-platform-releases). |
 | `init_image` | string `[a-z0-9.\-_/:@]+` | `busybox:1.36.1` | Container image for the pack's init containers. Same validation as `runtime_image`; pin a digest in production. |
 | `router_replicas` | int (string or number) | `2` | Router replica count. Must be **≥ 2** (HA). |
 | `tunnel` | `"off"` \| `"cloudflared"` | `off` | Worker public-exposure mode. `cloudflared` → worker spawns a quick tunnel (single-revision only). |
@@ -591,6 +591,43 @@ telemetry slot binding exists; the contract may move there.
 | `messaging_endpoints[]` | `{ name, provider_type, links }`. `provider_type: "messaging.telegram.bot"`; `links` references a `bundle_id`. The URI segment for the bot-token secret is fixed `messaging-telegram` (not the endpoint name). |
 
 ---
+
+### Per-revision runtime pin (governed platform releases)
+
+The k8s deployer declares the `runtime_pin` capability. A manifest bundle or
+revision entry may carry `runtime_image_digest: sha256:<64 hex>` (the image
+**index** digest); the revision's own worker Deployment then renders
+`<repository of runtime_image>@<digest>`. Rules, each of which fails silently if
+broken:
+
+- **Workers only.** The shared router (`gtc-router`) always runs the
+  `runtime_image` answer. A platform rollout never moves the router.
+- **Router last.** Move the router by editing the `runtime_image` answer, as a
+  separate environment-level step, *after* every unit is on the new worker.
+  Changing that answer rolls the router **and every unpinned worker** in place
+  (a normal rolling update, no 0%-warm step) — pinned revisions keep their pin.
+- **Open risk — router/worker version skew.** Router and worker are the same
+  binary family and speak a runtime-config schema and an HTTP dispatch contract
+  defined in greentic-start / greentic-runner, not in this repo. During a
+  rollout "new worker, old router" must be tolerated, and so must the reverse on
+  rollback. Nothing in this repo can verify that; confirm it with the
+  greentic-start owners before relying on a platform release in production.
+- **A pin never changes the repository.** Only the tag/digest part is replaced;
+  registry host, port and path stay the answer's, so an air-gapped mirror
+  repository survives. A pin carrying `/`, `@` or a `:tag` is refused at
+  manifest validation.
+- **A tag-ref `runtime_image` names no runtime identity.** The engine reads the
+  environment's runtime answer as the digest of a digest-pinned `runtime_image`,
+  and as *unknown* for a tag ref — so an unpinned revision never converges with
+  a pinned manifest entry, and a pinned revision under an unchanged answer is
+  not restaged.
+- **"Recorded" means "requested + rollout ready".** Nothing reads the pod's
+  `imageID` back (it reports a platform digest, the pin is the index digest), so
+  the recorded pin is not verified against what the node actually runs. Health
+  evidence is the existing rollout-available + `/healthz` readiness signal.
+- Remote dispatch compares raw pins, so a legacy unstamped (`None`) revision versus an entry pinned to the answer's own digest restages once (harmless).
+- An adapter that does **not** declare `runtime_pin` (or an older deployer) still
+  refuses a manifest pin, so a pinned entry is never silently ignored.
 
 ## 9. Known gaps & production caveats
 
