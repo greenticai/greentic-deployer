@@ -896,7 +896,106 @@ fn load_secret_requirements_from_zip(pack_path: &Path) -> Result<Vec<PackSecretR
             Path::new("assets/setup.yaml"),
         )?);
     }
+    requirements.extend(generated_requirements_from_manifest(&mut archive)?);
     Ok(dedup_requirements(requirements))
+}
+
+/// The pack manifest extension a provider uses to declare a secret the platform
+/// mints for it (the webchat `jwt_signing_key`). greentic-start reads it from
+/// `manifest.cbor` (falling back to `pack.manifest.json`) — and a pack that
+/// declares ONLY here carries `[]` in `assets/secret-requirements.json`, so a
+/// reader that stops at the assets sees no generated secret at all.
+const GENERATED_SECRETS_EXTENSION: &str = "greentic.generated-secrets.v1";
+
+fn generated_requirements_from_manifest<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Result<Vec<PackSecretRequirement>> {
+    let manifest: Option<serde_json::Value> = match archive.by_name("manifest.cbor") {
+        Ok(mut entry) => {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            ciborium::from_reader(bytes.as_slice()).ok()
+        }
+        Err(ZipError::FileNotFound) => None,
+        Err(err) => return Err(DeployerError::Other(err.to_string())),
+    };
+    let manifest = match manifest {
+        Some(manifest) => manifest,
+        None => match archive.by_name("pack.manifest.json") {
+            Ok(mut entry) => {
+                let mut contents = String::new();
+                entry.read_to_string(&mut contents)?;
+                serde_json::from_str(&contents).unwrap_or(serde_json::Value::Null)
+            }
+            Err(ZipError::FileNotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(DeployerError::Other(err.to_string())),
+        },
+    };
+    let Some(inline) = manifest
+        .get("extensions")
+        .and_then(|extensions| extensions.get(GENERATED_SECRETS_EXTENSION))
+        .and_then(|extension| extension.get("inline"))
+    else {
+        return Ok(Vec::new());
+    };
+    let extension: GeneratedSecretsExtension = match serde_json::from_value(inline.clone()) {
+        Ok(extension) => extension,
+        Err(_) => return Ok(Vec::new()),
+    };
+    Ok(extension
+        .secrets
+        .into_iter()
+        .filter(|secret| secret.required.unwrap_or(true))
+        .map(|secret| PackSecretRequirement {
+            key: secret.key.to_lowercase(),
+            aliases: secret.aliases,
+            required: true,
+            default_value: None,
+            // Defaults match greentic-start's extension reader, NOT the asset
+            // path's: random, 20 characters, raw text, tenant scope.
+            generated: Some(AssetGeneratedSecret {
+                policy: Some(secret.policy.unwrap_or_else(|| "random".to_string())),
+                length: Some(secret.length.unwrap_or(20)),
+                encoding: Some(secret.encoding.unwrap_or_else(|| "raw_text".to_string())),
+                scope: Some(AssetGeneratedSecretScope {
+                    level: Some(
+                        secret
+                            .scope
+                            .as_ref()
+                            .and_then(|scope| scope.level.clone())
+                            .unwrap_or_else(|| "tenant".to_string()),
+                    ),
+                    team: secret.scope.and_then(|scope| scope.team),
+                }),
+                regenerate_if_present: Some(secret.regenerate_if_present.unwrap_or(false)),
+            }),
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct GeneratedSecretsExtension {
+    #[serde(default)]
+    secrets: Vec<ExtensionGeneratedSecret>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtensionGeneratedSecret {
+    key: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    required: Option<bool>,
+    #[serde(default)]
+    policy: Option<String>,
+    #[serde(default)]
+    length: Option<usize>,
+    #[serde(default)]
+    encoding: Option<String>,
+    #[serde(default)]
+    scope: Option<AssetGeneratedSecretScope>,
+    #[serde(default)]
+    regenerate_if_present: Option<bool>,
 }
 
 fn load_secret_requirements_from_tar(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
@@ -1115,6 +1214,63 @@ fn default_required() -> bool {
 mod tests {
     use super::*;
     use greentic_deploy_spec::MessagingEndpointId;
+
+    fn gtpack_with_manifest_cbor(manifest: &serde_json::Value) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let file = tempfile::NamedTempFile::new().expect("temp pack");
+        let mut zip = zip::ZipWriter::new(file.reopen().expect("reopen"));
+        let opts = zip::write::SimpleFileOptions::default();
+        let mut cbor = Vec::new();
+        ciborium::into_writer(manifest, &mut cbor).expect("encode manifest");
+        zip.start_file("manifest.cbor", opts)
+            .expect("start manifest");
+        zip.write_all(&cbor).expect("write manifest");
+        // The shape a real provider pack ships: an EMPTY requirements asset.
+        zip.start_file("assets/secret-requirements.json", opts)
+            .expect("start assets");
+        zip.write_all(b"[]").expect("write assets");
+        zip.finish().expect("finish zip");
+        file
+    }
+
+    #[test]
+    fn a_secret_declared_only_in_the_manifest_extension_is_generated() {
+        let pack = gtpack_with_manifest_cbor(&serde_json::json!({
+            "extensions": {
+                "greentic.generated-secrets.v1": {
+                    "inline": { "secrets": [{
+                        "key": "jwt_signing_key",
+                        "aliases": ["JWT_SIGNING_KEY"],
+                        "required": true,
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": { "level": "tenant", "team": "_" }
+                    }]}
+                }
+            }
+        }));
+        let reqs = load_secret_requirements_from_pack(pack.path()).expect("load");
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert_eq!(reqs[0].key, "jwt_signing_key");
+        let generated = reqs[0].generated.as_ref().expect("generated");
+        assert_eq!(generated.length, Some(20));
+        assert_eq!(generated.encoding.as_deref(), Some("raw_text"));
+        assert_eq!(
+            generated.scope.as_ref().and_then(|s| s.team.as_deref()),
+            Some("_")
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_the_extension_adds_no_requirement() {
+        let pack = gtpack_with_manifest_cbor(&serde_json::json!({ "extensions": {} }));
+        assert!(
+            load_secret_requirements_from_pack(pack.path())
+                .expect("load")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn extract_env_placeholder_matches_whole_string_dollar_brace_form() {
