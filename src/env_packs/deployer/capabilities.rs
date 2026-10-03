@@ -149,6 +149,15 @@ impl CapabilityReport {
     }
 }
 
+/// The one definition of a runtime pin: `sha256:` followed by 64 lowercase
+/// hex characters (an image index digest). Shared by manifest validation and
+/// every adapter that renders a pin.
+pub fn is_valid_runtime_pin(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

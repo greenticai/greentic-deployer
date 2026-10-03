@@ -62,7 +62,7 @@ fn image_for_keeps_registry_port() {
 }
 
 #[test]
-fn a_pin_that_is_not_a_bare_digest_cannot_change_the_repository() {
+fn an_invalid_pin_is_ignored_and_cannot_change_the_repository() {
     let p = params_with("registry.internal:5000/greentic/start:1.2");
     for bad in [
         "evil.example/x@sha256:aaaa",
@@ -70,6 +70,10 @@ fn a_pin_that_is_not_a_bare_digest_cannot_change_the_repository() {
         "other:tag",
         "sha256:aa@bb",
         "sha256:",
+        // Strict definition: 64 lowercase hex only.
+        "sha256:aaaa",
+        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
     ] {
         assert_eq!(p.image_for(Some(bad)), p.runtime_image, "{bad}");
     }

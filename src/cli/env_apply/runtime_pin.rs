@@ -89,10 +89,7 @@ pub(in crate::cli) fn validate_runtime_pin(
     let Some(value) = value else {
         return Ok(());
     };
-    let ok = value.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    });
-    if ok {
+    if crate::env_packs::deployer::is_valid_runtime_pin(value) {
         Ok(())
     } else {
         Err(format!(

@@ -421,20 +421,27 @@ impl K8sParams {
     /// (an image INDEX digest, `sha256:<hex>`) replaces only the tag/digest
     /// part: the repository (registry host, port and path) is always the
     /// answer's, so a pin can never move a worker to another registry and an
-    /// air-gapped mirror repository survives. A pin carrying anything other
-    /// than a bare digest (`/`, `@`, `:tag`) is ignored in favour of the
-    /// answer — manifest validation refuses such a pin long before render.
+    /// air-gapped mirror repository survives. An invalid pin (anything but
+    /// `sha256:` + 64 lowercase hex — the single definition,
+    /// `is_valid_runtime_pin`) is logged at `warn` and the answer is rendered
+    /// instead; manifest validation refuses such a pin long before render, so
+    /// this is a backstop for hand-written stores, not a normal path.
     /// The router never calls this: it always runs `runtime_image`.
     pub fn image_for(&self, pin: Option<&str>) -> String {
         let Some(pin) = pin else {
             return self.runtime_image.clone();
         };
-        let bare_digest = pin
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_alphanumeric()));
+        if !crate::env_packs::deployer::is_valid_runtime_pin(pin) {
+            tracing::warn!(
+                pin,
+                runtime_image = %self.runtime_image,
+                "ignoring an invalid runtime pin; rendering the runtime_image answer"
+            );
+            return self.runtime_image.clone();
+        }
         match image_repository(&self.runtime_image) {
-            Some(repo) if bare_digest => format!("{repo}@{pin}"),
-            _ => self.runtime_image.clone(),
+            Some(repo) => format!("{repo}@{pin}"),
+            None => self.runtime_image.clone(),
         }
     }
 
@@ -1753,15 +1760,6 @@ fn render_oci_credentials_secret(env: &Environment, params: &K8sParams) -> Value
     })
 }
 
-/// The registry host implied by a single image reference, using the same
-/// heuristic Docker itself uses to tell a registry authority from a bare
-/// repository path: everything before the first `/`, when the reference
-/// contains a `/` AT ALL and that first segment contains a `.` or a `:`
-/// (e.g. `ghcr.io/greenticai/x` vs `library/busybox`). A reference with no
-/// `/` at all (e.g. `myapp:v1`) can never be `host[:port]/path` — it is a
-/// bare repository name with a tag, implicitly `docker.io/library/myapp`, so
-/// the `:` there is a tag separator, not a port separator, and must not be
-/// read as one. `None` when the reference names no authority at all.
 /// The repository part of an image reference: everything before a trailing
 /// `@digest` or `:tag`. A `:` only counts as a tag separator when it sits in
 /// the last path segment, so `host:5000/x` keeps its port. `None` for an
@@ -1776,6 +1774,15 @@ fn image_repository(image: &str) -> Option<&str> {
     (!repo.is_empty()).then_some(repo)
 }
 
+/// The registry host implied by a single image reference, using the same
+/// heuristic Docker itself uses to tell a registry authority from a bare
+/// repository path: everything before the first `/`, when the reference
+/// contains a `/` AT ALL and that first segment contains a `.` or a `:`
+/// (e.g. `ghcr.io/greenticai/x` vs `library/busybox`). A reference with no
+/// `/` at all (e.g. `myapp:v1`) can never be `host[:port]/path` — it is a
+/// bare repository name with a tag, implicitly `docker.io/library/myapp`, so
+/// the `:` there is a tag separator, not a port separator, and must not be
+/// read as one. `None` when the reference names no authority at all.
 fn image_registry_host(image: &str) -> Option<String> {
     let (first_segment, has_slash) = match image.split_once('/') {
         Some((first, _)) => (first, true),

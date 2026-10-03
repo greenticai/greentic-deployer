@@ -625,6 +625,7 @@ broken:
   `imageID` back (it reports a platform digest, the pin is the index digest), so
   the recorded pin is not verified against what the node actually runs. Health
   evidence is the existing rollout-available + `/healthz` readiness signal.
+- Remote dispatch compares raw pins, so a legacy unstamped (`None`) revision versus an entry pinned to the answer's own digest restages once (harmless).
 - An adapter that does **not** declare `runtime_pin` (or an older deployer) still
   refuses a manifest pin, so a pinned entry is never silently ignored.
 

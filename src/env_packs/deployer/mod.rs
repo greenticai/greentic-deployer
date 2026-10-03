@@ -32,6 +32,7 @@ pub mod conformance;
 pub mod drain;
 pub mod trait_def;
 
+pub use capabilities::is_valid_runtime_pin;
 pub use capabilities::{AdapterCapabilities, Capability, CapabilityMissing, CapabilityReport};
 pub use drain::{DrainEvidence, DrainPolicy, DrainProbe};
 
