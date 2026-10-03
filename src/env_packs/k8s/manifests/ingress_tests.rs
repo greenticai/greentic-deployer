@@ -32,10 +32,15 @@ fn refusal(answers: Value) -> String {
 /// measured on an unmodified `develop` @ f13cf8d (a scratch test run on that
 /// tree before any Ingress code existed), not on this branch. An env
 /// that answers none of them must render exactly those bytes.
+///
+/// Re-measured once, deliberately, when the router Service gained
+/// `sessionAffinity: ClientIP` (the router keeps conversation state per
+/// replica): that is the ONLY difference between the old and new bytes, and it
+/// applies to every environment regardless of its Ingress answers.
 #[test]
 fn unanswered_ingress_keeps_the_rendered_set_byte_identical() {
-    const DEFAULT_GOLDEN: &str = "95ebefd97fd325c24c15004c1a1e637f5d707c2f9127fa37692b18faf67e05c5";
-    const CUSTOM_GOLDEN: &str = "2e21921500371970ae8c0d0d1bc26f44842ccd4be43f6f70c565f8f12366b726";
+    const DEFAULT_GOLDEN: &str = "f8c61a1cf342d759d3d070987fbdc2e3a47b98a58a3bebf4da9f899fe283a239";
+    const CUSTOM_GOLDEN: &str = "c5fee323cd83fd7a3c5ed2f51d30f07b31220db78930a87ae9b769fc3dcdf3ea";
     let env = build_fixture_env();
     let defaults = render_environment_manifests(&env, &K8sParams::for_env(&env));
     assert_eq!(sha256_hex(&defaults), DEFAULT_GOLDEN);

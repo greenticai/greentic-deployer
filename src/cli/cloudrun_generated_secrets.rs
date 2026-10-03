@@ -30,6 +30,7 @@ use greentic_secrets_lib::{
     GeneratedSecretRequirement, canonical_secret_name, generated_scope_team,
 };
 
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
 use crate::env_packs::gcp_cloudrun::shared_state::GeneratedSecretSeed;
 use crate::environment::LocalFsStore;
 use crate::runtime_secrets::{RuntimeSecretContext, canonical_secret_uri, collect_requirements};
@@ -226,6 +227,38 @@ pub(crate) fn staged_missing(
     Ok(missing)
 }
 
+/// Pre-mint every generated secret the env's revisions declare into the env dev
+/// store at `dev_path`, for a lane whose runtime is more than one process — the
+/// k8s router runs at least two replicas, and each used to mint its own webchat
+/// `jwt_signing_key` at boot, so a token signed by one replica failed on the
+/// other (`invalid token signature`) with nothing red at any layer.
+///
+/// Best effort per revision: one whose plan cannot be established (no staged
+/// `pack-list.lock`, an unreadable pack) is skipped with a warning rather than
+/// failing the reconcile, and `Ok(n)` reports how many secrets are now held.
+/// A value already present is never re-minted (see the module doc).
+pub(crate) fn premint_for_env(
+    store: &LocalFsStore,
+    env: &Environment,
+    dev_path: &Path,
+) -> Result<usize, OpError> {
+    let env_dir = store
+        .env_dir(&env.environment_id)
+        .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
+    let mut held = 0;
+    for revision in &env.revisions {
+        match plan_generated(&env_dir, env, revision) {
+            Ok(plans) => held += mint_missing(dev_path, &plans)?.len(),
+            Err(reason) => tracing::warn!(
+                revision = %revision.revision_id,
+                %reason,
+                "not pre-minting generated secrets for this revision"
+            ),
+        }
+    }
+    Ok(held)
+}
+
 /// Pre-mint the revision's generated secrets into the env dev store at
 /// `dev_path`, stage the seed through `read_staged` (the caller's
 /// `read_dev_secrets_bytes`), and report whether the staged bytes carry every
@@ -235,6 +268,7 @@ pub(crate) fn staged_missing(
 /// `dev_path` MUST be the file `read_staged` reads — the caller resolves both
 /// through one helper. Minting into another file (an override path the staging
 /// read ignores) would report every secret missing, forever.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
 pub(crate) fn premint_and_stage(
     store: &LocalFsStore,
     env: &Environment,
