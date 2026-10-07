@@ -22,6 +22,7 @@ pub mod mutations_local;
 pub mod reads;
 pub mod removal_local;
 pub mod runtime_config;
+pub mod seed;
 pub mod snapshot;
 pub mod sor_units;
 pub mod store;
@@ -53,6 +54,7 @@ pub use mutations::{
 };
 pub use reads::EnvironmentReads;
 pub use runtime_config::materialize_runtime_config;
+pub use seed::{prune_for_seed, seed_environment_bytes};
 pub use snapshot::{SnapshotId, restore_environment, snapshot_environment};
 pub use store::{
     DestroyOutcome, EnvironmentStore, LocalFsStore, Locked, PROVIDER_TEARDOWN_DESCRIPTORS,

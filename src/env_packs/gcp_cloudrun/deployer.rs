@@ -43,6 +43,7 @@ use crate::env_packs::deployer::{
 use crate::env_packs::telemetry::{
     self as telemetry_answers, HEADER_ENV_NAMES, TelemetryAnswerError, TelemetryAnswers,
 };
+use crate::environment::seed_environment_bytes;
 
 use super::GcpCloudRunDeployerHandler;
 use super::deploy_target::{
@@ -1188,7 +1189,10 @@ impl GcpCloudRunDeployerHandler {
         // greentic-start copies this mount into its writable store at boot. When
         // the env carries dev-store material, the CLI injected the raw bytes and
         // they are staged as a SECOND version of the same secret below.
-        let environment_json = serde_json::to_vec(env).map_err(|e| {
+        // The seed is a copy for the worker, so it omits archived revisions
+        // nothing references (Secret Manager caps a version at 64 KiB); the
+        // on-disk store stays complete. This revision is always kept.
+        let environment_json = seed_environment_bytes(env, &[revision_id]).map_err(|e| {
             DeployerError::Provider(format!(
                 "serializing environment.json for seed staging: {e}"
             ))
