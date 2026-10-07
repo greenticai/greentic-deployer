@@ -245,6 +245,38 @@ so the deployer stages into Secret Manager and mounts read-only.
   which is in-memory. The seed is re-copied on every cold start.
 - The deployer's own credential is **excluded** from the seed. A workload never
   receives the identity that deployed it.
+- **`environment.json` is a pruned copy, and one Secret Manager version is capped
+  at 65,536 bytes.** The store keeps every revision ever staged (~1.8 KB each).
+  Measured 2026-10-07: 9 bundles / 53 revisions = 96,140 bytes, and the
+  environment could not be deployed at all; every redeploy adds one revision per
+  unit. `environment::seed::prune_for_seed` (called from `create_revision`)
+  leaves out every `Archived` revision that no traffic-split entry, no bundle's
+  `current_revisions` and no explicit `keep` (the revision being warmed) names.
+  The on-disk store stays complete; only the seed copy is pruned.
+  - **Why that is safe.** greentic-start pulls only *routed* (split-referenced)
+    revisions (`revision_pull::pull_with`), finds its own `GREENTIC_REVISION_ID`
+    among them, and builds everything else from the runtime-config projection
+    (`materialize_runtime_config`: one block per split entry). It never reads an
+    unrouted revision. Checked against greentic-start `origin/develop` `bf9f6f8`;
+    greentic-runner reads no `environment.json` at all.
+  - **Why only `Archived`.** `Environment::validate` (run on every store load)
+    checks a bundle's `config_overrides` against the pack lists of its
+    *non-archived* revisions, so dropping one of those can invalidate a valid
+    document. Archived ones are outside that rule. A pruned document that still
+    fails `validate()` falls back to the full one, and nothing to prune is
+    byte-identical output.
+  - **Open point.** Unrouted `Ready`/`Inactive`/`Failed` revisions are unread by
+    the runtime too but are kept. If superseded revisions in a real environment
+    stay `Ready` rather than being archived, this does not shrink the seed
+    enough; dropping them needs the `config_overrides` rule reconciled first
+    (re-run validation per candidate, or exempt overridden packs).
+  - **k8s is not covered.** The k8s env-store ConfigMap
+    (`render_env_store_config_map`) serializes the full document at a separate
+    call site; its cap is ~1 MiB, so it has ~15x the headroom. It needs a
+    one-line change to adopt `prune_for_seed` if it ever matters.
+  - This does not cap growth: an environment whose *live* revisions alone exceed
+    the cap still fails. Archive stale revisions (`op revisions archive`) to
+    keep it small.
 
 Boot env vars are set by `runtime_boot_env`. `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0`
 is required — greentic-start otherwise binds loopback and Cloud Run's health

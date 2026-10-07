@@ -89,6 +89,22 @@ For the Cloud Run subsystem specifically — module map, the seam, the invariant
 a change must not break, and how to test without touching GCP — read
 **[`docs/cloudrun-internals.md`](docs/cloudrun-internals.md)**.
 
+### The Cloud Run `environment.json` seed is a pruned copy
+
+Cloud Run stages `environment.json` as ONE Secret Manager version, capped at
+65,536 bytes, while the store keeps every revision ever staged (~1.8 KB each; a
+9-bundle environment with 53 revisions was 96,140 bytes and undeployable).
+`environment::seed::prune_for_seed` (called from `create_revision`) drops
+`Archived` revisions that no split entry, no `current_revisions` and not the
+revision being warmed names — the seed only, never the on-disk store. greentic-start
+pulls and projects only split-referenced revisions, so nothing it reads is lost;
+only `Archived` is dropped because `Environment::validate` checks
+`config_overrides` against non-archived revisions. Output is byte-identical when
+there is nothing to prune, and falls back to the full document if the pruned one
+would not validate. The k8s ConfigMap seed is not pruned. Evidence, open point
+(unrouted `Ready` revisions are kept) and limits:
+`docs/cloudrun-internals.md` §7.
+
 ## CLI shape
 
 ```
