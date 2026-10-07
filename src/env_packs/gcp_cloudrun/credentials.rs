@@ -779,7 +779,7 @@ fn parse_test_iam_response(body: &serde_json::Value) -> Vec<String> {
 /// or a `Bearer ` prefix with an empty token) are unit-tested without a live
 /// credential.
 #[cfg(feature = "deploy-gcp-cloudrun")]
-fn extract_bearer_token(headers: &http::HeaderMap) -> Result<String, GcpClientError> {
+pub(super) fn extract_bearer_token(headers: &http::HeaderMap) -> Result<String, GcpClientError> {
     let raw = headers
         .get(http::header::AUTHORIZATION)
         .ok_or_else(|| {

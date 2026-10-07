@@ -39,6 +39,7 @@ mod drain;
 #[cfg(feature = "deploy-gcp-cloudrun")]
 pub mod real_target;
 pub mod redis_secret;
+pub mod seed_pointer;
 pub mod shared_state;
 pub mod sor;
 

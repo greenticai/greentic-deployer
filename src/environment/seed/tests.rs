@@ -156,6 +156,12 @@ struct Fixture {
 }
 
 fn nine_bundle_fixture() -> Fixture {
+    fixture_with_history(RevisionLifecycle::Archived)
+}
+
+/// Same shape, but the superseded history is `history` rather than `Archived`
+/// (the `unrouted_ready` revision keeps `Ready`).
+fn fixture_with_history(history: RevisionLifecycle) -> Fixture {
     let mut env = empty_env();
     let (mut routed, mut unrouted_ready, mut archived) = (Vec::new(), Vec::new(), Vec::new());
     for unit in 0..9u64 {
@@ -169,7 +175,7 @@ fn nine_bundle_fixture() -> Fixture {
             let lifecycle = if seq >= count - 1 {
                 RevisionLifecycle::Ready
             } else {
-                RevisionLifecycle::Archived
+                history
             };
             let rev = revision(deployment_id, &bundle_id, seq, lifecycle);
             if seq == count {
@@ -210,7 +216,7 @@ fn archived_unreferenced_revisions_are_left_out_and_the_seed_shrinks() {
         full.len(),
         fx.env.revisions.len(),
         seed.len(),
-        fx.env.revisions.len() - fx.archived.len()
+        fx.routed.len()
     );
     assert!(
         full.len() > SECRET_VERSION_CAP,
@@ -227,22 +233,88 @@ fn archived_unreferenced_revisions_are_left_out_and_the_seed_shrinks() {
     for gone in &fx.archived {
         assert!(!ids(&pruned).contains(gone), "archived {gone} must be gone");
     }
-    assert_eq!(pruned.revisions.len(), 53 - fx.archived.len());
+    // The unrouted `Ready` revisions go too: only the 9 routed ones remain.
+    assert_eq!(pruned.revisions.len(), 9);
 }
 
 #[test]
-fn every_routed_or_non_archived_revision_survives() {
+fn every_routed_revision_survives_and_unrouted_ready_ones_go() {
     let fx = nine_bundle_fixture();
     let pruned = prune_for_seed(&fx.env, &[]);
-    for kept in fx.routed.iter().chain(&fx.unrouted_ready) {
+    for kept in &fx.routed {
         assert!(ids(&pruned).contains(kept), "{kept} must be kept");
     }
-    // Every lifecycle other than `Archived` is kept, referenced or not.
-    for rev in &fx.env.revisions {
-        if rev.lifecycle != RevisionLifecycle::Archived {
-            assert!(ids(&pruned).contains(&rev.revision_id));
+    for gone in &fx.unrouted_ready {
+        assert!(!ids(&pruned).contains(gone), "unrouted Ready {gone} goes");
+    }
+    pruned.validate().expect("pruned seed must validate");
+}
+
+#[test]
+fn realistic_ready_history_fits_a_secret_version() {
+    // Production's superseded revisions are mostly NOT archived: every
+    // non-routed revision here is `Ready`, `Inactive` or `Failed`.
+    for history in [
+        RevisionLifecycle::Ready,
+        RevisionLifecycle::Inactive,
+        RevisionLifecycle::Failed,
+    ] {
+        let fx = fixture_with_history(history);
+        let full = serde_json::to_vec(&fx.env).unwrap();
+        assert!(
+            full.len() > SECRET_VERSION_CAP,
+            "{history:?}: {}",
+            full.len()
+        );
+        let seed = seed_environment_bytes(&fx.env, &[]).unwrap();
+        assert!(
+            seed.len() < SECRET_VERSION_CAP,
+            "{history:?}: pruned seed is {} bytes",
+            seed.len()
+        );
+        let pruned: Environment = serde_json::from_slice(&seed).unwrap();
+        assert_eq!(pruned.revisions.len(), 9, "{history:?}");
+        pruned.validate().expect("pruned seed must validate");
+    }
+}
+
+fn override_on_unit_0(fx: &mut Fixture, pack: &str) {
+    fx.env.bundles[0].config_overrides.insert(
+        pack.to_string(),
+        [("k".to_string(), serde_json::json!(1))].into(),
+    );
+}
+
+#[test]
+fn the_newest_revision_carrying_an_overridden_pack_is_kept() {
+    let mut fx = fixture_with_history(RevisionLifecycle::Ready);
+    // The routed revision of unit-0 no longer lists pack-0; older Ready ones do.
+    let routed0 = fx.routed[0];
+    for rev in &mut fx.env.revisions {
+        if rev.revision_id == routed0 {
+            rev.pack_list
+                .retain(|e| e.pack_id.as_str() != "greentic.fixture.pack-0");
         }
     }
+    override_on_unit_0(&mut fx, "greentic.fixture.pack-0");
+    fx.env.validate().expect("valid before pruning");
+
+    let pruned = prune_for_seed(&fx.env, &[]);
+    pruned.validate().expect("pruned seed must validate");
+    // 9 routed + exactly one rescued revision: unit-0's newest carrying pack-0
+    // (sequence 5, the `unrouted_ready` one).
+    assert_eq!(pruned.revisions.len(), 10);
+    assert!(ids(&pruned).contains(&fx.unrouted_ready[0]));
+}
+
+#[test]
+fn overrides_already_covered_by_a_kept_revision_rescue_nothing() {
+    let mut fx = fixture_with_history(RevisionLifecycle::Ready);
+    override_on_unit_0(&mut fx, "greentic.fixture.pack-0");
+    fx.env.validate().expect("valid before pruning");
+    let pruned = prune_for_seed(&fx.env, &[]);
+    assert_eq!(pruned.revisions.len(), 9);
+    pruned.validate().expect("pruned seed must validate");
 }
 
 #[test]
@@ -321,9 +393,9 @@ fn the_runtime_reads_the_same_thing_from_the_pruned_seed() {
 #[test]
 fn nothing_to_prune_is_byte_identical() {
     let mut fx = nine_bundle_fixture();
-    fx.env
-        .revisions
-        .retain(|r| r.lifecycle != RevisionLifecycle::Archived);
+    // Only the routed revisions remain: nothing is unreferenced.
+    let routed = fx.routed.clone();
+    fx.env.revisions.retain(|r| routed.contains(&r.revision_id));
     let seed = seed_environment_bytes(&fx.env, &[]).unwrap();
     assert_eq!(seed, serde_json::to_vec(&fx.env).unwrap());
     assert!(matches!(prune_for_seed(&fx.env, &[]), Cow::Borrowed(_)));
@@ -339,7 +411,7 @@ fn nothing_to_prune_is_byte_identical() {
 #[test]
 fn the_revision_being_warmed_is_never_dropped() {
     let fx = nine_bundle_fixture();
-    let warming = fx.archived[0];
+    let warming = fx.unrouted_ready[0];
     assert!(!ids(&prune_for_seed(&fx.env, &[])).contains(&warming));
     assert!(ids(&prune_for_seed(&fx.env, &[warming])).contains(&warming));
 }

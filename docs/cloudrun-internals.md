@@ -250,33 +250,62 @@ so the deployer stages into Secret Manager and mounts read-only.
   Measured 2026-10-07: 9 bundles / 53 revisions = 96,140 bytes, and the
   environment could not be deployed at all; every redeploy adds one revision per
   unit. `environment::seed::prune_for_seed` (called from `create_revision`)
-  leaves out every `Archived` revision that no traffic-split entry, no bundle's
-  `current_revisions` and no explicit `keep` (the revision being warmed) names.
-  The on-disk store stays complete; only the seed copy is pruned.
+  leaves out every revision — `Archived` or not — that no traffic-split entry, no
+  bundle's `current_revisions` and no explicit `keep` (the revision being warmed)
+  names. The on-disk store stays complete; only the seed copy is pruned.
   - **Why that is safe.** greentic-start pulls only *routed* (split-referenced)
     revisions (`revision_pull::pull_with`), finds its own `GREENTIC_REVISION_ID`
     among them, and builds everything else from the runtime-config projection
     (`materialize_runtime_config`: one block per split entry). It never reads an
-    unrouted revision. Checked against greentic-start `origin/develop` `bf9f6f8`;
-    greentic-runner reads no `environment.json` at all.
-  - **Why only `Archived`.** `Environment::validate` (run on every store load)
-    checks a bundle's `config_overrides` against the pack lists of its
-    *non-archived* revisions, so dropping one of those can invalidate a valid
-    document. Archived ones are outside that rule. A pruned document that still
-    fails `validate()` falls back to the full one, and nothing to prune is
-    byte-identical output.
-  - **Open point.** Unrouted `Ready`/`Inactive`/`Failed` revisions are unread by
-    the runtime too but are kept. If superseded revisions in a real environment
-    stay `Ready` rather than being archived, this does not shrink the seed
-    enough; dropping them needs the `config_overrides` rule reconciled first
-    (re-run validation per candidate, or exempt overridden packs).
+    unrouted revision, whatever its lifecycle. Checked against greentic-start
+    `origin/develop` `bf9f6f8`; greentic-runner reads no `environment.json` at all.
+  - **The one thing that must survive: `config_overrides` coverage.**
+    `Environment::validate` (run on every store load) requires every key of a
+    bundle's `config_overrides` to appear in the pack list of a *non-archived*
+    revision of that deployment. `protect_override_coverage` takes back out of the
+    drop set, per deployment, the newest revision (highest `sequence`) listing an
+    override pack that no surviving non-archived revision lists. A pruned document
+    that still fails `validate()` falls back to the full one, and nothing to
+    prune is byte-identical output.
   - **k8s is not covered.** The k8s env-store ConfigMap
     (`render_env_store_config_map`) serializes the full document at a separate
     call site; its cap is ~1 MiB, so it has ~15x the headroom. It needs a
     one-line change to adopt `prune_for_seed` if it ever matters.
-  - This does not cap growth: an environment whose *live* revisions alone exceed
-    the cap still fails. Archive stale revisions (`op revisions archive`) to
-    keep it small.
+  - Pruning cannot cap growth by itself: an environment whose *routed* revisions
+    alone exceed the cap still fails — which is what `seed_mode` is for.
+- **`seed_mode` (wizard answer): `inline` | `auto`.** `inline` is the default and
+  stages the pruned seed as the version itself, exactly as above. Under `auto`, a
+  seed larger than 48 KiB (`SEED_INLINE_THRESHOLD`) is pushed to the
+  environment's Artifact Registry repository and the version holds a POINTER
+  (`env_packs::gcp_cloudrun::seed_pointer`); a seed at or under the threshold is
+  still staged inline, byte for byte.
+  - **The pointer is a cross-repo contract with greentic-start**, which detects
+    the `$greentic_seed_pointer` key in the mounted `environment.json`, pulls the
+    artifact with the runtime service account's metadata token, verifies `sha256`
+    and writes the real file. Shape and field order are fixed:
+    `{"$greentic_seed_pointer":1,"kind":"oci","uri":"<registry-path>@sha256:<manifest digest>","sha256":"<hex sha256 of the original compact environment.json>","size":<original bytes>}`.
+    `uri` has no `oci://` scheme; the `@sha256:` pin is the OCI *manifest*
+    digest (the only digest a registry resolves), while `sha256` is over the
+    document itself.
+  - **Where.** `<location>-docker.pkg.dev/<project>/<repo>/seed/<env-id>:<12 hex of
+    sha256>`, in the repository of the warmed revision's `oci://` bundle source
+    (the one the runtime account already reads). Content-addressed tag, so an
+    unchanged seed re-pushes to the same manifest.
+  - **Who pushes.** `CloudRunTarget::push_seed_artifact`; the real target reuses
+    `bundle_upload::oci_pusher::MonolithicRegistryPusher` (the transport
+    `bundle-upload oci://` already uses — Artifact Registry refuses `oci-client`'s
+    chunked push) with a token minted from the bound deployer credential, then
+    reads the manifest digest back with a manifest `HEAD`. No `oras` shell-out.
+    The deployer credential therefore needs Artifact Registry write on that
+    repository (`artifactregistry.repositories.uploadArtifacts`, the same grant
+    the bundle push needs).
+  - **Failure.** If a pointer is wanted but cannot be made (no Artifact Registry
+    bundle source, push denied) the seed stays inline when it still fits one
+    version, with a warning; otherwise the warm fails naming the cause. Superseded
+    seed artifacts are never deleted by the deployer.
+  - **A greentic-start that does not know the pointer would boot with an
+    environment.json that is not an environment.** Only turn `auto` on once the
+    runtime image carries the reader.
 
 Boot env vars are set by `runtime_boot_env`. `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0`
 is required — greentic-start otherwise binds loopback and Cloud Run's health

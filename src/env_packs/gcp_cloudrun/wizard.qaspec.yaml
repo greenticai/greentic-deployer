@@ -245,3 +245,19 @@ questions:
       everything, e.g. through a Cloud NAT.
     required: false
     choices: ["private-ranges-only", "all-traffic"]
+
+  - id: seed_mode
+    type: enum
+    title: Environment seed mode
+    description: >-
+      `inline` (the default) stages the environment seed (`environment.json`)
+      as the Secret Manager version itself, which Secret Manager caps at 64 KiB.
+      `auto` does the same while the seed is under 48 KiB and, beyond that,
+      pushes it to the environment's Artifact Registry repository as an OCI
+      artifact and stages a small pointer that greentic-start resolves at boot.
+      `auto` needs a greentic-start that understands the pointer, and the
+      runtime service account must be able to read the repository (it already
+      does for the bundle).
+    required: false
+    default_value: "inline"
+    choices: ["inline", "auto"]

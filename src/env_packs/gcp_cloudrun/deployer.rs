@@ -51,6 +51,7 @@ use super::deploy_target::{
     SecretMount, SecretMountItem, ServiceRef, ServiceSpec, TrafficTarget,
 };
 use super::redis_secret::{self, redis_url_secret_name};
+use super::seed_pointer::{SeedMode, stage_seed};
 use super::shared_state::{
     self, REDIS_URL_ENV_NAMES, RawSharedStateAnswers, SharedState, SharedStateAnswerError,
     VpcAccess, VpcTarget,
@@ -150,6 +151,10 @@ pub struct GcpCloudRunParams {
     /// `min_instances >= 1`: greentic-start's cron loop runs in-process and is
     /// starved while CPU is throttled.
     pub cpu_always_allocated: bool,
+    /// `seed_mode`: `inline` (default — the seed is the secret version, exactly
+    /// as before the answer existed) or `auto` (a seed over 48 KiB is staged as
+    /// an OCI pointer). See [`super::seed_pointer`].
+    pub seed_mode: SeedMode,
     /// Telemetry profile (`telemetry_env` / `telemetry_headers`). Empty by
     /// default, which leaves the boot env and the revision intent unchanged.
     pub telemetry: TelemetryAnswers,
@@ -188,6 +193,7 @@ impl GcpCloudRunParams {
             min_instances: 0,
             concurrency: 80,
             cpu_always_allocated: false,
+            seed_mode: SeedMode::default(),
             telemetry: TelemetryAnswers::default(),
             shared_state: SharedState::default(),
         }
@@ -232,6 +238,7 @@ impl GcpCloudRunParams {
                 "min_instances" => params.min_instances = parse_u32(key, value)?,
                 "concurrency" => params.concurrency = parse_u32(key, value)?,
                 "cpu_always_allocated" => params.cpu_always_allocated = parse_bool(key, value)?,
+                "seed_mode" => params.seed_mode = parse_seed_mode(key, value)?,
                 telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
                 telemetry_answers::TELEMETRY_HEADERS_KEY => telemetry_headers = Some(value),
                 other => return Err(GcpCloudRunParamsError::UnknownKey(other.to_string())),
@@ -554,6 +561,18 @@ fn parse_u32(key: &str, value: &Value) -> Result<u32, GcpCloudRunParamsError> {
             key: key.to_string(),
             detail: format!("`{s}` is not a non-negative integer: {e}"),
         })
+}
+
+fn parse_seed_mode(key: &str, value: &Value) -> Result<SeedMode, GcpCloudRunParamsError> {
+    let s = answer_string(key, value)?;
+    // Blank is "not answered": the default, like every other optional answer.
+    if s.trim().is_empty() {
+        return Ok(SeedMode::default());
+    }
+    SeedMode::parse(&s).ok_or_else(|| GcpCloudRunParamsError::Invalid {
+        key: key.to_string(),
+        detail: format!("`{}` is not one of `inline` | `auto`", s.trim()),
+    })
 }
 
 fn parse_bool(key: &str, value: &Value) -> Result<bool, GcpCloudRunParamsError> {
@@ -1197,6 +1216,24 @@ impl GcpCloudRunDeployerHandler {
                 "serializing environment.json for seed staging: {e}"
             ))
         })?;
+        // `seed_mode = auto` pushes an oversize seed to the bundle's Artifact
+        // Registry repository and stages a pointer instead; `inline` (default)
+        // and any seed under the threshold pass through byte for byte. The
+        // bundle source of the revision being warmed names the repository.
+        let source_uri = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == revision_id)
+            .and_then(|r| r.bundle_source_uri.as_deref());
+        let environment_json = stage_seed(
+            self.target.as_ref(),
+            params.seed_mode,
+            env.environment_id.as_str(),
+            source_uri,
+            environment_json,
+        )
+        .await
+        .map_err(provider)?;
         // Claim the secret before the first write, and refuse if it is another
         // environment's (H1): `secret_prefix` is a free-text answer, so two envs
         // in one project can resolve to one secret name while keeping DIFFERENT
@@ -1221,7 +1258,7 @@ impl GcpCloudRunDeployerHandler {
         }
         let env_version = self
             .target
-            .add_secret_version(secret_name, &environment_json)
+            .add_secret_version(secret_name, environment_json.bytes())
             .await
             .map_err(provider)?;
         let mut secret_items = vec![SecretMountItem {
@@ -1414,6 +1451,10 @@ mod runtime_pin_tests;
 #[cfg(test)]
 #[path = "deployer_cpu_tests.rs"]
 mod cpu_always_allocated_tests;
+
+#[cfg(test)]
+#[path = "deployer_seed_tests.rs"]
+mod seed_mode_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1687,6 +1728,13 @@ mod tests {
             version: &str,
         ) -> Result<(), CloudRunTargetError> {
             self.inner.destroy_secret_version(name, version).await
+        }
+        async fn push_seed_artifact(
+            &self,
+            reference: &str,
+            bytes: &[u8],
+        ) -> Result<String, CloudRunTargetError> {
+            self.inner.push_seed_artifact(reference, bytes).await
         }
     }
 
