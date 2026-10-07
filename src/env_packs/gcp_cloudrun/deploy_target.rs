@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use super::shared_state::VpcAccess;
 use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, RevisionId};
+use sha2::Digest as _;
 
 /// Whether a Cloud Run Service admits unauthenticated traffic.
 ///
@@ -488,6 +489,19 @@ pub trait CloudRunTarget: std::fmt::Debug + Send + Sync {
         name: &str,
         version: &str,
     ) -> Result<(), CloudRunTargetError>;
+
+    /// Push `bytes` as a single-layer OCI artifact at `reference`
+    /// (`<host>/<project>/<repo>/seed/<env>:<tag>`, no scheme), authenticated as
+    /// the deployer's own credential, and return the artifact's MANIFEST digest
+    /// (`sha256:<hex>`) — the one a registry resolves an `@sha256:` pin against.
+    /// Only used for the `seed_mode = auto` pointer seed
+    /// ([`seed_pointer`](super::seed_pointer)). Needs the Artifact Registry
+    /// write the bundle push already needs.
+    async fn push_seed_artifact(
+        &self,
+        reference: &str,
+        bytes: &[u8],
+    ) -> Result<String, CloudRunTargetError>;
 }
 
 /// Default target: every verb fails with [`CloudRunTargetError::Unconfigured`]
@@ -590,6 +604,14 @@ impl CloudRunTarget for UnconfiguredCloudRunTarget {
     ) -> Result<(), CloudRunTargetError> {
         Err(CloudRunTargetError::Unconfigured)
     }
+
+    async fn push_seed_artifact(
+        &self,
+        _reference: &str,
+        _bytes: &[u8],
+    ) -> Result<String, CloudRunTargetError> {
+        Err(CloudRunTargetError::Unconfigured)
+    }
 }
 
 /// In-memory fake modelling Cloud Run's single-resource + etag semantics.
@@ -635,6 +657,12 @@ pub struct InMemoryCloudRun {
     /// When set, `destroy_secret_version` fails — models a credential without
     /// the optional `secretmanager.versions.disable` / `.destroy`.
     deny_version_destroy: Mutex<bool>,
+    /// Seed artifacts pushed by `push_seed_artifact`, keyed by reference:
+    /// `(manifest digest, bytes)`.
+    seed_artifacts: Mutex<BTreeMap<String, (String, Vec<u8>)>>,
+    /// When set, `push_seed_artifact` fails — models a credential without
+    /// Artifact Registry write.
+    deny_seed_push: Mutex<bool>,
 }
 
 impl InMemoryCloudRun {
@@ -687,6 +715,19 @@ impl InMemoryCloudRun {
                 owner: owner.map(str::to_string),
             },
         );
+    }
+
+    /// Every seed artifact pushed so far: reference → `(manifest digest, bytes)`.
+    pub fn seed_artifacts(&self) -> BTreeMap<String, (String, Vec<u8>)> {
+        self.seed_artifacts
+            .lock()
+            .expect("seed-artifacts mutex")
+            .clone()
+    }
+
+    /// Make `push_seed_artifact` fail from now on.
+    pub fn deny_seed_push(&self) {
+        *self.deny_seed_push.lock().expect("deny-seed-push mutex") = true;
     }
 
     /// Every version of `name`, oldest first (version `n` at index `n - 1`).
@@ -1189,6 +1230,35 @@ impl CloudRunTarget for InMemoryCloudRun {
         v.destroyed = true;
         v.payload.clear();
         Ok(())
+    }
+
+    async fn push_seed_artifact(
+        &self,
+        reference: &str,
+        bytes: &[u8],
+    ) -> Result<String, CloudRunTargetError> {
+        if *self.deny_seed_push.lock().expect("deny-seed-push mutex") {
+            return Err(CloudRunTargetError::Api(
+                "artifactregistry.repositories.uploadArtifacts denied".to_string(),
+            ));
+        }
+        // A real registry's manifest digest differs from the content digest;
+        // the fake derives a distinct, deterministic one so a test cannot
+        // confuse the two.
+        let manifest_digest = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(
+                [b"manifest:".as_slice(), bytes].concat()
+            ))
+        );
+        self.seed_artifacts
+            .lock()
+            .expect("seed-artifacts mutex")
+            .insert(
+                reference.to_string(),
+                (manifest_digest.clone(), bytes.to_vec()),
+            );
+        Ok(manifest_digest)
     }
 }
 

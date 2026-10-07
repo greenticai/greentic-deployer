@@ -40,6 +40,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use google_cloud_auth::credentials::Credentials;
 use google_cloud_gax::error::Error as GaxError;
 use google_cloud_gax::error::rpc::Code;
 use google_cloud_iam_v1::model as iam;
@@ -118,6 +119,8 @@ pub struct RealCloudRunTarget {
     pub(super) services: Services,
     pub(super) revisions: Revisions,
     secrets: SecretManagerService,
+    /// Kept to mint a registry token for [`CloudRunTarget::push_seed_artifact`].
+    credentials: Credentials,
     project: String,
     region: String,
 }
@@ -164,7 +167,7 @@ impl RealCloudRunTarget {
                 CloudRunTargetError::Api(format!("build Cloud Run Revisions client: {e}"))
             })?;
         let secrets = SecretManagerService::builder()
-            .with_credentials(creds)
+            .with_credentials(creds.clone())
             .build()
             .await
             .map_err(|e| CloudRunTargetError::Api(format!("build Secret Manager client: {e}")))?;
@@ -173,6 +176,7 @@ impl RealCloudRunTarget {
             services,
             revisions,
             secrets,
+            credentials: creds,
             project: project.to_string(),
             region: region.to_string(),
         })
@@ -557,6 +561,54 @@ impl CloudRunTarget for RealCloudRunTarget {
             Err(e) if is_not_found(&e) || is_precondition(&e) => Ok(()),
             Err(e) => Err(classify("destroy_secret_version", &e)),
         }
+    }
+
+    async fn push_seed_artifact(
+        &self,
+        reference: &str,
+        bytes: &[u8],
+    ) -> Result<String, CloudRunTargetError> {
+        use std::str::FromStr as _;
+
+        use google_cloud_auth::credentials::CacheableResource;
+        use greentic_distributor_client::oci_distribution::Reference;
+        use greentic_distributor_client::oci_push::layer_media_type_for;
+
+        use crate::bundle_upload::oci_pusher::MonolithicRegistryPusher;
+
+        let parsed = Reference::from_str(reference).map_err(|e| {
+            CloudRunTargetError::Api(format!(
+                "invalid seed artifact reference `{reference}`: {e}"
+            ))
+        })?;
+        // Minted per push: the pusher freezes its credential, and Artifact
+        // Registry tokens are short-lived. The bound deployer identity, as for
+        // every other call on this target.
+        let headers = match self
+            .credentials
+            .headers(http::Extensions::new())
+            .await
+            .map_err(|e| CloudRunTargetError::Api(format!("minting a registry token: {e}")))?
+        {
+            CacheableResource::New { data, .. } => data,
+            CacheableResource::NotModified => {
+                return Err(CloudRunTargetError::Api(
+                    "credentials returned NotModified for a fresh header request".to_string(),
+                ));
+            }
+        };
+        let token = super::credentials::extract_bearer_token(&headers)
+            .map_err(|e| CloudRunTargetError::Api(format!("minting a registry token: {e}")))?;
+        let pusher = MonolithicRegistryPusher::with_basic_auth("oauth2accesstoken", token);
+        pusher
+            .push_artifact_with_manifest_digest(&parsed, bytes, layer_media_type_for(bytes))
+            .await
+            .map_err(|e| {
+                CloudRunTargetError::Api(format!(
+                    "pushing the environment seed to `{reference}`: {e} (the deployer \
+                     credential needs Artifact Registry write on that repository)"
+                ))
+            })
     }
 }
 

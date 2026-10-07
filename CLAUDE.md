@@ -94,16 +94,26 @@ a change must not break, and how to test without touching GCP — read
 Cloud Run stages `environment.json` as ONE Secret Manager version, capped at
 65,536 bytes, while the store keeps every revision ever staged (~1.8 KB each; a
 9-bundle environment with 53 revisions was 96,140 bytes and undeployable).
-`environment::seed::prune_for_seed` (called from `create_revision`) drops
-`Archived` revisions that no split entry, no `current_revisions` and not the
-revision being warmed names — the seed only, never the on-disk store. greentic-start
-pulls and projects only split-referenced revisions, so nothing it reads is lost;
-only `Archived` is dropped because `Environment::validate` checks
-`config_overrides` against non-archived revisions. Output is byte-identical when
-there is nothing to prune, and falls back to the full document if the pruned one
-would not validate. The k8s ConfigMap seed is not pruned. Evidence, open point
-(unrouted `Ready` revisions are kept) and limits:
-`docs/cloudrun-internals.md` §7.
+`environment::seed::prune_for_seed` (called from `create_revision`) drops every
+revision — `Archived` or not — that no split entry, no `current_revisions` and
+not the revision being warmed names; the seed only, never the on-disk store.
+greentic-start pulls and projects only split-referenced revisions, so nothing it
+reads is lost. `Environment::validate` checks a bundle's `config_overrides`
+against non-archived revisions, so `protect_override_coverage` keeps, per
+deployment, the newest revision listing any override pack nothing else lists.
+Output is byte-identical when there is nothing to prune, and falls back to the
+full document if the pruned one would not validate. The k8s ConfigMap seed is not
+pruned.
+
+**`seed_mode` (`inline` default | `auto`)** lifts the cap for what pruning cannot
+shrink: under `auto`, a seed over 48 KiB is pushed to the bundle's Artifact
+Registry repo as an OCI artifact (`…/seed/<env-id>`, same
+`MonolithicRegistryPusher` the bundle upload uses, no `oras`) and the secret
+version holds the pointer
+`{"$greentic_seed_pointer":1,"kind":"oci","uri":"<path>@sha256:<manifest digest>","sha256":"<hex of the original bytes>","size":N}`
+— a contract with greentic-start's reader (`gcp_cloudrun::seed_pointer`); do not
+change the shape. A smaller seed stays inline byte for byte even under `auto`.
+Evidence and limits: `docs/cloudrun-internals.md` §7.
 
 ## CLI shape
 

@@ -101,6 +101,25 @@ impl MonolithicRegistryPusher {
         }
     }
 
+    /// Push `bytes` as a one-layer artifact and return the MANIFEST digest the
+    /// registry holds for `reference` (`sha256:<hex>`).
+    ///
+    /// [`RegistryPusher::push_artifact`] returns nothing and the
+    /// `greentic-distributor-client` helper only the content digest, which a
+    /// registry does NOT resolve an `@sha256:` pin against; a pointer needs the
+    /// manifest digest, so it is read back with a `HEAD` on the manifest.
+    pub async fn push_artifact_with_manifest_digest(
+        &self,
+        reference: &Reference,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<String, OciDistributionError> {
+        self.push_artifact(reference, bytes, media_type).await?;
+        self.client
+            .fetch_manifest_digest(reference, &self.auth)
+            .await
+    }
+
     /// Plain HTTP against the named registries, for driving a stub server in
     /// tests. Never reachable from a production path: every caller there goes
     /// through [`Self::with_basic_auth`], which is HTTPS-only.
