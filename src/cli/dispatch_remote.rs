@@ -679,6 +679,7 @@ fn remote_bundles_add(
         .add_bundle(
             &env_id,
             AddBundlePayload {
+                pack_name: None,
                 bundle_id,
                 customer_id,
                 revenue_share,
@@ -717,6 +718,7 @@ fn remote_bundles_update(
         .update_bundle(
             &env_id,
             UpdateBundlePayload {
+                pack_name: None,
                 deployment_id,
                 status: payload.status,
                 route_binding: new_route_binding,
@@ -1209,6 +1211,7 @@ fn remote_deploy(
                 .add_bundle(
                     &env_id,
                     AddBundlePayload {
+                        pack_name: None,
                         bundle_id: BundleId::new(bundle_id.clone()),
                         customer_id: customer_id.clone(),
                         revenue_share: super::bundles::convert_revenue_share(
@@ -1286,6 +1289,7 @@ fn remote_deploy(
             .update_bundle(
                 &env_id,
                 UpdateBundlePayload {
+                    pack_name: None,
                     deployment_id,
                     status: None,
                     route_binding: None,
@@ -2104,6 +2108,7 @@ fn bundle_metadata_update(
         return None;
     }
     Some(UpdateBundlePayload {
+        pack_name: None,
         deployment_id: dep.deployment_id,
         status,
         route_binding,
@@ -2438,6 +2443,7 @@ fn remote_env_apply(
                         .add_bundle(
                             &env_id,
                             AddBundlePayload {
+                                pack_name: None,
                                 bundle_id: BundleId::new(&b.bundle_id),
                                 customer_id: customer_id.clone(),
                                 revenue_share,

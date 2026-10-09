@@ -877,6 +877,7 @@ mod default_bundle_tests {
         deployment_id: DeploymentId,
     ) -> BundleDeployment {
         BundleDeployment {
+            pack_name: None,
             schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
             deployment_id,
             env_id: env_id(),

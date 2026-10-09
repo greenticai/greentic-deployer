@@ -1652,6 +1652,7 @@ mod warm_revision_tests {
             packs: Vec::new(),
             credentials_ref: None,
             bundles: vec![BundleDeployment {
+                pack_name: None,
                 schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
                 deployment_id: did,
                 env_id: env_id(),
