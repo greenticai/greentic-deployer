@@ -778,6 +778,7 @@ const CLOUDRUN_DESCRIPTOR: &str = "greentic.deployer.gcp-cloudrun@1.0.0";
 /// `Environment::validate` needs no matching revisions).
 fn make_cloudrun_bundle(id: &EnvId) -> BundleDeployment {
     BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id: mint_deployment_id(),
         env_id: id.clone(),

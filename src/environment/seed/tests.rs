@@ -73,6 +73,7 @@ fn revision(
 
 fn deployment(deployment_id: DeploymentId, bundle_id: &BundleId) -> BundleDeployment {
     BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id,
         env_id: env_id(),
