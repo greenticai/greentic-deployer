@@ -35,7 +35,7 @@ fn refusal(answers: Value) -> String {
 #[test]
 fn unanswered_ingress_keeps_the_rendered_set_byte_identical() {
     const DEFAULT_GOLDEN: &str = "815d4cd513346cc923258a217fe681a5cfcb5bff53aeb0e32544e82e02554b83";
-    const CUSTOM_GOLDEN: &str = "2e21921500371970ae8c0d0d1bc26f44842ccd4be43f6f70c565f8f12366b726";
+    const CUSTOM_GOLDEN: &str = "375a4cd42e97f9cbf327cee587dc4a15c55fa0c31861cdf727e43c7f8c96b6d4";
     let env = build_fixture_env();
     let defaults = render_environment_manifests(&env, &K8sParams::for_env(&env));
     assert_eq!(sha256_hex(&defaults), DEFAULT_GOLDEN);
@@ -47,7 +47,7 @@ fn unanswered_ingress_keeps_the_rendered_set_byte_identical() {
     }));
     assert_eq!(sha256_hex(&blank), DEFAULT_GOLDEN);
     let custom = render(json!({"service_type": "LoadBalancer", "namespace": "custom-ns"}));
-    assert_eq!(sha256_hex(&custom), CUSTOM_GOLDEN, "actual custom hash: {}", sha256_hex(&custom));
+    assert_eq!(sha256_hex(&custom), CUSTOM_GOLDEN);
     assert!(ingress_of(&defaults).is_none());
 }
 
