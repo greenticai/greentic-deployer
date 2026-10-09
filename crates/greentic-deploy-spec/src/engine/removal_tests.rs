@@ -43,6 +43,7 @@ fn env() -> Environment {
 
 fn deployment(bundle: &str) -> BundleDeployment {
     BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id: DeploymentId::new(),
         env_id: env_id(),

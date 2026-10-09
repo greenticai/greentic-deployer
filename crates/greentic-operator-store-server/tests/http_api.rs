@@ -580,6 +580,7 @@ async fn seed_env_with_deployment(store: &SqliteEnvironmentStore, env_id: &str) 
     );
     let deployment_id = DeploymentId::new();
     env.bundles.push(BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id,
         env_id: eid,
