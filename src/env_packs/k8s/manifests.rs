@@ -70,7 +70,7 @@ pub use telemetry::TELEMETRY_HEADERS_SECRET_NAME;
 /// boot, so sandbox pods actually serve `/healthz`. The stable `main` lane
 /// uses `:latest`; keep these in sync when forward-porting — `:develop` must
 /// not land on `main`.
-pub const DEFAULT_RUNTIME_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless:develop";
+pub const DEFAULT_RUNTIME_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless:latest";
 
 /// Stable name of the router Deployment / Service / PDB.
 pub const ROUTER_NAME: &str = "gtc-router";

@@ -74,7 +74,7 @@ questions:
     description: >-
       Container image for the router and worker pods. Leave blank for
       the sandbox default
-      (`ghcr.io/greenticai/greentic-start-distroless:develop`).
+      (`ghcr.io/greenticai/greentic-start-distroless:latest`).
       Production deployments MUST pin a digest
       (`...@sha256:<digest>`) — the ship gate verifies it.
     required: false
