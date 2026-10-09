@@ -99,6 +99,12 @@ pub struct RevisionStagePayload {
     pub signature_sidecar_ref: PathBuf,
     #[serde(default = "default_drain_seconds")]
     pub drain_seconds: u32,
+    /// The runtime image (`sha256:` digest of greentic-start-distroless) this
+    /// revision runs, when the manifest pinned one for it (unified update L2).
+    /// `None` = the environment's deployer answer, which is every revision
+    /// staged before L2 (ruling L2-R3: `effective_runtime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image_digest: Option<String>,
 }
 
 pub(super) fn default_bundle_digest() -> String {
@@ -191,6 +197,13 @@ pub fn stage(
         return Ok(OpOutcome::new(NOUN, "stage", stage_schema()));
     }
     let payload = resolve_payload::<RevisionStagePayload>(flags, payload)?;
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "revisions stage payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let deployment_id = parse_deployment_id(&payload.deployment_id)?;
     // Pre-parse the pack list outside the lock so a payload error doesn't
@@ -226,6 +239,7 @@ pub fn stage(
         config_digest,
         signature_sidecar_ref,
         drain_seconds,
+        runtime_image_digest,
         ..
     } = payload;
     audit_and_record(store, ctx, |_committed| {
@@ -273,23 +287,21 @@ pub fn stage(
                         revision_id,
                         &bundle_path,
                     )?;
-                    // Walk `staged.lock.packs` once: build both
-                    // `lock_derived_pack_list` (feeds `Revision.pack_list`
+                    // `lock_derived_pack_list` feeds `Revision.pack_list`
                     // so `Environment::validate`'s config-overrides
-                    // cross-ref has data) and the pinned-pack-id set for
-                    // `materialize_pack_configs` in one pass.
+                    // cross-ref has data.
                     let mut lock_derived_pack_list: Vec<PackListEntry> =
                         Vec::with_capacity(staged.lock.packs.len());
-                    let mut pinned_pack_ids: std::collections::HashSet<String> =
-                        std::collections::HashSet::with_capacity(staged.lock.packs.len());
                     for lp in &staged.lock.packs {
                         let pack_id = lp.pack_id.clone();
-                        pinned_pack_ids.insert(pack_id.as_str().to_string());
                         lock_derived_pack_list.push(PackListEntry::from_lock_primitives(
                             pack_id,
                             lp.digest.clone(),
                         ));
                     }
+                    // Stems AND manifest ids — see `pack_config_pack_ids`.
+                    let pinned_pack_ids =
+                        super::bundle_stage::pack_config_pack_ids(&env_dir, &staged.lock);
                     let rev_dir = env_dir.join("revisions").join(revision_id.to_string());
                     // If pack-config materialization fails AFTER
                     // `stage_local_bundle` succeeded, drop the rev_dir
@@ -332,6 +344,7 @@ pub fn stage(
             config_digest,
             signature_sidecar_ref,
             drain_seconds,
+            runtime_image_digest,
         };
         // Post-staging cleanup: if the typed verb fails after the
         // `--bundle` path already wrote files under `rev_dir`, drop
@@ -778,6 +791,7 @@ pub fn payload_from_stage_args(
         config_digest: default_config_digest(),
         signature_sidecar_ref: default_signature_sidecar_ref(),
         drain_seconds: default_drain_seconds(),
+        runtime_image_digest: None,
     }))
 }
 
@@ -1013,6 +1027,7 @@ mod tests {
             config_digest: default_config_digest(),
             signature_sidecar_ref: default_signature_sidecar_ref(),
             drain_seconds: default_drain_seconds(),
+            runtime_image_digest: None,
         }
     }
 

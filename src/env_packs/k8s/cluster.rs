@@ -117,6 +117,70 @@ pub enum K8sClusterError {
         existing_env: String,
         incoming_env: String,
     },
+    /// Refusing to take over an object this deployer did not create (it lacks
+    /// the deployer's owner labels). Raised for kinds a forced apply must never
+    /// adopt (`refuse_adoption`).
+    #[error(
+        "refusing to apply {kind} `{object}` in namespace `{namespace}`: an object of that \
+         name already exists that this deployer did not create (it lacks the deployer's \
+         owner labels) — rename or remove it, or clear the answer that renders it \
+         (`ingress_host` for the Ingress)"
+    )]
+    UnmanagedObject {
+        kind: String,
+        object: String,
+        namespace: String,
+    },
+}
+
+/// Kinds a forced server-side apply must never adopt from someone else. The
+/// Ingress publishes the environment on a public hostname, and adopting an
+/// operator's `gtc-router` Ingress would replace their routing wholesale and
+/// stamp our owner labels on it — making it deletable by
+/// `ingress_prune` later.
+#[cfg(any(test, feature = "k8s-client"))]
+const NEVER_ADOPTED_KINDS: &[&str] = &["Ingress"];
+
+/// Refuse to apply `manifest` over an existing object of a never-adopted kind
+/// unless the existing object already carries every label `manifest` does
+/// (i.e. this deployer created it). `existing_labels` is the existing object's
+/// `metadata.labels` (`None`/`null` when it has none). Shared by every
+/// [`K8sCluster`] impl so the fake and the real client refuse identically.
+#[cfg(any(test, feature = "k8s-client"))]
+pub(crate) fn refuse_adoption(
+    manifest: &Value,
+    existing_labels: Option<&Value>,
+) -> Result<(), K8sClusterError> {
+    let kind = manifest
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !NEVER_ADOPTED_KINDS.contains(&kind) {
+        return Ok(());
+    }
+    let incoming = manifest
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object);
+    let owned = incoming.is_some_and(|incoming| {
+        incoming
+            .iter()
+            .all(|(key, value)| existing_labels.and_then(|labels| labels.get(key)) == Some(value))
+    });
+    if owned {
+        return Ok(());
+    }
+    let field = |pointer: &str| {
+        manifest
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Err(K8sClusterError::UnmanagedObject {
+        kind: kind.to_string(),
+        object: field("/metadata/name"),
+        namespace: field("/metadata/namespace"),
+    })
 }
 
 /// A worker Deployment's rollout progress, read for the warm readiness wait.
@@ -170,6 +234,41 @@ impl RolloutStatus {
     }
 }
 
+/// What the API server reports about a Service's exposure, read back after the
+/// apply so the reconcile can tell the operator where the env is reachable.
+///
+/// The fields are the raw readback, not a verdict: the `NodePort` allocation
+/// and the `LoadBalancer` ingress are assigned by the API server and the cloud
+/// controller respectively, so neither is knowable from the manifest that was
+/// applied. Turning them into one named state is
+/// [`RouterAddress::from_status`](super::deployer::RouterAddress::from_status) —
+/// the same split as [`RolloutStatus`] and its `is_complete` policy, so the
+/// interpretation stays pure and unit-testable without a cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceStatus {
+    /// `.spec.type` as the API server recorded it. Read back rather than
+    /// assumed from the applied manifest: a Service that already existed under
+    /// a different type is reconciled by the apply, and reporting the type we
+    /// SENT would describe an object we had not confirmed.
+    pub service_type: String,
+    /// `.spec.ports[].nodePort` for the `http` port — allocated by the API
+    /// server for `NodePort` and `LoadBalancer`, absent for `ClusterIP`.
+    pub node_port: Option<i32>,
+    /// `.status.loadBalancer.ingress[0].hostname` — what AWS-style load
+    /// balancers assign. `None` while provisioning, and for non-LB types.
+    pub ingress_hostname: Option<String>,
+    /// `.status.loadBalancer.ingress[0].ip` — what GCP-style load balancers
+    /// assign. `None` while provisioning, and for non-LB types.
+    pub ingress_ip: Option<String>,
+}
+
+/// One object [`K8sCluster::list`] returned, with the labels it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabeledObject {
+    pub object: ObjectRef,
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
 /// Declarative mutation surface against one cluster.
 ///
 /// ## Idempotency contract
@@ -189,6 +288,21 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
     /// Delete one object; absent is `Ok`.
     async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError>;
 
+    /// Delete `object` ONLY if it exists and carries every `(key, value)` in
+    /// `labels`; `Ok(true)` when something was deleted. An absent object, one
+    /// missing any label (e.g. created by an operator), or one this identity
+    /// may not read is left alone and answers `Ok(false)`.
+    ///
+    /// The default never deletes: a cluster that cannot read labels must not
+    /// remove anything on their strength.
+    async fn delete_if_labeled(
+        &self,
+        _object: &ObjectRef,
+        _labels: &[(&str, &str)],
+    ) -> Result<bool, K8sClusterError> {
+        Ok(false)
+    }
+
     /// Read a worker Deployment's [`RolloutStatus`] for the warm readiness
     /// wait. Called only after [`apply`](Self::apply) has accepted the
     /// Deployment, so the object is expected to exist.
@@ -196,6 +310,66 @@ pub trait K8sCluster: std::fmt::Debug + Send + Sync {
         &self,
         deployment: &ObjectRef,
     ) -> Result<RolloutStatus, K8sClusterError>;
+
+    /// Read a Service's [`ServiceStatus`] so the reconcile can report where the
+    /// env is reachable. Called only after [`apply`](Self::apply) has accepted
+    /// the Service, so the object is expected to exist.
+    ///
+    /// Needs no RBAC beyond what the deployer already holds: `services` `get`
+    /// is in
+    /// [`VALIDATED_K8S_OPERATIONS`](super::credentials::VALIDATED_K8S_OPERATIONS)
+    /// and in the Role the bootstrap rules pack mints, so an env bound before
+    /// this method existed can serve it with its existing credential.
+    async fn get_service_status(
+        &self,
+        service: &ObjectRef,
+    ) -> Result<ServiceStatus, K8sClusterError>;
+
+    /// List the worker `Deployment`s and `Service`s in `namespace` matching
+    /// `label_selector` (a Kubernetes equality selector, `k=v,k2=v2`). The
+    /// orphan sweep's read: it only ever asks for the deployer's own labels,
+    /// so an unlabeled object can never be returned. Needs `list` on
+    /// `deployments` / `services`, which the bootstrap Role does not grant —
+    /// see `op env sweep`. Default: unconfigured.
+    async fn list(
+        &self,
+        namespace: &str,
+        label_selector: &str,
+    ) -> Result<Vec<LabeledObject>, K8sClusterError> {
+        let _ = (namespace, label_selector);
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    /// Set a Deployment's `spec.replicas` (the drain's stop step). `Ok(false)`
+    /// when the Deployment does not exist — nothing to stop. Default:
+    /// unconfigured.
+    async fn scale_deployment(
+        &self,
+        deployment: &ObjectRef,
+        replicas: i32,
+    ) -> Result<bool, K8sClusterError> {
+        let _ = (deployment, replicas);
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    /// Read one object back as JSON; `None` when absent. The drain reads the
+    /// router's runtime-config ConfigMap through it (`configmaps get` is in
+    /// the bound Role). Default: unconfigured.
+    async fn get_object(&self, object: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+        let _ = object;
+        Err(K8sClusterError::Unconfigured)
+    }
+
+    /// [`Self::get_rollout_status`] that reports an absent Deployment as
+    /// `None` rather than an error — the drain probe, where "gone" is a
+    /// drained answer. Default: unconfigured.
+    async fn get_rollout_status_opt(
+        &self,
+        deployment: &ObjectRef,
+    ) -> Result<Option<RolloutStatus>, K8sClusterError> {
+        let _ = deployment;
+        Err(K8sClusterError::Unconfigured)
+    }
 }
 
 /// The scaffold default: no client wired, every call fails honestly.
@@ -218,62 +392,17 @@ impl K8sCluster for UnconfiguredCluster {
     ) -> Result<RolloutStatus, K8sClusterError> {
         Err(K8sClusterError::Unconfigured)
     }
-}
 
-/// In-memory fake honoring the [`K8sCluster`] idempotency contract.
-/// Backs the conformance run and the verb-behavior tests; integration
-/// against a real cluster is the PR-5.3 kind E2E.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub struct InMemoryCluster {
-    objects: std::sync::Mutex<std::collections::BTreeMap<ObjectRef, Value>>,
-}
-
-#[cfg(test)]
-impl InMemoryCluster {
-    pub fn objects(&self) -> std::collections::BTreeMap<ObjectRef, Value> {
-        self.objects.lock().expect("mutex not poisoned").clone()
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl K8sCluster for InMemoryCluster {
-    async fn apply(&self, manifest: &Value) -> Result<(), K8sClusterError> {
-        let object = ObjectRef::from_manifest(manifest)?;
-        self.objects
-            .lock()
-            .expect("mutex not poisoned")
-            .insert(object, manifest.clone());
-        Ok(())
-    }
-
-    async fn delete(&self, object: &ObjectRef) -> Result<(), K8sClusterError> {
-        // Absent => Ok: deleting twice is the retried-archive path.
-        self.objects
-            .lock()
-            .expect("mutex not poisoned")
-            .remove(object);
-        Ok(())
-    }
-
-    async fn get_rollout_status(
+    async fn get_service_status(
         &self,
-        _deployment: &ObjectRef,
-    ) -> Result<RolloutStatus, K8sClusterError> {
-        // The fake has no rollout controller; report a fully-rolled-out
-        // Deployment (all replicas updated and available, none lingering) so
-        // warm's readiness wait resolves on the first poll for any desired
-        // count.
-        Ok(RolloutStatus {
-            generation: 0,
-            observed_generation: Some(0),
-            replicas: i32::MAX,
-            updated_replicas: i32::MAX,
-            available_replicas: i32::MAX,
-        })
+        _service: &ObjectRef,
+    ) -> Result<ServiceStatus, K8sClusterError> {
+        Err(K8sClusterError::Unconfigured)
     }
 }
+
+#[cfg(test)]
+pub use super::cluster_fake::InMemoryCluster;
 
 #[cfg(test)]
 mod tests {
@@ -418,14 +547,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_cluster_upserts_and_deletes_idempotently() {
-        let c = InMemoryCluster::default();
-        c.apply(&manifest()).await.unwrap();
-        c.apply(&manifest()).await.unwrap();
-        assert_eq!(c.objects().len(), 1, "apply is an upsert");
+    async fn unconfigured_cluster_cannot_read_a_service_status() {
+        let c = UnconfiguredCluster;
         let r = ObjectRef::from_manifest(&manifest()).unwrap();
-        c.delete(&r).await.unwrap();
-        c.delete(&r).await.unwrap();
-        assert!(c.objects().is_empty(), "delete of absent is Ok");
+        assert!(matches!(
+            c.get_service_status(&r).await.unwrap_err(),
+            K8sClusterError::Unconfigured
+        ));
     }
 }

@@ -1235,6 +1235,7 @@ mod tests {
             warmed_at: None,
             drain_seconds: 0,
             abort_metrics: Vec::new(),
+            runtime_image_digest: None,
         });
         let idx = added(&mut env, "teams", "legal", "k1");
         let eid = env.messaging_endpoints[idx].endpoint_id;

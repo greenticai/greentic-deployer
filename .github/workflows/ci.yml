@@ -97,6 +97,20 @@ jobs:
           kind load docker-image "$IMG" --name gtc-e2e
           echo "GREENTIC_K8S_SERVING_IMAGE=$IMG" >> "$GITHUB_ENV"
           echo "::notice::loaded $IMG; the serving E2Es will run"
+      # SoR unit E2E: the sorx image (public on ghcr) and the landlord pack from
+      # greentic-sorla develop at a verified commit (committer GitHub). Both are
+      # MANDATORY, like the serving image: a silent skip would be a false green.
+      - name: Load the sorx image and the landlord pack for the SoR E2E
+        run: |
+          IMG=ghcr.io/greenticai/greentic-sorx:develop
+          docker pull "$IMG"
+          kind load docker-image "$IMG" --name gtc-e2e
+          echo "GREENTIC_K8S_SORX_IMAGE=$IMG" >> "$GITHUB_ENV"
+          PACK="$RUNNER_TEMP/landlord-tenant-sor.gtpack"
+          curl -fsSL -o "$PACK" \
+            https://raw.githubusercontent.com/greenticai/greentic-sorla/5c0bb5528dfbd5b0fd171c1255c98d2b44fc45c7/examples/landlord-tenant/landlord-tenant-sor.gtpack
+          echo "d812385d9f76782e1b8284abd1482393ccaa1b712bf13b128808ab37aabb2ba7  $PACK" | sha256sum -c -
+          echo "GREENTIC_K8S_SOR_PACK=$PACK" >> "$GITHUB_ENV"
       # `oras` loads the fixture bundle into the in-cluster registry for the OCI
       # boot-pull test (`worker_pulls_oci_bundle_and_serves_the_real_revision`);
       # `registry:2` itself is pulled on-demand by kind, like `busybox`.

@@ -9,6 +9,7 @@ use super::types::{UploadOptions, UploadedBundle};
 /// - `S3Uploader` (feature `bundle-upload-aws`)
 /// - `GcsUploader` (feature `bundle-upload-gcp`, currently stub)
 /// - `AzureUploader` (feature `bundle-upload-azure`, currently stub)
+/// - `OciBundleUploader` (feature `deploy-gcp-cloudrun`)
 #[async_trait::async_trait]
 pub trait BundleUploader: Send + Sync + std::fmt::Debug {
     /// Upload `bundle_path`. If an object with matching digest already exists at

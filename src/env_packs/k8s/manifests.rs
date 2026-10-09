@@ -14,7 +14,10 @@
 //!   topology-spread) receives all ingress for the env; the Gateway /
 //!   Ingress (Zain's choice, Q4) sends 100% of matching traffic to the
 //!   stable router Service. Provider-native revision weighting is
-//!   deferred to Phase E.
+//!   deferred to Phase E. No Ingress is rendered here — external
+//!   reachability is selected on the router Service's own `spec.type`
+//!   ([`ServiceType`]), which needs no ingress controller and no RBAC
+//!   beyond the `services` verbs the deployer already holds.
 //! - One **worker** Deployment + ClusterIP Service per revision, labeled
 //!   `greentic.ai/revision: <ULID>`. The router resolves the deployment,
 //!   applies the authoritative `TrafficSplit` from the runtime-config
@@ -46,10 +49,17 @@
 //! the spec's canonical ULID rendering.
 
 use greentic_deploy_spec::{CapabilitySlot, EnvId, Environment, Revision, RevisionLifecycle};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::environment::runtime_config::materialize_runtime_config;
+
+pub mod ingress;
+pub mod sor;
+mod telemetry;
+use crate::env_packs::telemetry::{self as telemetry_answers, TelemetryAnswers};
+pub use ingress::{INGRESS_TLS_SECRET_NAME, IngressConfig, IngressTls};
+pub use telemetry::TELEMETRY_HEADERS_SECRET_NAME;
 
 /// Sandbox-default runtime image (S1). Tag-pinned for the sandbox only —
 /// production requires a digest-pinned ref supplied via the env-pack
@@ -95,7 +105,12 @@ pub const ENV_STORE_CONFIG_MAP_NAME: &str = "gtc-env-store";
 /// into the writable HOME volume — the runtime image is distroless (no shell).
 /// M1 scaffold: M2 replaces this with the distributor-pull init container that
 /// also stages the runtime-config and the revision's packs.
-const STAGE_INIT_IMAGE: &str = "busybox:1.36.1";
+///
+/// Image the init containers run. Overridable through the `init_image`
+/// answer, which an air-gapped cluster needs: this default is pulled from
+/// Docker Hub by the kubelet, which no setting on the caller's side can
+/// redirect.
+pub const DEFAULT_INIT_IMAGE: &str = "busybox:1.36.1";
 
 /// Name of the Secret carrying the env's local dev-store (the operator's
 /// `.dev.secrets.env`). Rendered only for envs that bind a secrets pack; the
@@ -103,6 +118,14 @@ const STAGE_INIT_IMAGE: &str = "busybox:1.36.1";
 /// so `secret://` refs (messaging bot tokens, webhook secrets) resolve in-pod —
 /// closing the K8s "no runtime secrets" gap without a cloud secret-store.
 pub const DEV_SECRETS_SECRET_NAME: &str = "gtc-dev-secrets";
+
+/// Name of the Secret carrying the operator's `oci_password` answer for an
+/// authenticated `oci://` bundle pull. Env-level (one per namespace, not
+/// per-revision) — the worker and router pods both reference its `password`
+/// key via `valueFrom.secretKeyRef`, so the value never appears in a plain
+/// pod-spec env value a `get deployment` reader could see. Rendered only when
+/// [`K8sParams::oci_password`] is set.
+pub const OCI_CREDENTIALS_SECRET_NAME: &str = "gtc-oci-credentials";
 
 /// Read-only mount of the dev-store Secret the staging init container copies from.
 const DEV_SECRETS_SRC: &str = "/etc/greentic/dev-secrets";
@@ -143,6 +166,31 @@ pub enum TunnelMode {
 /// SA→Vault-role binding is provisioned out-of-band by the Vault bootstrap
 /// (Phase E.4). One per namespace, env-level.
 pub const WORKER_SERVICE_ACCOUNT: &str = "gtc-worker";
+
+/// Fixed object names this pack renders into an environment's namespace,
+/// checked against the `image_pull_secret` answer
+/// ([`K8sParams::from_answers`]) so an operator can never name a NEW Secret
+/// the same as one of these. A `Secret`'s `type` is immutable, so a name
+/// collision with [`DEV_SECRETS_SECRET_NAME`] / [`OCI_CREDENTIALS_SECRET_NAME`]
+/// / [`TELEMETRY_HEADERS_SECRET_NAME`] (all `Opaque`) would apply cleanly the
+/// first time and fail the SECOND server-side apply of
+/// `kubernetes.io/dockerconfigjson` under the same name — an error naming
+/// neither this answer nor the reason. The non-Secret names
+/// ([`ROUTER_NAME`], [`RUNTIME_CONFIG_MAP_NAME`], [`ENV_STORE_CONFIG_MAP_NAME`],
+/// [`WORKER_SERVICE_ACCOUNT`]) would not hit that specific failure — different
+/// `kind`s may share a name in one namespace — but are refused too, since a
+/// Secret answering to the same name as this pack's own Deployment/ConfigMap/
+/// ServiceAccount is confusing for no operator benefit.
+const RESERVED_OBJECT_NAMES: &[&str] = &[
+    ROUTER_NAME,
+    RUNTIME_CONFIG_MAP_NAME,
+    ENV_STORE_CONFIG_MAP_NAME,
+    DEV_SECRETS_SECRET_NAME,
+    OCI_CREDENTIALS_SECRET_NAME,
+    TELEMETRY_HEADERS_SECRET_NAME,
+    WORKER_SERVICE_ACCOUNT,
+    INGRESS_TLS_SECRET_NAME,
+];
 
 // Vault provider defaults (mirror `greentic-secrets-provider-vault-kv`). The
 // worker pod emits a `VAULT_*` var only when its value differs from the
@@ -201,6 +249,70 @@ pub struct VaultBackend {
     pub namespace: Option<String>,
 }
 
+/// How the env's stable router Service is exposed (deployer answer
+/// `service_type`), i.e. `Service.spec.type` on the object the rendered
+/// Gateway / Ingress would otherwise front.
+///
+/// Unless the operator answers `ingress_host` (see [`ingress`]) the env-pack
+/// renders **no Ingress** — routing a hostname into the cluster needs the
+/// operator's own decisions (cert issuer, controller class, DNS). That
+/// left the router reachable only from inside the cluster, so an operator had
+/// no address at all short of `kubectl port-forward`. Selecting the Service
+/// TYPE closes that without an Ingress and, deliberately, **without an RBAC
+/// migration**: `services` (get/create/patch/delete) is already in
+/// [`VALIDATED_K8S_OPERATIONS`](super::credentials::VALIDATED_K8S_OPERATIONS),
+/// so an env bootstrapped before this answer existed can adopt it with the
+/// credential it already holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ServiceType {
+    /// In-cluster address only — the historical, and still default, shape.
+    #[default]
+    ClusterIp,
+    /// The API server allocates a port on every node; reachable at
+    /// `<any-node-ip>:<nodePort>`. The node IP half is the operator's to
+    /// supply, so the reconcile report carries the port alone.
+    NodePort,
+    /// The cloud provider provisions a load balancer and assigns an ingress
+    /// address. Provisioning is ASYNCHRONOUS — the address is routinely absent
+    /// for the first minutes after the apply, which is why
+    /// [`RouterAddress`](super::deployer::RouterAddress) reports a distinct
+    /// `pending` rather than an empty one.
+    LoadBalancer,
+}
+
+impl ServiceType {
+    /// The canonical Kubernetes spelling written to `Service.spec.type`.
+    pub fn as_k8s_str(self) -> &'static str {
+        match self {
+            Self::ClusterIp => "ClusterIP",
+            Self::NodePort => "NodePort",
+            Self::LoadBalancer => "LoadBalancer",
+        }
+    }
+
+    /// Parse the `service_type` wizard answer.
+    ///
+    /// Matching is ASCII-case-insensitive on the canonical Kubernetes names.
+    /// That is a normalization, not a fallback: `LoadBalancer` is a CamelCase
+    /// API enum typed by hand into a free-text wizard field, and rejecting
+    /// `loadbalancer` would fail a deploy over letter case while the operator's
+    /// intent is unambiguous. Anything the table does not name is an `Err` —
+    /// an unrecognised value must never quietly resolve to `ClusterIP`, which
+    /// is exactly the silent non-exposure this answer exists to end.
+    fn parse(raw: &str) -> Result<Self, String> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "clusterip" => Ok(Self::ClusterIp),
+            "nodeport" => Ok(Self::NodePort),
+            "loadbalancer" => Ok(Self::LoadBalancer),
+            _ => Err(format!(
+                "service_type `{raw}` is not valid (expected `ClusterIP`, \
+                 `NodePort` or `LoadBalancer`)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct K8sParams {
     /// Namespace every rendered object lands in. One namespace per
@@ -208,6 +320,9 @@ pub struct K8sParams {
     pub namespace: String,
     /// Container image for router and worker pods.
     pub runtime_image: String,
+    /// Container image for the init containers. From the `init_image` answer;
+    /// [`DEFAULT_INIT_IMAGE`] when the operator named none.
+    pub init_image: String,
     /// Router replica count. Plan step 11 mandates ≥ 2 for HA.
     pub router_replicas: u32,
     /// Worker public-exposure mode. From the `tunnel` deployer answer.
@@ -216,6 +331,28 @@ pub struct K8sParams {
     /// bundles from over plain HTTP. From the `oci_insecure_registries` answer;
     /// rendered as `GREENTIC_OCI_INSECURE_REGISTRIES`. Empty → HTTPS only.
     pub oci_insecure_registries: Vec<String>,
+    /// Registry username for an authenticated `oci://` bundle pull. From the
+    /// `oci_username` answer; rendered as a plain `OCI_USERNAME` pod env var —
+    /// usernames are not secret material. `None` unless the operator supplied
+    /// one; [`K8sParams::from_answers`] rejects a request that sets this
+    /// without [`Self::oci_password`] (and vice versa), since a lone
+    /// credential half is almost always an operator mistake rather than a
+    /// deliberate setting.
+    pub oci_username: Option<String>,
+    /// Registry password for an authenticated `oci://` bundle pull. From the
+    /// `oci_password` answer. Unlike `oci_username` this is real secret
+    /// material: it is never rendered as a plain pod env value. It is instead
+    /// carried into the cluster as the [`OCI_CREDENTIALS_SECRET_NAME`] Secret
+    /// (an env-level object, like [`DEV_SECRETS_SECRET_NAME`]) and the worker
+    /// / router pods reference it via `valueFrom.secretKeyRef` — so reading a
+    /// rendered Deployment (`kubectl get deployment -o yaml`) never exposes
+    /// the value, only readers with `get secret` in the namespace can. The
+    /// reference is `optional: true`: a single-revision `warm_revision` /
+    /// `archive_revision` call never applies this env-level Secret (only the
+    /// full `reconcile` does, mirroring the dev-store Secret), so a worker
+    /// warmed in isolation before the first full reconcile boots without the
+    /// credential rather than failing pod admission.
+    pub oci_password: Option<String>,
     /// Base64 of the env's local dev-store, set at reconcile time so the
     /// rendered [`DEV_SECRETS_SECRET_NAME`] Secret carries the operator's
     /// secrets. `None` on the pure preview path (`op env render`) and for the
@@ -230,20 +367,103 @@ pub struct K8sParams {
     /// backend (it owns the binding-answers read, exactly like
     /// [`Self::dev_secrets_data`]).
     pub secrets_backend: SecretsBackend,
+    /// How the stable ROUTER Service is exposed. From the `service_type`
+    /// answer; [`ServiceType::ClusterIp`] (the pre-existing, hardcoded shape)
+    /// unless the operator selects otherwise.
+    ///
+    /// It governs the router Service ONLY. The per-revision worker Services
+    /// stay `ClusterIP` unconditionally and must: the router is the env's
+    /// single front door precisely because it is the thing that enforces the
+    /// authoritative `TrafficSplit` (see the module docs), so giving each
+    /// revision its own externally-reachable address would hand callers a way
+    /// to reach a revision the split routes 0% of traffic to — and, for
+    /// `LoadBalancer`, bill one load balancer per revision.
+    pub service_type: ServiceType,
+    /// Telemetry profile for worker + router pods. From the
+    /// `telemetry_env` / `telemetry_headers` answers; empty by default, which
+    /// renders exactly what was rendered before these answers existed.
+    pub telemetry: TelemetryAnswers,
+    /// Name of a `kubernetes.io/dockerconfigjson` Secret to render (built
+    /// from [`Self::oci_username`] / [`Self::oci_password`]) and reference as
+    /// `imagePullSecrets` from the worker and router pods this pack renders
+    /// — NOT every pod: the dev-mode Vault Deployment
+    /// ([`super::vault_infra`]) is also rendered by this pack and carries no
+    /// `imagePullSecrets` key at all. From the `image_pull_secret` answer;
+    /// an air-gapped cluster's registry is usually authenticated, and
+    /// nothing else in this pack supplies the KUBELET a credential to pull
+    /// the worker/router/init image with — [`Self::oci_username`] /
+    /// [`Self::oci_password`] instead authenticate greentic-start's own
+    /// in-process `oci://` bundle pull, a different consumer entirely.
+    /// `None` → no Secret, no `imagePullSecrets` key at all (never an empty
+    /// array). Requires both [`Self::oci_username`] and [`Self::oci_password`]
+    /// to be set, and must not collide with an object name this pack already
+    /// renders — both enforced in [`Self::from_answers`].
+    pub image_pull_secret: Option<String>,
+    /// Optional managed Ingress in front of the router. From the
+    /// `ingress_host` / `ingress_class` / `ingress_tls_secret` /
+    /// `ingress_cert_manager_issuer` answers (see [`ingress`]). `None` → no
+    /// Ingress rendered, exactly the set rendered before these answers existed.
+    pub ingress: Option<IngressConfig>,
+    /// Store-unique ownership stamp ([`STORE_LABEL`]) put on every worker
+    /// Deployment/Service's `metadata.labels` (never on a selector, which is
+    /// immutable). The env id is not unique across stores — every
+    /// designer-driven store is `local` — so the orphan sweep claims a worker
+    /// only when this label matches its own store. `None` (preview renders,
+    /// remote stores) stamps nothing; the sweep then reports such workers as
+    /// unattributed and never deletes them.
+    pub store_label: Option<String>,
 }
 
 impl K8sParams {
+    /// The runtime image a worker runs for one revision (unified update L2b).
+    ///
+    /// `None` is the environment's `runtime_image` answer, verbatim. A pin
+    /// (an image INDEX digest, `sha256:<hex>`) replaces only the tag/digest
+    /// part: the repository (registry host, port and path) is always the
+    /// answer's, so a pin can never move a worker to another registry and an
+    /// air-gapped mirror repository survives. An invalid pin (anything but
+    /// `sha256:` + 64 lowercase hex — the single definition,
+    /// `is_valid_runtime_pin`) is logged at `warn` and the answer is rendered
+    /// instead; manifest validation refuses such a pin long before render, so
+    /// this is a backstop for hand-written stores, not a normal path.
+    /// The router never calls this: it always runs `runtime_image`.
+    pub fn image_for(&self, pin: Option<&str>) -> String {
+        let Some(pin) = pin else {
+            return self.runtime_image.clone();
+        };
+        if !crate::env_packs::deployer::is_valid_runtime_pin(pin) {
+            tracing::warn!(
+                pin,
+                runtime_image = %self.runtime_image,
+                "ignoring an invalid runtime pin; rendering the runtime_image answer"
+            );
+            return self.runtime_image.clone();
+        }
+        match image_repository(&self.runtime_image) {
+            Some(repo) => format!("{repo}@{pin}"),
+            None => self.runtime_image.clone(),
+        }
+    }
+
     /// Sandbox defaults: namespace `gtc-<env-id>`, the S1 default image,
     /// two router replicas.
     pub fn for_env(env: &Environment) -> Self {
         Self {
             namespace: namespace_for_env(&env.environment_id),
             runtime_image: DEFAULT_RUNTIME_IMAGE.to_string(),
+            init_image: DEFAULT_INIT_IMAGE.to_string(),
             router_replicas: 2,
             tunnel: TunnelMode::Off,
             oci_insecure_registries: Vec::new(),
+            oci_username: None,
+            oci_password: None,
             dev_secrets_data: None,
             secrets_backend: SecretsBackend::DevStore,
+            service_type: ServiceType::ClusterIp,
+            telemetry: TelemetryAnswers::default(),
+            image_pull_secret: None,
+            ingress: None,
+            store_label: None,
         }
     }
 
@@ -260,12 +480,31 @@ impl K8sParams {
     ///   provisioned). `null` / empty-string → default.
     /// - `runtime_image`: non-empty string matching `[a-z0-9.\-_/:@]+`.
     ///   `null` / empty-string → default.
+    /// - `init_image`: same validation as `runtime_image`. `null` /
+    ///   empty-string → default.
     /// - `router_replicas`: JSON string or number parsed to `u32`; must
     ///   be >= 2 (the router must stay HA). `null` / empty-string →
     ///   default.
     /// - `kubeconfig_context`: silently accepted and ignored (client-
     ///   targeting knob, not a manifest knob — consumed by
     ///   [`kube_client::connect`](super::kube_client::connect)).
+    /// - `service_type`: `ClusterIP` (default) / `NodePort` / `LoadBalancer`,
+    ///   matched case-insensitively. `null` / empty-string → `ClusterIP`, so
+    ///   an env that never answers it renders exactly what it rendered before
+    ///   the answer existed. An unrecognised value is an `Err`.
+    /// - `oci_username` / `oci_password`: either both set (non-blank) or both
+    ///   left blank/absent — one without the other is rejected as `Err`,
+    ///   since supplying half a credential pair is almost certainly a mistake
+    ///   rather than an intentional answer.
+    /// - `image_pull_secret`: valid RFC 1123 label (same rule as
+    ///   `namespace` — it names a Secret). Requires BOTH `oci_username` AND
+    ///   `oci_password` to be set — a Secret named but given no credential
+    ///   would authenticate nothing, exactly like no `imagePullSecrets` at
+    ///   all, only silently.
+    /// - `ingress_host` / `ingress_class` / `ingress_tls_secret` /
+    ///   `ingress_cert_manager_issuer`: see [`ingress`]. Host required
+    ///   when any of the others is set; the two TLS answers are mutually
+    ///   exclusive; `ingress_tls_secret` must not equal `image_pull_secret`.
     /// - Any other key → `Err` (fail closed on wizard version skew or
     ///   typos).
     pub fn from_answers(
@@ -286,12 +525,21 @@ impl K8sParams {
             "kubeconfig_context",
             "namespace",
             "runtime_image",
+            "init_image",
             "router_replicas",
             "tunnel",
             "oci_insecure_registries",
+            "oci_username",
+            "oci_password",
+            "service_type",
+            "image_pull_secret",
+            telemetry_answers::TELEMETRY_ENV_KEY,
+            telemetry_answers::TELEMETRY_HEADERS_KEY,
         ];
         for key in obj.keys() {
-            if !KNOWN_KEYS.contains(&key.as_str()) {
+            if !KNOWN_KEYS.contains(&key.as_str())
+                && !ingress::INGRESS_ANSWER_KEYS.contains(&key.as_str())
+            {
                 return Err(format!("unknown answer key `{key}`"));
             }
         }
@@ -306,18 +554,8 @@ impl K8sParams {
             None => defaults.namespace,
         };
 
-        let runtime_image = match answer_string(obj, "runtime_image") {
-            Some(img) => {
-                if !img
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_/:@".contains(&b))
-                {
-                    return Err(format!("runtime_image `{img}` contains invalid characters"));
-                }
-                img
-            }
-            None => defaults.runtime_image,
-        };
+        let runtime_image = validated_image(obj, "runtime_image", defaults.runtime_image)?;
+        let init_image = validated_image(obj, "init_image", defaults.init_image)?;
 
         let router_replicas = match obj.get("router_replicas") {
             None | Some(serde_json::Value::Null) => defaults.router_replicas,
@@ -359,6 +597,11 @@ impl K8sParams {
             None => defaults.tunnel,
         };
 
+        let service_type = match answer_string(obj, "service_type") {
+            Some(s) => ServiceType::parse(&s)?,
+            None => defaults.service_type,
+        };
+
         // Accepts a comma-separated string (the wizard form) or a JSON array of
         // strings (declarative env-manifest authors). Blank → no registries.
         let oci_insecure_registries = match obj.get("oci_insecure_registries") {
@@ -390,12 +633,81 @@ impl K8sParams {
 
         // kubeconfig_context: silently accepted and ignored.
 
+        let oci_username = answer_string(obj, "oci_username");
+        let oci_password = answer_string(obj, "oci_password");
+        if oci_username.is_some() != oci_password.is_some() {
+            return Err(
+                "oci_username and oci_password must both be set, or both left blank — \
+                 supplying only one is almost certainly a mistake"
+                    .to_string(),
+            );
+        }
+
+        let image_pull_secret = match answer_string(obj, "image_pull_secret") {
+            Some(name) => {
+                if !is_dns1123_label(&name) {
+                    return Err(format!(
+                        "image_pull_secret `{name}` is not a valid RFC 1123 label"
+                    ));
+                }
+                // A DNS-1123 label alone does not stop it colliding with a
+                // fixed name this pack already renders into the same
+                // namespace. A `Secret`'s `type` is immutable, so naming
+                // this one e.g. `gtc-oci-credentials` (Opaque) produces two
+                // Secrets sharing a name with different `type`s in one apply
+                // list — the second server-side apply is rejected with an
+                // error naming neither this answer nor the reason.
+                if RESERVED_OBJECT_NAMES.contains(&name.as_str()) {
+                    return Err(format!(
+                        "image_pull_secret `{name}` collides with an object this pack already \
+                         renders into the same namespace — choose a different name"
+                    ));
+                }
+                // The check above already guarantees `oci_username` and
+                // `oci_password` agree on presence, so this is really "both
+                // set or both absent" collapsed to "both set" for this answer.
+                if oci_username.is_none() || oci_password.is_none() {
+                    return Err(
+                        "image_pull_secret requires both oci_username and oci_password to be set"
+                            .to_string(),
+                    );
+                }
+                Some(name)
+            }
+            None => defaults.image_pull_secret,
+        };
+
+        let ingress = ingress::parse(obj, RESERVED_OBJECT_NAMES)?;
+        if let (
+            Some(IngressConfig {
+                tls: IngressTls::Secret(tls),
+                ..
+            }),
+            Some(pull),
+        ) = (&ingress, &image_pull_secret)
+            && tls == pull
+        {
+            return Err(format!(
+                "ingress_tls_secret `{tls}` is also the image_pull_secret — a Secret's `type` \
+                 is immutable, so one name cannot be both a TLS and a registry Secret"
+            ));
+        }
+
+        let telemetry = telemetry_answers::parse(
+            obj.get(telemetry_answers::TELEMETRY_ENV_KEY),
+            obj.get(telemetry_answers::TELEMETRY_HEADERS_KEY),
+        )
+        .map_err(|e| e.to_string())?;
+
         Ok(Self {
             namespace,
             runtime_image,
+            init_image,
             router_replicas,
             tunnel,
             oci_insecure_registries,
+            oci_username,
+            oci_password,
             // Reconcile injects the dev-store bytes after this pure parse (it
             // owns the filesystem read); the preview path leaves it unset.
             dev_secrets_data: defaults.dev_secrets_data,
@@ -403,6 +715,12 @@ impl K8sParams {
             // binding, not the deployer wizard answers parsed here; the call
             // site overlays it (like `dev_secrets_data`).
             secrets_backend: defaults.secrets_backend,
+            service_type,
+            telemetry,
+            image_pull_secret,
+            ingress,
+            // Store identity comes from the call site, never the answers.
+            store_label: defaults.store_label,
         })
     }
 }
@@ -416,6 +734,23 @@ fn parse_insecure_registries(raw: &str) -> Vec<String> {
         .filter(|e| !e.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Both image answers accept the same character set; one function so the two
+/// answers cannot drift into disagreeing about what an image reference is.
+fn validated_image(obj: &Map<String, Value>, key: &str, default: String) -> Result<String, String> {
+    match answer_string(obj, key) {
+        Some(img) => {
+            if !img
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_/:@".contains(&b))
+            {
+                return Err(format!("{key} `{img}` contains invalid characters"));
+            }
+            Ok(img)
+        }
+        None => Ok(default),
+    }
 }
 
 /// Extract a non-empty string answer, treating JSON `null` and empty
@@ -558,6 +893,10 @@ fn sanitize_dns1123_label(raw: &str) -> String {
 /// silently turn the guard into a no-op.
 pub const ENV_LABEL: &str = "greentic.ai/env";
 
+/// Label key carrying the owning STORE's identity on worker objects — see
+/// [`K8sParams::store_label`].
+pub const STORE_LABEL: &str = "greentic.ai/store";
+
 /// Shared labels stamped on every object the env-pack renders.
 fn common_labels(env: &Environment, component: &str) -> Value {
     let mut labels = json!({
@@ -689,13 +1028,33 @@ fn dev_secrets_content_hash(data: Option<&str>) -> String {
     hex
 }
 
+/// Content hash of the telemetry header credential — same format as
+/// [`dev_secrets_content_hash`] (a full sha256 hex digest of the value
+/// alone, so the annotation is never reversible to the credential in
+/// practice). Placed on BOTH the worker AND router pod templates: the
+/// header reaches a running pod only through `secretKeyRef`
+/// (`OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS`), which `greentic-start`
+/// resolves once at container start — so rotating only the
+/// `gtc-telemetry-headers` Secret's `stringData` does not reach a pod
+/// already running, and a changed hash here is what makes `reconcile` roll
+/// it, mirroring `greentic.ai/dev-store-hash` above.
+fn telemetry_headers_content_hash(headers: &str) -> String {
+    let digest = Sha256::digest(headers.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Init container that copies the dev-store Secret into the worker's writable
 /// HOME at the path greentic-start's dev-store backend reads
 /// (`$HOME/.greentic/environments/<env_id>/.greentic/dev/.dev.secrets.env`). The
 /// copy is guarded on the source existing, so an empty/absent Secret is a no-op
 /// rather than a boot failure; the dev-store is opened read-write under a flock
 /// at runtime, so it must land on the writable volume, not the read-only mount.
-fn stage_dev_secrets_init_container(env: &Environment) -> Value {
+fn stage_dev_secrets_init_container(env: &Environment, params: &K8sParams) -> Value {
     let dev_dir = format!(
         "{STAGE_HOME}/.greentic/environments/{}/.greentic/dev",
         env.environment_id.as_str()
@@ -703,7 +1062,7 @@ fn stage_dev_secrets_init_container(env: &Environment) -> Value {
     let src = format!("{DEV_SECRETS_SRC}/.dev.secrets.env");
     json!({
         "name": "stage-dev-secrets",
-        "image": STAGE_INIT_IMAGE,
+        "image": params.init_image,
         "securityContext": container_security_context(),
         "command": [
             "sh",
@@ -790,26 +1149,63 @@ fn render_worker_service_account(env: &Environment, params: &K8sParams) -> Value
 /// every already-published runtime image regardless.
 const RAYON_THREADS: &str = "4";
 
+/// Registry-pull env shared by every pod that pulls over OCI at boot (router,
+/// worker, SoR): the plain-HTTP allow-list, the plain username, and the
+/// password from the env's [`OCI_CREDENTIALS_SECRET_NAME`] Secret.
+///
+/// `OCI_USERNAME` / `OCI_PASSWORD` authenticate the boot-pull against a
+/// private registry: both roles do a `start --env` boot-pull of a routed
+/// `bundle_source_uri` (see [`env_has_pullable_routed_revision`]), so both
+/// need the credential, not just the worker. `greentic-setup`'s
+/// `registry_basic_auth_for_reference` and greentic-start's boot-pull read
+/// exactly these two names — matched verbatim here, or the whole chain is
+/// inert. `OCI_USERNAME` is a plain value (not secret material); `OCI_PASSWORD`
+/// is sourced from the [`OCI_CREDENTIALS_SECRET_NAME`] Secret via
+/// `valueFrom.secretKeyRef` (see [`K8sParams::oci_password`] for why), marked
+/// `optional` so a pod rendered without that env-level Secret having been
+/// applied yet (a single-revision `warm_revision` ahead of the first full
+/// `reconcile`) still boots — just without the credential.
+fn oci_pull_env(params: &K8sParams) -> Vec<Value> {
+    let mut vars = Vec::new();
+    // greentic-start honors this only on the digest-gated OCI boot-pull; emitting
+    // it when unset would be a harmless no-op, but skip it to keep the pod spec lean.
+    if !params.oci_insecure_registries.is_empty() {
+        vars.push(json!({
+            "name": "GREENTIC_OCI_INSECURE_REGISTRIES",
+            "value": params.oci_insecure_registries.join(","),
+        }));
+    }
+    if let Some(username) = &params.oci_username {
+        vars.push(json!({"name": "OCI_USERNAME", "value": username}));
+    }
+    if params.oci_password.is_some() {
+        vars.push(json!({
+            "name": "OCI_PASSWORD",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": OCI_CREDENTIALS_SECRET_NAME,
+                    "key": "password",
+                    "optional": true,
+                },
+            },
+        }));
+    }
+    vars
+}
+
 /// Boot env shared by router + worker. `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0`
 /// binds all interfaces (the kubelet probes the pod IP, not loopback, so the
 /// runtime's `127.0.0.1` default would make every probe fail); `HOME` roots
 /// the env store on the writable staging volume; `RAYON_NUM_THREADS` caps the
 /// bundle-unpack thread pool (see [`RAYON_THREADS`]).
-fn runtime_boot_env(env: &Environment, oci_insecure_registries: &[String]) -> Vec<Value> {
+fn runtime_boot_env(env: &Environment, params: &K8sParams) -> Vec<Value> {
     let mut vars = vec![
         json!({"name": "GREENTIC_ENV_ID", "value": env.environment_id.as_str()}),
         json!({"name": "HOME", "value": STAGE_HOME}),
         json!({"name": "GREENTIC_GATEWAY_LISTEN_ADDR", "value": "0.0.0.0"}),
         json!({"name": "RAYON_NUM_THREADS", "value": RAYON_THREADS}),
     ];
-    // greentic-start honors this only on the digest-gated OCI boot-pull; emitting
-    // it when unset would be a harmless no-op, but skip it to keep the pod spec lean.
-    if !oci_insecure_registries.is_empty() {
-        vars.push(json!({
-            "name": "GREENTIC_OCI_INSECURE_REGISTRIES",
-            "value": oci_insecure_registries.join(","),
-        }));
-    }
+    vars.extend(oci_pull_env(params));
     vars
 }
 
@@ -842,14 +1238,14 @@ fn runtime_pod_volumes() -> Vec<Value> {
 ///
 /// Assumes a simple (RFC 1123-ish) env id so the path segment matches the
 /// store's; the sandbox env ids the wizard accepts satisfy this.
-fn env_store_init_container(env: &Environment) -> Value {
+fn env_store_init_container(env: &Environment, params: &K8sParams) -> Value {
     let dst = format!(
         "{STAGE_HOME}/.greentic/environments/{}",
         env.environment_id.as_str()
     );
     json!({
         "name": "stage-env-store",
-        "image": STAGE_INIT_IMAGE,
+        "image": params.init_image,
         "securityContext": container_security_context(),
         "command": [
             "sh",
@@ -875,64 +1271,116 @@ fn env_store_init_container(env: &Environment) -> Value {
 /// Readiness probes `/healthz` today; the per-revision
 /// `/healthz/<revision_id>` route is the acceptance-gate target once
 /// `greentic-start` serves it.
+/// How a runtime pod — the worker AND the router — resolves `secret://` refs.
+///
+/// - `DevStore`: stage the operator's dev-store into the pod's writable HOME
+///   (messaging bot tokens, webhook secrets, per-unit ingress credentials
+///   resolve there). The Secret volume is `optional` and the init copy is
+///   guarded on the file existing, so an env with no secrets yet boots cleanly.
+/// - `Vault`: no values cross into the cluster — the pod gets the Vault
+///   ServiceAccount identity ([`WORKER_SERVICE_ACCOUNT`]) plus `VAULT_*`
+///   connection env, and greentic-start resolves refs from Vault in-pod.
+///
+/// **The router needs this too, and did without it until greentic-start's
+/// worker-interop contract D7.** D7 makes the runtime refuse every
+/// non-loopback caller of the generic JSON ingress that presents no bearer
+/// listed in `secrets://<env>/<tenant>/_/ingress/<bundle>`. The router is the
+/// pod that serves external traffic, so a router with no secret store read that
+/// document as absent and answered `401` to EVERY external request — including
+/// one carrying the correct bearer. The router therefore holds the same store
+/// as the workers (the dev-store cannot be filtered by category: it ships
+/// whole).
+///
+/// Pure on `env` + `params` so reconcile and `apply-revision` agree.
+struct SecretsWiring {
+    init_container: Option<Value>,
+    volume: Option<Value>,
+    env: Vec<Value>,
+    service_account: Option<&'static str>,
+    uses_dev_secrets: bool,
+}
+
+fn secrets_wiring(env: &Environment, params: &K8sParams) -> SecretsWiring {
+    let uses_dev_secrets =
+        matches!(params.secrets_backend, SecretsBackend::DevStore) && env_uses_dev_secrets(env);
+    match &params.secrets_backend {
+        SecretsBackend::DevStore if uses_dev_secrets => SecretsWiring {
+            init_container: Some(stage_dev_secrets_init_container(env, params)),
+            volume: Some(json!({
+                "name": DEV_SECRETS_VOLUME,
+                "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
+            })),
+            env: Vec::new(),
+            service_account: None,
+            uses_dev_secrets,
+        },
+        SecretsBackend::DevStore => SecretsWiring {
+            init_container: None,
+            volume: None,
+            env: Vec::new(),
+            service_account: None,
+            uses_dev_secrets,
+        },
+        SecretsBackend::Vault(vault) => SecretsWiring {
+            init_container: None,
+            volume: None,
+            env: secrets_backend_env(vault),
+            service_account: Some(WORKER_SERVICE_ACCOUNT),
+            uses_dev_secrets,
+        },
+    }
+}
+
 pub fn render_worker_deployment(
     env: &Environment,
     revision: &Revision,
     params: &K8sParams,
 ) -> Value {
     let labels = worker_selector_labels(env, revision);
-    let mut env_vars = runtime_boot_env(env, &params.oci_insecure_registries);
+    let mut env_vars = runtime_boot_env(env, params);
     env_vars.extend([
         json!({"name": "GREENTIC_REVISION_ID", "value": revision.revision_id.0.to_string()}),
         json!({"name": "GREENTIC_DEPLOYMENT_ID", "value": revision.deployment_id.0.to_string()}),
         json!({"name": "GREENTIC_BUNDLE_ID", "value": revision.bundle_id.as_str()}),
         json!({"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest}),
     ]);
+    env_vars.extend(telemetry::pod_env(params, "worker"));
 
-    // How the worker resolves `secret://` refs at runtime. Worker-only either
-    // way — the router never resolves secrets, mirroring the historical
-    // dev-store staging.
-    //
-    // - `DevStore`: stage the operator's dev-store into the worker's writable
-    //   HOME (messaging bot tokens, webhook secrets resolve there). The Secret
-    //   volume is `optional` and the init copy is guarded on the file existing,
-    //   so an env with no secrets yet boots cleanly.
-    // - `Vault`: no values cross into the cluster — the pod gets the Vault
-    //   ServiceAccount identity ([`WORKER_SERVICE_ACCOUNT`]) plus `VAULT_*`
-    //   connection env, and greentic-start resolves refs from Vault in-pod.
-    //
-    // Pure on `env` + `params` so reconcile and `apply-revision` agree.
-    let mut init_containers = vec![env_store_init_container(env)];
+    // How the worker resolves `secret://` refs at runtime — see
+    // [`secrets_wiring`], which the router shares.
+    let wiring = secrets_wiring(env, params);
+    let mut init_containers = vec![env_store_init_container(env, params)];
+    init_containers.extend(wiring.init_container);
     let mut volumes = runtime_pod_volumes();
-    let mut service_account: Option<&str> = None;
-    let uses_dev_secrets =
-        matches!(params.secrets_backend, SecretsBackend::DevStore) && env_uses_dev_secrets(env);
-    match &params.secrets_backend {
-        SecretsBackend::DevStore => {
-            if uses_dev_secrets {
-                init_containers.push(stage_dev_secrets_init_container(env));
-                volumes.push(json!({
-                    "name": DEV_SECRETS_VOLUME,
-                    "secret": {"secretName": DEV_SECRETS_SECRET_NAME, "optional": true},
-                }));
-            }
-        }
-        SecretsBackend::Vault(vault) => {
-            env_vars.extend(secrets_backend_env(vault));
-            service_account = Some(WORKER_SERVICE_ACCOUNT);
-        }
-    }
+    volumes.extend(wiring.volume);
+    env_vars.extend(wiring.env);
+    let service_account = wiring.service_account;
+    let uses_dev_secrets = wiring.uses_dev_secrets;
 
     // Pod-template annotations: when the env stages dev-store material, a
     // content hash triggers a rolling restart on `reconcile` whenever the
     // operator rotates a credential. The preview path (`None`) omits the
     // annotation so `op env render` stays pure. `apply-revision` also
     // renders `None`, so the annotation is stable across verb paths.
+    //
+    // The telemetry header credential gets the same treatment: it is
+    // answer-derived rather than reconcile-materialized, so (unlike the
+    // dev-store hash) it is identical across the preview and apply paths —
+    // rendered whenever `telemetry_headers` was answered, omitted otherwise,
+    // so an environment with no header renders byte-identical to before this
+    // annotation existed.
     let mut pod_annotations = serde_json::Map::new();
     if uses_dev_secrets {
         let hash = dev_secrets_content_hash(params.dev_secrets_data.as_deref());
         pod_annotations.insert(
             "greentic.ai/dev-store-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    if let Some(headers) = params.telemetry.headers() {
+        let hash = telemetry_headers_content_hash(headers.expose());
+        pod_annotations.insert(
+            "greentic.ai/telemetry-headers-hash".to_string(),
             Value::String(hash),
         );
     }
@@ -962,7 +1410,7 @@ pub fn render_worker_deployment(
                     "initContainers": Value::Array(init_containers),
                     "containers": [{
                         "name": "worker",
-                        "image": params.runtime_image,
+                        "image": params.image_for(revision.runtime_image_digest.as_deref()),
                         "args": worker_boot_args(env, params),
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
@@ -986,11 +1434,25 @@ pub fn render_worker_deployment(
     if let Some(sa) = service_account {
         deployment["spec"]["template"]["spec"]["serviceAccountName"] = Value::from(sa);
     }
+    // Omit the key entirely when unset — an empty `imagePullSecrets: []` is a
+    // different document from no key at all, and the "absent answer renders
+    // byte-identically to today" contract depends on that distinction.
+    if let Some(name) = &params.image_pull_secret {
+        deployment["spec"]["template"]["spec"]["imagePullSecrets"] = json!([{"name": name}]);
+    }
     deployment
 }
 
 /// One revision's ClusterIP Service — the stable address the router
 /// dispatches that revision's traffic to.
+///
+/// Deliberately NOT driven by [`K8sParams::service_type`]: this Service is
+/// internal plumbing between the router and one revision, and the router is
+/// what enforces the authoritative `TrafficSplit`. An externally-reachable
+/// per-revision address would route around that split entirely (a caller could
+/// hit a revision weighted 0%), and under `LoadBalancer` would provision one
+/// load balancer per revision. External exposure is a property of the ENV, so
+/// it lands on the env's one front door: [`render_router_service`].
 pub fn render_worker_service(env: &Environment, revision: &Revision, params: &K8sParams) -> Value {
     json!({
         "apiVersion": "v1",
@@ -1018,10 +1480,21 @@ pub fn render_worker_manifests(
     revision: &Revision,
     params: &K8sParams,
 ) -> Vec<Value> {
-    vec![
+    let mut manifests = vec![
         render_worker_deployment(env, revision, params),
         render_worker_service(env, revision, params),
-    ]
+    ];
+    if let Some(store) = &params.store_label {
+        for manifest in &mut manifests {
+            if let Some(labels) = manifest
+                .pointer_mut("/metadata/labels")
+                .and_then(Value::as_object_mut)
+            {
+                labels.insert(STORE_LABEL.to_string(), json!(store));
+            }
+        }
+    }
+    manifests
 }
 
 /// Whether a revision's persisted lifecycle puts its worker objects in the
@@ -1053,7 +1526,36 @@ pub(crate) fn has_cluster_presence(lifecycle: RevisionLifecycle) -> bool {
 /// authoritative for `TrafficSplit` enforcement in the Zain v1 pilot.
 pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value {
     let labels = common_labels(env, "router");
-    json!({
+    // The router resolves secrets exactly as a worker does — it must read each
+    // unit's ingress credential to admit an external caller. See
+    // [`secrets_wiring`].
+    let wiring = secrets_wiring(env, params);
+    // Same rotation annotations as the worker pod template
+    // ([`render_worker_deployment`]): the router stages the SAME dev-store and
+    // references the SAME `gtc-telemetry-headers` Secret keys, so it must roll
+    // on the same rotations — a router still holding a rotated-out ingress
+    // credential keeps refusing the new one.
+    let mut pod_annotations = serde_json::Map::new();
+    if wiring.uses_dev_secrets {
+        let hash = dev_secrets_content_hash(params.dev_secrets_data.as_deref());
+        pod_annotations.insert(
+            "greentic.ai/dev-store-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    if let Some(headers) = params.telemetry.headers() {
+        let hash = telemetry_headers_content_hash(headers.expose());
+        pod_annotations.insert(
+            "greentic.ai/telemetry-headers-hash".to_string(),
+            Value::String(hash),
+        );
+    }
+    let pod_metadata = if pod_annotations.is_empty() {
+        json!({"labels": labels})
+    } else {
+        json!({"labels": labels, "annotations": Value::Object(pod_annotations)})
+    };
+    let mut deployment = json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {
@@ -1065,7 +1567,7 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
             "replicas": params.router_replicas,
             "selector": {"matchLabels": labels},
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": pod_metadata,
                 "spec": {
                     "securityContext": pod_security_context(),
                     "topologySpreadConstraints": [{
@@ -1074,7 +1576,11 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "whenUnsatisfiable": "ScheduleAnyway",
                         "labelSelector": {"matchLabels": labels},
                     }],
-                    "initContainers": [env_store_init_container(env)],
+                    "initContainers": Value::Array(
+                        std::iter::once(env_store_init_container(env, params))
+                            .chain(wiring.init_container)
+                            .collect(),
+                    ),
                     "containers": [{
                         "name": "router",
                         "image": params.runtime_image,
@@ -1082,7 +1588,13 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                         "securityContext": container_security_context(),
                         "resources": resource_baseline(),
                         "ports": [{"name": "http", "containerPort": SERVE_PORT}],
-                        "env": Value::Array(runtime_boot_env(env, &params.oci_insecure_registries)),
+                        "env": Value::Array(
+                            runtime_boot_env(env, params)
+                                .into_iter()
+                                .chain(telemetry::pod_env(params, "router"))
+                                .chain(wiring.env)
+                                .collect(),
+                        ),
                         "volumeMounts": runtime_volume_mounts(),
                         "readinessProbe": {
                             "httpGet": {"path": "/healthz", "port": SERVE_PORT},
@@ -1090,15 +1602,34 @@ pub fn render_router_deployment(env: &Environment, params: &K8sParams) -> Value 
                             "periodSeconds": 5,
                         },
                     }],
-                    "volumes": Value::Array(runtime_pod_volumes()),
+                    "volumes": Value::Array(
+                        runtime_pod_volumes().into_iter().chain(wiring.volume).collect(),
+                    ),
                 },
             },
         },
-    })
+    });
+    if let Some(sa) = wiring.service_account {
+        deployment["spec"]["template"]["spec"]["serviceAccountName"] = Value::from(sa);
+    }
+    // Omit the key entirely when unset — an empty `imagePullSecrets: []` is a
+    // different document from no key at all, and the "absent answer renders
+    // byte-identically to today" contract depends on that distinction.
+    if let Some(name) = &params.image_pull_secret {
+        deployment["spec"]["template"]["spec"]["imagePullSecrets"] = json!([{"name": name}]);
+    }
+    deployment
 }
 
 /// The stable router Service — the single target the Gateway / Ingress
-/// routes 100% of the env's traffic to.
+/// routes 100% of the env's traffic to, and the one object whose
+/// `spec.type` the operator selects ([`K8sParams::service_type`]).
+///
+/// The default is `ClusterIP`, so an env with no `service_type` answer renders
+/// byte-for-byte what it rendered before the answer existed. `NodePort` /
+/// `LoadBalancer` are what give the env an address reachable from outside the
+/// cluster at all; the env-pack still renders no Ingress (see
+/// [`ServiceType`]).
 pub fn render_router_service(env: &Environment, params: &K8sParams) -> Value {
     let labels = common_labels(env, "router");
     json!({
@@ -1110,7 +1641,7 @@ pub fn render_router_service(env: &Environment, params: &K8sParams) -> Value {
             "labels": labels,
         },
         "spec": {
-            "type": "ClusterIP",
+            "type": params.service_type.as_k8s_str(),
             "selector": labels,
             "ports": [{"name": "http", "port": SERVE_PORT, "targetPort": SERVE_PORT}],
         },
@@ -1205,6 +1736,176 @@ fn render_dev_secrets_secret(env: &Environment, params: &K8sParams) -> Value {
     })
 }
 
+/// The `oci_password` answer, delivered into the cluster as a Secret so
+/// neither the worker nor the router pod spec carries it as a plain value —
+/// only a caller with `get secret` in the namespace (a narrower grant than
+/// `get deployment`) can read it back. Uses `stringData` (server-side
+/// base64-encoded) since, unlike [`K8sParams::dev_secrets_data`], the answer
+/// arrives as plain text, never pre-encoded. Only rendered when
+/// [`K8sParams::oci_password`] is set — [`render_environment_manifests`]
+/// gates the call.
+fn render_oci_credentials_secret(env: &Environment, params: &K8sParams) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": OCI_CREDENTIALS_SECRET_NAME,
+            "namespace": params.namespace,
+            "labels": common_labels(env, "oci-credentials"),
+        },
+        "stringData": {
+            "password": params.oci_password.clone().unwrap_or_default(),
+        },
+    })
+}
+
+/// The repository part of an image reference: everything before a trailing
+/// `@digest` or `:tag`. A `:` only counts as a tag separator when it sits in
+/// the last path segment, so `host:5000/x` keeps its port. `None` for an
+/// empty repository.
+fn image_repository(image: &str) -> Option<&str> {
+    let without_digest = image.split_once('@').map_or(image, |(repo, _)| repo);
+    let last_segment_start = without_digest.rfind('/').map_or(0, |i| i + 1);
+    let repo = match without_digest[last_segment_start..].find(':') {
+        Some(i) => &without_digest[..last_segment_start + i],
+        None => without_digest,
+    };
+    (!repo.is_empty()).then_some(repo)
+}
+
+/// The registry host implied by a single image reference, using the same
+/// heuristic Docker itself uses to tell a registry authority from a bare
+/// repository path: everything before the first `/`, when the reference
+/// contains a `/` AT ALL and that first segment contains a `.` or a `:`
+/// (e.g. `ghcr.io/greenticai/x` vs `library/busybox`). A reference with no
+/// `/` at all (e.g. `myapp:v1`) can never be `host[:port]/path` — it is a
+/// bare repository name with a tag, implicitly `docker.io/library/myapp`, so
+/// the `:` there is a tag separator, not a port separator, and must not be
+/// read as one. `None` when the reference names no authority at all.
+fn image_registry_host(image: &str) -> Option<String> {
+    let (first_segment, has_slash) = match image.split_once('/') {
+        Some((first, _)) => (first, true),
+        None => (image, false),
+    };
+    if has_slash && (first_segment.contains('.') || first_segment.contains(':')) {
+        Some(first_segment.to_string())
+    } else {
+        None
+    }
+}
+
+/// The registry hosts to key an image-pull Secret's `.dockerconfigjson`
+/// `auths` map under. Kubernetes matches an `auths` key against the
+/// registry host it is actually pulling FROM — a credential keyed on the
+/// wrong host authenticates nothing and fails exactly like no credential at
+/// all, so getting this right is load-bearing, not cosmetic.
+///
+/// This Secret authenticates the KUBELET's image pull — [`K8sParams::runtime_image`]
+/// and [`K8sParams::init_image`] are the two images it ever pulls under this
+/// pack, so their own authorities are what must be keyed, one `auths` entry
+/// per DISTINCT authority (deduplicated, first-seen order: runtime then
+/// init). [`K8sParams::oci_insecure_registries`] is a DIFFERENT consumer's
+/// answer — it drives greentic-start's own in-process `oci://` bundle pull,
+/// not the kubelet — so it is consulted only as a FALLBACK, when neither
+/// image reference yields an authority at all: an operator who set it
+/// clearly named a registry the cluster talks to, and a Secret with zero
+/// `auths` entries would authenticate nothing while looking configured.
+/// Preferring it over the images (the pre-fix behaviour) silently mis-keyed
+/// the credential whenever the bundle registry and the image registry
+/// differ — e.g. an in-cluster plain-HTTP bundle mirror alongside images
+/// hosted on a separate HTTPS registry — and never keyed [`K8sParams::init_image`]
+/// at all, so a differently-hosted init image could never pull.
+///
+/// When NEITHER an image authority NOR `oci_insecure_registries` yields a
+/// host, this keys the literal `docker.io` — what a bare repository
+/// reference (no host segment at all, e.g. `myapp:v1` or `library/busybox`)
+/// actually implies. The alternative (refusing `image_pull_secret` outright
+/// in [`K8sParams::from_answers`] for this combination) was considered and
+/// rejected: a bare reference naming Docker Hub with an authenticated pull
+/// (a real, supported case — private Docker Hub repositories) is exactly
+/// what this answer exists to serve, and refusing it would make that case
+/// inexpressible. `docker.io` is never returned as an EMPTY string, unlike
+/// the pre-fix fallback (`unwrap_or_default()` on `None`), which rendered a
+/// structurally valid but unauthenticating `"auths": {"": {…}}`.
+fn pull_secret_registry_hosts(params: &K8sParams) -> Vec<String> {
+    const DOCKER_HUB_HOST: &str = "docker.io";
+    let mut hosts = Vec::new();
+    for image in [params.runtime_image.as_str(), params.init_image.as_str()] {
+        if let Some(host) = image_registry_host(image)
+            && !hosts.contains(&host)
+        {
+            hosts.push(host);
+        }
+    }
+    if hosts.is_empty() {
+        match params.oci_insecure_registries.first() {
+            Some(first) => hosts.push(first.clone()),
+            None => hosts.push(DOCKER_HUB_HOST.to_string()),
+        }
+    }
+    hosts
+}
+
+/// The image-pull Secret naming the operator's `image_pull_secret` answer —
+/// a `kubernetes.io/dockerconfigjson` Secret the KUBELET reads to
+/// authenticate pulling the worker/router/init images from the client's own
+/// registry. Distinct from [`render_oci_credentials_secret`] just above:
+/// that Secret authenticates greentic-start's own in-process `oci://` bundle
+/// pull (an application-level HTTP call), while this one authenticates the
+/// image pull itself, which the kubelet performs before the container ever
+/// starts — two different consumers, two different Secret shapes, sharing
+/// the same [`K8sParams::oci_username`] / [`K8sParams::oci_password`]
+/// credential. `from_answers` already refuses `image_pull_secret` without
+/// both, so both are guaranteed present by the time this renders. Carries
+/// `auth` (base64 `user:pass`) alongside the broken-out `username`/`password`
+/// fields — some registries (and some `imagePullSecrets` consumers) read
+/// only the combined `auth` key. `auths` carries one entry per distinct
+/// authority [`pull_secret_registry_hosts`] resolves (see its doc comment
+/// for the preference order), all under the SAME credential — there is only
+/// one `oci_username`/`oci_password` pair to render, so a `runtime_image`
+/// and `init_image` hosted on different registries both get keyed with it.
+/// Only rendered when [`K8sParams::image_pull_secret`] is set —
+/// [`render_environment_manifests`] gates the call.
+fn render_image_pull_secret(env: &Environment, params: &K8sParams) -> Value {
+    let name = params
+        .image_pull_secret
+        .as_deref()
+        .expect("caller checks params.image_pull_secret.is_some() first");
+    let username = params.oci_username.as_deref().unwrap_or_default();
+    let password = params.oci_password.as_deref().unwrap_or_default();
+    let auth = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+    };
+    let mut auths = serde_json::Map::new();
+    for host in pull_secret_registry_hosts(params) {
+        auths.insert(
+            host,
+            json!({
+                "username": username,
+                "password": password,
+                "auth": auth,
+            }),
+        );
+    }
+    let docker_config_json = serde_json::to_string(&json!({ "auths": Value::Object(auths) }))
+        .expect("a JSON object of strings always serializes");
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "kubernetes.io/dockerconfigjson",
+        "metadata": {
+            "name": name,
+            "namespace": params.namespace,
+            "labels": common_labels(env, "image-pull-secret"),
+        },
+        "stringData": {
+            ".dockerconfigjson": docker_config_json,
+        },
+    })
+}
+
 /// Whether the environment routes a revision that the worker pulls at boot —
 /// a revision referenced by a traffic split that carries a `bundle_source_uri`.
 /// This mirrors greentic-start's bundle-less boot, which materializes only
@@ -1286,6 +1987,14 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
             "spec": {
                 "podSelector": {"matchLabels": router_labels},
                 "policyTypes": ["Ingress", "Egress"],
+                // No `from` selector: an ingress rule with ports only admits
+                // ANY source on that port. That is what makes an externally
+                // exposed router ([`K8sParams::service_type`]) actually
+                // reachable — narrowing this to in-cluster peers would leave a
+                // `NodePort` / `LoadBalancer` Service that resolves while the
+                // pod drops the packets, under a NetworkPolicy-enforcing CNI
+                // only. Pinned by
+                // `router_ingress_admits_traffic_from_outside_the_cluster`.
                 "ingress": [{"ports": [{"protocol": "TCP", "port": SERVE_PORT}]}],
                 "egress": [{
                     "to": [{"podSelector": {"matchLabels": worker_component}}],
@@ -1317,20 +2026,32 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     // the default-deny namespace. BOTH the worker AND the router boot
     // `start --env` and materialize routed bundle-sourced revisions, so BOTH
     // need egress to the bundle source while a routed revision is pullable;
-    // additionally the WORKER needs egress to Vault when it resolves secrets
-    // there (`SecretsBackend::Vault`) — the router never resolves secrets.
+    // additionally BOTH need egress to Vault when secrets resolve there
+    // (`SecretsBackend::Vault`): the router reads each unit's ingress
+    // credential to admit an external caller (see [`secrets_wiring`]).
     // Render one stable, env-scoped policy per role: allow-all egress when that
     // role has an opening (the pod fetches its own packs integrity-gated against
     // the revision's `bundle_digest`, and the Vault token exchange is the
-    // worker's own outbound call, so breadth is not a pack-injection vector — a
+    // pod's own outbound call, so breadth is not a pack-injection vector — a
     // per-destination allow-list is a tracked hardening follow-up); an empty
     // deny rule otherwise. Always rendered so reconcile converges allow→deny
     // without env-level pruning, closing the opening once the env stops pulling
     // or leaves Vault. DNS egress stays granted by `gtc-allow-dns` regardless.
     let pullable = env_has_pullable_routed_revision(env);
-    let worker_uses_vault = matches!(params.secrets_backend, SecretsBackend::Vault(_));
+    let uses_vault = matches!(params.secrets_backend, SecretsBackend::Vault(_));
     for role in ["worker", "router"] {
-        let allow_all = pullable || (role == "worker" && worker_uses_vault);
+        // Telemetry: both roles export to an operator collector. A
+        // per-destination rule joins the hardening follow-up above.
+        //
+        // `!params.telemetry.is_empty()` opens egress for a profile carrying
+        // ONLY `TELEMETRY_EXPORT=none` (no endpoint, no headers) — there is
+        // nowhere for that profile to export to, so the opening buys nothing.
+        // Accepted rather than special-cased: the designer does not send
+        // `telemetry_env` at all for a disabled profile (see the delivery
+        // spec), so this is not a shape `telemetry_env` is answered with in
+        // practice, and narrowing it here would need parsing the VALUE of an
+        // allow-listed key rather than just its presence.
+        let allow_all = pullable || uses_vault || !params.telemetry.is_empty();
         let egress = if allow_all { json!([{}]) } else { json!([]) };
         policies.push(json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -1350,22 +2071,34 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
     policies
 }
 
-/// Every environment-level object, in apply order: Namespace, env-store
-/// ConfigMap + runtime ConfigMap (the pods stage / mount them — must exist
-/// first), router Deployment + Service + PDB, NetworkPolicies. Per-revision
-/// worker objects are NOT included — they ride the revision lifecycle verbs.
-/// `gtc op env render` emits this set (plus present-revision workers)
-/// through the [`ManifestRenderer`](crate::env_packs::render::ManifestRenderer)
-/// impl in [`super::render`].
+/// Every environment-level object, in apply order: Namespace, the image-pull
+/// Secret (when `image_pull_secret` is set), env-store ConfigMap + runtime
+/// ConfigMap (the pods stage / mount them — must exist first), router
+/// Deployment + Service + PDB, NetworkPolicies. Per-revision worker objects
+/// are NOT included — they ride the revision lifecycle verbs. `gtc op env
+/// render` emits this set (plus present-revision workers) through the
+/// [`ManifestRenderer`](crate::env_packs::render::ManifestRenderer) impl in
+/// [`super::render`].
 pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Vec<Value> {
-    let mut manifests = vec![
-        render_namespace(env, params),
+    let mut manifests = vec![render_namespace(env, params)];
+    // The image-pull Secret is rendered here, immediately after the
+    // Namespace, NOT appended last like the env-level secrets below
+    // (dev-store / Vault SA / oci-credentials / telemetry-headers). Those are
+    // mounted/assumed by pods that retry on a transient miss; this one gates
+    // the image pull itself — a Deployment applied before its
+    // `imagePullSecrets` entry exists fails its very first pull with
+    // `ImagePullBackOff` on every fresh install, which no retry recovers from
+    // without the operator noticing the ordering bug.
+    if params.image_pull_secret.is_some() {
+        manifests.push(render_image_pull_secret(env, params));
+    }
+    manifests.extend([
         render_env_store_config_map(env, params),
         render_runtime_config_map(env, params),
         render_router_deployment(env, params),
         render_router_service(env, params),
         render_router_pdb(env, params),
-    ];
+    ]);
     manifests.extend(render_network_policies(env, params));
     // The env-level secrets object, last (never pruned; appended after the
     // NetworkPolicies so it never shifts the index-pinned env-level objects;
@@ -1386,8 +2119,27 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
             manifests.push(render_worker_service_account(env, params));
         }
     }
+    // The `oci_password` credential Secret, appended after the DevStore/Vault
+    // object so both env-level secret objects share the "last, never pruned"
+    // placement — orthogonal to the `SecretsBackend` choice above (a
+    // registry credential is unrelated to how `secret://` refs resolve).
+    if params.oci_password.is_some() {
+        manifests.push(render_oci_credentials_secret(env, params));
+    }
+    if let Some(secret) = telemetry::render_headers_secret(env, params) {
+        manifests.push(secret);
+    }
+    // Appended LAST so an env without `ingress_host` renders exactly the
+    // set (and indices) it rendered before the answer existed.
+    if let Some(ingress) = ingress::render(env, params) {
+        manifests.push(ingress);
+    }
     manifests
 }
+
+#[cfg(test)]
+#[path = "manifests_runtime_pin_tests.rs"]
+mod runtime_pin_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1426,6 +2178,74 @@ mod tests {
         assert_eq!(params.namespace, format!("gtc-{}", env.environment_id));
         assert_eq!(params.runtime_image, DEFAULT_RUNTIME_IMAGE);
         assert_eq!(params.router_replicas, 2, "plan step 11: router HA ≥ 2");
+    }
+
+    #[test]
+    fn init_image_defaults_to_the_bundled_busybox() {
+        let (env, params) = fixture();
+        assert_eq!(params.init_image, "busybox:1.36.1");
+        let manifests = render_environment_manifests(&env, &params);
+        let json = serde_json::to_string(&manifests).unwrap();
+        assert!(json.contains("busybox:1.36.1"));
+    }
+
+    #[test]
+    fn init_image_answer_replaces_every_init_container_image() {
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "init_image": "registry.client.local/greentic/busybox:1.36.1" })),
+        )
+        .expect("a known answer key is accepted");
+        assert_eq!(
+            params.init_image,
+            "registry.client.local/greentic/busybox:1.36.1"
+        );
+        let json = serde_json::to_string(&render_environment_manifests(&env, &params)).unwrap();
+        assert!(
+            !json.contains("\"image\":\"busybox:1.36.1\""),
+            "no init container may keep the default once the answer is set"
+        );
+    }
+
+    /// `render_environment_manifests` renders neither the worker Deployment
+    /// nor a secrets-bound env, so it never reaches
+    /// `stage_dev_secrets_init_container` — one of the two sites the
+    /// `init_image` answer changed. Reverting that site to the
+    /// `DEFAULT_INIT_IMAGE` constant kept the test above green, because it
+    /// never exercises this code path at all.
+    #[test]
+    fn init_image_answer_replaces_the_dev_secrets_staging_init_container_image_too() {
+        let env = secrets_env();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "init_image": "registry.client.local/greentic/busybox:1.36.1" })),
+        )
+        .expect("a known answer key is accepted");
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        let init = d["spec"]["template"]["spec"]["initContainers"]
+            .as_array()
+            .unwrap();
+        let names: Vec<&str> = init.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["stage-env-store", "stage-dev-secrets"]);
+        for container in init {
+            assert_eq!(
+                container["image"], "registry.client.local/greentic/busybox:1.36.1",
+                "{} must use the init_image answer, not the busybox default",
+                container["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn init_image_rejects_invalid_characters() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "init_image": "Registry.Client.Local/BusyBox" })),
+        )
+        .unwrap_err();
+        assert!(err.contains("init_image"), "{err}");
     }
 
     #[test]
@@ -1545,6 +2365,22 @@ mod tests {
             serde_json::to_string(&wa).unwrap(),
             serde_json::to_string(&wb).unwrap()
         );
+        let sa = sor::render_sor_manifests(
+            &env,
+            &sor::tests::unit(),
+            &sor::tests::inputs(true),
+            &params,
+        );
+        let sb = sor::render_sor_manifests(
+            &env,
+            &sor::tests::unit(),
+            &sor::tests::inputs(true),
+            &params,
+        );
+        assert_eq!(
+            serde_json::to_string(&sa).unwrap(),
+            serde_json::to_string(&sb).unwrap()
+        );
     }
 
     #[test]
@@ -1621,11 +2457,507 @@ mod tests {
     }
 
     #[test]
+    fn oci_credentials_render_into_worker_and_router_pods() {
+        let (env, mut params) = fixture();
+        params.oci_username = Some("registry-user".to_string());
+        params.oci_password = Some("hunter2".to_string());
+
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            let envs = d["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            let username = envs
+                .iter()
+                .find(|e| e["name"] == "OCI_USERNAME")
+                .expect("OCI_USERNAME is rendered on both pods");
+            assert_eq!(
+                username["value"], "registry-user",
+                "the username is a plain value, not secret material"
+            );
+            let password = envs
+                .iter()
+                .find(|e| e["name"] == "OCI_PASSWORD")
+                .expect("OCI_PASSWORD is rendered on both pods");
+            // The password must never appear as a plain `value` — only as a
+            // reference into the credentials Secret.
+            assert!(
+                password.get("value").is_none(),
+                "OCI_PASSWORD must not carry a plain value"
+            );
+            assert_eq!(
+                password["valueFrom"]["secretKeyRef"]["name"],
+                OCI_CREDENTIALS_SECRET_NAME
+            );
+            assert_eq!(password["valueFrom"]["secretKeyRef"]["key"], "password");
+            assert_eq!(
+                password["valueFrom"]["secretKeyRef"]["optional"], true,
+                "a pod rendered before the env-level Secret exists must still boot"
+            );
+        }
+    }
+
+    #[test]
+    fn no_oci_credentials_env_vars_by_default() {
+        let (env, params) = fixture();
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            let envs = d["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            assert!(
+                !envs.iter().any(|e| e["name"] == "OCI_USERNAME"),
+                "no oci_username answer must not emit OCI_USERNAME"
+            );
+            assert!(
+                !envs.iter().any(|e| e["name"] == "OCI_PASSWORD"),
+                "no oci_password answer must not emit OCI_PASSWORD"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_credentials_secret_rendered_only_when_password_is_set() {
+        let (env, params) = fixture();
+        // Default params: no oci_password → no Secret in the env-level set.
+        let env_level = render_environment_manifests(&env, &params);
+        assert!(
+            !env_level
+                .iter()
+                .any(|o| o["metadata"]["name"] == OCI_CREDENTIALS_SECRET_NAME),
+            "the oci-credentials Secret must not render without an oci_password"
+        );
+
+        let mut with_creds = params.clone();
+        with_creds.oci_username = Some("registry-user".to_string());
+        with_creds.oci_password = Some("hunter2".to_string());
+        let env_level = render_environment_manifests(&env, &with_creds);
+        let secret = env_level
+            .iter()
+            .find(|o| o["metadata"]["name"] == OCI_CREDENTIALS_SECRET_NAME)
+            .expect("the oci-credentials Secret renders once oci_password is set");
+        assert_eq!(secret["kind"], "Secret");
+        assert_eq!(secret["metadata"]["namespace"], json!(with_creds.namespace));
+        assert_eq!(secret["stringData"]["password"], "hunter2");
+        // The Secret must never carry the username or any other identifying
+        // field beyond the password itself.
+        assert!(secret["stringData"]["username"].is_null());
+    }
+
+    #[test]
+    fn from_answers_oci_credentials_pair_accepted() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "oci_username": "registry-user",
+            "oci_password": "hunter2",
+        });
+        let params = K8sParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.oci_username.as_deref(), Some("registry-user"));
+        assert_eq!(params.oci_password.as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn from_answers_oci_credentials_absent_is_fine() {
+        let env = build_fixture_env();
+        let params = K8sParams::from_answers(&env, Some(&serde_json::json!({}))).unwrap();
+        assert_eq!(params.oci_username, None);
+        assert_eq!(params.oci_password, None);
+    }
+
+    #[test]
+    fn from_answers_oci_username_without_password_rejected() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"oci_username": "registry-user"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("oci_username and oci_password"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_oci_password_without_username_rejected() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"oci_password": "hunter2"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("oci_username and oci_password"), "got: {err}");
+    }
+
+    #[test]
+    fn from_answers_oci_credentials_unknown_key_still_rejected() {
+        // The new keys must not have widened KNOWN_KEYS into accept-everything.
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"oci_usernam": "typo"});
+        let err = K8sParams::from_answers(&env, Some(&answers)).unwrap_err();
+        assert!(err.contains("oci_usernam"), "got: {err}");
+    }
+
+    // ---- image_pull_secret --------------------------------------------------
+
+    #[test]
+    fn no_pull_secret_answer_renders_exactly_as_before() {
+        let (env, params) = fixture();
+        let json = serde_json::to_string(&render_environment_manifests(&env, &params)).unwrap();
+        assert!(!json.contains("imagePullSecrets"));
+        assert!(!json.contains("dockerconfigjson"));
+    }
+
+    /// The env-level set (checked above) is not the only place
+    /// `imagePullSecrets` is injected — the per-revision worker Deployment
+    /// (rendered OUTSIDE `render_environment_manifests`) carries the other
+    /// site, and a substring check over the env-level JSON alone can never
+    /// see it. Structural (key-absence), matching
+    /// `an_unanswered_service_type_renders_the_pre_existing_router_service`'s
+    /// pattern of pinning the unanswered case explicitly rather than
+    /// inferring it from what the answered case does.
+    #[test]
+    fn no_pull_secret_answer_renders_the_worker_deployment_with_no_image_pull_secrets_key() {
+        let (env, params) = fixture();
+        let d = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert!(
+            d["spec"]["template"]["spec"]
+                .as_object()
+                .unwrap()
+                .get("imagePullSecrets")
+                .is_none(),
+            "an absent image_pull_secret answer must render no imagePullSecrets key at all \
+             on the worker Deployment, not an empty array — same contract as the env-level set"
+        );
+    }
+
+    #[test]
+    fn the_pull_secret_is_rendered_before_the_workloads_that_reference_it() {
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+                "oci_insecure_registries": "registry.client.local"
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+
+        let secret_at = manifests
+            .iter()
+            .position(|m| m["kind"] == "Secret" && m["metadata"]["name"] == "gtc-registry")
+            .expect("the pull secret is rendered");
+        let deployment_at = manifests
+            .iter()
+            .position(|m| m["kind"] == "Deployment")
+            .expect("the router deployment is rendered");
+        assert!(
+            secret_at < deployment_at,
+            "a pod admitted before its pull secret exists fails its first pull"
+        );
+        assert_eq!(
+            manifests[secret_at]["type"],
+            "kubernetes.io/dockerconfigjson"
+        );
+        assert_eq!(
+            manifests[deployment_at]["spec"]["template"]["spec"]["imagePullSecrets"][0]["name"],
+            "gtc-registry"
+        );
+
+        // The per-revision worker Deployment is rendered outside
+        // `render_environment_manifests`; it must reference the same secret.
+        let worker = render_worker_deployment(&env, &env.revisions[0], &params);
+        assert_eq!(
+            worker["spec"]["template"]["spec"]["imagePullSecrets"][0]["name"],
+            "gtc-registry"
+        );
+    }
+
+    /// Parses the rendered `image_pull_secret`'s `.dockerconfigjson` back out
+    /// of `render_environment_manifests`' output, for asserting on its
+    /// `auths` map. Panics if the Secret named `name` is missing.
+    fn pull_secret_auths(manifests: &[Value], name: &str) -> serde_json::Value {
+        let secret = manifests
+            .iter()
+            .find(|m| m["metadata"]["name"] == name)
+            .unwrap_or_else(|| panic!("no rendered object named `{name}`"));
+        let doc: serde_json::Value =
+            serde_json::from_str(secret["stringData"][".dockerconfigjson"].as_str().unwrap())
+                .unwrap();
+        doc["auths"].clone()
+    }
+
+    #[test]
+    fn the_pull_secret_credential_derives_its_host_from_the_runtime_image_when_no_insecure_registries_are_set()
+     {
+        // No `oci_insecure_registries` this time — the registry host must
+        // fall back to the `runtime_image`'s own authority
+        // (`ghcr.io/greenticai/greentic-start-distroless:develop` -> `ghcr.io`).
+        // `init_image` stays at its bare-repository default (`busybox:1.36.1`,
+        // no host), so `ghcr.io` is the only entry.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["ghcr.io"]
+        );
+        let auth = &auths["ghcr.io"];
+        assert_eq!(auth["username"], "robot");
+        assert_eq!(auth["password"], "s3cret");
+        assert_eq!(auth["auth"], "cm9ib3Q6czNjcmV0");
+    }
+
+    #[test]
+    fn the_pull_secret_prefers_the_image_authority_over_oci_insecure_registries() {
+        // The regression this exists to catch: `oci_insecure_registries`
+        // answers a DIFFERENT consumer (greentic-start's in-process `oci://`
+        // bundle pull) than this Secret (the kubelet's image pull). An
+        // in-cluster plain-HTTP bundle mirror alongside images hosted on a
+        // separate HTTPS registry must not leave the kubelet's credential
+        // keyed on the bundle mirror's host — `runtime_image`'s own
+        // authority (`ghcr.io`) wins, and the mirror is never keyed here at
+        // all (it authenticates a different pull entirely).
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+                "oci_insecure_registries": "registry.client.local"
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["ghcr.io"],
+            "the image's own authority must win; the bundle-pull registry is a different consumer"
+        );
+        let auth = &auths["ghcr.io"];
+        assert_eq!(auth["username"], "robot");
+        assert_eq!(auth["password"], "s3cret");
+    }
+
+    #[test]
+    fn the_pull_secret_keys_one_auths_entry_per_distinct_image_authority() {
+        // `runtime_image` and `init_image` hosted on two different
+        // registries must BOTH be keyed — the pre-fix helper never keyed
+        // `init_image`'s authority at all, so a differently-hosted init
+        // image could never pull.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "runtime_image": "ghcr.io/greenticai/greentic-start-distroless:develop",
+                "init_image": "registry.client.local/greentic/busybox:1.36.1",
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        let mut keys: Vec<&str> = auths
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["ghcr.io", "registry.client.local"]);
+        for host in ["ghcr.io", "registry.client.local"] {
+            assert_eq!(auths[host]["username"], "robot");
+            assert_eq!(auths[host]["password"], "s3cret");
+        }
+    }
+
+    #[test]
+    fn the_pull_secret_falls_back_to_oci_insecure_registries_only_when_no_image_yields_a_host() {
+        // Both images are bare/slash-free (no authority); the only
+        // operator-supplied host signal is `oci_insecure_registries`, so it
+        // is used as the fallback — same host list documented in
+        // `pull_secret_registry_hosts`.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "runtime_image": "myapp:v1",
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+                "oci_insecure_registries": "registry.client.local",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["registry.client.local"]
+        );
+    }
+
+    #[test]
+    fn the_pull_secret_keys_docker_io_when_no_source_yields_a_host() {
+        // "myapp:v1" has no `/` at all, so it can never be `host[:port]/path`
+        // — it is a bare repository name with a tag (implicitly
+        // `docker.io/library/myapp:v1`). `init_image` stays at its own
+        // bare-repository default and `oci_insecure_registries` is unset, so
+        // NEITHER source yields a host — the deliberate fallback is the
+        // literal `docker.io`, what a bare reference actually implies, never
+        // an empty-string key that would authenticate nothing while looking
+        // configured.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "runtime_image": "myapp:v1",
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["docker.io"]
+        );
+        let auth = &auths["docker.io"];
+        assert_eq!(auth["username"], "robot");
+        assert_eq!(auth["password"], "s3cret");
+    }
+
+    #[test]
+    fn the_pull_secret_keys_docker_io_for_a_bare_repository_path_too() {
+        // "library/busybox" has a `/` but its first segment contains
+        // neither `.` nor `:` — a bare repository path, not a registry
+        // authority (Docker's own heuristic, restated in
+        // `image_registry_host`'s doc comment). No `oci_insecure_registries`
+        // either, so neither source yields a host and the fallback applies.
+        let (env, _) = fixture();
+        let params = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "runtime_image": "library/busybox",
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap();
+        let manifests = render_environment_manifests(&env, &params);
+        let auths = pull_secret_auths(&manifests, "gtc-registry");
+        assert_eq!(
+            auths.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["docker.io"]
+        );
+    }
+
+    #[test]
+    fn a_pull_secret_without_a_credential_is_refused() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({ "image_pull_secret": "gtc-registry" })),
+        )
+        .unwrap_err();
+        assert!(err.contains("image_pull_secret"), "{err}");
+    }
+
+    #[test]
+    fn a_pull_secret_with_only_half_a_credential_is_refused() {
+        // develop's pre-existing `oci_username`/`oci_password` invariant
+        // ("both or neither") fires FIRST here, before `image_pull_secret`'s
+        // own check is ever reached — so this refuses for the oci-pair
+        // reason, not the image_pull_secret-specific one. Still refused
+        // either way, which is the property this test protects.
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "gtc-registry",
+                "oci_username": "robot",
+            })),
+        )
+        .unwrap_err();
+        assert!(err.contains("oci_username and oci_password"), "{err}");
+    }
+
+    #[test]
+    fn image_pull_secret_rejects_an_invalid_dns1123_label() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({
+                "image_pull_secret": "Not_A_Label",
+                "oci_username": "robot",
+                "oci_password": "s3cret",
+            })),
+        )
+        .unwrap_err();
+        assert!(err.contains("image_pull_secret"), "{err}");
+    }
+
+    #[test]
+    fn image_pull_secret_rejects_a_name_reserved_by_the_pack_itself() {
+        // Naming the new Secret after an object this pack already renders
+        // into the same namespace is refused up front — a Secret's `type`
+        // is immutable, so an unguarded collision applies cleanly the first
+        // time and fails the SECOND server-side apply of a different `type`
+        // under the same name, with an error naming neither this answer nor
+        // the reason.
+        let (env, _) = fixture();
+        for reserved in [
+            ROUTER_NAME,
+            RUNTIME_CONFIG_MAP_NAME,
+            ENV_STORE_CONFIG_MAP_NAME,
+            DEV_SECRETS_SECRET_NAME,
+            OCI_CREDENTIALS_SECRET_NAME,
+            TELEMETRY_HEADERS_SECRET_NAME,
+            WORKER_SERVICE_ACCOUNT,
+        ] {
+            let err = K8sParams::from_answers(
+                &env,
+                Some(&serde_json::json!({
+                    "image_pull_secret": reserved,
+                    "oci_username": "robot",
+                    "oci_password": "s3cret",
+                })),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("image_pull_secret") && err.contains(reserved),
+                "expected a refusal naming `image_pull_secret` and `{reserved}`, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn every_pod_spec_passes_the_restricted_hardening_gate() {
         let (env, params) = fixture();
+        let sor = sor::render_sor_deployment(
+            &env,
+            &sor::tests::unit(),
+            &sor::tests::inputs(true),
+            &params,
+        );
         let pods = [
             render_worker_deployment(&env, &env.revisions[0], &params),
             render_router_deployment(&env, &params),
+            sor,
         ];
         for d in &pods {
             let pod = &d["spec"]["template"]["spec"];
@@ -1644,10 +2976,12 @@ mod tests {
             assert!(c["resources"]["limits"]["memory"].is_string());
             assert!(c["readinessProbe"]["httpGet"]["path"].is_string());
             // The staging init container rides the same restricted profile.
-            let ic = &pod["initContainers"][0];
-            assert_eq!(ic["securityContext"]["allowPrivilegeEscalation"], false);
-            assert_eq!(ic["securityContext"]["readOnlyRootFilesystem"], true);
-            assert_eq!(ic["securityContext"]["capabilities"]["drop"][0], "ALL");
+            // A SoR pod has no init container.
+            if let Some(ic) = pod["initContainers"].get(0) {
+                assert_eq!(ic["securityContext"]["allowPrivilegeEscalation"], false);
+                assert_eq!(ic["securityContext"]["readOnlyRootFilesystem"], true);
+                assert_eq!(ic["securityContext"]["capabilities"]["drop"][0], "ALL");
+            }
         }
     }
 
@@ -1915,6 +3249,158 @@ mod tests {
     }
 
     // ---- from_answers + is_dns1123_label -----------------------------------
+
+    /// The regression pin the `service_type` answer is measured against: an env
+    /// that does not answer it must render the router Service EXACTLY as it did
+    /// before the answer existed. Written as a whole-object literal rather than
+    /// a `spec.type` probe on purpose — a field quietly added to the default
+    /// Service is the same silent change to existing deployments that this test
+    /// exists to catch.
+    #[test]
+    fn an_unanswered_service_type_renders_the_pre_existing_router_service() {
+        let (env, params) = fixture();
+        assert_eq!(params.service_type, ServiceType::ClusterIp, "the default");
+        let labels = common_labels(&env, "router");
+        assert_eq!(
+            render_router_service(&env, &params),
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": ROUTER_NAME,
+                    "namespace": params.namespace,
+                    "labels": labels,
+                },
+                "spec": {
+                    "type": "ClusterIP",
+                    "selector": labels,
+                    "ports": [{"name": "http", "port": SERVE_PORT, "targetPort": SERVE_PORT}],
+                },
+            })
+        );
+    }
+
+    /// The whole env-level set, not just the router: answering nothing must be
+    /// indistinguishable from answering the default explicitly, so an operator
+    /// who writes `ClusterIP` into a binding gets no surprise diff either.
+    #[test]
+    fn an_unanswered_service_type_matches_an_explicit_clusterip_answer() {
+        let (env, defaults) = fixture();
+        let explicit =
+            K8sParams::from_answers(&env, Some(&json!({"service_type": "ClusterIP"}))).unwrap();
+        assert_eq!(
+            render_environment_manifests(&env, &defaults),
+            render_environment_manifests(&env, &explicit)
+        );
+    }
+
+    #[test]
+    fn service_type_answer_selects_the_router_service_type() {
+        let (env, _) = fixture();
+        for (answer, expected) in [("NodePort", "NodePort"), ("LoadBalancer", "LoadBalancer")] {
+            let params =
+                K8sParams::from_answers(&env, Some(&json!({"service_type": answer}))).unwrap();
+            let svc = render_router_service(&env, &params);
+            assert_eq!(
+                svc.pointer("/spec/type").and_then(Value::as_str),
+                Some(expected),
+                "router Service type for answer `{answer}`"
+            );
+        }
+    }
+
+    /// Exposure is a property of the ENV, so it lands on the env's single front
+    /// door. Exposing a per-revision worker would hand callers an address that
+    /// routes around the router's `TrafficSplit` entirely — reaching a revision
+    /// weighted 0% — and, under `LoadBalancer`, bill one load balancer per
+    /// revision.
+    #[test]
+    fn an_exposed_env_still_renders_in_cluster_worker_services() {
+        let (env, mut params) = fixture();
+        let revision = env.revisions.first().expect("fixture has a revision");
+        for service_type in [ServiceType::NodePort, ServiceType::LoadBalancer] {
+            params.service_type = service_type;
+            let svc = render_worker_service(&env, revision, &params);
+            assert_eq!(
+                svc.pointer("/spec/type").and_then(Value::as_str),
+                Some("ClusterIP"),
+                "worker Service must stay in-cluster under {service_type:?}"
+            );
+        }
+    }
+
+    /// `LoadBalancer` is a CamelCase Kubernetes API enum typed by hand into a
+    /// free-text field; failing a deploy over letter case would be a worse
+    /// answer than normalizing one.
+    #[test]
+    fn from_answers_service_type_matching_is_case_insensitive() {
+        let (env, _) = fixture();
+        for (answer, expected) in [
+            ("clusterip", ServiceType::ClusterIp),
+            ("NODEPORT", ServiceType::NodePort),
+            ("loadbalancer", ServiceType::LoadBalancer),
+            (" LoadBalancer ", ServiceType::LoadBalancer),
+        ] {
+            let params =
+                K8sParams::from_answers(&env, Some(&json!({"service_type": answer}))).unwrap();
+            assert_eq!(params.service_type, expected, "answer `{answer}`");
+        }
+    }
+
+    /// An unrecognised value must never quietly resolve to `ClusterIP` — that
+    /// is exactly the silent non-exposure this answer exists to end.
+    #[test]
+    fn from_answers_unknown_service_type_rejected() {
+        let (env, _) = fixture();
+        let err = K8sParams::from_answers(&env, Some(&json!({"service_type": "Ingress"})))
+            .expect_err("an unmodelled Service type must be rejected");
+        assert!(err.contains("service_type"), "got {err}");
+        assert!(
+            err.contains("Ingress"),
+            "the error names the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn from_answers_blank_service_type_falls_back_to_clusterip() {
+        let (env, _) = fixture();
+        for blank in [json!(""), json!(null)] {
+            let params =
+                K8sParams::from_answers(&env, Some(&json!({"service_type": blank}))).unwrap();
+            assert_eq!(params.service_type, ServiceType::ClusterIp);
+        }
+    }
+
+    /// The other half of external exposure, and the half that fails silently:
+    /// a `NodePort` / `LoadBalancer` Service only reaches the pod if the
+    /// router's NetworkPolicy admits the traffic. An ingress rule carrying
+    /// ports and NO `from` selector admits any source; adding one would leave
+    /// the Service resolving while the pod drops the packets — and only under
+    /// a NetworkPolicy-enforcing CNI, so it would pass on a cluster without
+    /// one.
+    #[test]
+    fn router_ingress_admits_traffic_from_outside_the_cluster() {
+        let (env, mut params) = fixture();
+        params.service_type = ServiceType::LoadBalancer;
+        let policies = render_network_policies(&env, &params);
+        let router = policies
+            .iter()
+            .find(|p| p["metadata"]["name"] == "gtc-allow-router")
+            .expect("the router allow-policy is always rendered");
+        let rules = router["spec"]["ingress"]
+            .as_array()
+            .expect("the router policy carries ingress rules");
+        assert_eq!(rules.len(), 1);
+        assert!(
+            rules[0].get("from").is_none(),
+            "a `from` selector would make an exposed router unreachable: {}",
+            router["spec"]["ingress"]
+        );
+        assert_eq!(
+            rules[0]["ports"],
+            json!([{"protocol": "TCP", "port": SERVE_PORT}])
+        );
+    }
 
     #[test]
     fn from_answers_none_equals_for_env() {
@@ -2455,25 +3941,51 @@ mod tests {
     }
 
     #[test]
-    fn vault_router_has_no_secrets_identity() {
+    fn vault_router_resolves_secrets_like_a_worker() {
         let env = build_fixture_env();
         let params = vault_params(&env);
         let r = render_router_deployment(&env, &params);
-        // The router routes traffic; it never resolves `secret://`, so it gets
-        // neither the Vault identity nor the connection env.
-        assert!(
-            r["spec"]["template"]["spec"]
-                .get("serviceAccountName")
-                .is_none(),
-            "router must not carry the Vault ServiceAccount"
+        // Worker-interop D7: the router must read each unit's ingress
+        // credential to admit an external caller, so under Vault it carries the
+        // same identity and connection env as a worker. Without them every
+        // external request answered 401, a correct bearer included.
+        assert_eq!(
+            r["spec"]["template"]["spec"]["serviceAccountName"],
+            json!(WORKER_SERVICE_ACCOUNT),
+            "router must carry the Vault ServiceAccount"
         );
         let envs = r["spec"]["template"]["spec"]["containers"][0]["env"]
             .as_array()
             .unwrap();
-        assert!(
-            envs.iter()
-                .all(|e| e["name"] != "GREENTIC_SECRETS_BACKEND" && e["name"] != "VAULT_ADDR"),
-            "router carries no Vault connection env"
+        for name in ["GREENTIC_SECRETS_BACKEND", "VAULT_ADDR"] {
+            assert!(
+                envs.iter().any(|e| e["name"] == name),
+                "router carries {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_store_router_stages_the_same_store_as_the_worker() {
+        let env = secrets_env();
+        let params = K8sParams::for_env(&env);
+        let r = render_router_deployment(&env, &params);
+        let w = render_worker_deployment(&env, &env.revisions[0], &params);
+        let names = |d: &Value, key: &str| -> Vec<String> {
+            d["spec"]["template"]["spec"][key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(&r, "initContainers"), names(&w, "initContainers"));
+        assert!(names(&r, "volumes").contains(&DEV_SECRETS_VOLUME.to_string()));
+        // A rotated credential must roll the router too, or it keeps refusing
+        // the new ingress bearer.
+        assert_eq!(
+            r["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"],
+            w["spec"]["template"]["metadata"]["annotations"]["greentic.ai/dev-store-hash"],
         );
     }
 
@@ -2497,7 +4009,7 @@ mod tests {
     }
 
     #[test]
-    fn vault_opens_worker_egress_not_router() {
+    fn vault_opens_worker_and_router_egress() {
         let env = build_fixture_env();
         let params = vault_params(&env); // no pullable routed revision
         let policies = render_network_policies(&env, &params);
@@ -2508,9 +4020,294 @@ mod tests {
                 .map(|p| p["spec"]["egress"].clone())
                 .unwrap()
         };
-        // The worker needs egress to reach Vault; the router does not resolve
-        // secrets, so its egress stays denied (no pullable revision either).
+        // Both resolve secrets from Vault — the router reads each unit's
+        // ingress credential — so both need egress to reach it.
         assert_eq!(egress("gtc-allow-worker-egress"), json!([{}]));
-        assert_eq!(egress("gtc-allow-router-egress"), json!([]));
+        assert_eq!(egress("gtc-allow-router-egress"), json!([{}]));
+    }
+
+    fn telemetry_params() -> (Environment, K8sParams) {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "telemetry_env": {
+                "TELEMETRY_EXPORT": "otlp-grpc",
+                "OTLP_ENDPOINT": "http://collector.observability:4317",
+                "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod"
+            },
+            "telemetry_headers": "authorization=Bearer s3cret"
+        });
+        let params =
+            K8sParams::from_answers(&env, Some(&answers)).expect("telemetry answers parse");
+        (env, params)
+    }
+
+    fn container_env(d: &Value) -> Vec<Value> {
+        d["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn telemetry_renders_into_worker_and_router_with_their_roles() {
+        let (env, params) = telemetry_params();
+        for (d, role) in [
+            (
+                render_worker_deployment(&env, &env.revisions[0], &params),
+                "worker",
+            ),
+            (render_router_deployment(&env, &params), "router"),
+        ] {
+            let envs = container_env(&d);
+            let get = |n: &str| envs.iter().find(|e| e["name"] == n).cloned();
+            assert_eq!(get("TELEMETRY_EXPORT").unwrap()["value"], "otlp-grpc");
+            assert_eq!(
+                get("OTEL_RESOURCE_ATTRIBUTES").unwrap()["value"],
+                format!("service.namespace=prod,greentic.role={role}")
+            );
+            for name in crate::env_packs::telemetry::HEADER_ENV_NAMES {
+                let h = get(name).unwrap_or_else(|| panic!("{name} rendered on {role}"));
+                assert!(
+                    h.get("value").is_none(),
+                    "{name} must never carry a plain value"
+                );
+                assert_eq!(
+                    h["valueFrom"]["secretKeyRef"]["name"],
+                    TELEMETRY_HEADERS_SECRET_NAME
+                );
+                assert_eq!(h["valueFrom"]["secretKeyRef"]["key"], "headers");
+                assert_eq!(h["valueFrom"]["secretKeyRef"]["optional"], true);
+            }
+            let rendered = serde_json::to_string(&d).unwrap();
+            assert!(
+                !rendered.contains("s3cret"),
+                "the credential must not reach a pod spec"
+            );
+            let mut names: Vec<&str> = envs.iter().map(|e| e["name"].as_str().unwrap()).collect();
+            let total = names.len();
+            names.sort();
+            names.dedup();
+            assert_eq!(
+                names.len(),
+                total,
+                "telemetry must not collide with a boot variable on {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_headers_secret_is_rendered_only_when_answered() {
+        let (env, params) = telemetry_params();
+        let set = render_environment_manifests(&env, &params);
+        let secret = set
+            .iter()
+            .find(|m| {
+                m["kind"] == "Secret" && m["metadata"]["name"] == TELEMETRY_HEADERS_SECRET_NAME
+            })
+            .expect("header Secret rendered");
+        assert_eq!(
+            secret["stringData"]["headers"],
+            "authorization=Bearer s3cret"
+        );
+
+        let (env, plain) = fixture();
+        assert!(
+            !render_environment_manifests(&env, &plain)
+                .iter()
+                .any(|m| m["metadata"]["name"] == TELEMETRY_HEADERS_SECRET_NAME)
+        );
+    }
+
+    /// `greentic.ai/telemetry-headers-hash` annotation on a rendered pod
+    /// template, if any.
+    fn telemetry_headers_hash_annotation(d: &Value) -> Option<String> {
+        d["spec"]["template"]["metadata"]["annotations"]["greentic.ai/telemetry-headers-hash"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn rotating_the_telemetry_header_changes_the_pod_template_annotation_on_both_roles() {
+        // `secretKeyRef` env is resolved once at container start, so rotating
+        // only the Secret's `stringData` does not roll a pod already running.
+        // A pod-template annotation must change so `reconcile` rolls it —
+        // mirroring `greentic.ai/dev-store-hash`.
+        let env = build_fixture_env();
+        let one = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "authorization=Bearer one"})),
+        )
+        .expect("telemetry_headers answer parses");
+        let two = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "authorization=Bearer two"})),
+        )
+        .expect("telemetry_headers answer parses");
+
+        let worker_one = render_worker_deployment(&env, &env.revisions[0], &one);
+        let worker_two = render_worker_deployment(&env, &env.revisions[0], &two);
+        let router_one = render_router_deployment(&env, &one);
+        let router_two = render_router_deployment(&env, &two);
+
+        let worker_hash_one =
+            telemetry_headers_hash_annotation(&worker_one).expect("worker annotation rendered");
+        let worker_hash_two =
+            telemetry_headers_hash_annotation(&worker_two).expect("worker annotation rendered");
+        assert_ne!(
+            worker_hash_one, worker_hash_two,
+            "a header rotation must change the worker's pod-template annotation"
+        );
+
+        let router_hash_one =
+            telemetry_headers_hash_annotation(&router_one).expect("router annotation rendered");
+        let router_hash_two =
+            telemetry_headers_hash_annotation(&router_two).expect("router annotation rendered");
+        assert_ne!(
+            router_hash_one, router_hash_two,
+            "a header rotation must change the router's pod-template annotation"
+        );
+
+        // The hash is never the value itself.
+        for rendered in [&worker_one, &worker_two, &router_one, &router_two] {
+            let text = serde_json::to_string(rendered).unwrap();
+            assert!(!text.contains("Bearer one") && !text.contains("Bearer two"));
+        }
+    }
+
+    #[test]
+    fn no_telemetry_headers_render_no_rotation_annotation_on_either_role() {
+        let (env, params) = fixture();
+        let worker = render_worker_deployment(&env, &env.revisions[0], &params);
+        let router = render_router_deployment(&env, &params);
+        assert_eq!(telemetry_headers_hash_annotation(&worker), None);
+        assert_eq!(telemetry_headers_hash_annotation(&router), None);
+    }
+
+    #[test]
+    fn no_telemetry_answers_render_exactly_what_they_rendered_before() {
+        let (env, params) = fixture();
+        let with_empty = K8sParams::from_answers(&env, Some(&serde_json::json!({}))).unwrap();
+        assert_eq!(params, with_empty);
+        for d in [
+            render_worker_deployment(&env, &env.revisions[0], &params),
+            render_router_deployment(&env, &params),
+        ] {
+            assert!(!container_env(&d).iter().any(|e| {
+                let n = e["name"].as_str().unwrap();
+                n.starts_with("OTEL")
+                    || n.starts_with("OTLP")
+                    || n.starts_with("TELEMETRY")
+                    || n.starts_with("GREENTIC_TELEMETRY")
+            }));
+        }
+    }
+
+    #[test]
+    fn telemetry_opens_egress_even_with_no_pullable_revision() {
+        let (mut env, params) = telemetry_params();
+        env.traffic_splits.clear();
+        let policies = render_network_policies(&env, &params);
+        for role in ["worker", "router"] {
+            let p = policies
+                .iter()
+                .find(|p| p["metadata"]["name"] == format!("gtc-allow-{role}-egress"))
+                .unwrap();
+            assert_eq!(
+                p["spec"]["egress"],
+                serde_json::json!([{}]),
+                "{role} must reach the collector"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_telemetry_answer_fails_the_parse_by_name() {
+        let env = build_fixture_env();
+        let err = K8sParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_env": {"FOO": "x"}})),
+        )
+        .unwrap_err();
+        assert!(err.contains("`FOO`"), "{err}");
+    }
+
+    /// One valid value per name in `telemetry::ALLOWED_ENV` (spec §4.3),
+    /// self-checked against the const so it cannot silently drift out of
+    /// sync with it (adding a 13th allowed name without updating this
+    /// fixture fails loudly here rather than testing a stale list).
+    fn all_allowed_telemetry_env() -> serde_json::Value {
+        let answer = serde_json::json!({
+            "TELEMETRY_EXPORT": "otlp-grpc",
+            "OTLP_ENDPOINT": "http://collector.internal:4317",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example.com:4318",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+            "OTEL_TRACES_SAMPLER_ARG": "0.1",
+            "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod",
+            "OTEL_SERVICE_NAME": "greentic-worker",
+            "GREENTIC_TELEMETRY_ENABLED": "1",
+            "GREENTIC_TELEMETRY_EXPORTER": "otlp",
+            "GREENTIC_TELEMETRY_ENDPOINT": "https://telemetry.example.com",
+            "GREENTIC_TELEMETRY_SAMPLING": "0.5",
+        });
+        let obj = answer.as_object().unwrap();
+        for name in crate::env_packs::telemetry::ALLOWED_ENV {
+            assert!(
+                obj.contains_key(*name),
+                "fixture missing allowed name {name}"
+            );
+        }
+        assert_eq!(
+            obj.len(),
+            crate::env_packs::telemetry::ALLOWED_ENV.len(),
+            "fixture must cover exactly ALLOWED_ENV — update both together"
+        );
+        answer
+    }
+
+    /// Every env var name rendered on a Deployment's single container is
+    /// unique — the allow-list, the boot env, and (for Vault) the secrets-
+    /// backend connection vars are three sources feeding one `env` array,
+    /// and a name shared by two of them would have the later one silently
+    /// shadow the earlier with no error at any layer.
+    fn assert_no_duplicate_container_env_names(d: &Value) {
+        let envs = container_env(d);
+        let mut names: Vec<&str> = envs.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate env var name rendered: {names:?}"
+        );
+    }
+
+    #[test]
+    fn allowed_names_and_devstore_boot_env_are_disjoint() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"telemetry_env": all_allowed_telemetry_env()});
+        let params = K8sParams::from_answers(&env, Some(&answers)).expect("all names are allowed");
+        assert_no_duplicate_container_env_names(&render_worker_deployment(
+            &env,
+            &env.revisions[0],
+            &params,
+        ));
+        assert_no_duplicate_container_env_names(&render_router_deployment(&env, &params));
+    }
+
+    #[test]
+    fn allowed_names_and_vault_boot_env_are_disjoint() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({"telemetry_env": all_allowed_telemetry_env()});
+        let mut params =
+            K8sParams::from_answers(&env, Some(&answers)).expect("all names are allowed");
+        params.secrets_backend = SecretsBackend::Vault(vault_backend());
+        assert_no_duplicate_container_env_names(&render_worker_deployment(
+            &env,
+            &env.revisions[0],
+            &params,
+        ));
+        assert_no_duplicate_container_env_names(&render_router_deployment(&env, &params));
     }
 }

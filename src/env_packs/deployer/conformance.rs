@@ -117,10 +117,15 @@ pub async fn run_conformance<D: Deployer + ?Sized>(deployer: &D) -> Result<(), C
         || deployer.warm_revision(&env, r_warm, None),
     )
     .await?;
+    // P5-R2: a drain follows the traffic move, so the bench drains against
+    // the env AFTER r_drain's weight went to r_warm (and with a zero drain
+    // window, so the bench never sleeps). An adapter whose drain stops the
+    // revision's workers refuses a still-routed revision by design.
+    let drain_env = env_with_drained_weight(&env, r_drain, r_warm);
     check_idempotent(
         "drain_revision",
-        || deployer.drain_revision(&env, r_drain),
-        || deployer.drain_revision(&env, r_drain),
+        || deployer.drain_revision(&drain_env, r_drain, None),
+        || deployer.drain_revision(&drain_env, r_drain, None),
     )
     .await?;
     check_idempotent(
@@ -192,7 +197,10 @@ async fn check_unknown_revision_rejected<D: Deployer + ?Sized>(
     )?;
     classify_unknown_revision(
         "drain_revision",
-        deployer.drain_revision(&env, unknown).await.map(|_| ()),
+        deployer
+            .drain_revision(&env, unknown, None)
+            .await
+            .map(|_| ()),
     )?;
     classify_unknown_revision(
         "archive_revision",
@@ -360,6 +368,33 @@ pub(crate) fn build_fixture_env() -> Environment {
     }
 }
 
+/// `env` with `from`'s split weight moved onto `to` and `from`'s drain window
+/// zeroed — the state a drain runs in after `op traffic set`.
+fn env_with_drained_weight(env: &Environment, from: RevisionId, to: RevisionId) -> Environment {
+    let mut env = env.clone();
+    for split in &mut env.traffic_splits {
+        let moved: u32 = split
+            .entries
+            .iter()
+            .filter(|e| e.revision_id == from)
+            .map(|e| e.weight_bps)
+            .sum();
+        for entry in &mut split.entries {
+            if entry.revision_id == from {
+                entry.weight_bps = 0;
+            } else if entry.revision_id == to {
+                entry.weight_bps += moved;
+            }
+        }
+    }
+    for revision in &mut env.revisions {
+        if revision.revision_id == from {
+            revision.drain_seconds = 0;
+        }
+    }
+    env
+}
+
 fn build_env_with_invalid_split() -> Environment {
     let mut env = build_fixture_env();
     // First split now sums to 9000 — violates the 10000-bps invariant.
@@ -448,6 +483,7 @@ fn make_revision(
         warmed_at: None,
         drain_seconds: 30,
         abort_metrics: Vec::new(),
+        runtime_image_digest: None,
     }
 }
 
@@ -518,6 +554,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<DrainOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(DrainOutcome::default())
@@ -594,6 +631,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<DrainOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(DrainOutcome::default())
@@ -665,6 +703,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<DrainOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(DrainOutcome::default())
@@ -733,6 +772,7 @@ mod tests {
             &self,
             env: &Environment,
             revision_id: RevisionId,
+            _answers: Option<&serde_json::Value>,
         ) -> Result<DrainOutcome, DeployerError> {
             require_revision(env, revision_id)?;
             Ok(DrainOutcome::default())

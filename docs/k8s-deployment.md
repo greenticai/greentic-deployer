@@ -82,11 +82,14 @@ auditable act against a cluster.
 | `Secret` | 1 | `gtc-dev-secrets` — base64 of the operator dev-store, rendered only when the env binds a secrets pack (see [secrets](#5-secrets--the-dev-store-bridge)). `optional: true`. |
 | `NetworkPolicy` | 5 | Default-deny + scoped allow rules (e.g. `gtc-allow-worker-egress`, rendered when a routed revision has a `bundle_source_uri`). |
 | `PodDisruptionBudget` | 1 | Keeps the router available during voluntary disruptions. |
+| `Ingress` | 0 or 1 | `gtc-router`, **only** when the `ingress_host` answer is set (see [managed Ingress](#public-exposure-options)). Routes `<host>/` to the router Service on `:8080`. |
 
 Key facts about the rendered topology:
 
-- **Services are `ClusterIP` on port 8080.** The deployer renders **no Ingress
-  and no LoadBalancer** — external exposure is bring-your-own (see
+- **Services are `ClusterIP` on port 8080 by default.** The router Service's
+  type follows the `service_type` answer (`NodePort` / `LoadBalancer`), and an
+  optional managed Ingress fronts the router when `ingress_host` is answered.
+  With neither, external exposure is bring-your-own (see
   [§7](#7-reaching-the-worker)).
 - **No `imagePullPolicy` is set.** A non-digest tag (e.g. `:develop`) therefore
   defaults to `IfNotPresent`, and a warm node can serve a **stale** cached
@@ -280,7 +283,7 @@ Two secrets backends are supported. The env-manifest `packs[]` entry on the
 
 When an env binds the `greentic.secrets.dev-store@1.0.0` pack:
 
-1. `op env apply` (or `op secrets put`) writes secret values into the operator's
+1. `op env apply` (or `op secrets put`; `op secrets delete` removes one) writes secret values into the operator's
    **local dev-store** (`<store>/<env>/.greentic/dev/.dev.secrets.env`,
    AES-256-GCM per secret).
 2. At **reconcile** the deployer base64-encodes that dev-store file and renders
@@ -423,13 +426,55 @@ can't serve a stale `:develop` layer:
 "runtime_image": "ghcr.io/greenticai/greentic-start-distroless@sha256:<digest>"
 ```
 
-### Two public-exposure options
+### Public-exposure options
 
 **A. Bring-your-own Ingress/LoadBalancer (production-shaped).** Set
 `environment.public_base_url` to your HTTPS host and wire your Ingress/LB so
 that `https://<host>` → the **worker** Service on port 8080, TLS terminated at
 the edge. At boot the worker reads `public_base_url` and auto-registers the
 Telegram webhook against it — no tunnel needed. Leave `tunnel` off / unset.
+
+**C. Managed Ingress (`ingress_host`).** Answer `ingress_host` (plus, as
+needed, `ingress_class` and ONE of `ingress_tls_secret` /
+`ingress_cert_manager_issuer`) and the deployer renders a
+`networking.k8s.io/v1` Ingress named `gtc-router` that routes `<host>/` to the
+**router** Service on `:8080` — the router, never a worker Service, because the
+router enforces the traffic split:
+
+```json
+{
+  "ingress_host": "chat.example.com",
+  "ingress_class": "nginx",
+  "ingress_cert_manager_issuer": "letsencrypt-prod"
+}
+```
+
+- `ingress_tls_secret`: terminate TLS with your own `kubernetes.io/tls` Secret
+  (must already exist in the namespace).
+- `ingress_cert_manager_issuer`: cert-manager's `ClusterIssuer` mints the
+  certificate into the reserved `gtc-router-tls` Secret (the
+  `cert-manager.io/cluster-issuer` annotation). cert-manager must be installed.
+- Neither: plain HTTP.
+
+`op env reconcile` then reports `public_base_url` beside `router_address`:
+`https://<host>` with TLS, `http://<host>` without. It is derived from the
+answers (the host the Ingress was rendered for), not read back from the
+controller, so DNS for the host must point at your ingress controller. Set
+`environment.public_base_url` to the same value so the worker registers
+webhooks against it (Telegram requires HTTPS).
+
+- **RBAC.** The bootstrap Role grants `networking.k8s.io/ingresses`
+  get/create/patch/delete. `op credentials requirements` probes those verbs
+  ONLY when an `ingress_*` answer is set, so an env bootstrapped before they
+  existed and using no Ingress validates exactly as before; one that adds an
+  Ingress fails validation naming the missing verb until you re-run
+  `gtc op credentials bootstrap <env>` (or re-apply its rules pack).
+- **Removal.** Clearing the answers makes the next `op env reconcile` delete
+  the `gtc-router` Ingress and list it under `pruned` — but only if it carries
+  the deployer's owner labels (`app.kubernetes.io/managed-by: greentic`,
+  `app.kubernetes.io/component: router-ingress`, `greentic.ai/env: <env>`). An
+  operator-created Ingress of the same name is never deleted, and an identity
+  that may not read Ingresses deletes nothing.
 
 **B. Zero-infra cloudflared tunnel (demo / no Ingress).** Set
 `"tunnel": "cloudflared"` in `deployer-answers.json` and **remove**
@@ -512,10 +557,24 @@ are **rejected** (fail closed on version skew).
 |-----|------|---------|--------|
 | `kubeconfig_context` | string | current context | Which kubeconfig context `reconcile` targets. Client-targeting only — not a manifest knob. When the manifest carries a `cluster` block, `env up` derives this (`kind-<name>`) for its own reconcile; setting it to a *different* value here is an error. |
 | `namespace` | string (RFC 1123 label) | `gtc-<env-id>` | Override the namespace every object lands in. |
-| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:latest` | Container image for router + worker pods. Pin to a digest in production. (The `develop` lane defaults to the `:develop` tag.) |
+| `runtime_image` | string `[a-z0-9.\-_/:@]+` | `ghcr.io/greenticai/greentic-start-distroless:latest` | Container image for router + worker pods. Pin to a digest in production. (The `develop` lane defaults to the `:develop` tag.) A revision's `runtime_image_digest` pin overrides the tag/digest of its **worker** image only — see [Per-revision runtime pin](#per-revision-runtime-pin-governed-platform-releases). |
+| `init_image` | string `[a-z0-9.\-_/:@]+` | `busybox:1.36.1` | Container image for the pack's init containers. Same validation as `runtime_image`; pin a digest in production. |
 | `router_replicas` | int (string or number) | `2` | Router replica count. Must be **≥ 2** (HA). |
 | `tunnel` | `"off"` \| `"cloudflared"` | `off` | Worker public-exposure mode. `cloudflared` → worker spawns a quick tunnel (single-revision only). |
 | `oci_insecure_registries` | string[] (`host[:port]`) | `[]` | Registry authorities the worker/router may pull bundles from over plain HTTP. Rendered as `GREENTIC_OCI_INSECURE_REGISTRIES`. Empty → HTTPS only. |
+| `oci_username` | string | *(unset)* | Registry username for an authenticated `oci://` bundle pull — greentic-start's own in-process pull, NOT the kubelet's image pull (see `image_pull_secret` below for that). Rendered as a plain `OCI_USERNAME` pod env var; usernames are not treated as secret material. Must be set together with `oci_password`, or left unset — one without the other is rejected. |
+| `oci_password` | string | *(unset)* | Registry password for the same `oci://` bundle pull. Real secret material: never rendered as a plain pod env value — carried into the cluster as the `gtc-oci-credentials` Secret and referenced by the worker/router via `secretKeyRef`. Must be set together with `oci_username`, or left unset. The Secret is env-scoped and is **never pruned** when both answers are removed later — clearing them only stops the pods referencing it; the Secret itself stays in the namespace, mirroring `gtc-telemetry-headers` and `image_pull_secret` below. |
+| `image_pull_secret` | string (RFC 1123 label) | *(unset)* | Name of a `kubernetes.io/dockerconfigjson` Secret to render (from the `oci_username` / `oci_password` credential) and reference as `imagePullSecrets` from the worker and router pods — for a private runtime/init image or an authenticated air-gapped registry. Requires both `oci_username` and `oci_password` to also be set, and must not collide with the name of an object this pack already renders (`gtc-router`, `gtc-runtime-config`, `gtc-env-store`, `gtc-dev-secrets`, `gtc-oci-credentials`, `gtc-telemetry-headers`, `gtc-worker`, `gtc-router-tls`) — a `Secret`'s `type` is immutable, so a colliding name applies once and then fails every later reconcile. Unset → no Secret, no `imagePullSecrets` key at all. **Never pruned**: removing the answer later drops `imagePullSecrets` from the worker/router pods on the next reconcile, but the Secret itself stays in the namespace indefinitely, still holding live registry credentials — env-level objects are not pruned by design ([§9](#9-known-gaps--production-caveats)). **The `auths` entry's host is derived, not answered**: one entry per distinct authority of `runtime_image` and `init_image` (Docker's own segment-before-`/` heuristic), falling back to the first `oci_insecure_registries` entry only when neither image names an authority, and to the literal `docker.io` when nothing does at all — getting this host right is what decides whether the credential authenticates anything (`pull_secret_registry_hosts` in `manifests.rs`). |
+| `service_type` | `"ClusterIP"` \| `"NodePort"` \| `"LoadBalancer"` (case-insensitive) | `ClusterIP` | How the router Service is exposed. `op env reconcile` reports the resulting `router_address` (a load balancer still being provisioned reads `pending`). Worker Services stay `ClusterIP`. |
+| `ingress_host` | string (lowercase DNS name, ≥ 2 labels, no wildcard / IP) | *(unset)* | Render a managed Ingress `gtc-router` routing `<host>/` to the router Service on `:8080`, and report `public_base_url` from `op env reconcile`. Required when any other `ingress_*` key is set. Unset → no Ingress, manifests byte-identical to before; a deployer-owned Ingress left from earlier is deleted by the next reconcile and listed under `pruned`. See [§6 option C](#public-exposure-options). |
+| `ingress_class` | string (DNS-1123 subdomain) | cluster default | `spec.ingressClassName`. Requires `ingress_host`. |
+| `ingress_tls_secret` | string (DNS-1123 subdomain) | *(unset)* | Existing `kubernetes.io/tls` Secret to terminate TLS with → `public_base_url` is `https://`. Mutually exclusive with `ingress_cert_manager_issuer`; must not be a name this pack renders (incl. `gtc-router-tls`) or the `image_pull_secret`. |
+| `ingress_cert_manager_issuer` | string (DNS-1123 subdomain) | *(unset)* | cert-manager `ClusterIssuer` that issues the certificate into `gtc-router-tls` (annotation `cert-manager.io/cluster-issuer`) → `public_base_url` is `https://`. Mutually exclusive with `ingress_tls_secret`. |
+| `telemetry_env` | object (string values, exact-name allow-list) | *(unset)* | Plain telemetry env vars (`OTLP_ENDPOINT`, `OTEL_*`, `GREENTIC_TELEMETRY_*`, …) rendered into both the worker and the router pod, sorted, with `greentic.role=<worker\|router>` appended to `OTEL_RESOURCE_ATTRIBUTES`. No telemetry env at all, same as before this key existed, only when **neither** `telemetry_env` nor `telemetry_headers` is answered — answering either one on its own still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=<worker\|router>` to both pods. |
+| `telemetry_headers` | string | *(unset)* | The OTLP header credential (e.g. `authorization=Bearer …`). Never rendered as a literal — staged as a `gtc-telemetry-headers` Secret and referenced via `secretKeyRef` (`optional: true`) as `OTEL_EXPORTER_OTLP_HEADERS` / `OTLP_HEADERS`. The Secret is env-scoped and is never pruned when the answer is removed — clearing it only stops the pods referencing it, mirroring `gtc-oci-credentials`. Answering this alone (with `telemetry_env` unset) still adds `OTEL_RESOURCE_ATTRIBUTES=greentic.role=<worker\|router>` to both pods — see `telemetry_env` above. |
+
+Transitional: `telemetry_env` / `telemetry_headers` carry telemetry until a
+telemetry slot binding exists; the contract may move there.
 
 ### Env-manifest (`greentic.env-manifest.v1`) — K8s-relevant fields
 
@@ -533,24 +592,81 @@ are **rejected** (fail closed on version skew).
 
 ---
 
+### Per-revision runtime pin (governed platform releases)
+
+The k8s deployer declares the `runtime_pin` capability. A manifest bundle or
+revision entry may carry `runtime_image_digest: sha256:<64 hex>` (the image
+**index** digest); the revision's own worker Deployment then renders
+`<repository of runtime_image>@<digest>`. Rules, each of which fails silently if
+broken:
+
+- **Workers only.** The shared router (`gtc-router`) always runs the
+  `runtime_image` answer. A platform rollout never moves the router.
+- **Router last.** Move the router by editing the `runtime_image` answer, as a
+  separate environment-level step, *after* every unit is on the new worker.
+  Changing that answer rolls the router **and every unpinned worker** in place
+  (a normal rolling update, no 0%-warm step) — pinned revisions keep their pin.
+- **Open risk — router/worker version skew.** Router and worker are the same
+  binary family and speak a runtime-config schema and an HTTP dispatch contract
+  defined in greentic-start / greentic-runner, not in this repo. During a
+  rollout "new worker, old router" must be tolerated, and so must the reverse on
+  rollback. Nothing in this repo can verify that; confirm it with the
+  greentic-start owners before relying on a platform release in production.
+- **A pin never changes the repository.** Only the tag/digest part is replaced;
+  registry host, port and path stay the answer's, so an air-gapped mirror
+  repository survives. A pin carrying `/`, `@` or a `:tag` is refused at
+  manifest validation.
+- **A tag-ref `runtime_image` names no runtime identity.** The engine reads the
+  environment's runtime answer as the digest of a digest-pinned `runtime_image`,
+  and as *unknown* for a tag ref — so an unpinned revision never converges with
+  a pinned manifest entry, and a pinned revision under an unchanged answer is
+  not restaged.
+- **"Recorded" means "requested + rollout ready".** Nothing reads the pod's
+  `imageID` back (it reports a platform digest, the pin is the index digest), so
+  the recorded pin is not verified against what the node actually runs. Health
+  evidence is the existing rollout-available + `/healthz` readiness signal.
+- Remote dispatch compares raw pins, so a legacy unstamped (`None`) revision versus an entry pinned to the answer's own digest restages once (harmless).
+- An adapter that does **not** declare `runtime_pin` (or an older deployer) still
+  refuses a manifest pin, so a pinned entry is never silently ignored.
+
 ## 9. Known gaps & production caveats
 
 All verified in source. None silently broken — each is a deliberate current
 limitation with a workaround.
 
-- **No managed Ingress/LoadBalancer.** The deployer renders only `ClusterIP`
-  Services on `:8080`. External exposure is BYO-Ingress ([§7](#7-reaching-the-worker)
-  option A) or the ephemeral cloudflared tunnel (option B). There is no
-  first-class stable-hostname mode yet.
+- **Removal is explicit.** `op env apply` never deletes by omission. Retire a
+  deployment with `op bundles retire` (clears its split, drains, tears down its
+  workers, removes it), or opt into `op env apply --prune --confirm-prune` for
+  what the manifest owns — see [removal.md](removal.md). Then `op env reconcile`
+  to refresh the router's runtime config.
+
+- **Managed Ingress is opt-in and minimal.** `ingress_host` renders one
+  Ingress to the router (one host, path `/`, optional TLS); anything richer
+  (multiple hosts, custom annotations, a namespaced cert-manager `Issuer`) is
+  still BYO-Ingress ([§6](#6-deploying-to-a-new--real-cluster-eks-gke-aks-on-prem-k3s)
+  option A). An env bootstrapped before the Ingress verbs existed must be
+  re-bootstrapped before it can use one.
 - **Vault is dev-mode only.** The `dev-in-cluster` path deploys an in-memory,
   auto-unsealed Vault (`-dev`) — suitable for kind / local dev, not production.
   For production, use `external` mode pointed at a managed Vault instance
   ([§5b](#5b-hashicorp-vault-greenticsecretsvaul010)).
-- **No `imagePullSecrets`.** A private runtime image or private bundle registry
-  is not yet supported by the rendered manifests. The demo image and bundle are
-  public ghcr. Use `oci_insecure_registries` only for plain-HTTP dev registries.
+- **`imagePullSecrets` needs the `image_pull_secret` answer.** By default the
+  rendered manifests carry no `imagePullSecrets` key — the demo image and
+  bundle are public ghcr. Set `image_pull_secret` (with `oci_username` /
+  `oci_password`) to render a `kubernetes.io/dockerconfigjson` Secret and
+  attach it to the worker and router pods (init containers included, since
+  `imagePullSecrets` applies per-pod), for a private image or an
+  authenticated air-gapped registry.
 - **No `imagePullPolicy`.** Non-digest tags default to `IfNotPresent`; pin a
   digest for deterministic pulls.
+- **`warm_revision` applies worker manifests alone.** Adding `image_pull_secret`
+  (or any other env-level answer) and warming a revision before the next full
+  `reconcile` produces a worker referencing objects — the pull Secret included
+  — that were never applied to the cluster. This surfaces as a rollout
+  timeout on the worker Deployment, not as a missing-secret or missing-object
+  error, since the API server admits the Deployment and only the pod's own
+  `ImagePullBackOff`/mount failure reveals the real cause. Run `reconcile`
+  after changing an env-level answer, before warming a revision against it.
 - **Tunnel is single-revision.** Each worker pod spawns its own cloudflared
   tunnel, so a traffic split registers N competing webhooks. For multi-revision
   / production use BYO-Ingress with a stable `public_base_url`.
@@ -561,6 +677,61 @@ limitation with a workaround.
   with RBAC, idempotency replay, and CAS — exists in scaffold form but the
   remote `revisions stage`/`warm` verbs are not yet wired end-to-end. Until then,
   each operator's named envs live in their own local store.
+
+### Retiring a revision: drain, archive, sweep (P5-R2)
+
+Retiring is a sequence, not a delete: move the revision's traffic weight away →
+**drain** → archive → remove.
+
+- **`op env drain-revision <env> <rev>`** first stamps a `Ready` revision
+  `Draining` in the store (so the next `op env reconcile` does not re-apply its
+  replicas), then confirms routing is already at 0 — the recorded split, AND
+  the router's LIVE runtime-config ConfigMap after projecting the store's split
+  into it (a split recorded or cleared but never pushed still routes; an
+  unreadable ConfigMap fails closed). Only then does it wait the revision's
+  `drain_seconds` (capped by `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`, default 600;
+  every env duration is clamped to 24 h) as grace for sessions in flight at the
+  cut, scale the worker Deployment to 0, and poll until it runs no pod (up to
+  `GREENTIC_DEPLOYER_DRAIN_CONFIRM_TIMEOUT_SECS`, default 120).
+  **The confirmation signal is "zero ready endpoints"**, read from the worker
+  Deployment's `status.replicas` / `availableReplicas`: the router
+  (greentic-start) exposes no per-revision in-flight or session count to ask
+  instead. The Deployment status is read rather than EndpointSlices because the
+  bound Role already grants `deployments get` but not `endpointslices list`.
+- **`op env apply-revision` on an absent revision (the archive branch) is
+  gated:** it checks, right then, that the live router config no longer weights
+  the revision and that the worker has no READY pod (zero ready endpoints — a
+  worker whose pods never became ready serves nothing and passes), and refuses
+  with `not-drained` naming the revision otherwise. `--force-drain` archives
+  anyway (logged, evidence `forced`). `op bundles retire` drains its revisions
+  concurrently (at most 4 at a time), so a retire waits about one window.
+  `op bundles retire --drain-seconds <n>` replaces every revision's
+  `drain_seconds` for that retire (not shortened by
+  `GREENTIC_DEPLOYER_DRAIN_MAX_SECONDS`; above 86400 it is refused, not
+  clamped); absent, each revision drains by its own window. The retire result
+  echoes it as `drain_seconds`; `--schema-only` lists it as a property.
+- **`op env sweep <env> [--apply]`** lists worker Deployments/Services carrying
+  `app.kubernetes.io/managed-by=greentic`, `app.kubernetes.io/component=worker`
+  and `greentic.ai/env=<env>`. The env id is not unique across stores (every
+  designer-driven store is `local`, often sharing one namespace), so every
+  worker is also stamped `greentic.ai/store=<hash of the store's env dir>` on
+  apply, and the sweep deletes ONLY objects carrying this store's label whose
+  `greentic.ai/revision` is absent from the store. An object without the store
+  label (rendered before it existed; it gains it on the next reconcile) is
+  reported `unattributed`, one with another store's label is `skipped` — neither
+  is ever deleted. Each delete re-checks every ownership label on the live
+  object. Dry-run by default; `--apply` holds the env lock for the whole
+  list → delete span. Listing needs
+  `get`/`list` on `deployments` and `services`: the bootstrap Role grants them,
+  but `op credentials requirements` does **not** probe them, so an env bound
+  before they existed keeps validating. The sweep checks them itself first
+  (`SelfSubjectAccessReview`) and refuses with `permission-missing`, naming the
+  permission and `gtc op credentials bootstrap <env>`, when the identity lacks
+  them.
+- **`op env capabilities <env>`** (also under `deployer_capabilities` in
+  `op env doctor`) reports the adapter's flags: K8s claims `drain`,
+  `traffic_split`, `private_registry_auth`, `remove`; not `ingress_managed` (no
+  Ingress is rendered) nor `multi_instance_safe` (no shared session store).
 
 ---
 

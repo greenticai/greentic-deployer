@@ -30,6 +30,8 @@ use greentic_deploy_spec::BundleDeploymentStatus;
 use super::OpError;
 use super::bundles::{RevenueShareEntryPayload, RouteBindingPayload, TenantSelectorPayload};
 
+pub use crate::environment::sor_units::SorUnit as ManifestSorUnit;
+
 /// Exact `schema` discriminator the manifest must carry.
 pub const ENV_MANIFEST_SCHEMA_V1: &str = "greentic.env-manifest.v1";
 
@@ -92,6 +94,13 @@ pub struct EnvManifest {
     /// bind). Ignored by plain `env apply`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_bootstrap: Option<VaultBootstrapConfig>,
+    /// System-of-Record units (SoRLa phase 3, contract C2). JSON-first like
+    /// `cluster` / `updates` / `vault_bootstrap`: not a wizard question, not in
+    /// the emitted schema. Absent = leave the recorded set untouched; `[]` =
+    /// remove every SoR unit. `op env apply` records it in
+    /// `<env_dir>/sor-units.json`; `op env reconcile` deploys it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sor_units: Option<Vec<ManifestSorUnit>>,
 }
 
 /// `updates` block of [`EnvManifest`] — a declarative mirror of
@@ -480,18 +489,30 @@ pub struct ManifestBundle {
     /// Recommended for a `bundle_source_uri`-only bundle so the pull is pinned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_digest: Option<String>,
+    /// `sha256:<hex>` of the greentic-start-distroless image this bundle runs
+    /// (unified update L2). Absent = the deployer binding's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image_digest: Option<String>,
 }
 
 /// One revision in a multi-revision bundle entry. Each carries its own
-/// bundle artifact path and optional traffic weight / drain / abort knobs.
+/// artifact source and optional traffic weight / drain / abort knobs.
+///
+/// The source is a local `bundle_path` (optionally with a `bundle_source_uri`
+/// pull ref recorded alongside it) OR, remote-only, a `bundle_source_uri` plus
+/// a pinned `bundle_digest` with no `bundle_path` — fetched and verified
+/// exactly like a single-revision URI-only bundle. A remote-only revision that
+/// an existing split already serves unchanged is not fetched at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestRevision {
     /// Manifest-local handle — unique within the bundle's `revisions[]`.
     pub name: String,
     /// Local `.gtbundle`. Same path-resolution rules as
-    /// [`ManifestBundle::bundle_path`].
-    pub bundle_path: PathBuf,
+    /// [`ManifestBundle::bundle_path`]. Absent = remote-only: then
+    /// `bundle_source_uri` AND `bundle_digest` are both required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<PathBuf>,
     /// Traffic weight as a percentage (0..=100). Mutually exclusive with
     /// `weight_bps` on the same revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,16 +529,22 @@ pub struct ManifestRevision {
     /// canary-evaluation engine (not consumed by apply today).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub abort_metrics: Vec<String>,
-    /// Optional `oci://`/`repo://`/`store://` pull ref recorded on this staged
-    /// revision so a K8s worker can fetch it at boot. `bundle_path` stays
-    /// required (integrity digest). Absent = local-serve only.
+    /// `oci://`/`repo://`/`store://` pull ref recorded on this staged revision
+    /// so a remote worker can fetch it at boot. With a `bundle_path` it rides
+    /// alongside (the path is the digest source); without one it is the
+    /// artifact source (`oci://` only, like the single-revision form).
+    /// Absent = local-serve only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_source_uri: Option<String>,
-    /// Optional `sha256:<hex>` integrity pin for `bundle_path`. When set, apply
-    /// fails closed unless the artifact hashes to this; absent = record the
-    /// computed digest.
+    /// `sha256:<hex>` integrity pin for the artifact. When set, apply fails
+    /// closed unless the artifact hashes to this; absent = record the computed
+    /// digest. Required for a remote-only revision (no `bundle_path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_digest: Option<String>,
+    /// `sha256:<hex>` of the greentic-start-distroless image this revision runs
+    /// (unified update L2). Absent = the deployer binding's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,6 +835,19 @@ impl EnvManifest {
             }
             // Integrity pin format (when declared): a `sha256:<hex>` string.
             validate_digest_pin(&b.bundle_id, None, b.bundle_digest.as_deref())?;
+            super::env_apply::runtime_pin::validate_runtime_pin(
+                &format!("bundle `{}`", b.bundle_id),
+                b.runtime_image_digest.as_deref(),
+            )
+            .map_err(OpError::InvalidArgument)?;
+            if b.revisions.is_some() && b.runtime_image_digest.is_some() {
+                return Err(OpError::InvalidArgument(format!(
+                    "bundle `{}`: bundle-level `runtime_image_digest` is for the \
+                     single-revision form — declare a per-revision \
+                     `runtime_image_digest` inside `revisions[]` for a traffic split",
+                    b.bundle_id
+                )));
+            }
 
             // Per-revision validation (multi-revision form only).
             if let Some(revisions) = &b.revisions {
@@ -845,6 +885,66 @@ impl EnvManifest {
                         Some(&rev.name),
                         rev.bundle_digest.as_deref(),
                     )?;
+                    super::env_apply::runtime_pin::validate_runtime_pin(
+                        &format!("bundle `{}`, revision `{}`", b.bundle_id, rev.name),
+                        rev.runtime_image_digest.as_deref(),
+                    )
+                    .map_err(OpError::InvalidArgument)?;
+                    // Source: a local `bundle_path`, or remote-only — a
+                    // `bundle_source_uri` with a pinned `bundle_digest`. The
+                    // pin is mandatory remote-only: it is what lets apply
+                    // match an already-serving revision without pulling, and
+                    // what the pull is verified against when it does.
+                    //
+                    // `bundle_path` + `bundle_source_uri` together stays
+                    // legal, exactly as in the single-revision form: the path
+                    // supplies (and is hashed as) the artifact and the URI is
+                    // only the pull ref recorded for a remote worker.
+                    if rev.bundle_path.is_none() {
+                        let has_uri = rev
+                            .bundle_source_uri
+                            .as_deref()
+                            .is_some_and(|u| !u.trim().is_empty());
+                        if !has_uri || rev.bundle_digest.is_none() {
+                            return Err(OpError::InvalidArgument(format!(
+                                "bundle `{}`, revision `{}`: a revision needs a local \
+                                 `bundle_path`, or a remote `bundle_source_uri` together \
+                                 with a pinned `bundle_digest` (sha256:…)",
+                                b.bundle_id, rev.name
+                            )));
+                        }
+                        // The pin must be canonical before anything is pulled:
+                        // reuse matches it byte-for-byte against the stored
+                        // digest, so e.g. uppercase hex would always re-pull
+                        // and then fail the gate.
+                        let pin = rev.bundle_digest.as_deref().unwrap_or_default();
+                        if !is_canonical_sha256(pin) {
+                            return Err(OpError::InvalidArgument(format!(
+                                "bundle `{}`, revision `{}`: a remote-only revision's \
+                                 bundle_digest `{pin}` must be `sha256:` followed by 64 \
+                                 lowercase hex characters",
+                                b.bundle_id, rev.name
+                            )));
+                        }
+                    }
+                }
+                // Two members pinning the same artifact AND the same runtime
+                // are degenerate. Unpinned members stay legal (split_reuse
+                // treats same-artifact members as distinct revisions).
+                for (i, x) in revisions.iter().enumerate() {
+                    for y in &revisions[i + 1..] {
+                        if x.bundle_digest.is_some()
+                            && x.bundle_digest == y.bundle_digest
+                            && x.runtime_image_digest.is_some()
+                            && x.runtime_image_digest == y.runtime_image_digest
+                        {
+                            return Err(OpError::InvalidArgument(format!(
+                                "bundle `{}`: revisions `{}` and `{}` name the same \
+                                 artifact and runtime",
+                                b.bundle_id, x.name, y.name
+                            )));
+                        }
+                    }
                 }
                 // Weight consistency: all-set must sum to FULL_TRAFFIC_BPS;
                 // all-unset = equal split (computed at resolve time); mixed = error.
@@ -988,6 +1088,10 @@ impl EnvManifest {
                 }
             }
         }
+
+        if let Some(units) = &self.sor_units {
+            super::env_sor::validate_sor_units(units)?;
+        }
         Ok(())
     }
 }
@@ -1016,6 +1120,17 @@ fn validate_digest_pin(
     Err(OpError::InvalidArgument(format!(
         "{location}: bundle_digest `{digest}` must be a `sha256:<hex>` string"
     )))
+}
+
+/// `sha256:` + exactly 64 lowercase hex characters — the form the store
+/// records for a staged artifact.
+fn is_canonical_sha256(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
 }
 
 /// Validate the weight consistency of a multi-revision bundle entry.
@@ -1210,17 +1325,18 @@ pub fn manifest_schema() -> Value {
                             "description": "multi-revision / traffic-split form; mutually exclusive with `bundle_path`",
                             "items": {
                                 "type": "object",
-                                "required": ["name", "bundle_path"],
+                                "required": ["name"],
                                 "additionalProperties": false,
                                 "properties": {
                                     "name": {"type": "string", "description": "manifest-local handle, unique within the bundle"},
-                                    "bundle_path": {"type": "string", "description": "local .gtbundle; relative to the manifest file"},
+                                    "bundle_path": {"type": ["string", "null"], "description": "local .gtbundle; relative to the manifest file. Absent = remote-only: bundle_source_uri + bundle_digest required"},
                                     "weight_percent": {"type": ["integer", "null"], "description": "0..100; mutually exclusive with weight_bps"},
                                     "weight_bps": {"type": ["integer", "null"], "description": "0..10000; mutually exclusive with weight_percent"},
                                     "drain_seconds": {"type": ["integer", "null"], "description": "per-revision drain window override"},
                                     "abort_metrics": {"type": "array", "items": {"type": "string"}, "description": "reserved for canary evaluation"},
-                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for K8s boot; rides alongside bundle_path (digest source); absent = local-serve only"},
-                                    "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for bundle_path; verified at apply"}
+                                    "bundle_source_uri": {"type": ["string", "null"], "description": "oci://repo://store:// pull ref for remote boot; rides alongside bundle_path (digest source), or without one is the artifact source (oci:// only, fetched at apply unless an unchanged serving revision is reused); absent = local-serve only"},
+                                    "bundle_digest": {"type": ["string", "null"], "description": "sha256:<hex> integrity pin, verified at apply; required when bundle_path is absent"},
+                                    "runtime_image_digest": {"type": ["string", "null"], "description": "sha256:<hex> of the greentic-start-distroless image this revision runs; absent = the deployer binding's answer"}
                                 }
                             }
                         },
@@ -1253,7 +1369,8 @@ pub fn manifest_schema() -> Value {
                             }
                         },
                         "bundle_source_uri": {"type": ["string", "null"], "description": "single-revision oci:// pull ref for K8s boot; may stand alone (apply fetches it once for the digest) or ride alongside bundle_path; absent = local bundle_path required"},
-                        "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for the resolved artifact; verified at apply, else the computed digest is recorded"}
+                        "bundle_digest": {"type": ["string", "null"], "description": "optional sha256:<hex> integrity pin for the resolved artifact; verified at apply, else the computed digest is recorded"},
+                        "runtime_image_digest": {"type": ["string", "null"], "description": "sha256:<hex> of the greentic-start-distroless image this bundle runs (single-revision form); absent = the deployer binding's answer"}
                     }
                 }
             },
@@ -1841,6 +1958,7 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
             // pins are JSON-first (hand-authored for K8s deployments).
             bundle_source_uri: None,
             bundle_digest: None,
+            runtime_image_digest: None,
         });
     }
 
@@ -1900,6 +2018,7 @@ pub fn answers_to_manifest(answers: &AnswerSet) -> Result<EnvManifest, OpError> 
         // JSON-first block (like `cluster`/`updates`); the wizard never asks
         // about in-cluster Vault provisioning.
         vault_bootstrap: None,
+        sor_units: None,
         trust_root,
         secrets,
         packs: Vec::new(),
@@ -2593,6 +2712,7 @@ mod tests {
             // OCI/repo/store pull ref + digest pin are JSON-first (no form question).
             ("bundles[].bundle_source_uri", ""),
             ("bundles[].bundle_digest", ""),
+            ("bundles[].runtime_image_digest", ""),
             // Multi-revision fields are JSON-first (no form question).
             ("bundles[].revisions[].name", ""),
             ("bundles[].revisions[].bundle_path", ""),
@@ -2602,6 +2722,7 @@ mod tests {
             ("bundles[].revisions[].abort_metrics", ""),
             ("bundles[].revisions[].bundle_source_uri", ""),
             ("bundles[].revisions[].bundle_digest", ""),
+            ("bundles[].revisions[].runtime_image_digest", ""),
             ("bundles[].customer_id", "bundles.customer_id"),
             // revenue_share / status are JSON-first (no form question).
             ("bundles[].revenue_share[].party_id", ""),
@@ -2989,6 +3110,72 @@ mod tests {
         assert_eq!(weights, vec![7000, 3000]);
     }
 
+    fn split_manifest(revisions: serde_json::Value) -> EnvManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "split", "revisions": revisions}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_only_and_mixed_split_revisions_are_accepted() {
+        split_manifest(serde_json::json!([
+            {"name": "a", "bundle_source_uri": "oci://r/a:1", "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+             "weight_percent": 90},
+            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "weight_percent": 10}
+        ]))
+        .validate_shape()
+        .expect("remote-only split");
+        split_manifest(serde_json::json!([
+            {"name": "a", "bundle_path": "a.gtbundle", "weight_percent": 90},
+            {"name": "b", "bundle_source_uri": "oci://r/b:1", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+             "weight_percent": 10}
+        ]))
+        .validate_shape()
+        .expect("mixed path + remote split");
+    }
+
+    #[test]
+    fn a_remote_only_pin_must_be_canonical_sha256() {
+        for pin in [
+            "sha256:aa".to_string(),
+            format!("sha256:{}", "A".repeat(64)),
+            "a".repeat(64),
+            format!("sha256:{}", "g".repeat(64)),
+        ] {
+            let err = split_manifest(serde_json::json!([
+                {"name": "a", "bundle_source_uri": "oci://r/a:1", "bundle_digest": pin}
+            ]))
+            .validate_shape()
+            .expect_err("non-canonical pin");
+            assert!(
+                matches!(&err, OpError::InvalidArgument(_)),
+                "{pin}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_revision_without_a_path_needs_a_uri_and_a_pinned_digest() {
+        for rev in [
+            serde_json::json!({"name": "a", "bundle_source_uri": "oci://r/a:1"}),
+            serde_json::json!({"name": "a", "bundle_digest": "sha256:aa"}),
+            serde_json::json!({"name": "a", "bundle_source_uri": " ", "bundle_digest": "sha256:aa"}),
+            serde_json::json!({"name": "a"}),
+        ] {
+            let err = split_manifest(serde_json::json!([rev.clone()]))
+                .validate_shape()
+                .expect_err("refused");
+            assert!(
+                matches!(&err, OpError::InvalidArgument(m) if m.contains("pinned `bundle_digest`")),
+                "{rev}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn multi_revision_weight_sum_not_10000_fails() {
         let manifest: EnvManifest = serde_json::from_value(serde_json::json!({
@@ -3183,6 +3370,90 @@ mod tests {
             err.to_string().contains("must be a `sha256:<hex>` string"),
             "{err}"
         );
+    }
+
+    const RT_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RT_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const RT_DIGEST: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn runtime_split(rt0: Option<&str>, rt1: Option<&str>) -> serde_json::Value {
+        let mut r0 = serde_json::json!({"name": "baseline", "bundle_source_uri": "oci://r/b:1",
+            "bundle_digest": RT_DIGEST, "weight_percent": 100});
+        let mut r1 = serde_json::json!({"name": "candidate", "bundle_source_uri": "oci://r/b:1",
+            "bundle_digest": RT_DIGEST, "weight_percent": 0});
+        if let Some(v) = rt0 {
+            r0["runtime_image_digest"] = v.into();
+        }
+        if let Some(v) = rt1 {
+            r1["runtime_image_digest"] = v.into();
+        }
+        serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b", "revisions": [r0, r1]}]
+        })
+    }
+
+    #[test]
+    fn a_split_revision_may_pin_its_runtime() {
+        let m: EnvManifest = serde_json::from_value(runtime_split(Some(RT_A), Some(RT_B))).unwrap();
+        m.validate_shape().expect("valid");
+        assert_eq!(
+            m.bundles[0].revisions.as_ref().unwrap()[1]
+                .runtime_image_digest
+                .as_deref(),
+            Some(RT_B)
+        );
+    }
+
+    #[test]
+    fn two_split_members_pinning_the_same_artifact_and_runtime_are_refused() {
+        let m: EnvManifest = serde_json::from_value(runtime_split(Some(RT_A), Some(RT_A))).unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("same artifact and runtime"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unpinned_same_artifact_split_members_stay_legal() {
+        let m: EnvManifest = serde_json::from_value(runtime_split(None, None)).unwrap();
+        m.validate_shape().expect("legacy split unchanged");
+        let m: EnvManifest = serde_json::from_value(runtime_split(Some(RT_A), None)).unwrap();
+        m.validate_shape().expect("one pin is legal");
+    }
+
+    #[test]
+    fn a_malformed_runtime_pin_is_refused() {
+        let m: EnvManifest = serde_json::from_value(runtime_split(Some("develop"), None)).unwrap();
+        let msg = m.validate_shape().expect_err("malformed pin").to_string();
+        assert!(msg.contains("runtime_image_digest"), "{msg}");
+        assert!(msg.contains("`develop`"), "{msg}");
+    }
+
+    #[test]
+    fn a_single_revision_bundle_may_pin_its_runtime_but_a_split_bundle_may_not() {
+        let single: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"},
+            "bundles": [{"bundle_id": "b", "bundle_source_uri": "oci://r/b:1",
+                "runtime_image_digest": RT_A}]
+        }))
+        .unwrap();
+        single.validate_shape().expect("valid");
+        assert_eq!(
+            single.bundles[0].runtime_image_digest.as_deref(),
+            Some(RT_A)
+        );
+        let mut v = runtime_split(None, None);
+        v["bundles"][0]["runtime_image_digest"] = RT_A.into();
+        let split: EnvManifest = serde_json::from_value(v).unwrap();
+        let msg = split
+            .validate_shape()
+            .expect_err("bundle-level pin on a split")
+            .to_string();
+        assert!(msg.contains("runtime_image_digest"), "{msg}");
+        assert!(msg.contains("single-revision form"), "{msg}");
     }
 
     #[test]
@@ -3935,5 +4206,83 @@ mod tests {
         .unwrap();
         let err2 = m2.validate_shape().unwrap_err();
         assert!(matches!(err2, OpError::InvalidArgument(_)), "{err2}");
+    }
+
+    fn sor_unit_json() -> Value {
+        serde_json::json!({
+            "unit_id": "landlord",
+            "sor": "landlord-tenant-sor",
+            "pack_ref": format!("oci://registry.example/greentic/sor-landlord:sor-landlord-3f2a9c1b8d7e@sha256:{}", "b".repeat(64)),
+            "image": "ghcr.io/greenticai/greentic-sorx:0.2.36114419551",
+            "tenant_id": "acme",
+            "answers_ref": "default/_/sor-landlord/answers",
+            "postgres_url_ref": "default/_/sor-landlord/postgres_url",
+            "postgres_ca_ref": null,
+            "shared_secret_ref": "default/_/sor-landlord/shared_secret"
+        })
+    }
+
+    #[test]
+    fn sor_units_round_trip_keeping_their_shape() {
+        let doc = serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1,
+            "environment": {"id": "local"},
+            "sor_units": [sor_unit_json()]
+        });
+        let m: EnvManifest = serde_json::from_value(doc.clone()).expect("parses");
+        m.validate_shape().expect("valid");
+        assert_eq!(m.sor_units.as_ref().unwrap()[0].unit_id, "landlord");
+        let back = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            back["sor_units"], doc["sor_units"],
+            "the C2 shape survives a round trip"
+        );
+    }
+
+    #[test]
+    fn an_absent_sor_units_key_is_none_and_an_empty_list_is_some() {
+        let absent: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"}
+        }))
+        .unwrap();
+        assert!(absent.sor_units.is_none());
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("sor_units")
+                .is_none()
+        );
+        let empty: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"}, "sor_units": []
+        }))
+        .unwrap();
+        assert_eq!(empty.sor_units.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn an_unknown_sor_unit_key_is_refused() {
+        let mut unit = sor_unit_json();
+        unit["replicas"] = serde_json::json!(2);
+        let err = serde_json::from_value::<EnvManifest>(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"}, "sor_units": [unit]
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("replicas"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_sor_unit_id_fails_validate_shape() {
+        let mut second = sor_unit_json();
+        second["sor"] = serde_json::json!("other-sor");
+        let m: EnvManifest = serde_json::from_value(serde_json::json!({
+            "schema": ENV_MANIFEST_SCHEMA_V1, "environment": {"id": "local"},
+            "sor_units": [sor_unit_json(), second]
+        }))
+        .unwrap();
+        let err = m.validate_shape().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate unit_id `landlord`"),
+            "{err}"
+        );
     }
 }

@@ -72,12 +72,20 @@ pub(crate) mod async_bridge;
 pub mod bootstrap;
 pub mod bound_identity;
 pub mod cluster;
+#[cfg(test)]
+pub(crate) mod cluster_fake;
 pub mod credentials;
 pub mod deployer;
+mod drain;
+mod ingress_prune;
 #[cfg(feature = "k8s-client")]
 pub mod kube_client;
+#[cfg(feature = "k8s-client")]
+mod kube_ops;
 pub mod manifests;
 pub mod render;
+pub mod sor_reconcile;
+pub mod sweep;
 #[cfg(feature = "k8s-client")]
 pub mod vault_bootstrap;
 #[cfg(feature = "k8s-client")]
@@ -88,15 +96,21 @@ use std::sync::Arc;
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
 
+use super::deployer::DrainPolicy;
 use super::slot::EnvPackHandler;
 use crate::tool_check::ToolCheck;
 
 pub use bound_identity::resolve_bound_identity;
-pub use cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, UnconfiguredCluster};
+pub use cluster::{
+    K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, ServiceStatus, UnconfiguredCluster,
+};
 pub use credentials::{K8sDeployerCredentials, K8sValidatorClient};
-pub use deployer::ReconcileReport;
+pub use deployer::{ReconcileReport, RouterAddress};
 #[cfg(feature = "k8s-client")]
 pub use kube_client::{KubeCluster, KubeValidatorClient};
+pub use sor_reconcile::{
+    RouteDocument, SorReconcile, SorRoutePublisher, SorUnitRender, SorUnitStatus,
+};
 
 /// Native handler for the K8s deployer env-pack.
 #[derive(Debug)]
@@ -116,6 +130,13 @@ pub struct K8sDeployerHandler {
     /// [`Self::with_secrets_backend`]; defaults to
     /// [`SecretsBackend::DevStore`](manifests::SecretsBackend::DevStore).
     secrets_backend: manifests::SecretsBackend,
+    /// How `drain_revision` waits and confirms (P5-R2). Defaults to
+    /// [`DrainPolicy::from_env`]; tests inject [`DrainPolicy::immediate`].
+    pub(crate) drain_policy: DrainPolicy,
+    /// This store's identity, stamped on every worker it renders
+    /// ([`manifests::STORE_LABEL`]); the orphan sweep claims only matching
+    /// workers. `None` stamps nothing.
+    pub(crate) store_label: Option<String>,
 }
 
 impl Default for K8sDeployerHandler {
@@ -125,6 +146,8 @@ impl Default for K8sDeployerHandler {
             cluster: Arc::new(UnconfiguredCluster),
             dev_secrets_data: None,
             secrets_backend: manifests::SecretsBackend::DevStore,
+            drain_policy: DrainPolicy::from_env(),
+            store_label: None,
         }
     }
 }
@@ -148,6 +171,8 @@ impl K8sDeployerHandler {
             cluster,
             dev_secrets_data: None,
             secrets_backend: manifests::SecretsBackend::DevStore,
+            drain_policy: DrainPolicy::from_env(),
+            store_label: None,
         }
     }
 
@@ -164,6 +189,8 @@ impl K8sDeployerHandler {
             cluster,
             dev_secrets_data,
             secrets_backend: manifests::SecretsBackend::DevStore,
+            drain_policy: DrainPolicy::from_env(),
+            store_label: None,
         }
     }
 
@@ -174,6 +201,18 @@ impl K8sDeployerHandler {
     /// `VAULT_*` env).
     pub fn with_secrets_backend(mut self, secrets_backend: manifests::SecretsBackend) -> Self {
         self.secrets_backend = secrets_backend;
+        self
+    }
+
+    /// Set this store's identity (builder-style); see [`sweep::store_label_for`].
+    pub fn with_store_label(mut self, store_label: Option<String>) -> Self {
+        self.store_label = store_label;
+        self
+    }
+
+    /// Override the drain wait/confirm policy (builder-style).
+    pub fn with_drain_policy(mut self, drain_policy: DrainPolicy) -> Self {
+        self.drain_policy = drain_policy;
         self
     }
 }
@@ -275,5 +314,33 @@ mod tests {
         let spec: qa_spec::FormSpec =
             serde_yaml_bw::from_str(yaml).expect("wizard.qaspec.yaml parses as FormSpec");
         assert_eq!(spec.id, "greentic.deployer.k8s.wizard");
+    }
+
+    /// The wizard's own header states credential MATERIAL is never
+    /// collected here — which is why `oci_username`/`oci_password` have no
+    /// questions of their own. `image_pull_secret` is a KNOWN, accepted
+    /// `K8sParams::from_answers` key (declarative env manifests may still
+    /// set it directly), but `from_answers` hard-refuses it unless BOTH
+    /// `oci_username` AND `oci_password` are also set — answers the wizard
+    /// can never collect. A wizard question for it can therefore only ever
+    /// fail, naming two answers the operator was never asked for. `init_image`
+    /// has no such prerequisite and keeps its question.
+    #[test]
+    fn wizard_omits_image_pull_secret_but_keeps_init_image() {
+        let yaml = K8sDeployerHandler::default()
+            .wizard_qaspec_yaml()
+            .expect("k8s handler ships a wizard QASpec");
+        let spec: qa_spec::FormSpec =
+            serde_yaml_bw::from_str(yaml).expect("wizard.qaspec.yaml parses as FormSpec");
+        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"image_pull_secret"),
+            "image_pull_secret requires oci_username/oci_password, which this wizard never \
+             collects, so it can only ever fail — got questions: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"init_image"),
+            "init_image has no such prerequisite and must keep its question — got: {ids:?}"
+        );
     }
 }

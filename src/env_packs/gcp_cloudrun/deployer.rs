@@ -1,0 +1,2932 @@
+//! [`Deployer`] impl for the GCP Cloud Run env-pack.
+//!
+//! Drives the Cloud Run revision lifecycle through the
+//! [`CloudRunTarget`](super::deploy_target) seam, mirroring the AWS-ECS
+//! [`deployer`](crate::env_packs::aws::deployer) structure but against Cloud
+//! Run's single-resource + `etag` model:
+//!
+//! - **`warm`** creates the revision only if it does not already exist, then
+//!   waits for it to report `Ready` and applies the invoker policy. Creating
+//!   reads the live Service (for its `etag`) and upserts the new revision at 0%
+//!   traffic when the Service already exists, or creates the Service with 100%
+//!   pinned to the *named* first revision when it does not (plan D4). Cloud Run
+//!   revisions are immutable, so an existing one is converged onto rather than
+//!   re-rendered — but only when its stamped intent matches this warm's, else
+//!   the name is taken by a configuration we cannot reconcile (`live_revision`).
+//! - **`apply_traffic_split`** enforces the shared `sum == 10000 bps`
+//!   invariant, then rejects any weight that is not a whole multiple of 100 bps
+//!   (Cloud Run's `percent` is an integer 0..=100 and cannot represent basis
+//!   points faithfully — plan D1), converts the rest to integer percent, and
+//!   sets the Service traffic under `etag` optimistic concurrency.
+//! - **`stage`** is a guarded no-op; **`drain`** waits the drain window then
+//!   confirms the live Service gives the revision 0 % (P5-R2, `super::drain`);
+//!   **`archive`** is an idempotent revision delete.
+//!
+//! Pure-spec preconditions (`require_revision`, `enforce_split_invariants`, the
+//! bps-granularity check) run BEFORE any provider call. The bps-granularity
+//! rejection surfaces as [`DeployerError::Provider`] — the same channel the
+//! AWS impl uses for its pre-provider `params_from_answers` failures; the typed
+//! `InvalidSplit` variant stays reserved for the shared `sum != 10000`
+//! invariant it documents.
+
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use greentic_deploy_spec::{DeploymentId, Environment, Revision, RevisionId, TrafficSplitEntry};
+use serde_json::Value;
+
+use crate::cli::secrets::DEV_STORE_RELATIVE;
+use crate::env_packs::deployer::{
+    AdapterCapabilities, ArchiveOutcome, Deployer, DeployerError, DrainEvidence, DrainOutcome,
+    StageOutcome, TrafficSplitOutcome, WarmOutcome, enforce_split_invariants, require_revision,
+};
+use crate::env_packs::telemetry::{
+    self as telemetry_answers, HEADER_ENV_NAMES, TelemetryAnswerError, TelemetryAnswers,
+};
+use crate::environment::seed_environment_bytes;
+
+use super::GcpCloudRunDeployerHandler;
+use super::deploy_target::{
+    AccessMode, CloudRunTargetError, EnsuredSecret, RevisionRef, ScalingSpec, SecretEnvVar,
+    SecretMount, SecretMountItem, ServiceRef, ServiceSpec, TrafficTarget,
+};
+use super::redis_secret::{self, redis_url_secret_name};
+use super::seed_pointer::{SeedMode, stage_seed};
+use super::shared_state::{
+    self, REDIS_URL_ENV_NAMES, RawSharedStateAnswers, SharedState, SharedStateAnswerError,
+    VpcAccess, VpcTarget,
+};
+
+/// Default runtime image (plan D2/D3): the public GHCR distroless image Cloud
+/// Run pulls directly. `:develop` matches this lane; digest-pinning is
+/// recommended in the answers to defeat the ≤1h tag cache.
+const DEFAULT_RUNTIME_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless";
+const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
+
+/// Warm-readiness poll deadline (plan D4). Overridable via the env var so a
+/// slow first cold-start image pull does not trip a fixed budget.
+const WARM_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const WARM_READY_TIMEOUT_ENV: &str = "GREENTIC_GCP_WARM_READY_TIMEOUT_SECS";
+const WARM_READY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Cloud Run `sessionAffinity` (plan D11). A constant rather than a literal at
+/// the render site: [`revision_intent`] fingerprints it, and a stamp that
+/// disagreed with what was stamped would reject every warm as a conflict.
+const SESSION_AFFINITY: bool = true;
+
+/// Bounded retries for an `etag` optimistic-concurrency conflict (plan D4: on a
+/// precondition failure the adapter re-reads and recomputes rather than
+/// replaying stale state). A concurrent warm/traffic mutation should resolve
+/// well within this budget; exceeding it is surfaced as a provider error.
+const MAX_ETAG_RETRIES: u32 = 5;
+
+fn warm_ready_timeout() -> Duration {
+    std::env::var(WARM_READY_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(WARM_READY_TIMEOUT)
+}
+
+/// Operator-facing knobs the Cloud Run deployer reads from the binding's wizard
+/// answers (`answers_ref`, flat JSON keyed by question id). `None` answers use
+/// the sandbox defaults from [`GcpCloudRunParams::for_env`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcpCloudRunParams {
+    pub project: String,
+    pub region: String,
+    pub access_mode: AccessMode,
+    /// Optional Artifact Registry *remote repository* proxying ghcr.io for the
+    /// higher-availability case (plan D3). Empty = deploy the public GHCR image
+    /// directly (the free-when-idle default).
+    pub ar_repo: Option<String>,
+    pub runtime_image_tag: String,
+    /// When set, the image is pinned by digest (recommended — plan D3).
+    pub runtime_image_digest: Option<String>,
+    pub service_account: Option<String>,
+    /// The tenant the deployed workload resolves secrets under, projected as
+    /// `GREENTIC_TENANT` (see [`runtime_boot_env`]).
+    ///
+    /// **Not cosmetic identity.** greentic-start's `config.tenant` defaults to
+    /// `default`, and that value is a path SEGMENT of every `secrets://` URI the
+    /// workload builds: `secrets://{env}/{tenant}/{team}/…`. Nothing else in the
+    /// env-manifest overrides it, so a workload owned by tenant `aws` looked
+    /// under `default` and never found what the deploy had written. Measured
+    /// live on 2026-09-15, with the credential staged under the tenant `aws`:
+    ///
+    /// ```text
+    /// WASM secrets read MISS uri=secrets://default/default/_/mcp/ff308b9c-951a-…
+    /// ```
+    ///
+    /// Nothing was red at any layer — the deploy reported success, every flow
+    /// node reported ok, and the card rendered with every field blank. This
+    /// answer is therefore the difference between a credential being found and
+    /// being written somewhere nothing reads.
+    ///
+    /// `None` omits the variable entirely rather than emitting an empty one, so
+    /// an environment that sends no answer keeps today's boot env byte for byte
+    /// and greentic-start keeps its own default.
+    pub runtime_tenant: Option<String>,
+    /// The team the deployed workload resolves secrets under, projected as
+    /// `GREENTIC_TEAM` (see [`runtime_boot_env`]).
+    ///
+    /// The third segment of the same `secrets://{env}/{tenant}/{team}/…` URI as
+    /// [`Self::runtime_tenant`], and it fails the same silent way: greentic-
+    /// start's `config.team` also defaults to `default`, so a team-scoped
+    /// credential resolves to a path the runtime never reads, with no error at
+    /// any layer. See the doc on `runtime_tenant` for the measured MISS line.
+    ///
+    /// `None` omits the variable, leaving greentic-start's own default in force.
+    pub runtime_team: Option<String>,
+    pub secret_prefix: String,
+    pub cpu: String,
+    pub memory: String,
+    pub max_instances: u32,
+    pub min_instances: u32,
+    pub concurrency: u32,
+    /// `cpu_always_allocated`: keep CPU allocated between requests
+    /// (`cpu_idle = false`, instance-based billing). Default `false` renders
+    /// the Service and the revision intent byte for byte as before the answer
+    /// existed. Needed for a cron-triggered worker, together with
+    /// `min_instances >= 1`: greentic-start's cron loop runs in-process and is
+    /// starved while CPU is throttled.
+    pub cpu_always_allocated: bool,
+    /// `seed_mode`: `inline` (default — the seed is the secret version, exactly
+    /// as before the answer existed) or `auto` (a seed over 48 KiB is staged as
+    /// an OCI pointer). See [`super::seed_pointer`].
+    pub seed_mode: SeedMode,
+    /// Telemetry profile (`telemetry_env` / `telemetry_headers`). Empty by
+    /// default, which leaves the boot env and the revision intent unchanged.
+    pub telemetry: TelemetryAnswers,
+    /// Redis-backed sessions + VPC egress (`redis_url`, `vpc_*`). Empty by
+    /// default, which renders the Service and the revision intent byte for
+    /// byte as before these answers existed. See [`super::shared_state`].
+    pub shared_state: SharedState,
+}
+
+impl GcpCloudRunParams {
+    /// Sandbox defaults for an env with no (or partial) wizard answers. Project
+    /// and region get placeholders so the conformance bench + local dev run
+    /// without answers; the real `op env up` path validates they are set.
+    pub fn for_env(env: &Environment) -> Self {
+        let env_id = env.environment_id.as_str();
+        Self {
+            project: format!("greentic-{env_id}"),
+            region: env
+                .host_config
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-central1".to_string()),
+            access_mode: AccessMode::Public,
+            ar_repo: None,
+            runtime_image_tag: DEFAULT_RUNTIME_IMAGE_TAG.to_string(),
+            runtime_image_digest: None,
+            service_account: None,
+            // Absent by default: greentic-start keeps its own `default`/`default`
+            // unless an environment explicitly answers otherwise.
+            runtime_tenant: None,
+            runtime_team: None,
+            secret_prefix: format!("gtc-{env_id}"),
+            cpu: "1".to_string(),
+            memory: "512Mi".to_string(),
+            max_instances: 1,
+            min_instances: 0,
+            concurrency: 80,
+            cpu_always_allocated: false,
+            seed_mode: SeedMode::default(),
+            telemetry: TelemetryAnswers::default(),
+            shared_state: SharedState::default(),
+        }
+    }
+
+    /// Parse the binding's wizard answers over the sandbox defaults. Unknown
+    /// keys are rejected (deny-by-default, per the AWS precedent).
+    pub fn from_answers(
+        env: &Environment,
+        answers: Option<&Value>,
+    ) -> Result<Self, GcpCloudRunParamsError> {
+        let mut params = Self::for_env(env);
+        let Some(answers) = answers else {
+            return Ok(params);
+        };
+        let obj = answers
+            .as_object()
+            .ok_or(GcpCloudRunParamsError::NotAnObject)?;
+        let mut telemetry_env = None;
+        let mut telemetry_headers = None;
+        let mut shared = RawSharedStateAnswers::default();
+        for (key, value) in obj {
+            if shared.accept(key, value) {
+                continue;
+            }
+            match key.as_str() {
+                "project" => params.project = answer_string(key, value)?,
+                "region" => params.region = answer_string(key, value)?,
+                "access_mode" => params.access_mode = parse_access_mode(key, value)?,
+                "ar_repo" => params.ar_repo = optional_string(key, value)?,
+                "runtime_image_tag" => params.runtime_image_tag = answer_string(key, value)?,
+                "runtime_image_digest" => {
+                    params.runtime_image_digest = optional_string(key, value)?
+                }
+                "service_account" => params.service_account = optional_string(key, value)?,
+                "runtime_tenant" => params.runtime_tenant = optional_string(key, value)?,
+                "runtime_team" => params.runtime_team = optional_string(key, value)?,
+                "secret_prefix" => params.secret_prefix = answer_string(key, value)?,
+                "cpu" => params.cpu = answer_string(key, value)?,
+                "memory" => params.memory = answer_string(key, value)?,
+                "max_instances" => params.max_instances = parse_u32(key, value)?,
+                "min_instances" => params.min_instances = parse_u32(key, value)?,
+                "concurrency" => params.concurrency = parse_u32(key, value)?,
+                "cpu_always_allocated" => params.cpu_always_allocated = parse_bool(key, value)?,
+                "seed_mode" => params.seed_mode = parse_seed_mode(key, value)?,
+                telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
+                telemetry_answers::TELEMETRY_HEADERS_KEY => telemetry_headers = Some(value),
+                other => return Err(GcpCloudRunParamsError::UnknownKey(other.to_string())),
+            }
+        }
+        params.telemetry = telemetry_answers::parse(telemetry_env, telemetry_headers)?;
+        // After the loop: a bare connector name expands against the answered
+        // project/region, whichever order the keys arrived in.
+        params.shared_state = shared_state::parse(shared, &params.project, &params.region)?;
+        Ok(params)
+    }
+
+    /// The single runtime image ref all revisions run (plan D2). Digest-pinned
+    /// when supplied; otherwise tag-based. Routed through the Artifact Registry
+    /// remote repo when `ar_repo` is set, else the direct public GHCR ref
+    /// (plan D3).
+    pub fn image_ref(&self) -> String {
+        self.image_ref_for(None)
+    }
+
+    /// The runtime image ref for one specific revision (unified update L2).
+    /// A revision's own `pin` (an image index digest) wins over the binding's
+    /// `runtime_image_digest` answer / tag, but the repository (direct GHCR or
+    /// the Artifact Registry remote repo) is always the binding's.
+    pub fn image_ref_for(&self, pin: Option<&str>) -> String {
+        let base = match &self.ar_repo {
+            Some(repo) => format!(
+                "{region}-docker.pkg.dev/{project}/{repo}/greenticai/greentic-start-distroless",
+                region = self.region,
+                project = self.project,
+            ),
+            None => DEFAULT_RUNTIME_IMAGE.to_string(),
+        };
+        match pin.or(self.runtime_image_digest.as_deref()) {
+            Some(digest) => format!("{base}@{digest}"),
+            None => format!("{base}:{tag}", tag = self.runtime_image_tag),
+        }
+    }
+
+    fn scaling(&self) -> ScalingSpec {
+        ScalingSpec {
+            cpu: self.cpu.clone(),
+            memory: self.memory.clone(),
+            min_instances: self.min_instances,
+            max_instances: self.max_instances,
+            concurrency: self.concurrency,
+            cpu_always_allocated: self.cpu_always_allocated,
+        }
+    }
+
+    /// The least-privilege runtime service account the revision runs as: the
+    /// `service_account` answer when set, otherwise the default the bootstrap
+    /// Terraform provisions (`gtc-{env}-runtime@{project}.iam.gserviceaccount.com`).
+    /// Never empty — a revision must never fall back to the Compute Engine
+    /// default identity.
+    pub fn runtime_service_account(&self, env_id: &str) -> String {
+        self.service_account
+            .clone()
+            .unwrap_or_else(|| default_runtime_service_account(env_id, &self.project))
+    }
+}
+
+/// The bootstrap-provisioned default runtime service-account email for an env in
+/// a project. The single source of the formula: both the deployer (threading the
+/// identity onto the revision) and the credentials validator (probing
+/// `iam.serviceAccounts.actAs` against this resource, when no `service_account`
+/// override is set) must agree on it, or the preflight validates the wrong SA.
+pub(crate) fn default_runtime_service_account(env_id: &str, project: &str) -> String {
+    format!("gtc-{env_id}-runtime@{project}.iam.gserviceaccount.com")
+}
+
+/// Deterministic Cloud Run Service name for a deployment: `gtc-svc-{ulid}`
+/// (lowercased; RFC1123 DNS-label safe). Plan D1.
+pub fn service_name(deployment_id: DeploymentId) -> String {
+    format!("gtc-svc-{}", deployment_id.0.to_string().to_lowercase())
+}
+
+/// Container directory the env-store seed secrets are volume-mounted under
+/// (plan D6). Exported to the runtime as `GREENTIC_SEED_DIR` (see
+/// [`runtime_boot_env`]) so greentic-start's boot-copy reads this tree into the
+/// writable env store.
+const SEED_MOUNT_DIR: &str = "/seed";
+/// The `environment.json` seed file name under [`SEED_MOUNT_DIR`].
+const ENVIRONMENT_SEED_FILE: &str = "environment.json";
+/// Writable env-store root for the runtime container, exported as `HOME`. Cloud
+/// Run's root filesystem is read-only except `/tmp` (in-memory, world-writable)
+/// on the gen1 execution environment, so `LocalFsStore` (`$HOME/.greentic/
+/// environments`) must root there to be creatable under the distroless nonroot
+/// uid. The seed is re-copied on every cold start, matching this ephemeral root.
+const RUNTIME_HOME: &str = "/tmp";
+
+/// The Secret Manager secret name carrying an env's `environment.json` seed
+/// (plan D6): `<secret_prefix>-environment` (default `gtc-{env}-environment`).
+/// Shared so `op env destroy` teardown deletes exactly what `warm` staged.
+pub fn environment_secret_name(secret_prefix: &str) -> String {
+    format!("{secret_prefix}-environment")
+}
+
+/// The value stamped as a staged secret's owner: a GCP-label-safe rendering of
+/// `env_id`.
+///
+/// GCP label values admit only `[a-z0-9_-]{0,63}` while
+/// [`EnvId`](greentic_types::EnvId) also admits uppercase and `.`, so the raw id
+/// cannot be stamped. **The digest is the identity; the readable prefix is
+/// decoration** for the console and [`secret_conflict`]'s message. Folding the
+/// id into the charset is lossy — `a.b` and `a-b` render identically — so a
+/// stamp built from the fold alone would read two environments as one owner and
+/// wave through exactly the cross-environment write the check exists to stop.
+/// The digest is taken over the ORIGINAL id, which is what keeps them apart.
+///
+/// 26 bytes of SHA-256 (208 bits, 52 hex chars — the most that fits beside a
+/// 10-char prefix inside the 63-char limit). Collision-resistant, not injective:
+/// two ids CAN in principle share a stamp, and one that did would be classified
+/// [`SecretOwnership::Ours`]. At 208 bits that is infeasible to hit by accident
+/// or to construct. Do not shorten it — an earlier 32-bit digest here had
+/// findable collisions between two valid env ids, which is a full bypass of the
+/// ownership boundary.
+pub(crate) fn env_owner_stamp(env_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(&Sha256::digest(env_id.as_bytes())[..26]);
+    // `EnvId` is ASCII-only, so chars are bytes and 10 + '-' + 52 == 63.
+    let readable: String = env_id
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(10)
+        .collect();
+    format!("{readable}-{digest}")
+}
+
+/// What a live staged secret is, relative to the environment about to write it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SecretOwnership {
+    /// No such secret — this warm creates it and stamps itself the owner.
+    Absent,
+    /// Stamped with our own [`env_owner_stamp`].
+    Ours,
+    /// Exists carrying no stamp: staged before ownership stamping. Adopted as
+    /// ours without re-stamping — the deployer never asks for
+    /// `secretmanager.secrets.update`, and these envs predate the fix on a lane
+    /// Cloud Run has never shipped to stable users from.
+    Legacy,
+    /// Stamped by a DIFFERENT environment. Writing here would add our seed to
+    /// their secret, grant our runtime SA read over every version of theirs
+    /// (their dev-store included), and put their secret on our teardown's
+    /// delete list.
+    Conflict { owner: String },
+}
+
+/// Classify a live secret's owner stamp against `env_id`'s. The whole ownership
+/// decision, kept as one pure function: both the warm (via
+/// [`CloudRunTarget::ensure_secret`]) and the teardown (via
+/// [`secret_ownership`]) route through it, so the two cannot drift into
+/// disagreeing about who owns what.
+pub(crate) fn classify_owner(live: Option<String>, env_id: &str) -> SecretOwnership {
+    match live {
+        Some(live) if live == env_owner_stamp(env_id) => SecretOwnership::Ours,
+        Some(live) => SecretOwnership::Conflict { owner: live },
+        None => SecretOwnership::Legacy,
+    }
+}
+
+/// Read `name`'s owner stamp and classify it for `env_id`, WITHOUT creating it.
+/// The teardown's probe — the warm uses [`CloudRunTarget::ensure_secret`], which
+/// cannot be split into probe-then-create without reopening the create race.
+pub(crate) async fn secret_ownership(
+    target: &dyn super::deploy_target::CloudRunTarget,
+    name: &str,
+    env_id: &str,
+) -> Result<SecretOwnership, DeployerError> {
+    match target.get_secret_owner(name).await {
+        Ok(live) => Ok(classify_owner(live, env_id)),
+        Err(CloudRunTargetError::NotFound(_)) => Ok(SecretOwnership::Absent),
+        Err(e) => Err(provider(e)),
+    }
+}
+
+/// The refusal for a secret another environment owns. Names both stamps: the
+/// live one identifies who to talk to, ours confirms which environment was
+/// refused.
+pub(crate) fn secret_conflict(name: &str, owner: &str, env_id: &str) -> DeployerError {
+    DeployerError::Provider(format!(
+        "Secret Manager secret `{name}` belongs to environment `{owner}`, but this is environment \
+         `{ours}`. Two environments cannot share one secret — each would grant its own runtime \
+         service account read over the other's staged seed. Give this environment a distinct \
+         `secret_prefix` answer.",
+        ours = env_owner_stamp(env_id),
+    ))
+}
+
+/// Literal boot env vars projected onto every Cloud Run revision (plan D6
+/// activation + runtime identity). `GREENTIC_SEED_DIR` triggers greentic-start's
+/// boot-copy of the mounted `environment.json` into the writable store rooted at
+/// `HOME`; `GREENTIC_ENV` selects the env dir the seed lands in (greentic-start's
+/// `resolve_env` reads it, and it must agree with where the store opens);
+/// `GREENTIC_GATEWAY_LISTEN_ADDR=0.0.0.0` makes the gateway reachable (greentic-
+/// start otherwise binds loopback and Cloud Run's health check never passes);
+/// and the revision-identity vars mirror the k8s pack-pull contract so the
+/// runtime knows which revision to serve. The bundle *source* URI is read from
+/// the seeded `environment.json`, not an env var, so none is set here.
+///
+/// `GREENTIC_TENANT` / `GREENTIC_TEAM` are appended only when the binding
+/// answered them (see [`GcpCloudRunParams::runtime_tenant`]). They are the
+/// tenant and team segments of every `secrets://` URI the workload resolves, and
+/// they are **omitted rather than emitted empty** when absent: an environment
+/// that answers neither produces byte for byte the boot env it produced before
+/// these answers existed, so every already-deployed revision is unchanged and
+/// [`revision_intent`] fingerprints the same value it fingerprinted before.
+fn runtime_boot_env(
+    env: &Environment,
+    revision: &Revision,
+    params: &GcpCloudRunParams,
+) -> Vec<(String, String)> {
+    let env_id = env.environment_id.as_str();
+    let mut vars = vec![
+        ("GREENTIC_ENV".to_string(), env_id.to_string()),
+        ("GREENTIC_ENV_ID".to_string(), env_id.to_string()),
+        ("GREENTIC_SEED_DIR".to_string(), SEED_MOUNT_DIR.to_string()),
+        ("HOME".to_string(), RUNTIME_HOME.to_string()),
+        (
+            "GREENTIC_GATEWAY_LISTEN_ADDR".to_string(),
+            "0.0.0.0".to_string(),
+        ),
+        (
+            "GREENTIC_REVISION_ID".to_string(),
+            revision.revision_id.0.to_string(),
+        ),
+        (
+            "GREENTIC_DEPLOYMENT_ID".to_string(),
+            revision.deployment_id.0.to_string(),
+        ),
+        (
+            "GREENTIC_BUNDLE_ID".to_string(),
+            revision.bundle_id.as_str().to_string(),
+        ),
+        (
+            "GREENTIC_BUNDLE_DIGEST".to_string(),
+            revision.bundle_digest.clone(),
+        ),
+    ];
+    if let Some(tenant) = &params.runtime_tenant {
+        vars.push(("GREENTIC_TENANT".to_string(), tenant.clone()));
+    }
+    if let Some(team) = &params.runtime_team {
+        vars.push(("GREENTIC_TEAM".to_string(), team.clone()));
+    }
+    // Shared-state backend selectors: empty unless `redis_url` is answered, so
+    // an environment without it boots byte for byte as before.
+    vars.extend(params.shared_state.boot_env());
+    // Telemetry: appended last and sorted, and empty unless answered — so an
+    // environment with no profile boots byte for byte as before and
+    // `revision_intent` fingerprints the same value.
+    vars.extend(params.telemetry.env_for_role("worker"));
+    vars
+}
+
+/// Deterministic Cloud Run revision name: `gtc-svc-{dep}-{rev}` (61 chars ≤ the
+/// 63-char limit; Cloud Run requires the service-name prefix). Plan D1.
+pub fn revision_name(deployment_id: DeploymentId, revision_id: RevisionId) -> String {
+    format!(
+        "gtc-svc-{}-{}",
+        deployment_id.0.to_string().to_lowercase(),
+        revision_id.0.to_string().to_lowercase()
+    )
+}
+
+/// Errors parsing the binding's wizard answers.
+#[derive(Debug, thiserror::Error)]
+pub enum GcpCloudRunParamsError {
+    #[error("answers must be a JSON object")]
+    NotAnObject,
+    #[error("answer `{0}` must be a string")]
+    NotAString(String),
+    #[error("unknown answer key `{0}`")]
+    UnknownKey(String),
+    #[error("answer `{key}` is invalid: {detail}")]
+    Invalid { key: String, detail: String },
+    #[error(transparent)]
+    Telemetry(#[from] TelemetryAnswerError),
+    #[error(transparent)]
+    SharedState(#[from] SharedStateAnswerError),
+}
+
+fn answer_string(key: &str, value: &Value) -> Result<String, GcpCloudRunParamsError> {
+    value
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| GcpCloudRunParamsError::NotAString(key.to_string()))
+}
+
+fn optional_string(key: &str, value: &Value) -> Result<Option<String>, GcpCloudRunParamsError> {
+    let s = answer_string(key, value)?;
+    let trimmed = s.trim();
+    Ok(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    })
+}
+
+fn parse_u32(key: &str, value: &Value) -> Result<u32, GcpCloudRunParamsError> {
+    // Accept both a JSON number and a numeric string (qa-spec answers are
+    // flat strings; a caller-built JSON may use a number).
+    if let Some(n) = value.as_u64() {
+        return u32::try_from(n).map_err(|_| GcpCloudRunParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("{n} is out of range for a u32"),
+        });
+    }
+    let s = answer_string(key, value)?;
+    s.trim()
+        .parse::<u32>()
+        .map_err(|e| GcpCloudRunParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{s}` is not a non-negative integer: {e}"),
+        })
+}
+
+fn parse_seed_mode(key: &str, value: &Value) -> Result<SeedMode, GcpCloudRunParamsError> {
+    let s = answer_string(key, value)?;
+    // Blank is "not answered": the default, like every other optional answer.
+    if s.trim().is_empty() {
+        return Ok(SeedMode::default());
+    }
+    SeedMode::parse(&s).ok_or_else(|| GcpCloudRunParamsError::Invalid {
+        key: key.to_string(),
+        detail: format!("`{}` is not one of `inline` | `auto`", s.trim()),
+    })
+}
+
+fn parse_bool(key: &str, value: &Value) -> Result<bool, GcpCloudRunParamsError> {
+    // Accept a JSON bool and the flat-string form qa-spec answers arrive in.
+    if let Some(b) = value.as_bool() {
+        return Ok(b);
+    }
+    let s = value
+        .as_str()
+        .ok_or_else(|| GcpCloudRunParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{value}` is not a boolean (`true` | `false`)"),
+        })?;
+    match s.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(GcpCloudRunParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{other}` is not one of `true` | `false`"),
+        }),
+    }
+}
+
+fn parse_access_mode(key: &str, value: &Value) -> Result<AccessMode, GcpCloudRunParamsError> {
+    match answer_string(key, value)?.as_str() {
+        "public" => Ok(AccessMode::Public),
+        "authenticated" => Ok(AccessMode::Authenticated),
+        other => Err(GcpCloudRunParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{other}` is not one of `public` | `authenticated`"),
+        }),
+    }
+}
+
+/// Wrap a [`CloudRunTargetError`] as a [`DeployerError::Provider`].
+pub(crate) fn provider(err: CloudRunTargetError) -> DeployerError {
+    DeployerError::Provider(err.to_string())
+}
+
+/// Wrap answer-parse failures as a pre-provider [`DeployerError::Provider`]
+/// (mirrors the AWS `params_from_answers` precedent).
+pub(super) fn params_from_answers(
+    env: &Environment,
+    answers: Option<&Value>,
+) -> Result<GcpCloudRunParams, DeployerError> {
+    GcpCloudRunParams::from_answers(env, answers)
+        .map_err(|e| DeployerError::Provider(format!("invalid answers: {e}")))
+}
+
+/// Convert a spec-side (basis-point) split into Cloud Run integer-percent
+/// targets. Rejects any weight that is not a whole multiple of 100 bps — Cloud
+/// Run cannot represent sub-1% or non-round-percent weights (plan D1). The
+/// caller has already enforced `sum == 10000`, so the resulting percents sum to
+/// exactly 100.
+fn split_to_traffic_targets(
+    entries: &[TrafficSplitEntry],
+) -> Result<Vec<TrafficTarget>, DeployerError> {
+    let mut targets = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.weight_bps % 100 != 0 {
+            return Err(DeployerError::Provider(format!(
+                "Cloud Run cannot faithfully represent traffic weight {bps} bps for revision \
+                 `{rev}`; weights must be whole multiples of 100 bps (1%)",
+                bps = entry.weight_bps,
+                rev = entry.revision_id,
+            )));
+        }
+        targets.push(TrafficTarget {
+            revision_id: entry.revision_id,
+            percent: entry.weight_bps / 100,
+        });
+    }
+    Ok(targets)
+}
+
+pub(super) fn find_revision(env: &Environment, revision_id: RevisionId) -> Option<&Revision> {
+    env.revisions.iter().find(|r| r.revision_id == revision_id)
+}
+
+/// Fingerprint of everything the caller pins onto this revision, stamped at
+/// create and compared on every later warm (see [`live_revision`]).
+///
+/// Covers each field that lands in the immutable revision — image, runtime
+/// identity, scaling, session affinity, the seed secret's NAME, and the boot
+/// env. Two exclusions are deliberate:
+///
+/// * **Secret versions.** They are an artifact of staging, not intent: every
+///   warm mints new ones, so folding them in would make a plain retry look like
+///   a config change — the very thing this exists to rule out. The fingerprint
+///   must also be computable BEFORE staging, which is what lets the probe skip
+///   staging entirely on a retry. `secret_env_names` follows the same rule: only
+///   the NAMES of secret-sourced env vars are hashed, never the version or the
+///   value — a header change is a deployer-answers change, which `op env apply`
+///   rolls into a NEW revision (#603), never a fingerprint mutation here.
+/// * **`access_mode`.** The invoker policy is a separate IAM resource, not part
+///   of the revision, and the converge tail reapplies it on every warm. Folding
+///   it in would demand a new revision to flip public/authenticated.
+///
+/// Fields are length-prefixed so no value can forge a boundary by embedding the
+/// separator. Truncated to 32 hex chars: a valid GCP label value (lowercase
+/// alnum, ≤63), and 128 bits is far past what an accident could collide.
+fn revision_intent(
+    image: &str,
+    runtime_service_account: &str,
+    scaling: &ScalingSpec,
+    session_affinity: bool,
+    secret_name: &str,
+    boot_env: &[(String, String)],
+    secret_env_names: &[&str],
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(image.as_bytes());
+    field(runtime_service_account.as_bytes());
+    field(scaling.cpu.as_bytes());
+    field(scaling.memory.as_bytes());
+    field(&scaling.min_instances.to_le_bytes());
+    field(&scaling.max_instances.to_le_bytes());
+    field(&scaling.concurrency.to_le_bytes());
+    // Hashed ONLY when set: an env that never answers `cpu_always_allocated`
+    // (or answers `false`) keeps the fingerprint its revisions were stamped
+    // with, so the new answer rolls no existing deployment.
+    if scaling.cpu_always_allocated {
+        field(b"cpu-always-allocated");
+    }
+    field(&[u8::from(session_affinity)]);
+    field(secret_name.as_bytes());
+    for (key, value) in boot_env {
+        field(key.as_bytes());
+        field(value.as_bytes());
+    }
+    // Names only, never version or value: versions are staging artifacts (see
+    // above) and the value is a credential. Absent → nothing hashed, so every
+    // existing revision keeps its fingerprint. A header change is a
+    // deployer-answers change, which `op env apply` rolls into a NEW revision.
+    for name in secret_env_names {
+        field(b"secret-env");
+        field(name.as_bytes());
+    }
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// Fold the revision's `vpcAccess` into an intent computed by
+/// [`revision_intent`]. `None` returns `intent` UNCHANGED, so every revision
+/// without a VPC answer keeps the fingerprint it was stamped with; `Some`
+/// re-hashes the base intent together with the connector (or network +
+/// subnetwork) and the egress setting, all length-prefixed like the base.
+fn revision_intent_with_vpc(intent: String, vpc: Option<&VpcAccess>) -> String {
+    use sha2::{Digest, Sha256};
+    let Some(vpc) = vpc else {
+        return intent;
+    };
+    let mut hasher = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field(intent.as_bytes());
+    match &vpc.target {
+        VpcTarget::Connector(connector) => {
+            field(b"vpc-connector");
+            field(connector.as_bytes());
+        }
+        VpcTarget::Direct {
+            network,
+            subnetwork,
+        } => {
+            field(b"vpc-direct");
+            field(network.as_bytes());
+            field(subnetwork.as_bytes());
+        }
+    }
+    field(vpc.egress.as_str().as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// The names of the secret-sourced env vars a revision carries: the telemetry
+/// header pair when answered, then the Redis URL pair when answered. Empty for
+/// an environment with neither, so its intent is unchanged.
+fn secret_env_names(params: &GcpCloudRunParams) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if params.telemetry.headers().is_some() {
+        names.extend(HEADER_ENV_NAMES);
+    }
+    names.extend(params.shared_state.secret_env_names());
+    names
+}
+
+/// What the provider holds for the revision this warm intends to create.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveRevision {
+    /// Nothing by that name — create it.
+    Absent,
+    /// A revision stamped with this warm's own intent: the same warm, retried.
+    /// Converge on it.
+    SameIntent,
+    /// The name is taken by a revision this warm did not ask for — a different
+    /// intent, or no stamp to verify. Cloud Run revisions are immutable, so
+    /// this cannot be reconciled: it needs a new revision, not a retry.
+    Conflict { live: Option<String> },
+}
+
+/// Classify the live revision against `intent`.
+///
+/// Existence alone is NOT convergence. The revision name is a pure function of
+/// (deployment, revision), while the image, runtime identity, scaling, and
+/// secret name all come from the env-pack binding's `answers_ref` — which the
+/// operator can edit between warms. So a live revision may be running something
+/// the current answers no longer describe, and reporting that as a converged
+/// warm would tell the operator their new image is live when the old one is
+/// still serving. The stamp is what tells the two apart.
+///
+/// This is also the only signal separating the two distinct 409s the seam
+/// collapses into [`CloudRunTargetError::PreconditionFailed`] (see
+/// `real_target::classify`): a **stale-etag race**, transient and worth a
+/// retry, from a **revision-name conflict**, which is permanent. Guessing
+/// "etag race" is what makes a re-warm burn `MAX_ETAG_RETRIES` futile upserts
+/// and then report a race that never happened.
+async fn live_revision(
+    target: &dyn super::deploy_target::CloudRunTarget,
+    revision: &RevisionRef,
+    intent: &str,
+) -> Result<LiveRevision, DeployerError> {
+    match target.get_revision_status(revision).await {
+        Ok(status) if status.intent.as_deref() == Some(intent) => Ok(LiveRevision::SameIntent),
+        Ok(status) => Ok(LiveRevision::Conflict {
+            live: status.intent,
+        }),
+        Err(CloudRunTargetError::NotFound(_)) => Ok(LiveRevision::Absent),
+        Err(e) => Err(provider(e)),
+    }
+}
+
+/// Reject a revision name already taken by a different configuration.
+fn revision_conflict(revision_id: RevisionId, intent: &str, live: Option<String>) -> DeployerError {
+    let held = match live {
+        Some(live) => format!("holds a different configuration (`{live}`)"),
+        None => "carries no configuration stamp, so it cannot be verified".to_string(),
+    };
+    DeployerError::Provider(format!(
+        "Cloud Run revision `{name}` already exists and {held}; this warm intends `{intent}`. \
+         Cloud Run revisions are immutable, so the live one cannot be updated in place — stage a \
+         NEW revision to roll out the changed configuration.",
+        name = revision_id,
+    ))
+}
+
+async fn wait_for_revision_ready(
+    target: &dyn super::deploy_target::CloudRunTarget,
+    revision: &RevisionRef,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), DeployerError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = match target.get_revision_status(revision).await {
+            Ok(status) if status.ready => return Ok(()),
+            Ok(status) => status,
+            Err(e) => return Err(provider(e)),
+        };
+        if Instant::now() >= deadline {
+            return Err(readiness_timeout(
+                revision.revision_id,
+                timeout,
+                Some(&status),
+            ));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// The error a readiness timeout reports, carrying what Cloud Run last said.
+///
+/// "Did not become ready within 300s" alone is true of an image that will not
+/// pull, a container that crashes at boot and one that is merely slow, and it
+/// sent operators hunting through IAM for a crash in their own worker. Cloud
+/// Run knows which of those it is — the revision's failing conditions and a
+/// link to its logs — so the error says so. The leading sentence is kept
+/// verbatim: callers match on it.
+fn readiness_timeout(
+    revision_id: RevisionId,
+    timeout: Duration,
+    last: Option<&super::deploy_target::RevisionStatus>,
+) -> DeployerError {
+    let mut message = format!(
+        "Cloud Run revision `{revision_id}` did not become ready within {}s",
+        timeout.as_secs()
+    );
+    if let Some(reason) = last.and_then(|s| s.not_ready_reason.as_deref()) {
+        message.push_str(&format!(". Cloud Run reports: {reason}"));
+    }
+    if let Some(uri) = last.and_then(|s| s.log_uri.as_deref()) {
+        message.push_str(&format!(". Revision logs: {uri}"));
+    }
+    DeployerError::Provider(message)
+}
+
+#[async_trait]
+impl Deployer for GcpCloudRunDeployerHandler {
+    async fn stage_revision(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+    ) -> Result<StageOutcome, DeployerError> {
+        // No provider work: bundle + secret staging happens on the `op env up`
+        // path (follow-up PR). Cloud Run OCI-pulls the bundle at boot.
+        require_revision(env, revision_id)?;
+        Ok(StageOutcome::default())
+    }
+
+    async fn warm_revision(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<WarmOutcome, DeployerError> {
+        require_revision(env, revision_id)?;
+        let revision = find_revision(env, revision_id).expect("require_revision passed");
+        let deployment_id = revision.deployment_id;
+        let params = params_from_answers(env, answers)?;
+        // Pre-provider: refuse a multi-instance shape unless the shared store, the
+        // VPC route to it and the pre-minted generated secrets are all in place.
+        shared_state::gate(&params, &self.generated_secret_seed)
+            .map_err(|e| DeployerError::Provider(e.to_string()))?;
+
+        let service_ref = ServiceRef {
+            deployment_id,
+            project: params.project.clone(),
+            region: params.region.clone(),
+        };
+        let revision_ref = RevisionRef {
+            deployment_id,
+            revision_id,
+            project: params.project.clone(),
+            region: params.region.clone(),
+        };
+
+        // What this warm intends, computed BEFORE staging — staging mints secret
+        // versions, and a retry must not have to mint any to know what it wants.
+        let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let boot_env = runtime_boot_env(env, revision, &params);
+        // Only when the operator answered a header (or a Redis URL) does the
+        // revision carry a secret-sourced env var at all — mirrors the staging
+        // in `create_revision`, below.
+        let secret_env_names = secret_env_names(&params);
+        let image = params.image_ref_for(revision.runtime_image_digest.as_deref());
+        let intent = revision_intent_with_vpc(
+            revision_intent(
+                &image,
+                &runtime_service_account,
+                &params.scaling(),
+                SESSION_AFFINITY,
+                &secret_name,
+                &boot_env,
+                &secret_env_names,
+            ),
+            params.shared_state.vpc.as_ref(),
+        );
+
+        // Create the revision only if it is not already there, then converge the
+        // rest unconditionally (below). A warm is retried routinely — the CLI
+        // re-runs `op env up`, or a previous attempt died after the upsert
+        // committed but before the readiness wait or the invoker grant — and the
+        // trait requires the second call, against the SAME input, to succeed.
+        //
+        // Recreating is impossible: Cloud Run revisions are immutable, and a
+        // re-render could not reproduce the live template anyway (staging mints
+        // fresh secret versions). Probing before staging is what keeps a retry
+        // from minting versions that could never reach the live revision.
+        //
+        // A live revision therefore keeps its pinned secret versions. That is
+        // not a policy choice — an immutable revision cannot pick up restaged
+        // material. New material means a NEW revision, and the same goes for
+        // changed answers: see `live_revision` for why existence alone is not
+        // convergence.
+        let created = match live_revision(self.target.as_ref(), &revision_ref, &intent).await? {
+            LiveRevision::SameIntent => CreatedRevision {
+                endpoint_url: self
+                    .target
+                    .get_service_url(&service_ref)
+                    .await
+                    .map_err(provider)?,
+                // A live revision staged nothing this time, so there is no
+                // freshly minted Redis URL version to prune against.
+                staged_redis: None,
+            },
+            LiveRevision::Conflict { live } => {
+                return Err(revision_conflict(revision_id, &intent, live));
+            }
+            LiveRevision::Absent => {
+                self.create_revision(
+                    env,
+                    &params,
+                    &service_ref,
+                    &revision_ref,
+                    CreateRevisionSpec {
+                        runtime_service_account: &runtime_service_account,
+                        secret_name: &secret_name,
+                        boot_env: &boot_env,
+                        intent: &intent,
+                        image: &image,
+                    },
+                )
+                .await?
+            }
+        };
+
+        // Converge the non-revision state on BOTH paths: neither step is part
+        // of the immutable revision, and a resumed warm is precisely the case
+        // where the first attempt died before reaching them.
+        wait_for_revision_ready(
+            self.target.as_ref(),
+            &revision_ref,
+            warm_ready_timeout(),
+            WARM_READY_POLL_INTERVAL,
+        )
+        .await?;
+
+        // Apply the invoker IAM binding for the requested access mode (plan D12)
+        // as the FINAL commit step — only after the new revision is proven ready.
+        // The invoker policy is service-WIDE (it governs every revision at once),
+        // so mutating it before readiness would change access on the currently-
+        // serving revision even when this deploy then fails or times out: a
+        // `public`→`authenticated` flip is an outage, the inverse exposes prod on
+        // a failed deploy. Deferring it past the readiness wait means a failed
+        // revision never touches live access. The Service upsert alone does NOT
+        // set the policy (it is a separate IAM resource, so a `Public` service's
+        // `run.app` URL 403s without this), and re-applying the same binding on a
+        // second-revision warm is a harmless idempotent no-op.
+        self.target
+            .set_invoker_policy(&service_ref, params.access_mode)
+            .await
+            .map_err(provider)?;
+        // The deploy succeeded: only now destroy Redis URL versions superseded
+        // by a NEW value (keeping the immediately previous one). Best effort.
+        if let Some((redis_secret, staged)) = &created.staged_redis
+            && staged.minted
+        {
+            redis_secret::prune_after_ready(self.target.as_ref(), redis_secret, &staged.version)
+                .await;
+        }
+        Ok(WarmOutcome {
+            endpoint_url: created.endpoint_url,
+        })
+    }
+
+    async fn drain_revision(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<DrainOutcome, DeployerError> {
+        // Enforced drain (P5-R2) — wait the window, then confirm the live
+        // Service gives the revision 0 %. See `super::drain`.
+        self.drain_enforced(env, revision_id, answers).await
+    }
+
+    async fn confirm_drained(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<DrainEvidence, DeployerError> {
+        self.confirm_drained_now(env, revision_id, answers).await
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            drain: true,
+            traffic_split: true,
+            ingress_managed: true,
+            private_registry_auth: false,
+            multi_instance_safe: false,
+            remove: true,
+            runtime_pin: true,
+        }
+    }
+
+    fn capability_notes(&self) -> &'static [&'static str] {
+        &[
+            "drain: confirmed by the Service's live traffic giving the revision 0%",
+            "traffic_split: whole-percent granularity only (multiples of 100 bps)",
+            "ingress_managed: Cloud Run assigns the *.run.app URL; the invoker policy sets access",
+            "private_registry_auth: not claimed — bundles and the image are pulled from public \
+             registries (or a pre-provisioned Artifact Registry remote repo)",
+            "multi_instance_safe: false — the environment/session store is per-instance in-memory \
+             /tmp, so max_instances must stay 1 (docs/cloudrun-deployment.md §10)",
+            "remove: archive deletes the revision; env destroy deletes the Service",
+            "runtime_pin: each revision runs the runtime image its manifest pinned (unified \
+             update L2); unpinned revisions run the binding answer",
+        ]
+    }
+
+    async fn archive_revision(
+        &self,
+        env: &Environment,
+        revision_id: RevisionId,
+        answers: Option<&Value>,
+    ) -> Result<ArchiveOutcome, DeployerError> {
+        require_revision(env, revision_id)?;
+        let revision = find_revision(env, revision_id).expect("require_revision passed");
+        let deployment_id = revision.deployment_id;
+        let params = params_from_answers(env, answers)?;
+        // A whole-bundle retire tears down the Service: its last revision is
+        // always routed (traffic sums to 100 %), so it cannot be deleted
+        // on its own. Idempotent against an absent Service.
+        if super::drain::whole_bundle_retiring(env, revision_id) {
+            self.target
+                .delete_service(&ServiceRef {
+                    deployment_id,
+                    project: params.project,
+                    region: params.region,
+                })
+                .await
+                .map_err(provider)?;
+            return Ok(ArchiveOutcome::default());
+        }
+        self.target
+            .delete_revision(&RevisionRef {
+                deployment_id,
+                revision_id,
+                project: params.project,
+                region: params.region,
+            })
+            .await
+            .map_err(provider)?;
+        Ok(ArchiveOutcome::default())
+    }
+
+    async fn apply_traffic_split(
+        &self,
+        env: &Environment,
+        deployment_id: DeploymentId,
+        answers: Option<&Value>,
+    ) -> Result<TrafficSplitOutcome, DeployerError> {
+        // Pure-spec precondition first: sum == 10000 bps + the CR-specific
+        // whole-multiple-of-100-bps rejection, both BEFORE any provider call.
+        let outcome = enforce_split_invariants(env, deployment_id)?;
+        let targets = split_to_traffic_targets(&outcome.applied_entries)?;
+        let params = params_from_answers(env, answers)?;
+
+        let service_ref = ServiceRef {
+            deployment_id,
+            project: params.project,
+            region: params.region,
+        };
+        // When the Service exists, set traffic under its live etag (read-modify-
+        // write) with bounded retries on an etag conflict (plan D4). When it
+        // does not (no revision warmed yet), the recorded split is authoritative
+        // and projects at the next warm — mirroring the AWS impl's "no provider
+        // mirror configured" no-op so the spec stays the source of truth. In the
+        // real `op env up` flow the deployment is always warmed before its split
+        // is applied, so the Service exists whenever enforcement matters.
+        let mut attempt = 0;
+        loop {
+            let Some(status) = self
+                .target
+                .get_service(&service_ref)
+                .await
+                .map_err(provider)?
+            else {
+                break;
+            };
+            match self
+                .target
+                .set_traffic(&service_ref, &targets, &status.etag)
+                .await
+            {
+                Ok(_) => break,
+                Err(CloudRunTargetError::PreconditionFailed) => {
+                    attempt += 1;
+                    if attempt > MAX_ETAG_RETRIES {
+                        return Err(DeployerError::Provider(format!(
+                            "Cloud Run traffic split for deployment `{deployment_id}` kept losing \
+                             the etag race after {MAX_ETAG_RETRIES} retries"
+                        )));
+                    }
+                }
+                Err(e) => return Err(provider(e)),
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+/// The parts of the revision [`Deployer::warm_revision`] resolved before
+/// staging, so [`GcpCloudRunDeployerHandler::create_revision`] renders exactly
+/// what [`revision_intent`] fingerprinted rather than deriving them a second
+/// time and risking drift between the stamp and the stamped.
+struct CreateRevisionSpec<'a> {
+    runtime_service_account: &'a str,
+    secret_name: &'a str,
+    boot_env: &'a [(String, String)],
+    intent: &'a str,
+    /// The image this revision runs (its own pin, else the binding's answer).
+    image: &'a str,
+}
+
+impl GcpCloudRunDeployerHandler {
+    /// Stage the seed secrets and create the revision, returning the Service's
+    /// `*.run.app` URL. Only called once the revision is known absent — see
+    /// [`Deployer::warm_revision`].
+    async fn create_revision(
+        &self,
+        env: &Environment,
+        params: &GcpCloudRunParams,
+        service_ref: &ServiceRef,
+        revision_ref: &RevisionRef,
+        spec: CreateRevisionSpec<'_>,
+    ) -> Result<CreatedRevision, DeployerError> {
+        let CreateRevisionSpec {
+            runtime_service_account,
+            secret_name,
+            boot_env,
+            intent,
+            image,
+        } = spec;
+        let deployment_id = revision_ref.deployment_id;
+        let revision_id = revision_ref.revision_id;
+
+        // Stage the env-store seed (plan D6): upload environment.json to a
+        // version-pinned Secret Manager secret and grant the runtime SA read
+        // access, then mount that exact version read-only. The grant is
+        // load-bearing — Cloud Run rejects a revision whose SA cannot read a
+        // mounted secret version. Staged ONCE, before the etag retry loop, so a
+        // precondition retry does not add a redundant secret version. The
+        // revision's boot env (`runtime_boot_env`) sets `GREENTIC_SEED_DIR`, so
+        // greentic-start copies this mount into its writable store at boot. When
+        // the env carries dev-store material, the CLI injected the raw bytes and
+        // they are staged as a SECOND version of the same secret below.
+        // The seed is a copy for the worker, so it omits archived revisions
+        // nothing references (Secret Manager caps a version at 64 KiB); the
+        // on-disk store stays complete. This revision is always kept.
+        let environment_json = seed_environment_bytes(env, &[revision_id]).map_err(|e| {
+            DeployerError::Provider(format!(
+                "serializing environment.json for seed staging: {e}"
+            ))
+        })?;
+        // `seed_mode = auto` pushes an oversize seed to the bundle's Artifact
+        // Registry repository and stages a pointer instead; `inline` (default)
+        // and any seed under the threshold pass through byte for byte. The
+        // bundle source of the revision being warmed names the repository.
+        let source_uri = env
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == revision_id)
+            .and_then(|r| r.bundle_source_uri.as_deref());
+        let environment_json = stage_seed(
+            self.target.as_ref(),
+            params.seed_mode,
+            env.environment_id.as_str(),
+            source_uri,
+            environment_json,
+        )
+        .await
+        .map_err(provider)?;
+        // Claim the secret before the first write, and refuse if it is another
+        // environment's (H1): `secret_prefix` is a free-text answer, so two envs
+        // in one project can resolve to one secret name while keeping DIFFERENT
+        // runtime service accounts (`gtc-{env}-runtime@`) — staging on would hand
+        // our SA read over their dev-store. Claim-then-write rather than
+        // probe-then-write: two warms racing would both probe `Absent`, and the
+        // loser's seed would land in the winner's secret. Only on the create
+        // path — the revision-exists path never stages, so it has nothing to
+        // protect.
+        let env_id = env.environment_id.as_str();
+        let ensured = self
+            .target
+            .ensure_secret(secret_name, &env_owner_stamp(env_id))
+            .await
+            .map_err(provider)?;
+        // A secret we just created is ours by construction; only one we found
+        // has an owner to answer for.
+        if let EnsuredSecret::Existed { owner } = ensured
+            && let SecretOwnership::Conflict { owner: live } = classify_owner(owner, env_id)
+        {
+            return Err(secret_conflict(secret_name, &live, env_id));
+        }
+        let env_version = self
+            .target
+            .add_secret_version(secret_name, environment_json.bytes())
+            .await
+            .map_err(provider)?;
+        let mut secret_items = vec![SecretMountItem {
+            version: env_version.version,
+            rel_path: ENVIRONMENT_SEED_FILE.to_string(),
+        }];
+        // Stage the operator's encrypted dev-store (`.dev.secrets.env`) as a
+        // second version of the SAME secret, projected at a subdirectory item
+        // path under the one `/seed` volume — Cloud Run forbids nested mounts, so
+        // the two seed files cannot be two volumes. Absent for envs with no
+        // `Secrets`-slot pack (the CLI passes `None`).
+        if let Some(dev_bytes) = &self.dev_secrets {
+            let dev_version = self
+                .target
+                .add_secret_version(secret_name, dev_bytes)
+                .await
+                .map_err(provider)?;
+            secret_items.push(SecretMountItem {
+                version: dev_version.version,
+                // The seed tree mirrors the on-disk store, so the dev-store's
+                // store-relative path is also its path under `/seed`, projected
+                // as a subdirectory item (Cloud Run forbids a nested mount).
+                rel_path: DEV_STORE_RELATIVE.to_string(),
+            });
+        }
+        // The telemetry header credential: one more version of the SAME
+        // environment secret (so the accessor grant below already covers it),
+        // referenced as env — never a literal in the revision template.
+        let mut secret_env = Vec::new();
+        if let Some(headers) = params.telemetry.headers() {
+            let v = self
+                .target
+                .add_secret_version(secret_name, headers.expose().as_bytes())
+                .await
+                .map_err(provider)?;
+            for name in HEADER_ENV_NAMES {
+                secret_env.push(SecretEnvVar {
+                    name: name.to_string(),
+                    secret_name: secret_name.to_string(),
+                    version: v.version.clone(),
+                });
+            }
+        }
+        // The Redis URL (it carries the AUTH string): its OWN env-owned secret,
+        // so a superseded password can be destroyed without touching seed
+        // versions live revisions mount (see `redis_secret`). An unchanged URL
+        // reuses its version; both names read that ONE pinned version — never
+        // a literal in the template, never logged.
+        let mut staged_redis = None;
+        if let Some(redis_url) = &params.shared_state.redis_url {
+            let redis_secret = redis_url_secret_name(&params.secret_prefix);
+            let staged = redis_secret::stage(
+                self.target.as_ref(),
+                &redis_secret,
+                env_id,
+                redis_url.expose().as_bytes(),
+                runtime_service_account,
+            )
+            .await?;
+            for name in REDIS_URL_ENV_NAMES {
+                secret_env.push(SecretEnvVar {
+                    name: name.to_string(),
+                    secret_name: redis_secret.clone(),
+                    version: staged.version.clone(),
+                });
+            }
+            staged_redis = Some((redis_secret, staged));
+        }
+        // Grant the runtime SA read on the secret (covers every version) —
+        // load-bearing: Cloud Run rejects a revision whose SA cannot read a
+        // mounted version. Idempotent, so a re-warm is a no-op.
+        self.target
+            .grant_secret_accessor(secret_name, runtime_service_account)
+            .await
+            .map_err(provider)?;
+        let secret_mounts = vec![SecretMount {
+            mount_dir: SEED_MOUNT_DIR.to_string(),
+            secret_name: secret_name.to_string(),
+            items: secret_items,
+        }];
+
+        // Read-modify-write under etag optimistic concurrency with bounded
+        // retries on a precondition conflict (plan D4): re-read, recompute
+        // traffic from the fresh state, and retry rather than replaying a stale
+        // etag. Traffic is pinned to NAMED revisions in the same upsert — first
+        // create is 100% to the named first revision (never LATEST, never a
+        // 0%-only array); an update keeps the existing distribution and adds
+        // this revision at 0% if it is new, so warm never moves traffic.
+        let mut attempt = 0;
+        // The Service's `*.run.app` URL rides back on the upsert response (it is
+        // assigned at Service-create time and is immutable after), so take it as
+        // the loop's break value — the caller needs no extra `get_service`.
+        let endpoint_url = loop {
+            let existing = self
+                .target
+                .get_service(service_ref)
+                .await
+                .map_err(provider)?;
+            let (traffic, etag) = match &existing {
+                None => (
+                    vec![TrafficTarget {
+                        revision_id,
+                        percent: 100,
+                    }],
+                    None,
+                ),
+                Some(status) => {
+                    let mut traffic = status.traffic.clone();
+                    if !traffic.iter().any(|t| t.revision_id == revision_id) {
+                        traffic.push(TrafficTarget {
+                            revision_id,
+                            percent: 0,
+                        });
+                    }
+                    (traffic, Some(status.etag.clone()))
+                }
+            };
+            let spec = ServiceSpec {
+                deployment_id,
+                project: params.project.clone(),
+                region: params.region.clone(),
+                image: image.to_string(),
+                revision_id,
+                runtime_service_account: runtime_service_account.to_string(),
+                traffic,
+                scaling: params.scaling(),
+                access_mode: params.access_mode,
+                session_affinity: SESSION_AFFINITY,
+                revision_intent: intent.to_string(),
+                secrets: secret_mounts.clone(),
+                env: boot_env.to_vec(),
+                secret_env: secret_env.clone(),
+                vpc_access: params.shared_state.vpc.clone(),
+            };
+            match self.target.upsert_service(&spec, etag.as_deref()).await {
+                Ok(status) => break status.url,
+                Err(CloudRunTargetError::PreconditionFailed) => {
+                    // Both 409s land here (see `live_revision`). A rival warm
+                    // that took the name between our probe and this upsert makes
+                    // the conflict permanent, so re-classify rather than retry
+                    // into the identical rejection and then blame an etag race.
+                    match live_revision(self.target.as_ref(), revision_ref, intent).await? {
+                        LiveRevision::SameIntent => {
+                            break self
+                                .target
+                                .get_service_url(service_ref)
+                                .await
+                                .map_err(provider)?;
+                        }
+                        LiveRevision::Conflict { live } => {
+                            return Err(revision_conflict(revision_id, intent, live));
+                        }
+                        // Still absent, so it really was the etag: retry.
+                        LiveRevision::Absent => {}
+                    }
+                    attempt += 1;
+                    if attempt > MAX_ETAG_RETRIES {
+                        return Err(DeployerError::Provider(format!(
+                            "Cloud Run service for deployment `{deployment_id}` kept losing the \
+                             etag race after {MAX_ETAG_RETRIES} retries"
+                        )));
+                    }
+                }
+                Err(e) => return Err(provider(e)),
+            }
+        };
+        Ok(CreatedRevision {
+            endpoint_url,
+            staged_redis,
+        })
+    }
+}
+
+/// What [`GcpCloudRunDeployerHandler::create_revision`] produced: the
+/// Service URL, and the Redis URL secret version it staged (with its secret
+/// name), so the warm can prune superseded versions once the revision is ready.
+struct CreatedRevision {
+    endpoint_url: Option<String>,
+    staged_redis: Option<(String, redis_secret::StagedRedisUrl)>,
+}
+
+#[cfg(test)]
+#[path = "deployer_shared_state_tests.rs"]
+mod shared_state_warm_tests;
+
+#[cfg(test)]
+#[path = "deployer_runtime_pin_tests.rs"]
+mod runtime_pin_tests;
+
+#[cfg(test)]
+#[path = "deployer_cpu_tests.rs"]
+mod cpu_always_allocated_tests;
+
+#[cfg(test)]
+#[path = "deployer_seed_tests.rs"]
+mod seed_mode_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_ready(reason: Option<&str>, log_uri: Option<&str>) -> RevisionStatus {
+        RevisionStatus {
+            ready: false,
+            active: false,
+            intent: None,
+            not_ready_reason: reason.map(str::to_string),
+            log_uri: log_uri.map(str::to_string),
+        }
+    }
+
+    /// The timeout carries Cloud Run's own reason and the log link, after the
+    /// unchanged leading sentence callers match on.
+    #[test]
+    fn a_readiness_timeout_says_what_cloud_run_reported() {
+        let id = RevisionId::new();
+        let last = not_ready(
+            Some("Ready: The user-provided container failed to start"),
+            Some("https://console.cloud.google.com/logs/viewer?x=1"),
+        );
+        let DeployerError::Provider(msg) =
+            readiness_timeout(id, Duration::from_secs(300), Some(&last))
+        else {
+            panic!("a readiness timeout is a provider error");
+        };
+        assert!(
+            msg.starts_with(&format!(
+                "Cloud Run revision `{id}` did not become ready within 300s"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Cloud Run reports: Ready: The user-provided container failed to start"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Revision logs: https://console.cloud.google.com/logs/viewer?x=1"),
+            "{msg}"
+        );
+    }
+
+    /// Nothing reported (never polled, or no message yet): the old sentence,
+    /// exactly — no dangling "Cloud Run reports:".
+    #[test]
+    fn a_readiness_timeout_with_nothing_reported_is_the_plain_sentence() {
+        let id = RevisionId::new();
+        for last in [None, Some(not_ready(None, None))] {
+            let DeployerError::Provider(msg) =
+                readiness_timeout(id, Duration::from_secs(300), last.as_ref())
+            else {
+                panic!("a readiness timeout is a provider error");
+            };
+            assert_eq!(
+                msg,
+                format!("Cloud Run revision `{id}` did not become ready within 300s")
+            );
+        }
+    }
+
+    use std::sync::Arc;
+
+    use greentic_deploy_spec::TrafficSplitEntry;
+
+    use async_trait::async_trait;
+
+    use crate::env_packs::deployer::conformance::build_fixture_env;
+    use crate::env_packs::deployer::run_conformance;
+    use crate::env_packs::gcp_cloudrun::deploy_target::{
+        CloudRunTarget, InMemoryCloudRun, RevisionStatus, SecretVersion, SecretVersionInfo,
+        ServiceStatus,
+    };
+
+    fn handler_with_fake() -> (GcpCloudRunDeployerHandler, Arc<InMemoryCloudRun>) {
+        let target = Arc::new(InMemoryCloudRun::default());
+        (
+            GcpCloudRunDeployerHandler::with_target(target.clone()),
+            target,
+        )
+    }
+
+    /// Target that injects a fixed number of etag conflicts before delegating to
+    /// a real in-memory backend — proves the deployer's bounded read-modify-write
+    /// retry (plan D4). Only `upsert_service` / `set_traffic` are intercepted;
+    /// every other verb passes straight through.
+    #[derive(Debug)]
+    struct ConflictInjector {
+        inner: InMemoryCloudRun,
+        upsert_conflicts: std::sync::Mutex<u32>,
+        set_traffic_conflicts: std::sync::Mutex<u32>,
+        /// How a rival warm takes the revision name before our upsert lands.
+        rival: Rival,
+        /// Upserts attempted, so a test can prove the deployer did not burn its
+        /// retry budget on a conflict that could never resolve.
+        upsert_attempts: std::sync::Mutex<u32>,
+    }
+
+    /// What an injected upsert conflict means — indistinguishable to the caller,
+    /// since Cloud Run reports all three as the same `PreconditionFailed`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Rival {
+        /// Nobody else; a plain stale etag. Retrying is right.
+        None,
+        /// Our own warm, running concurrently: same intent, its own freshly
+        /// staged secret versions. Converging on it is right.
+        SameIntent,
+        /// A different configuration under the name we wanted. Neither
+        /// retryable nor convergeable.
+        DifferentIntent,
+    }
+
+    impl ConflictInjector {
+        fn new(upsert_conflicts: u32, set_traffic_conflicts: u32) -> Self {
+            Self {
+                inner: InMemoryCloudRun::default(),
+                upsert_conflicts: std::sync::Mutex::new(upsert_conflicts),
+                set_traffic_conflicts: std::sync::Mutex::new(set_traffic_conflicts),
+                rival: Rival::None,
+                upsert_attempts: std::sync::Mutex::new(0),
+            }
+        }
+
+        /// A rival warm wins the create race on our first upsert.
+        fn losing_create_race(rival: Rival) -> Self {
+            Self {
+                rival,
+                ..Self::new(1, 0)
+            }
+        }
+
+        fn take_conflict(slot: &std::sync::Mutex<u32>) -> bool {
+            let mut n = slot.lock().unwrap();
+            if *n > 0 {
+                *n -= 1;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CloudRunTarget for ConflictInjector {
+        async fn get_service(
+            &self,
+            service: &ServiceRef,
+        ) -> Result<Option<ServiceStatus>, CloudRunTargetError> {
+            self.inner.get_service(service).await
+        }
+        async fn upsert_service(
+            &self,
+            spec: &ServiceSpec,
+            etag: Option<&str>,
+        ) -> Result<ServiceStatus, CloudRunTargetError> {
+            *self.upsert_attempts.lock().unwrap() += 1;
+            if Self::take_conflict(&self.upsert_conflicts) {
+                let rival = match self.rival {
+                    Rival::None => None,
+                    // Same intent, but its own staged versions — so the rendered
+                    // template differs (our re-upsert would 409) while the stamp
+                    // still says this is our warm.
+                    Rival::SameIntent => {
+                        let mut rival = spec.clone();
+                        for mount in &mut rival.secrets {
+                            for item in &mut mount.items {
+                                item.version = format!("{}00", item.version);
+                            }
+                        }
+                        Some(rival)
+                    }
+                    Rival::DifferentIntent => Some(ServiceSpec {
+                        image: format!("{}-rival", spec.image),
+                        revision_intent: format!("{}-rival", spec.revision_intent),
+                        ..spec.clone()
+                    }),
+                };
+                if let Some(rival) = rival {
+                    self.inner.upsert_service(&rival, etag).await?;
+                }
+                return Err(CloudRunTargetError::PreconditionFailed);
+            }
+            self.inner.upsert_service(spec, etag).await
+        }
+        async fn get_revision_status(
+            &self,
+            revision: &RevisionRef,
+        ) -> Result<RevisionStatus, CloudRunTargetError> {
+            self.inner.get_revision_status(revision).await
+        }
+        async fn set_traffic(
+            &self,
+            service: &ServiceRef,
+            traffic: &[TrafficTarget],
+            etag: &str,
+        ) -> Result<ServiceStatus, CloudRunTargetError> {
+            if Self::take_conflict(&self.set_traffic_conflicts) {
+                return Err(CloudRunTargetError::PreconditionFailed);
+            }
+            self.inner.set_traffic(service, traffic, etag).await
+        }
+        async fn set_invoker_policy(
+            &self,
+            service: &ServiceRef,
+            access_mode: AccessMode,
+        ) -> Result<(), CloudRunTargetError> {
+            self.inner.set_invoker_policy(service, access_mode).await
+        }
+        async fn delete_revision(&self, revision: &RevisionRef) -> Result<(), CloudRunTargetError> {
+            self.inner.delete_revision(revision).await
+        }
+        async fn delete_service(&self, service: &ServiceRef) -> Result<(), CloudRunTargetError> {
+            self.inner.delete_service(service).await
+        }
+        async fn get_service_url(
+            &self,
+            service: &ServiceRef,
+        ) -> Result<Option<String>, CloudRunTargetError> {
+            self.inner.get_service_url(service).await
+        }
+        async fn get_secret_owner(
+            &self,
+            name: &str,
+        ) -> Result<Option<String>, CloudRunTargetError> {
+            self.inner.get_secret_owner(name).await
+        }
+        async fn ensure_secret(
+            &self,
+            name: &str,
+            owner: &str,
+        ) -> Result<EnsuredSecret, CloudRunTargetError> {
+            self.inner.ensure_secret(name, owner).await
+        }
+        async fn add_secret_version(
+            &self,
+            name: &str,
+            payload: &[u8],
+        ) -> Result<SecretVersion, CloudRunTargetError> {
+            self.inner.add_secret_version(name, payload).await
+        }
+        async fn grant_secret_accessor(
+            &self,
+            secret_name: &str,
+            service_account: &str,
+        ) -> Result<(), CloudRunTargetError> {
+            self.inner
+                .grant_secret_accessor(secret_name, service_account)
+                .await
+        }
+        async fn delete_secret(&self, name: &str) -> Result<(), CloudRunTargetError> {
+            self.inner.delete_secret(name).await
+        }
+        async fn list_secret_versions(
+            &self,
+            name: &str,
+        ) -> Result<Vec<SecretVersionInfo>, CloudRunTargetError> {
+            self.inner.list_secret_versions(name).await
+        }
+        async fn access_secret_version(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<(SecretVersion, Vec<u8>), CloudRunTargetError> {
+            self.inner.access_secret_version(name, version).await
+        }
+        async fn destroy_secret_version(
+            &self,
+            name: &str,
+            version: &str,
+        ) -> Result<(), CloudRunTargetError> {
+            self.inner.destroy_secret_version(name, version).await
+        }
+        async fn push_seed_artifact(
+            &self,
+            reference: &str,
+            bytes: &[u8],
+        ) -> Result<String, CloudRunTargetError> {
+            self.inner.push_seed_artifact(reference, bytes).await
+        }
+    }
+
+    #[tokio::test]
+    async fn gcp_cloudrun_deployer_passes_conformance() {
+        let (handler, _target) = handler_with_fake();
+        run_conformance(&handler)
+            .await
+            .expect("GCP Cloud Run deployer satisfies the Phase D conformance contract");
+    }
+
+    #[tokio::test]
+    async fn warm_first_create_pins_100_percent_to_named_revision() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        let traffic = target.traffic_for(dep_a).expect("service created");
+        assert_eq!(
+            traffic,
+            vec![TrafficTarget {
+                revision_id: r_warm,
+                percent: 100
+            }],
+            "first create pins 100% to the named first revision (never LATEST)"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_existing_service_adds_new_revision_at_zero() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let r_drain = env.revisions[1].revision_id; // same deployment as r_warm
+        let dep_a = env.bundles[0].deployment_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        handler.warm_revision(&env, r_drain, None).await.unwrap();
+
+        let traffic = target.traffic_for(dep_a).unwrap();
+        assert_eq!(
+            traffic,
+            vec![
+                TrafficTarget {
+                    revision_id: r_warm,
+                    percent: 100
+                },
+                TrafficTarget {
+                    revision_id: r_drain,
+                    percent: 0
+                },
+            ],
+            "warming a second revision adds it at 0% without moving traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_traffic_split_converts_bps_to_integer_percent() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let r_drain = env.revisions[1].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+
+        // Service must exist before a split can be projected onto it.
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        handler
+            .apply_traffic_split(&env, dep_a, None)
+            .await
+            .unwrap();
+
+        let traffic = target.traffic_for(dep_a).unwrap();
+        assert_eq!(
+            traffic,
+            vec![
+                TrafficTarget {
+                    revision_id: r_warm,
+                    percent: 50
+                },
+                TrafficTarget {
+                    revision_id: r_drain,
+                    percent: 50
+                },
+            ],
+            "5000/5000 bps projects to 50/50 integer percent"
+        );
+    }
+
+    /// A retained rollback baseline rides the split at 0 %: Cloud Run must
+    /// accept it as a `percent: 0` target rather than rejecting the split.
+    #[test]
+    fn split_to_traffic_targets_accepts_a_zero_percent_entry() {
+        let env = build_fixture_env();
+        let (a, b) = (env.revisions[0].revision_id, env.revisions[1].revision_id);
+        let targets = split_to_traffic_targets(&[
+            TrafficSplitEntry {
+                revision_id: a,
+                weight_bps: 0,
+            },
+            TrafficSplitEntry {
+                revision_id: b,
+                weight_bps: 10_000,
+            },
+        ])
+        .expect("a 0 % entry is a whole percent");
+        assert_eq!(
+            targets,
+            vec![
+                TrafficTarget {
+                    revision_id: a,
+                    percent: 0
+                },
+                TrafficTarget {
+                    revision_id: b,
+                    percent: 100
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_traffic_split_rejects_non_whole_percent_weights() {
+        let (handler, _target) = handler_with_fake();
+        let mut env = build_fixture_env();
+        let dep_a = env.bundles[0].deployment_id;
+        let r_warm = env.revisions[0].revision_id;
+        let r_drain = env.revisions[1].revision_id;
+        // 3333 + 6667 = 10000 (passes the sum invariant) but neither is a whole
+        // multiple of 100 bps, so Cloud Run cannot represent it.
+        env.traffic_splits[0].entries = vec![
+            TrafficSplitEntry {
+                revision_id: r_warm,
+                weight_bps: 3333,
+            },
+            TrafficSplitEntry {
+                revision_id: r_drain,
+                weight_bps: 6667,
+            },
+        ];
+        let err = handler
+            .apply_traffic_split(&env, dep_a, None)
+            .await
+            .expect_err("non-whole-percent split must be rejected");
+        assert!(
+            matches!(err, DeployerError::Provider(ref m) if m.contains("multiples of 100 bps")),
+            "expected a whole-percent rejection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_traffic_split_noops_when_service_absent() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let dep_b = env.bundles[1].deployment_id; // never warmed
+
+        let outcome = handler
+            .apply_traffic_split(&env, dep_b, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.applied_deployment_id, dep_b);
+        assert!(
+            target.traffic_for(dep_b).is_none(),
+            "no Service is created just to record a split; the spec stays authoritative"
+        );
+    }
+
+    #[test]
+    fn image_ref_defaults_to_direct_ghcr_and_honors_ar_repo_and_digest() {
+        let env = build_fixture_env();
+        let mut params = GcpCloudRunParams::for_env(&env);
+        assert_eq!(
+            params.image_ref(),
+            "ghcr.io/greenticai/greentic-start-distroless:develop",
+            "default is the direct public GHCR ref (free-when-idle)"
+        );
+        params.runtime_image_digest = Some("sha256:abc".to_string());
+        assert_eq!(
+            params.image_ref(),
+            "ghcr.io/greenticai/greentic-start-distroless@sha256:abc"
+        );
+        params.runtime_image_digest = None;
+        params.ar_repo = Some("gtc-mirror".to_string());
+        params.project = "my-proj".to_string();
+        params.region = "europe-west1".to_string();
+        assert_eq!(
+            params.image_ref(),
+            "europe-west1-docker.pkg.dev/my-proj/gtc-mirror/greenticai/greentic-start-distroless:develop"
+        );
+    }
+
+    #[test]
+    fn from_answers_rejects_unknown_keys_and_parses_known_ones() {
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "project": "prod-proj",
+            "region": "us-east1",
+            "access_mode": "authenticated",
+            "max_instances": "3",
+            "min_instances": "0",
+        });
+        let params = GcpCloudRunParams::from_answers(&env, Some(&answers)).unwrap();
+        assert_eq!(params.project, "prod-proj");
+        assert_eq!(params.region, "us-east1");
+        assert_eq!(params.access_mode, AccessMode::Authenticated);
+        assert_eq!(params.max_instances, 3);
+
+        let bad = serde_json::json!({ "nope": "x" });
+        assert!(matches!(
+            GcpCloudRunParams::from_answers(&env, Some(&bad)),
+            Err(GcpCloudRunParamsError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn service_and_revision_names_are_deterministic_and_within_limits() {
+        let env = build_fixture_env();
+        let dep = env.bundles[0].deployment_id;
+        let rev = env.revisions[0].revision_id;
+        let svc = service_name(dep);
+        let revn = revision_name(dep, rev);
+        assert!(svc.starts_with("gtc-svc-"));
+        assert_eq!(svc, svc.to_lowercase(), "service name must be lowercase");
+        assert!(revn.starts_with(&format!("{svc}-")));
+        assert!(
+            revn.len() <= 63,
+            "revision name `{revn}` ({}) must fit the 63-char Cloud Run limit",
+            revn.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_handler_target_is_unconfigured() {
+        // The default handler wires the Unconfigured target: a warm must fail
+        // honestly rather than silently succeed.
+        let handler = GcpCloudRunDeployerHandler::default();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let err = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect_err("unconfigured target must fail warm");
+        assert!(matches!(err, DeployerError::Provider(_)));
+    }
+
+    #[tokio::test]
+    async fn warm_threads_runtime_service_account_default_then_override() {
+        // Default: derived from the env id + project (the SA the bootstrap
+        // Terraform provisions), never blank.
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let sa = target
+            .runtime_service_account_for(dep_a)
+            .expect("warm records the runtime SA");
+        assert!(
+            sa.starts_with("gtc-conformance-runtime@"),
+            "default runtime SA is derived from the env, got {sa}"
+        );
+
+        // Override: the `service_account` answer wins and is threaded through.
+        let (handler2, target2) = handler_with_fake();
+        let answers =
+            serde_json::json!({ "service_account": "custom-runtime@acme.iam.gserviceaccount.com" });
+        handler2
+            .warm_revision(&env, r_warm, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            target2.runtime_service_account_for(dep_a).unwrap(),
+            "custom-runtime@acme.iam.gserviceaccount.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_applies_invoker_policy_for_the_requested_access_mode() {
+        // F5 (plan D12): a warm must apply the invoker IAM binding, not just the
+        // Service upsert — the IAM policy is a separate resource, so without this
+        // a Public service's `run.app` URL 403s every request. Default is Public.
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        assert_eq!(
+            target.invoker_policy_for(dep_a),
+            Some(AccessMode::Public),
+            "warm applies the default Public invoker binding"
+        );
+
+        // An `authenticated` answer leaves the service private.
+        let (handler2, target2) = handler_with_fake();
+        let answers = serde_json::json!({ "access_mode": "authenticated" });
+        handler2
+            .warm_revision(&env, r_warm, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            target2.invoker_policy_for(dep_a),
+            Some(AccessMode::Authenticated),
+            "an authenticated env applies the Authenticated invoker binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_returns_the_service_endpoint_url() {
+        // The Service's `*.run.app` URL rides back on the warm outcome (read from
+        // the upsert response), so the CLI needs no extra get_service round-trip.
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        let outcome = handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let url = outcome
+            .endpoint_url
+            .expect("warm surfaces the Service's *.run.app URL from the upsert response");
+        assert!(
+            url.contains(&service_name(dep_a)) && url.ends_with(".run.app"),
+            "endpoint URL should be the Service's run.app URL, got {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_retries_on_etag_conflict_then_succeeds() {
+        // Two conflicts, then success — within the retry budget (plan D4).
+        let target = Arc::new(ConflictInjector::new(2, 0));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("warm re-reads and retries past etag conflicts");
+        assert!(
+            target.inner.traffic_for(dep_a).is_some(),
+            "the service is created once the retry wins the etag race"
+        );
+    }
+
+    /// H2. A warm is retried routinely (`op env up` re-run, or a first attempt
+    /// that died past the upsert). Restaging would mint a fresh Secret Manager
+    /// version, which renders a different template for an IMMUTABLE revision —
+    /// rejected 409, and the versions are orphaned for good measure. So the
+    /// second warm must not stage at all.
+    #[tokio::test]
+    async fn warm_twice_reuses_the_existing_revision_without_restaging() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            1,
+            "first warm stages v1"
+        );
+
+        handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("re-warming a live revision must succeed (trait idempotency contract)");
+
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            1,
+            "the second warm must stage NO new secret version — a fresh version could \
+             never reach this immutable revision, so it would be pure orphan"
+        );
+        let mounts = target.service_secrets_for(dep_a).expect("service exists");
+        assert_eq!(
+            mounts[0].items[0].version, "1",
+            "the live revision keeps its originally pinned version"
+        );
+    }
+
+    /// H2. The resume path must converge the steps that are NOT part of the
+    /// immutable revision, not just return early: an attempt that died between
+    /// the upsert and the invoker grant leaves a revision that exists but is
+    /// unreachable, and the retry is what has to finish the job.
+    #[tokio::test]
+    async fn warm_resumes_a_revision_left_without_its_invoker_policy() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        // Exactly what a warm that died after its upsert leaves behind.
+        target.forget_invoker_policy(dep_a);
+
+        let outcome = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("a half-finished warm is resumable");
+
+        assert_eq!(
+            target.invoker_policy_for(dep_a),
+            Some(AccessMode::Public),
+            "the resumed warm must still apply the invoker policy — without it the \
+             revision is live but every request 403s"
+        );
+        assert!(
+            outcome.endpoint_url.is_some(),
+            "the resumed warm reports the endpoint the caller needs"
+        );
+    }
+
+    /// H1. `secret_prefix` is a free-text answer, so two environments in one
+    /// project can resolve to the same secret name. Their runtime service
+    /// accounts do NOT collide (`gtc-{env}-runtime@`), so staging on would grant
+    /// this env's SA `secretAccessor` over every version of the other's secret —
+    /// including the dev-store, which holds that env's whole credential set.
+    ///
+    /// Seeded through the real seam op rather than [`InMemoryCloudRun::seed_secret`],
+    /// so this covers the create race too: whether the rival was there all along
+    /// or won the race by a millisecond, it reaches the deployer as the same
+    /// `Existed { owner }` and must be refused the same way.
+    #[tokio::test]
+    async fn warm_refuses_a_secret_another_environment_owns() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let rival = env_owner_stamp("other-env");
+        // The rival's create landed first — a copied `secret_prefix` answer, or
+        // a concurrent warm that beat us to the name.
+        target.ensure_secret(&secret_name, &rival).await.unwrap();
+
+        let err = handler
+            .warm_revision(&env, env.revisions[0].revision_id, None)
+            .await
+            .expect_err("staging into another environment's secret must be refused");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("belongs to environment") && msg.contains("secret_prefix"),
+            "the refusal must name the owner and the answer to change, got: {msg}"
+        );
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            0,
+            "refuse BEFORE writing — a version added here is our seed sitting in \
+             their secret, readable by them, and no error can take it back"
+        );
+        assert!(
+            target.secret_accessors_for(&secret_name).is_none(),
+            "and before granting — the grant is the actual credential leak"
+        );
+        assert_eq!(
+            target.secrets()[&secret_name].owner,
+            Some(rival),
+            "and must not restamp the rival's secret as its own"
+        );
+    }
+
+    /// H1. `EnvId` admits `.` and uppercase, which GCP label values do not, so
+    /// the stamp folds the id into GCP's charset — and a fold alone maps `a.b`
+    /// and `a-b` onto one owner, letting each pass the other's ownership check.
+    /// The digest over the ORIGINAL id is what keeps them apart.
+    #[test]
+    fn owner_stamps_separate_env_ids_that_fold_to_the_same_label() {
+        for (left, right) in [
+            ("a.b", "a-b"),
+            ("Prod", "prod"),
+            ("x_y", "x.y"),
+            // Both fold to 10 `a`s, so ONLY the digest separates them — and both
+            // exceed the readable prefix, proving it is not carrying the identity.
+            ("aaaaaaaaaaaa1", "aaaaaaaaaaaa2"),
+            // Found against a 4-byte digest, where these two collided outright.
+            // Same fold, same 32-bit prefix: a full bypass of the boundary.
+            (
+                "AAAAAaaaAaAaAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "AAaAAAaAAaAaAaaAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
+            assert_ne!(
+                env_owner_stamp(left),
+                env_owner_stamp(right),
+                "`{left}` and `{right}` are different environments and must not share an owner"
+            );
+        }
+        // A GCP label value: `[a-z0-9_-]` and at most 63 chars, for the longest
+        // readable prefix the stamp can carry.
+        let stamp = env_owner_stamp("My.Env.Is.Really.Quite.Long");
+        assert!(
+            stamp
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'),
+            "not a valid GCP label value: `{stamp}`"
+        );
+        assert_eq!(
+            stamp.len(),
+            63,
+            "the stamp must use, and not exceed, the limit"
+        );
+        assert_eq!(
+            env_owner_stamp("prod"),
+            env_owner_stamp("prod"),
+            "the same env must stamp the same value on every warm, or it locks itself out"
+        );
+    }
+
+    /// H1. A secret staged before ownership stamping carries no label. The
+    /// deployer adopts it rather than failing closed — refusing would brick
+    /// every env deployed before this fix.
+    ///
+    /// That it is adopted *without being re-stamped* is not asserted here: the
+    /// fake stamps at create only, so no deployer-level assertion could fail. It
+    /// is pinned as a seam contract in
+    /// `deploy_target::ensure_secret_stamps_the_owner_at_create_only`.
+    #[tokio::test]
+    async fn warm_adopts_a_legacy_unstamped_secret() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        target.seed_secret(&secret_name, None);
+
+        handler
+            .warm_revision(&env, env.revisions[0].revision_id, None)
+            .await
+            .expect("an unstamped secret is legacy, not foreign");
+
+        assert_eq!(
+            target.secrets()[&secret_name].versions,
+            2,
+            "the legacy secret takes our new version rather than the warm failing"
+        );
+    }
+
+    /// H2. Existence is not convergence. `answers_ref` is env-level and
+    /// editable, so the same revision can be re-warmed under a configuration the
+    /// live revision does not have. Cloud Run cannot update an immutable
+    /// revision in place, so the only honest answer is to refuse — reporting
+    /// success would tell the operator their new image is live while the old one
+    /// keeps serving.
+    #[tokio::test]
+    async fn warm_refuses_a_live_revision_whose_configuration_changed() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        let staged_before = target.secrets().values().map(|s| s.versions).sum::<u64>();
+
+        // The operator edits the binding's answers and re-runs `op env up`.
+        let answers = serde_json::json!({ "runtime_image_tag": "v2-rolled-forward" });
+        let err = handler
+            .warm_revision(&env, r_warm, Some(&answers))
+            .await
+            .expect_err("a changed configuration cannot converge onto an immutable revision");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists") && msg.contains("NEW revision"),
+            "the error must name the conflict and the way out, got: {msg}"
+        );
+        assert_eq!(
+            target.secrets().values().map(|s| s.versions).sum::<u64>(),
+            staged_before,
+            "the refusal must come BEFORE staging — a rejected warm leaves no orphans"
+        );
+        assert_eq!(
+            target.service_secrets_for(dep_a).unwrap()[0].items[0].version,
+            "1",
+            "the live revision is untouched"
+        );
+    }
+
+    /// H2. Our own warm, running concurrently, takes the name between our probe
+    /// and our upsert: same intent, its own staged versions. Converging is
+    /// right, and retrying is not — the template can never match.
+    #[tokio::test]
+    async fn warm_converges_when_a_rival_warm_wins_the_create_race() {
+        let target = Arc::new(ConflictInjector::losing_create_race(Rival::SameIntent));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        let outcome = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect("a revision our own concurrent warm created is converged, not failed");
+
+        assert!(outcome.endpoint_url.is_some(), "endpoint still reported");
+        assert_eq!(
+            *target.upsert_attempts.lock().unwrap(),
+            1,
+            "the conflict is permanent, so it must cost exactly one upsert — retrying \
+             could only reproduce it {MAX_ETAG_RETRIES} more times"
+        );
+    }
+
+    /// H2. Same race, but the name was taken by a DIFFERENT configuration. The
+    /// stamp is what separates this from the case above; without it both look
+    /// like "the revision exists" and this one would be served as a success.
+    #[tokio::test]
+    async fn warm_refuses_when_a_rival_takes_the_name_with_another_configuration() {
+        let target = Arc::new(ConflictInjector::losing_create_race(Rival::DifferentIntent));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        let err = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect_err("a rival's different configuration must not be reported as our warm");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            *target.upsert_attempts.lock().unwrap(),
+            1,
+            "a permanent conflict costs exactly one upsert"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_stages_environment_secret_and_grants_runtime_sa() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        // environment.json is staged as a version-pinned Secret Manager secret (D6).
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let secrets = target.secrets();
+        let staged = secrets
+            .get(&secret_name)
+            .expect("warm stages the environment.json seed secret");
+        assert_eq!(staged.payload, serde_json::to_vec(&env).unwrap());
+        assert_eq!(staged.versions, 1, "first warm adds version 1");
+        assert_eq!(
+            staged.owner.as_deref(),
+            Some(env_owner_stamp(env.environment_id.as_str()).as_str()),
+            "the creating env stamps itself the secret's owner"
+        );
+
+        // The runtime SA is granted secretAccessor so the mounted version is
+        // readable — Cloud Run rejects a revision whose SA cannot read it.
+        let sa = params.runtime_service_account(env.environment_id.as_str());
+        let accessors = target
+            .secret_accessors_for(&secret_name)
+            .expect("secretAccessor grant recorded");
+        assert!(
+            accessors.contains(&sa),
+            "runtime SA {sa} must be granted secretAccessor"
+        );
+    }
+
+    #[test]
+    fn runtime_boot_env_activates_seed_and_carries_revision_identity() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let params = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
+        let vars = runtime_boot_env(&env, revision, &params);
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.as_str())
+        };
+
+        // Seed activation + writable store root: the exact contract greentic-
+        // start's boot-copy and `resolve_env` read.
+        assert_eq!(get("GREENTIC_SEED_DIR"), Some(SEED_MOUNT_DIR));
+        assert_eq!(get("HOME"), Some(RUNTIME_HOME));
+        assert_eq!(get("GREENTIC_ENV"), Some(env.environment_id.as_str()));
+        // Reachable on Cloud Run — greentic-start binds loopback by default.
+        assert_eq!(get("GREENTIC_GATEWAY_LISTEN_ADDR"), Some("0.0.0.0"));
+        // Revision identity (k8s pack-pull parity).
+        assert_eq!(get("GREENTIC_ENV_ID"), Some(env.environment_id.as_str()));
+        assert_eq!(
+            get("GREENTIC_REVISION_ID"),
+            Some(revision.revision_id.0.to_string().as_str())
+        );
+        assert_eq!(
+            get("GREENTIC_DEPLOYMENT_ID"),
+            Some(revision.deployment_id.0.to_string().as_str())
+        );
+        assert_eq!(get("GREENTIC_BUNDLE_ID"), Some(revision.bundle_id.as_str()));
+        assert_eq!(
+            get("GREENTIC_BUNDLE_DIGEST"),
+            Some(revision.bundle_digest.as_str())
+        );
+        // No bundle-source var — the source URI rides in the seeded environment.json.
+        assert!(get("GREENTIC_BUNDLE_SOURCE_URI").is_none());
+    }
+
+    /// An environment answering neither key must produce the boot env it
+    /// produced before these answers existed — not an empty-valued pair. An
+    /// empty `GREENTIC_TENANT` would override greentic-start's own default with
+    /// the empty string, and any new var at all moves `revision_intent`'s
+    /// fingerprint, which would make every live revision read as a conflict.
+    #[test]
+    fn runtime_boot_env_omits_tenant_and_team_when_unanswered() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let params = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
+        assert_eq!(params.runtime_tenant, None);
+        assert_eq!(params.runtime_team, None);
+
+        let vars = runtime_boot_env(&env, revision, &params);
+        let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !names.contains(&"GREENTIC_TENANT"),
+            "an unanswered tenant must be absent, not empty: {names:?}"
+        );
+        assert!(
+            !names.contains(&"GREENTIC_TEAM"),
+            "an unanswered team must be absent, not empty: {names:?}"
+        );
+
+        // The exact set, in order, that predates this feature.
+        assert_eq!(
+            names,
+            vec![
+                "GREENTIC_ENV",
+                "GREENTIC_ENV_ID",
+                "GREENTIC_SEED_DIR",
+                "HOME",
+                "GREENTIC_GATEWAY_LISTEN_ADDR",
+                "GREENTIC_REVISION_ID",
+                "GREENTIC_DEPLOYMENT_ID",
+                "GREENTIC_BUNDLE_ID",
+                "GREENTIC_BUNDLE_DIGEST",
+            ]
+        );
+
+        // An answers object that omits both keys is the same as no answers at
+        // all — the designer sends a flat map, so "absent" is the common case.
+        let sparse = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"region": "us-central1"})),
+        )
+        .expect("sparse answers parse");
+        assert_eq!(
+            runtime_boot_env(&env, revision, &sparse),
+            vars,
+            "omitting the keys from a non-empty answers object changes nothing"
+        );
+    }
+
+    /// The whole point of the feature: the answered tenant and team become the
+    /// segments of every `secrets://{env}/{tenant}/{team}/…` URI the workload
+    /// resolves, instead of greentic-start's `default`/`default`.
+    #[test]
+    fn runtime_boot_env_projects_the_answered_tenant_and_team() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let params = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "aws", "runtime_team": "general"})),
+        )
+        .expect("tenant and team answers parse");
+        assert_eq!(params.runtime_tenant.as_deref(), Some("aws"));
+        assert_eq!(params.runtime_team.as_deref(), Some("general"));
+
+        let vars = runtime_boot_env(&env, revision, &params);
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("GREENTIC_TENANT"), Some("aws"));
+        assert_eq!(get("GREENTIC_TEAM"), Some("general"));
+
+        // Projecting them adds exactly two vars and disturbs nothing else.
+        let baseline = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
+        assert_eq!(
+            vars.len(),
+            runtime_boot_env(&env, revision, &baseline).len() + 2
+        );
+    }
+
+    /// Each key is independently optional: answering one must not force the
+    /// other, and an explicitly blank answer is `None` (via `optional_string`)
+    /// rather than an empty variable.
+    #[test]
+    fn runtime_tenant_and_team_are_independently_optional() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+
+        let tenant_only = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "aws"})),
+        )
+        .expect("tenant-only answers parse");
+        let tenant_only_vars = runtime_boot_env(&env, revision, &tenant_only);
+        let names: Vec<&str> = tenant_only_vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"GREENTIC_TENANT"));
+        assert!(!names.contains(&"GREENTIC_TEAM"));
+
+        let blank = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "  ", "runtime_team": ""})),
+        )
+        .expect("blank answers parse");
+        assert_eq!(blank.runtime_tenant, None);
+        assert_eq!(blank.runtime_team, None);
+        let blank_vars = runtime_boot_env(&env, revision, &blank);
+        let names: Vec<&str> = blank_vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !names.contains(&"GREENTIC_TENANT") && !names.contains(&"GREENTIC_TEAM"),
+            "a blank answer must omit the var, never emit an empty one: {names:?}"
+        );
+    }
+
+    /// `from_answers` is deny-by-default, which is why this change must land
+    /// before greentic-designer starts sending the keys: an older deployer
+    /// rejects the whole deploy on `UnknownKey`. Pin that both new keys are
+    /// accepted AND that the refusal still works for a genuinely unknown one.
+    #[test]
+    fn from_answers_accepts_the_runtime_identity_keys_and_still_rejects_unknown_ones() {
+        let env = build_fixture_env();
+
+        GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenant": "aws", "runtime_team": "general"})),
+        )
+        .expect("both runtime identity keys are accepted");
+
+        let err = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"runtime_tenancy": "aws"})),
+        )
+        .expect_err("a genuinely unknown key is still refused");
+        assert!(
+            matches!(&err, GcpCloudRunParamsError::UnknownKey(k) if k == "runtime_tenancy"),
+            "expected UnknownKey(runtime_tenancy), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_threads_boot_env_onto_the_service() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let r_warm = revision.revision_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        // warm builds boot env once and projects it onto the upserted Service,
+        // so the running container actually boots from the staged seed.
+        let params = GcpCloudRunParams::from_answers(&env, None).expect("no answers parse");
+        let recorded = target
+            .service_env_for(revision.deployment_id)
+            .expect("warm upserts the Service with boot env");
+        assert_eq!(recorded, runtime_boot_env(&env, revision, &params));
+        assert!(
+            recorded
+                .iter()
+                .any(|(k, v)| k == "GREENTIC_SEED_DIR" && v == SEED_MOUNT_DIR),
+            "the seed boot-copy is activated"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_without_dev_secrets_mounts_only_environment_json() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+
+        handler
+            .warm_revision(&env, revision.revision_id, None)
+            .await
+            .unwrap();
+
+        let mounts = target
+            .service_secrets_for(revision.deployment_id)
+            .expect("warm upserts the Service with a seed mount");
+        assert_eq!(mounts.len(), 1, "one /seed volume");
+        assert_eq!(mounts[0].mount_dir, SEED_MOUNT_DIR);
+        assert_eq!(mounts[0].items.len(), 1, "no dev-store → env.json only");
+        assert_eq!(mounts[0].items[0].rel_path, ENVIRONMENT_SEED_FILE);
+    }
+
+    #[tokio::test]
+    async fn warm_stages_dev_store_as_second_version_under_one_seed_volume() {
+        let target = Arc::new(InMemoryCloudRun::default());
+        let handler = GcpCloudRunDeployerHandler::with_target_and_dev_secrets(
+            target.clone(),
+            Some(b"ENC-DEV-STORE".to_vec()),
+        );
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+
+        handler
+            .warm_revision(&env, revision.revision_id, None)
+            .await
+            .unwrap();
+
+        // Both seed files ride ONE secret's two versions under ONE /seed volume
+        // (Cloud Run forbids nested mounts): env.json at the root, dev-store at
+        // its on-disk subdirectory path.
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let version_count = target
+            .secrets()
+            .get(&secret_name)
+            .expect("seed secret staged")
+            .versions;
+        assert_eq!(version_count, 2, "env.json v1 + dev-store v2 on one secret");
+
+        let mounts = target
+            .service_secrets_for(revision.deployment_id)
+            .expect("warm upserts the Service with a seed mount");
+        assert_eq!(
+            mounts.len(),
+            1,
+            "one secret → one /seed volume, never nested"
+        );
+        assert_eq!(mounts[0].mount_dir, SEED_MOUNT_DIR);
+        assert_eq!(mounts[0].secret_name, secret_name);
+        assert_eq!(mounts[0].items.len(), 2);
+        assert_eq!(mounts[0].items[0].rel_path, ENVIRONMENT_SEED_FILE);
+        assert_eq!(mounts[0].items[0].version, "1");
+        assert_eq!(mounts[0].items[1].rel_path, DEV_STORE_RELATIVE);
+        assert_eq!(mounts[0].items[1].version, "2");
+
+        // The runtime SA can read the mounted versions.
+        let sa = params.runtime_service_account(env.environment_id.as_str());
+        assert!(
+            target
+                .secret_accessors_for(&secret_name)
+                .expect("grant recorded")
+                .contains(&sa)
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_stages_secret_once_across_etag_retries() {
+        // Two upsert_service conflicts before success: staging happens BEFORE the
+        // retry loop, so the seed secret gets exactly one version, not one per retry.
+        let target = Arc::new(ConflictInjector::new(2, 0));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+
+        let params = params_from_answers(&env, None).unwrap();
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let version = target
+            .inner
+            .secrets()
+            .get(&secret_name)
+            .expect("seed secret staged")
+            .versions;
+        assert_eq!(
+            version, 1,
+            "the seed secret is staged once, before the etag loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_gives_up_after_max_etag_retries() {
+        let target = Arc::new(ConflictInjector::new(MAX_ETAG_RETRIES + 1, 0));
+        let handler = GcpCloudRunDeployerHandler::with_target(target);
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let err = handler
+            .warm_revision(&env, r_warm, None)
+            .await
+            .expect_err("unbounded etag conflicts must surface a provider error");
+        assert!(matches!(err, DeployerError::Provider(ref m) if m.contains("etag race")));
+    }
+
+    #[tokio::test]
+    async fn apply_traffic_split_retries_on_etag_conflict() {
+        let target = Arc::new(ConflictInjector::new(0, 1));
+        let handler = GcpCloudRunDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        let r_warm = env.revisions[0].revision_id;
+        let dep_a = env.bundles[0].deployment_id;
+        handler.warm_revision(&env, r_warm, None).await.unwrap();
+        handler
+            .apply_traffic_split(&env, dep_a, None)
+            .await
+            .expect("traffic apply re-reads and retries past the etag conflict");
+        assert_eq!(
+            target.inner.traffic_for(dep_a).unwrap().len(),
+            2,
+            "the 50/50 split lands after the retry"
+        );
+    }
+
+    fn telemetry_answers() -> serde_json::Value {
+        serde_json::json!({
+            "telemetry_env": {
+                "TELEMETRY_EXPORT": "otlp-grpc",
+                "OTLP_ENDPOINT": "https://otlp.example.com:4317"
+            },
+            "telemetry_headers": "authorization=Bearer s3cret"
+        })
+    }
+
+    #[tokio::test]
+    async fn warm_renders_telemetry_env_and_stages_the_header_as_a_secret_version() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let r = env.revisions[0].revision_id;
+        let dep = env.bundles[0].deployment_id;
+        handler
+            .warm_revision(&env, r, Some(&telemetry_answers()))
+            .await
+            .unwrap();
+
+        let plain = target.service_env_for(dep).unwrap();
+        assert!(plain.contains(&("TELEMETRY_EXPORT".into(), "otlp-grpc".into())));
+        assert!(plain.contains(&(
+            "OTEL_RESOURCE_ATTRIBUTES".into(),
+            "greentic.role=worker".into()
+        )));
+        assert!(
+            !plain.iter().any(|(_, v)| v.contains("s3cret")),
+            "no credential in plain env"
+        );
+
+        let secret_env = target.service_secret_env_for(dep).unwrap();
+        let names: Vec<&str> = secret_env.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            crate::env_packs::telemetry::HEADER_ENV_NAMES.to_vec()
+        );
+        let secret_name = environment_secret_name(&GcpCloudRunParams::for_env(&env).secret_prefix);
+        assert!(secret_env.iter().all(|s| s.secret_name == secret_name));
+        let versions: std::collections::BTreeSet<&str> =
+            secret_env.iter().map(|s| s.version.as_str()).collect();
+        assert_eq!(versions.len(), 1, "both names reference ONE staged version");
+
+        let mut all: Vec<&str> = plain
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .chain(names.iter().copied())
+            .collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            n,
+            "telemetry must not collide with a boot variable"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_telemetry_answers_keep_the_intent_and_env_unchanged() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let plain = GcpCloudRunParams::for_env(&env);
+        let with_empty =
+            GcpCloudRunParams::from_answers(&env, Some(&serde_json::json!({}))).unwrap();
+        assert_eq!(
+            runtime_boot_env(&env, revision, &plain),
+            runtime_boot_env(&env, revision, &with_empty)
+        );
+
+        let intent = |p: &GcpCloudRunParams, names: &[&str]| {
+            revision_intent(
+                "img",
+                "sa",
+                &p.scaling(),
+                true,
+                "secret",
+                &runtime_boot_env(&env, revision, p),
+                names,
+            )
+        };
+        let baseline = intent(&plain, &[]);
+        let with_tel = GcpCloudRunParams::from_answers(&env, Some(&telemetry_answers())).unwrap();
+        assert_ne!(
+            baseline,
+            intent(&with_tel, &crate::env_packs::telemetry::HEADER_ENV_NAMES)
+        );
+    }
+
+    #[test]
+    fn the_intent_never_depends_on_the_header_value() {
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let a = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "k=one"})),
+        )
+        .unwrap();
+        let b = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_headers": "k=two"})),
+        )
+        .unwrap();
+        let names = crate::env_packs::telemetry::HEADER_ENV_NAMES;
+        assert_eq!(
+            revision_intent(
+                "img",
+                "sa",
+                &a.scaling(),
+                true,
+                "s",
+                &runtime_boot_env(&env, revision, &a),
+                &names
+            ),
+            revision_intent(
+                "img",
+                "sa",
+                &b.scaling(),
+                true,
+                "s",
+                &runtime_boot_env(&env, revision, &b),
+                &names
+            ),
+            "a header change rolls a new revision via #603, never via the intent"
+        );
+    }
+
+    #[test]
+    fn a_bad_telemetry_answer_is_a_params_error() {
+        let env = build_fixture_env();
+        let err = GcpCloudRunParams::from_answers(
+            &env,
+            Some(&serde_json::json!({"telemetry_env": {"FOO": "x"}})),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`FOO`"), "{err}");
+    }
+
+    /// One valid value per name in `telemetry::ALLOWED_ENV` (spec §4.3),
+    /// self-checked against the const so it cannot silently drift out of
+    /// sync with it.
+    fn all_allowed_telemetry_env() -> serde_json::Value {
+        let answer = serde_json::json!({
+            "TELEMETRY_EXPORT": "otlp-grpc",
+            "OTLP_ENDPOINT": "http://collector.internal:4317",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp.example.com:4318",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+            "OTEL_TRACES_SAMPLER_ARG": "0.1",
+            "OTEL_RESOURCE_ATTRIBUTES": "service.namespace=prod",
+            "OTEL_SERVICE_NAME": "greentic-worker",
+            "GREENTIC_TELEMETRY_ENABLED": "1",
+            "GREENTIC_TELEMETRY_EXPORTER": "otlp",
+            "GREENTIC_TELEMETRY_ENDPOINT": "https://telemetry.example.com",
+            "GREENTIC_TELEMETRY_SAMPLING": "0.5",
+        });
+        let obj = answer.as_object().unwrap();
+        for name in crate::env_packs::telemetry::ALLOWED_ENV {
+            assert!(
+                obj.contains_key(*name),
+                "fixture missing allowed name {name}"
+            );
+        }
+        assert_eq!(
+            obj.len(),
+            crate::env_packs::telemetry::ALLOWED_ENV.len(),
+            "fixture must cover exactly ALLOWED_ENV — update both together"
+        );
+        answer
+    }
+
+    #[test]
+    fn allowed_names_and_cloud_run_boot_env_are_disjoint() {
+        // `runtime_tenant` / `runtime_team` answered too, so `GREENTIC_TENANT`
+        // / `GREENTIC_TEAM` are actually present in the boot env this checks
+        // against, not just the names always rendered.
+        let env = build_fixture_env();
+        let revision = &env.revisions[0];
+        let mut answers = all_allowed_telemetry_env();
+        let full = serde_json::json!({
+            "runtime_tenant": "aws",
+            "runtime_team": "general",
+            "telemetry_env": answers.take(),
+        });
+        let params =
+            GcpCloudRunParams::from_answers(&env, Some(&full)).expect("all names are allowed");
+        let vars = runtime_boot_env(&env, revision, &params);
+        let mut names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "duplicate boot env name rendered: {names:?}"
+        );
+    }
+}

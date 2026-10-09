@@ -10,7 +10,7 @@
 //! - [`traffic`] — Traffic-split management (`set`, `show`, `rollback`)
 //! - [`config`] — Host/setup/runtime config inspection (`show`, `set`)
 //! - [`credentials`] — Credential modes (`requirements`, `bootstrap`, `rotate`)
-//! - [`secrets`] — Secrets management (`list`, `put`, `get`, `rotate`)
+//! - [`secrets`] — Secrets management (`list`, `put`, `get`, `rotate`, `delete`)
 //!
 //! Every command pair honors:
 //!
@@ -41,6 +41,9 @@ pub mod bootstrap;
 pub mod bundle_fetch;
 pub mod bundle_stage;
 pub mod bundles;
+pub mod bundles_retire;
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+pub(crate) mod cloudrun_generated_secrets;
 pub mod config;
 pub mod credentials;
 pub mod deploy;
@@ -48,8 +51,11 @@ pub mod dispatch;
 pub(crate) mod dispatch_remote;
 pub mod env;
 pub mod env_apply;
+pub(crate) mod env_cloudrun_sor;
+pub mod env_drain;
 pub mod env_manifest;
 pub mod env_packs;
+pub(crate) mod env_sor;
 pub mod env_up;
 pub mod extensions;
 pub mod messaging;
@@ -60,8 +66,10 @@ pub(crate) mod release_artifacts;
 pub mod revisions;
 pub mod secrets;
 pub mod traffic;
+pub mod traffic_clear;
 pub mod trust_root;
 pub mod updates;
+pub mod webchat_ui;
 // pub mod bundles;
 // pub mod revisions;
 // pub mod traffic;
@@ -128,6 +136,20 @@ pub enum OpError {
     /// envelopes.
     #[error("operator key: {0}")]
     OperatorKey(#[from] crate::operator_key::OperatorKeyError),
+    /// Archiving a revision that still serves (P5-R2). Names the revision;
+    /// `op env drain-revision` drains it, `--force-drain` overrides.
+    #[error(
+        "revision `{revision_id}` is not drained: {reason} — drain it first \
+         (`op env drain-revision`), or pass --force-drain to archive anyway"
+    )]
+    NotDrained { revision_id: String, reason: String },
+    /// The deployer identity lacks a Kubernetes permission a verb needs; the
+    /// message names it and the re-bootstrap that grants it.
+    #[error("{0}")]
+    PermissionMissing(String),
+    /// A plan needs an adapter capability the bound deployer lacks (P5-R3).
+    #[error("{0}")]
+    CapabilityMissing(#[from] crate::env_packs::deployer::CapabilityMissing),
 }
 
 impl From<LifecycleError> for OpError {
@@ -212,6 +234,9 @@ impl OpError {
             OpError::RevenuePolicy(_) => "revenue-policy",
             OpError::TrustRoot(_) => "trust-root",
             OpError::OperatorKey(_) => "operator-key",
+            OpError::NotDrained { .. } => "not-drained",
+            OpError::PermissionMissing(_) => "permission-missing",
+            OpError::CapabilityMissing(_) => "capability-missing",
         }
     }
 }
@@ -257,6 +282,15 @@ pub(crate) fn map_store_err_preserving_noun(e: crate::environment::StoreError) -
         }
         crate::environment::StoreError::NotYetImplemented(detail) => {
             OpError::NotYetImplemented(detail)
+        }
+        // Provider teardown could not complete (failed, or refused because this
+        // build cannot tear the resources down) — the env was NOT destroyed.
+        // Surface as a conflict so the operator sees the destroy did not proceed.
+        crate::environment::StoreError::ProviderTeardown(msg) => {
+            OpError::Conflict(format!("provider teardown failed: {msg}"))
+        }
+        unavailable @ crate::environment::StoreError::ProviderTeardownUnavailable { .. } => {
+            OpError::Conflict(unavailable.to_string())
         }
         // PR-3a.6: the typed revision-lifecycle verbs (`warm_revision` /
         // `drain_revision` / `archive_revision`) wrap their inner

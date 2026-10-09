@@ -43,7 +43,7 @@ The seven slots today (`CapabilitySlot::ALL`):
 
 | Slot         | Cardinality   | Examples                                                                              |
 | ------------ | ------------- | ------------------------------------------------------------------------------------- |
-| `deployer`   | 1 per env     | `greentic.deployer.local-process`, `greentic.deployer.k8s`                            |
+| `deployer`   | 1 per env     | `greentic.deployer.local-process`, `greentic.deployer.k8s`, `greentic.deployer.aws-ecs`, `greentic.deployer.gcp-cloudrun` |
 | `secrets`    | 1 per env     | `greentic.secrets.dev-store`, `greentic.secrets.aws-sm`, `greentic.secrets.vault`     |
 | `telemetry`  | 1 per env     | `greentic.telemetry.stdout`, `greentic.telemetry.otlp-grpc`                           |
 | `sessions`   | 1 per env     | `greentic.sessions.in-memory`, `greentic.sessions.redis`                              |

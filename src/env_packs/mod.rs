@@ -9,14 +9,19 @@
 #[cfg(feature = "creds-aws")]
 pub mod aws;
 pub mod deployer;
+#[cfg(feature = "creds-gcp")]
+pub mod gcp_cloudrun;
 pub mod k8s;
 pub mod local_process;
 pub mod registry;
 pub mod render;
 pub mod slot;
+pub mod telemetry;
 
 #[cfg(feature = "creds-aws")]
 pub use aws::{AwsDeployerCredentials, AwsEcsDeployerHandler, AwsValidatorClient};
+#[cfg(feature = "creds-gcp")]
+pub use gcp_cloudrun::{GcpCloudRunDeployerHandler, GcpDeployerCredentials, GcpValidatorClient};
 pub use k8s::{K8sDeployerCredentials, K8sDeployerHandler, K8sValidatorClient};
 pub use local_process::{LocalProcessCredentials, LocalProcessDeployerHandler};
 pub use registry::{EnvPackRegistry, RegistryError};

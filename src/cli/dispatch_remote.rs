@@ -141,6 +141,9 @@ fn route_remote(
             EnvVerb::Render(_) => Err(not_supported("env render")),
             EnvVerb::Reconcile(args) => remote_reconcile(store, flags, args),
             EnvVerb::ApplyRevision(_) => Err(not_supported("env apply-revision")),
+            EnvVerb::DrainRevision(_) => Err(not_supported("env drain-revision")),
+            EnvVerb::Sweep(_) => Err(not_supported("env sweep")),
+            EnvVerb::Capabilities { .. } => Err(not_supported("env capabilities")),
             EnvVerb::ApplyTraffic(_) => Err(not_supported("env apply-traffic")),
             EnvVerb::Destroy { .. } => Err(not_supported("env destroy")),
             EnvVerb::MigrateDev { .. } => Err(not_supported("env migrate-dev")),
@@ -170,6 +173,7 @@ fn route_remote(
             BundlesVerb::Add => remote_bundles_add(store, flags),
             BundlesVerb::Update => remote_bundles_update(store, flags),
             BundlesVerb::Remove => remote_bundles_remove(store, flags),
+            BundlesVerb::Retire(_) => Err(not_supported("bundles retire")),
             BundlesVerb::List { env_id } => super::bundles::list(store, flags, &env_id),
         },
 
@@ -187,6 +191,7 @@ fn route_remote(
                 let payload = super::traffic::payload_from_target_args(args)?;
                 remote_traffic_rollback(store, flags, payload)
             }
+            TrafficVerb::Clear(_) => Err(not_supported("traffic clear")),
         },
 
         // -- revisions ---------------------------------------------------------
@@ -280,6 +285,7 @@ fn route_remote(
             SecretsVerb::Put => Err(not_supported("secrets put")),
             SecretsVerb::Get => Err(not_supported("secrets get")),
             SecretsVerb::Rotate => Err(not_supported("secrets rotate")),
+            SecretsVerb::Delete => Err(not_supported("secrets delete")),
         },
         // Update-channel enrollment writes to the env's local secrets backend
         // and talks to the external Cert-CA — not a remote-store operation.
@@ -295,6 +301,9 @@ fn route_remote(
             // Signs with the local operator key against the local env trust
             // root; the remote store holds neither.
             UpdatesVerb::Publish(_) => Err(not_supported("updates publish")),
+            UpdatesVerb::Export(_) => Err(not_supported("updates export")),
+            UpdatesVerb::Import(_) => Err(not_supported("updates import")),
+            UpdatesVerb::CasGc(_) => Err(not_supported("updates cas-gc")),
         },
     }
 }
@@ -903,6 +912,13 @@ fn remote_revision_stage(
         ));
     }
     let payload = resolve_payload::<super::revisions::RevisionStagePayload>(flags, None)?;
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "revisions stage payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
     if payload.bundle_path.is_some() {
         return Err(OpError::InvalidArgument(
             "remote `revisions stage` needs pinned pointers, not a local `bundle_path`: push the \
@@ -969,10 +985,13 @@ fn remote_revision_stage(
         config_digest: payload.config_digest,
         signature_sidecar_ref: payload.signature_sidecar_ref,
         drain_seconds: payload.drain_seconds,
+        runtime_image_digest: payload.runtime_image_digest,
     };
+    let requested_runtime = store_payload.runtime_image_digest.clone();
     let revision = store
         .stage_revision(&env_id, store_payload, idempotency_key)
         .map_err(map_store_err_preserving_noun)?;
+    ensure_runtime_pin_kept(requested_runtime.as_deref(), &revision)?;
     Ok(OpOutcome::new(
         "revisions",
         "stage",
@@ -1075,6 +1094,13 @@ fn remote_deploy(
     payload: Option<super::deploy::BundleDeployPayload>,
 ) -> Result<OpOutcome, OpError> {
     let payload = resolve_payload::<super::deploy::BundleDeployPayload>(flags, payload)?;
+    // A pin reaches a Cloud Run image reference verbatim: refuse anything but
+    // `sha256:<64 lowercase hex>` before any mutation.
+    super::env_apply::runtime_pin::validate_runtime_pin(
+        "deploy payload",
+        payload.runtime_image_digest.as_deref(),
+    )
+    .map_err(OpError::InvalidArgument)?;
 
     // A remote store can't extract a local artifact server-side.
     if payload.bundle_path.is_some() {
@@ -1235,10 +1261,12 @@ fn remote_deploy(
                 drain_seconds: pins
                     .drain_seconds
                     .unwrap_or_else(super::revisions::default_drain_seconds),
+                runtime_image_digest: payload.runtime_image_digest.clone(),
             },
             sub_key("stage")?,
         )
         .map_err(map_store_err_preserving_noun)?;
+    ensure_runtime_pin_kept(payload.runtime_image_digest.as_deref(), &revision)?;
     let revision_id = revision.revision_id;
 
     // Warm it to Ready behind the no-op gate (deploy has no health producers).
@@ -1496,6 +1524,10 @@ fn remote_reconcile(
         None,
         secrets_backend,
         false,
+        // A remote store carries no sor-units.json sidecar (amendment 6).
+        None,
+        // No local store identity: workers stay unattributed, never swept.
+        None,
     )?;
 
     Ok(OpOutcome::new(
@@ -1936,15 +1968,56 @@ struct DesiredRevision {
     source_uri: String,
     digest: String,
     drain_seconds: u32,
+    /// Manifest runtime pin stamped on the staged revision (`None` = answer).
+    runtime_image_digest: Option<String>,
+}
+
+/// Refuse when a requested runtime pin did not survive the store round trip.
+///
+/// `StageRevisionPayload` is not `deny_unknown_fields`, so a control-plane
+/// store built before runtime pins accepts the field and silently drops it.
+/// The revision then runs the environment's answer instead of the pin, and
+/// [`deployment_converged_remote`] never matches it, so every later apply
+/// re-stages it again. Failing here names the cause once, before the warm.
+fn ensure_runtime_pin_kept(
+    requested: Option<&str>,
+    revision: &greentic_deploy_spec::Revision,
+) -> Result<(), OpError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if revision.runtime_image_digest.as_deref() == Some(requested) {
+        return Ok(());
+    }
+    Err(OpError::Conflict(format!(
+        "control-plane store predates runtime pins; upgrade the store: revision `{}` was \
+         staged with runtime_image_digest `{}` but the store recorded `{}`",
+        revision.revision_id,
+        requested,
+        revision.runtime_image_digest.as_deref().unwrap_or("none")
+    )))
 }
 
 /// True when the deployment's live traffic split already equals the desired
 /// revision set — the convergence skip that makes apply re-runnable without
 /// relying on the bounded server replay ledger.
+///
+/// `single_revision` (a manifest entry with no `revisions[]`) ignores live
+/// zero-weight entries, mirroring the local planner's `deployment_converged`:
+/// a retained `[baseline@0, candidate@100]` split is converged for the
+/// candidate, and the baseline is left in place for the rollback window. A
+/// multi-revision manifest stays an exact multiset, zeros included.
+///
+/// The runtime pin is part of the identity (unified update L2): a pin change
+/// is a new revision, never a silent no-op. The control-plane store keeps no
+/// deployer answers, so this is `effective_runtime` with no answer — the raw
+/// pins compare, and a revision staged before pins existed (`None`) stays
+/// converged for an unpinned entry.
 fn deployment_converged_remote(
     env: &greentic_deploy_spec::Environment,
     deployment_id: DeploymentId,
     desired: &[DesiredRevision],
+    single_revision: bool,
 ) -> bool {
     // Multiset equality of `(weight_bps, source_uri, digest)` between the live
     // split and the desired set: every live entry must resolve to a real-digest
@@ -1957,11 +2030,17 @@ fn deployment_converged_remote(
     else {
         return false;
     };
-    if split.entries.len() != desired.len() {
+    let entries: Vec<&greentic_deploy_spec::TrafficSplitEntry> = split
+        .entries
+        .iter()
+        .filter(|e| !single_revision || e.weight_bps > 0)
+        .collect();
+    if entries.len() != desired.len() {
         return false;
     }
-    let mut live: Vec<(u32, Option<&str>, &str)> = Vec::with_capacity(split.entries.len());
-    for entry in &split.entries {
+    type Key<'k> = (u32, Option<&'k str>, &'k str, Option<&'k str>);
+    let mut live: Vec<Key<'_>> = Vec::with_capacity(entries.len());
+    for entry in entries {
         let Some(rev) = env
             .revisions
             .iter()
@@ -1976,11 +2055,19 @@ fn deployment_converged_remote(
             entry.weight_bps,
             rev.bundle_source_uri.as_deref(),
             rev.bundle_digest.as_str(),
+            rev.runtime_image_digest.as_deref(),
         ));
     }
-    let mut want: Vec<(u32, Option<&str>, &str)> = desired
+    let mut want: Vec<Key<'_>> = desired
         .iter()
-        .map(|d| (d.weight_bps, Some(d.source_uri.as_str()), d.digest.as_str()))
+        .map(|d| {
+            (
+                d.weight_bps,
+                Some(d.source_uri.as_str()),
+                d.digest.as_str(),
+                d.runtime_image_digest.as_deref(),
+            )
+        })
         .collect();
     live.sort_unstable();
     want.sort_unstable();
@@ -2151,6 +2238,16 @@ fn remote_env_apply(
     flags: &OpFlags,
     opts: ApplyOptions,
 ) -> Result<OpOutcome, OpError> {
+    // Refused, never silently ignored: an upsert-only run reporting success
+    // would read as a prune that happened.
+    if opts.prune {
+        return Err(OpError::NotYetImplemented(
+            "prune is not supported on a remote store yet: `env apply --prune` needs the \
+             local ownership ledger; run it against the local store (without --store-url / \
+             GREENTIC_STORE_URL)"
+                .to_string(),
+        ));
+    }
     let manifest_path = flags.answers.clone().ok_or_else(|| {
         OpError::InvalidArgument(
             "env apply requires `--answers <manifest.json>` (a greentic.env-manifest.v1 \
@@ -2288,6 +2385,7 @@ fn remote_env_apply(
                         drain_seconds: r
                             .drain_seconds
                             .unwrap_or_else(super::revisions::default_drain_seconds),
+                        runtime_image_digest: r.runtime_image_digest.clone(),
                     })
                     .collect()
             }
@@ -2297,6 +2395,7 @@ fn remote_env_apply(
                 source_uri: b.bundle_source_uri.clone().unwrap_or_default(),
                 digest: b.bundle_digest.clone().unwrap_or_default(),
                 drain_seconds: super::revisions::default_drain_seconds(),
+                runtime_image_digest: b.runtime_image_digest.clone(),
             }],
         };
 
@@ -2367,7 +2466,7 @@ fn remote_env_apply(
         // Convergence: skip stage/warm/traffic when the live split already
         // matches the desired (weight, source_uri, digest) set.
         if let Some(dep_id) = deployment_id
-            && deployment_converged_remote(&env, dep_id, &revs)
+            && deployment_converged_remote(&env, dep_id, &revs, b.revisions.is_none())
         {
             plan.noop(json!({
                 "section": "revision", "bundle_id": b.bundle_id, "action": "converged"
@@ -2388,6 +2487,7 @@ fn remote_env_apply(
                 // collide (`DuplicateRevision`) on re-apply once the server
                 // replay ledger evicts the original key.
                 let revision_id = crate::environment::mint_revision_id();
+                let requested_runtime = rev.runtime_image_digest.clone();
                 let staged = store
                     .stage_revision(
                         &env_id,
@@ -2407,10 +2507,12 @@ fn remote_env_apply(
                             signature_sidecar_ref: super::revisions::default_signature_sidecar_ref(
                             ),
                             drain_seconds: rev.drain_seconds,
+                            runtime_image_digest: rev.runtime_image_digest,
                         },
                         super::mint_idempotency_key(),
                     )
                     .map_err(map_store_err_preserving_noun)?;
+                ensure_runtime_pin_kept(requested_runtime.as_deref(), &staged)?;
                 store
                     .warm_revision(
                         &env_id,
@@ -3962,6 +4064,68 @@ mod tests {
         assert!(matches!(err, OpError::InvalidArgument(m) if m.contains("revision `v2`")));
     }
 
+    /// A split whose revisions carry NO `bundle_path` — each a registry
+    /// pointer + pinned digest — is the natural remote shape and is accepted.
+    #[test]
+    fn remote_only_split_passes_validation() {
+        let mut j = base_manifest_json("prod");
+        j["bundles"] = serde_json::json!([{
+            "bundle_id": "app",
+            "customer_id": "acme",
+            "revisions": [
+                {"name": "v1", "weight_percent": 90,
+                 "bundle_source_uri": "oci://r/app:1", "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                {"name": "v2", "weight_percent": 10,
+                 "bundle_source_uri": "oci://r/app:2", "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+            ]
+        }]);
+        let manifest = manifest_from(j);
+        manifest
+            .validate_shape()
+            .expect("remote-only split is well-formed");
+        assert!(reject_unsupported_remote_sections(&manifest).is_ok());
+    }
+
+    #[test]
+    fn remote_apply_dry_run_plans_a_remote_only_split() {
+        let load = serde_json::json!({"environment": env_json_for("prod")}).to_string();
+        let mock = start_mock(vec![(200, &load)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod", "public_base_url": "https://prod.example"},
+            "bundles": [{
+                "bundle_id": "app",
+                "customer_id": "acme",
+                "revisions": [
+                    {"name": "v1", "weight_percent": 90,
+                     "bundle_source_uri": "oci://registry.example/app:1",
+                     "bundle_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                    {"name": "v2", "weight_percent": 10,
+                     "bundle_source_uri": "oci://registry.example/app:2",
+                     "bundle_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+                ]
+            }]
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let outcome = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::DryRun,
+                ..Default::default()
+            },
+        )
+        .expect("a remote-only split plans over a remote store");
+        let steps = outcome.result["steps"].as_array().unwrap();
+        assert_eq!(
+            steps.iter().filter(|s| s["section"] == "revision").count(),
+            2,
+            "one staged revision per split entry: {steps:?}"
+        );
+        assert!(steps.iter().any(|s| s["section"] == "traffic"));
+    }
+
     #[test]
     fn clean_manifest_passes_validation() {
         let mut j = base_manifest_json("prod");
@@ -4055,6 +4219,33 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|s| s["section"] == "environment")
+        );
+    }
+
+    #[test]
+    fn remote_apply_refuses_prune_before_any_request() {
+        // No mock responses: a request would hang `accept`.
+        let mock = start_mock(vec![], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let manifest = serde_json::json!({
+            "schema": "greentic.env-manifest.v1",
+            "environment": {"id": "prod"}
+        });
+        let (_tmp, flags) = answers_flags(manifest);
+        let err = remote_env_apply(
+            &store,
+            &flags,
+            ApplyOptions {
+                mode: ApplyMode::Apply,
+                prune: true,
+                confirm_prune: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, OpError::NotYetImplemented(m) if m.contains("prune is not supported on a remote store yet")),
+            "{err}"
         );
     }
 
@@ -4411,6 +4602,7 @@ mod tests {
             source_uri: source_uri.to_string(),
             digest: digest.to_string(),
             drain_seconds: 30,
+            runtime_image_digest: None,
         }
     }
 
@@ -4420,8 +4612,30 @@ mod tests {
         assert!(deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:1", "sha256:abc123")]
+            &[desired(10000, "oci://r/app:1", "sha256:abc123")],
+            true,
         ));
+    }
+
+    /// `[old@0, new@100]`: a single-revision manifest for `new` converges
+    /// (the retained zero-weight baseline is ignored, as in the local
+    /// planner); a multi-revision manifest naming only `new` does not.
+    #[test]
+    fn single_revision_convergence_ignores_a_zero_weight_baseline() {
+        let mut env = env_of(converged_env_json("sha256:abc123", "oci://r/app:2", 10000));
+        let mut old = env.revisions[0].clone();
+        old.revision_id = greentic_deploy_spec::RevisionId::new();
+        old.bundle_digest = "sha256:0ld000".to_string();
+        env.traffic_splits[0]
+            .entries
+            .push(greentic_deploy_spec::TrafficSplitEntry {
+                revision_id: old.revision_id,
+                weight_bps: 0,
+            });
+        env.revisions.push(old);
+        let want = [desired(10000, "oci://r/app:2", "sha256:abc123")];
+        assert!(deployment_converged_remote(&env, dep_id(), &want, true));
+        assert!(!deployment_converged_remote(&env, dep_id(), &want, false));
     }
 
     #[test]
@@ -4431,14 +4645,117 @@ mod tests {
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:1", "sha256:def456")]
+            &[desired(10000, "oci://r/app:1", "sha256:def456")],
+            true,
         ));
         // Changed pull ref (same digest) → still not converged.
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:2", "sha256:abc123")]
+            &[desired(10000, "oci://r/app:2", "sha256:abc123")],
+            true,
         ));
+    }
+
+    const RUNTIME_PIN: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn pinned_stage_flags() -> (tempfile::NamedTempFile, OpFlags) {
+        answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "deployment_id": TEST_REV_ID,
+            "bundle_digest": "sha256:abc",
+            "bundle_source_uri": "oci://registry.example/bundle@sha256:abc",
+            "pack_list": [],
+            "pack_list_lock_ref": "revisions/r/pack-list.lock",
+            "runtime_image_digest": RUNTIME_PIN
+        }))
+    }
+
+    fn stage_args() -> super::super::dispatch::RevisionStageArgs {
+        super::super::dispatch::RevisionStageArgs {
+            env_id: None,
+            deployment: None,
+            bundle: None,
+        }
+    }
+
+    /// An older control-plane store accepts `runtime_image_digest` and drops
+    /// it: the response revision carries no pin. That must fail loudly, or
+    /// every later apply re-stages the revision forever.
+    #[test]
+    fn a_store_that_drops_the_runtime_pin_is_refused_on_stage() {
+        let body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        let mock = start_mock(vec![(201, &body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = pinned_stage_flags();
+        let err = remote_revision_stage(&store, &flags, stage_args()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("predates runtime pins"), "{msg}");
+        assert!(msg.contains(RUNTIME_PIN), "{msg}");
+    }
+
+    #[test]
+    fn a_store_that_keeps_the_runtime_pin_stages_normally() {
+        let mut rev = revision_json(TEST_REV_ID, "staged");
+        rev["runtime_image_digest"] = serde_json::json!(RUNTIME_PIN);
+        let body = wrap_mutation(rev);
+        let mock = start_mock(vec![(201, &body)], None);
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = pinned_stage_flags();
+        remote_revision_stage(&store, &flags, stage_args()).expect("pin kept");
+    }
+
+    #[test]
+    fn a_store_that_drops_the_runtime_pin_is_refused_on_deploy_before_warm() {
+        let get_body = serde_json::json!({
+            "environment": env_json(),
+            "etag": "sha256:test",
+            "generation": 1
+        })
+        .to_string();
+        let add_body = wrap_mutation(deploy_bundle_json());
+        let stage_body = wrap_mutation(revision_json(TEST_REV_ID, "staged"));
+        // Only three responses: a warm call after the stage would hang.
+        let mock = start_mock(
+            vec![(200, &get_body), (201, &add_body), (201, &stage_body)],
+            None,
+        );
+        let store = mock_store(mock.addr, AuthMethod::None);
+        let (_tmp, flags) = answers_flags(serde_json::json!({
+            "environment_id": "local",
+            "bundle_id": "my-bundle",
+            "bundle_source_uri": "oci://registry.example/my-bundle@sha256:deadbeef",
+            "remote_pins": {"bundle_digest": "sha256:deadbeef"},
+            "runtime_image_digest": RUNTIME_PIN
+        }));
+        let err = remote_deploy(&store, &flags, None).unwrap_err();
+        assert!(err.to_string().contains("predates runtime pins"), "{err}");
+    }
+
+    #[test]
+    fn convergence_compares_the_runtime_pin() {
+        const PIN: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut env = env_of(converged_env_json("sha256:abc123", "oci://r/app:1", 10000));
+        let pinned = DesiredRevision {
+            runtime_image_digest: Some(PIN.to_string()),
+            ..desired(10000, "oci://r/app:1", "sha256:abc123")
+        };
+        // Unstamped live revision: an unpinned entry converges, a pin is owed.
+        assert!(deployment_converged_remote(
+            &env,
+            dep_id(),
+            &[desired(10000, "oci://r/app:1", "sha256:abc123")],
+            true,
+        ));
+        assert!(!deployment_converged_remote(
+            &env,
+            dep_id(),
+            std::slice::from_ref(&pinned),
+            true
+        ));
+        env.revisions[0].runtime_image_digest = Some(PIN.to_string());
+        assert!(deployment_converged_remote(&env, dep_id(), &[pinned], true));
     }
 
     #[test]
@@ -4449,7 +4766,8 @@ mod tests {
         assert!(!deployment_converged_remote(
             &env,
             dep_id(),
-            &[desired(10000, "oci://r/app:1", "sha256:00")]
+            &[desired(10000, "oci://r/app:1", "sha256:00")],
+            true,
         ));
     }
 

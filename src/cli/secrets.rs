@@ -1,4 +1,4 @@
-//! `gtc op secrets {list,put,get,rotate}` (`A3`).
+//! `gtc op secrets {list,put,get,rotate,delete}` (`A3`).
 //!
 //! Operates on the env's bound `Secrets` env-pack. The actual backend
 //! dispatch (AWS Secrets Manager, Azure Key Vault, dev-store, Vault, etc.)
@@ -15,7 +15,14 @@
 //! live backend — return `NotYetImplemented` and point at the gating PR
 //! (A9 — env-pack registry + handler dispatch).
 //! `list` returns the *namespace* keys the env owns (always `secret://<env>/...`)
-//! — no actual material is fetched.
+//! — no actual material is fetched. With a `prefix` it also enumerates the
+//! dev store's stored KEY NAMES under that prefix (never values).
+//!
+//! `delete` removes one key (`path`) or every key under a `prefix` from the dev
+//! store — dropped from the store file entirely, not tombstoned, because the
+//! env-packs ship that whole file into every workload (see
+//! `dev_store_keys`). Deleting a missing key is a success with
+//! `deleted: false`.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +37,12 @@ use crate::environment::{EnvFlock, EnvironmentStore, LocalFsStore};
 use super::{
     AuditCtx, AuditGens, OpError, OpFlags, OpOutcome, audit_and_record, resolve_idempotency_key,
 };
+
+#[cfg(test)]
+mod delete_tests;
+mod dev_store_keys;
+
+use dev_store_keys::DevStorePrefix;
 
 const NOUN: &str = "secrets";
 
@@ -54,25 +67,83 @@ pub(crate) const DEV_SECRETS_PATH_ENV: &str = "GREENTIC_DEV_SECRETS_PATH";
 pub(crate) const DEV_STORE_RELATIVE: &str = ".greentic/dev/.dev.secrets.env";
 pub(crate) const DEV_STORE_STATE_RELATIVE: &str = ".greentic/state/dev/.dev.secrets.env";
 
-/// The pack segment whose keys are owned by greentic-designer-admin rather
+/// Pack segments whose keys are owned by greentic-designer-admin rather
 /// than by an environment: stored VERBATIM, under the `default` env segment.
+/// `mcp` keys an MCP server by its hyphenated UUID; `a2a` keys an external
+/// A2A agent the same way (`agent_id` is a hyphenated UUID too); `sorla` keys
+/// a SoRLa route document (`secrets://default/<tenant>/_/sorla/<sor>`) by the
+/// hyphenated capability-URI pack segment greentic-designer already mints —
+/// including the `<sor>.unit-<slug>-<hex>` per-unit form. All three are
+/// written and read byte-for-byte because the writer mints the name and the
+/// runtime looks it up unmodified — canonicalising any of them would rewrite
+/// the hyphens to underscores and resolve nothing, silently, since a missing
+/// credential in any of these categories is reported as an ordinary
+/// node/tool error.
 ///
 /// Mirrors greentic-start's reader carve-out (`src/secrets_client.rs`,
 /// `canonicalize_dev_store_secret_uri`) exactly. The two must agree: a writer
 /// that normalizes a key the reader does not — or files it under a different
 /// env segment — stores a credential nothing ever looks up, and the failure
-/// surfaces only as an ordinary MCP node error.
+/// surfaces only as an ordinary MCP/A2A/SoRLa node error.
 const MCP_CATEGORY: &str = "mcp";
 
-/// Env segment every `mcp` key is written under, matching
+/// See [`MCP_CATEGORY`] — the same verbatim-storage rule applies to `a2a`.
+const A2A_CATEGORY: &str = "a2a";
+
+/// See [`MCP_CATEGORY`]: SoRLa route documents (`secrets://default/<tenant>/_/sorla/<sor>`,
+/// `<sor>` a hyphenated capability-URI pack segment) are read verbatim by
+/// greentic-runner's `sorla_route::resolve_route`, at the `default` env segment.
+const SORLA_CATEGORY: &str = "sorla";
+
+/// Env segment every `mcp`/`a2a`/`sorla` key is written under, matching
 /// `greentic_aw_runtime::mcp_secrets::MCP_ENV_SEGMENT`.
 const MCP_ENV_SEGMENT: &str = "default";
 
-/// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) names the `mcp`
-/// category. Keyed on the PACK position, never a substring: a tenant or a
-/// secret merely called `mcp` is an ordinary key.
-fn is_mcp_rel_path(rel_path: &str) -> bool {
-    rel_path.split('/').nth(2) == Some(MCP_CATEGORY)
+/// Whether `rel_path` (`<tenant>/<team>/<pack>/<name>`) names a category
+/// whose secret name is stored verbatim (`mcp`, `a2a` or `sorla`). Keyed on
+/// the PACK position, never a substring: a tenant or a secret merely called
+/// `mcp`, `a2a` or `sorla` is an ordinary key.
+fn is_verbatim_category_rel_path(rel_path: &str) -> bool {
+    matches!(
+        rel_path.split('/').nth(2),
+        Some(MCP_CATEGORY | A2A_CATEGORY | SORLA_CATEGORY)
+    )
+}
+
+/// The `llm` category: an agent's LLM API key, keyed by the agent's
+/// `llm.credential_ref`.
+///
+/// greentic-runner reads it at `secrets://default/<tenant>/_/llm/<ref>`
+/// (`resolve_in_process_llm_key`) — the `default` env segment is hardcoded
+/// there, exactly as it is for `mcp`. Unlike `mcp`/`a2a`/`sorla` the NAME is
+/// not verbatim: greentic-start's reader carve-out covers only those three,
+/// so it canonicalizes an `llm` name before lookup, and the ordinary
+/// canonical-name validation below is what makes the write land on that same
+/// key. Only the env segment differs from an ordinary key, and it is the
+/// whole defect: keyed by the environment id, every staged LLM key sat one
+/// segment away from the read and the agent ran with no key at all.
+const LLM_CATEGORY: &str = "llm";
+
+/// The `knowledge` category: the shared Chronicle knowledge index's two
+/// credentials (`chronicle_index_key`, `embedding_key`), staged by
+/// greentic-designer's `knowledge_stage`.
+///
+/// greentic-runner-host's `ChronicleIndexKnowledge` reads them through
+/// `greentic_aw_runtime::scoped_secrets`, whose env segment is the hardcoded
+/// `default` — the same shape as [`LLM_CATEGORY`], and the same defect when it
+/// was missing here: the write landed under the environment id, and an
+/// index-bound worker deployed green and answered with no knowledge at all.
+/// The name is canonical, so the ordinary name validation still applies.
+const KNOWLEDGE_CATEGORY: &str = "knowledge";
+
+/// Whether `rel_path` names a category read at the `default` env segment with
+/// a canonical name — `llm` or `knowledge` (pack position only, like
+/// [`is_verbatim_category_rel_path`]).
+fn is_default_segment_category_rel_path(rel_path: &str) -> bool {
+    matches!(
+        rel_path.split('/').nth(2),
+        Some(LLM_CATEGORY | KNOWLEDGE_CATEGORY)
+    )
 }
 
 /// The dev store's native key for `rel_path` in `env_id`.
@@ -81,7 +152,7 @@ fn is_mcp_rel_path(rel_path: &str) -> bool {
 /// [`dev_store_has`] so a write, the read that checks it and the presence
 /// probe `env apply` gates on cannot land on different keys.
 pub(super) fn dev_store_key(env_id: &EnvId, rel_path: &str) -> String {
-    if is_mcp_rel_path(rel_path) {
+    if is_verbatim_category_rel_path(rel_path) || is_default_segment_category_rel_path(rel_path) {
         format!("secrets://{MCP_ENV_SEGMENT}/{rel_path}")
     } else {
         format!("secrets://{}/{rel_path}", env_id.as_str())
@@ -91,6 +162,12 @@ pub(super) fn dev_store_key(env_id: &EnvId, rel_path: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsListPayload {
     pub environment_id: String,
+    /// Optional `<tenant>/<team>/<pack>/[<name-prefix>]`. When set, the
+    /// outcome also carries `prefix` and `stored_keys` — the dev store's live
+    /// key NAMES under it (dev-store backend only). Absent keeps the output
+    /// byte-for-byte what it was before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +201,22 @@ pub struct SecretsGetPayload {
 pub struct SecretsRotatePayload {
     pub environment_id: String,
     pub path: String,
+}
+
+/// `op secrets delete` payload. Exactly one of `path` / `prefix`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsDeletePayload {
+    pub environment_id: String,
+    /// One key, `<tenant>/<team>/<pack>/<name>` — validated exactly like `put`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Every live key under `<tenant>/<team>/<pack>/[<name-prefix>]`, removed
+    /// in one atomic rewrite of the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Caller-supplied A8 §2 idempotency key; minted per invocation when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// `op secrets list`. Returns the env's secret-ref namespace plus the kind
@@ -162,18 +255,25 @@ pub fn list(
         // visibility into where bundle auth resolves.
         known_refs.push(format!("auth://{bs}"));
     }
-    Ok(OpOutcome::new(
-        NOUN,
-        "list",
-        json!({
-            "environment_id": env_id.as_str(),
-            "secrets_kind": secrets.kind.to_string(),
-            "namespace": format!("secret://{}/", env_id.as_str()),
-            "known_refs": known_refs,
-            "snapshot_at": Utc::now(),
-            "note": "Phase A: namespace + known-refs only; live backend enumeration lands in A9.",
-        }),
-    ))
+    let mut result = json!({
+        "environment_id": env_id.as_str(),
+        "secrets_kind": secrets.kind.to_string(),
+        "namespace": format!("secret://{}/", env_id.as_str()),
+        "known_refs": known_refs,
+        "snapshot_at": Utc::now(),
+        "note": "Phase A: namespace + known-refs only; live backend enumeration lands in A9.",
+    });
+    if let Some(raw_prefix) = payload.prefix.as_deref() {
+        let prefix = DevStorePrefix::parse(raw_prefix)?;
+        require_dev_store_kind(secrets, "list --prefix")?;
+        let dev_path = env_dev_store_path(store, &env_id)?;
+        let keys = dev_store_keys::list_keys(&dev_path, &env_id, &prefix)?;
+        result["prefix"] = Value::String(prefix.render());
+        result["store_path"] = Value::String(dev_path.display().to_string());
+        result["stored_keys"] = serde_json::to_value(keys)
+            .map_err(|e| OpError::InvalidArgument(format!("serializing stored keys: {e}")))?;
+    }
+    Ok(OpOutcome::new(NOUN, "list", result))
 }
 
 pub fn put(
@@ -300,6 +400,125 @@ pub fn rotate(
     })
 }
 
+/// `op secrets delete`. Removes one key (`path`) or every live key under a
+/// `prefix` from the env's dev store. Idempotent: a key that is not there is a
+/// success with `deleted: false`. Audited like [`put`]. Only the dev-store
+/// backend is supported; other kinds return `NotYetImplemented`.
+pub fn delete(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    payload: Option<SecretsDeletePayload>,
+) -> Result<OpOutcome, OpError> {
+    if flags.schema_only {
+        return Ok(OpOutcome::new(NOUN, "delete", delete_schema()));
+    }
+    let payload = resolve_payload::<SecretsDeletePayload>(flags, payload)?;
+    let env_id = parse_env_id(&payload.environment_id)?;
+    let idempotency_key = resolve_idempotency_key(payload.idempotency_key.clone())?;
+    let target = match (&payload.path, &payload.prefix) {
+        (Some(path), None) => json!({"path": path}),
+        (None, Some(prefix)) => json!({"prefix": prefix}),
+        _ => {
+            return Err(OpError::InvalidArgument(
+                "exactly one of `path` or `prefix` is required".to_string(),
+            ));
+        }
+    };
+    let ctx = AuditCtx {
+        env_id: env_id.clone(),
+        noun: NOUN,
+        verb: "delete",
+        target,
+        idempotency_key: Some(idempotency_key.as_str().to_string()),
+    };
+    audit_and_record(store, ctx, |_committed| {
+        let env = store.load(&env_id)?;
+        let secrets = require_secrets_pack(&env, &env_id)?;
+        let result = match (&payload.path, &payload.prefix) {
+            (Some(path), None) => delete_one(store, &env_id, secrets, path)?,
+            (None, Some(prefix)) => delete_under_prefix(store, &env_id, secrets, prefix)?,
+            _ => {
+                return Err(OpError::InvalidArgument(
+                    "exactly one of `path` or `prefix` is required".to_string(),
+                ));
+            }
+        };
+        Ok((OpOutcome::new(NOUN, "delete", result), AuditGens::NONE))
+    })
+}
+
+fn delete_one(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    secrets: &EnvPackBinding,
+    path: &str,
+) -> Result<Value, OpError> {
+    let rel_path = path.trim_start_matches('/');
+    let secret_uri = format!("secret://{}/{rel_path}", env_id.as_str());
+    SecretRef::try_new(secret_uri.clone())
+        .map_err(|e| OpError::InvalidArgument(format!("secret path: {e}")))?;
+    require_dev_store_kind(secrets, "delete")?;
+    // Same validation as `put`/`get` — including the reservation of the
+    // deployer's own bound credential paths — and the same key derivation.
+    validate_dev_store_secret_path(rel_path)?;
+    let store_uri = dev_store_key(env_id, rel_path);
+    let dev_path = env_dev_store_path(store, env_id)?;
+    let deleted = dev_store_keys::delete_key(&dev_path, &store_uri)?;
+    Ok(json!({
+        "environment_id": env_id.as_str(),
+        "secret_ref": secret_uri,
+        "store_uri": store_uri,
+        "secrets_kind": secrets.kind.to_string(),
+        "store_path": dev_path.display().to_string(),
+        "deleted": deleted,
+    }))
+}
+
+fn delete_under_prefix(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    secrets: &EnvPackBinding,
+    raw_prefix: &str,
+) -> Result<Value, OpError> {
+    let prefix = DevStorePrefix::parse(raw_prefix)?;
+    require_dev_store_kind(secrets, "delete --prefix")?;
+    let dev_path = env_dev_store_path(store, env_id)?;
+    let removed = dev_store_keys::delete_prefix(&dev_path, env_id, &prefix)?;
+    let count = removed.len();
+    Ok(json!({
+        "environment_id": env_id.as_str(),
+        "prefix": prefix.render(),
+        "secrets_kind": secrets.kind.to_string(),
+        "store_path": dev_path.display().to_string(),
+        "deleted": count > 0,
+        "deleted_count": count,
+        "deleted_keys": serde_json::to_value(removed).map_err(|e| {
+            OpError::InvalidArgument(format!("serializing deleted keys: {e}"))
+        })?,
+    }))
+}
+
+/// Key enumeration and hard delete exist for the dev store only.
+fn require_dev_store_kind(secrets: &EnvPackBinding, verb: &str) -> Result<(), OpError> {
+    if secrets.kind.path() == DEV_STORE_KIND_PATH {
+        Ok(())
+    } else {
+        Err(OpError::NotYetImplemented(format!(
+            "`op secrets {verb}` supports the dev-store backend only; backend \
+             dispatch for `{}` lands in A9 (env-pack registry)",
+            secrets.kind
+        )))
+    }
+}
+
+/// The env's dev store file, resolved exactly as `put`/`get` resolve it.
+fn env_dev_store_path(store: &LocalFsStore, env_id: &EnvId) -> Result<PathBuf, OpError> {
+    Ok(resolve_dev_store_path(
+        &store.env_dir(env_id)?,
+        std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
+    ))
+}
+
 // --- internals -----------------------------------------------------------
 
 /// Persist `value` at `rel_path` (`<tenant>/<team>/<pack>/<name>`) into the
@@ -385,6 +604,22 @@ pub(super) fn get_env_secret(
                 .to_string(),
         ))
     }
+}
+
+/// Delete one key from the env's dev store. `Ok(false)` when it (or the store
+/// file) was absent. Dev-store only — the only backend with a delete. The
+/// store file resolves exactly as `put`/`get` resolve it.
+pub(super) fn delete_env_secret(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    rel_path: &str,
+) -> Result<bool, OpError> {
+    validate_dev_store_secret_path(rel_path)?;
+    let dev_path = env_dev_store_path(store, env_id)?;
+    if !dev_path.exists() {
+        return Ok(false);
+    }
+    dev_store_keys::delete_key(&dev_path, &dev_store_key(env_id, rel_path))
 }
 
 /// Build the `get` outcome body: identity fields + a `present` flag, plus the
@@ -797,28 +1032,57 @@ pub(super) fn validate_dev_store_secret_path(rel_path: &str) -> Result<(), OpErr
              name without surrounding whitespace)"
         )));
     }
-    // Outside the `mcp` category the runtime reader canonicalizes the name
-    // segment before lookup (greentic-start
+    // Outside the `mcp`/`a2a`/`sorla` categories the runtime reader
+    // canonicalizes the name segment before lookup (greentic-start
     // `secret_name::canonical_secret_name`), so a non-canonical name would be
     // written but never found. Reject instead of silently transforming —
     // producer and consumer must share one derivation, and we share it by
     // only accepting already-canonical input.
     //
-    // The `mcp` category is exempt, mirroring greentic-start's reader
-    // (`src/secrets_client.rs`, `canonicalize_dev_store_secret_uri`): admin
-    // keys an MCP server by its hyphenated UUID and the runtime reads it
-    // verbatim through `greentic_aw_runtime::mcp_secrets`. Normalizing here
-    // would rewrite the lookup to `…/mcp/ff308b9c_951a_…` and resolve nothing
-    // — silently, because a missing MCP credential is reported as an ordinary
-    // node error.
+    // The `mcp`, `a2a` and `sorla` categories are exempt, mirroring
+    // greentic-start's reader (`src/secrets_client.rs`,
+    // `canonicalize_dev_store_secret_uri`): admin keys an MCP server, and an
+    // external A2A agent, by a hyphenated UUID; greentic-designer keys a
+    // SoRLa route document by a hyphenated capability-URI pack segment. The
+    // runtime reads each verbatim (`greentic_aw_runtime::mcp_secrets`, the
+    // A2A equivalent, and `sorla_route::resolve_route`). Normalizing here
+    // would rewrite the lookup to `…/mcp/ff308b9c_951a_…` (or `…/a2a/…`, or
+    // `…/sorla/landlord_tenant_sor`) and resolve nothing — silently, because
+    // a missing MCP/A2A/SoRLa credential is reported as an ordinary
+    // node/tool error.
     //
     // The TEAM segment above is deliberately NOT exempt: the runtime
     // canonicalizes the team either way, so a literal `default` is still a key
     // nothing reads.
-    if !is_mcp_rel_path(rel_path) && !is_canonical_secret_name(name) {
+    if !is_verbatim_category_rel_path(rel_path) && !is_canonical_secret_name(name) {
         return Err(OpError::InvalidArgument(format!(
             "secret name `{name}` is not store-canonical: use lowercase \
              a-z, 0-9 and single `_` separators (no leading/trailing `_`)"
+        )));
+    }
+    reject_reserved_credential_rel_path(rel_path)?;
+    Ok(())
+}
+
+/// Refuse to write RUNTIME material onto the deployer's reserved credential
+/// namespace (see [`credentials::store_paths`](crate::credentials::store_paths)
+/// for what is reserved and why).
+///
+/// Two distinct harms, hence a hard reject rather than a warning:
+///
+/// * **Silent loss.** Those paths are stripped from every runtime seed, so a
+///   runtime secret written here would be stored and audited as present, then
+///   never reach the workload.
+/// * **Credential clobber.** A caller-supplied ref pointed at one of them would
+///   overwrite the env's live bound deployer credential with unrelated material,
+///   breaking every subsequent deployer verb.
+pub(super) fn reject_reserved_credential_rel_path(rel_path: &str) -> Result<(), OpError> {
+    if crate::credentials::store_paths::is_reserved_rel_path(rel_path) {
+        return Err(OpError::InvalidArgument(format!(
+            "`{rel_path}` is reserved for the deployer's own bound credential and \
+             cannot hold runtime material: writing it would overwrite the env's \
+             deployer credential, and it is stripped from every staged runtime seed \
+             so a workload could never read it back — choose another path"
         )));
     }
     Ok(())
@@ -888,19 +1152,73 @@ pub(super) fn secret_ref_to_store_uri(secret_ref: &SecretRef) -> Result<String, 
 
 /// downstream exhaustive matches (greentic-operator's HTTP status mapping).
 /// Error messages carry the backend's text only — never secret material.
+///
+/// Writes RUNTIME material, so it refuses the deployer's reserved credential
+/// namespace. The check lives here — at the shared writer — rather than at each
+/// caller, so a new write surface is protected by default instead of having to
+/// remember; the webhook writer needing its own check was a bug found in review,
+/// not a design. The credential sink uses
+/// [`dev_store_put_credential`] to opt out.
 pub(super) fn dev_store_put(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+    if let Some(rel) = crate::credentials::store_paths::split_store_uri(uri).map(|(_env, rel)| rel)
+    {
+        reject_reserved_credential_rel_path(&rel)?;
+    }
+    dev_store_put_credential(path, uri, value)
+}
+
+/// [`dev_store_put`] without the reserved-namespace check — the ONLY legitimate
+/// writer of the deployer's own bound credential, driven by
+/// [`put_credential_material`] from the credentials bootstrap/rotate sink.
+/// Runtime material must never use this.
+pub(super) fn dev_store_put_credential(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+    let _write_lock = DevStoreWriteLock::acquire(path)?;
+    dev_store_write_unlocked(path, uri, value)
+}
+
+/// The dev store's writer flock, held across a whole read-check-write cycle.
+///
+/// [`dev_store_put`] holds the lock around ONE write, which is not enough when
+/// the value written depends on what was read — two writers can both read
+/// "absent" and both write. Holding this guard serialises the cycle; writes
+/// made while it is held go through [`Self::put`], never `dev_store_put`, since
+/// the flock is not re-entrant.
+pub(super) struct DevStoreWriteLock {
+    _flock: EnvFlock,
+}
+
+impl DevStoreWriteLock {
+    /// Take the writer flock for the store at `path` (creating its directory).
+    pub(super) fn acquire(path: &Path) -> Result<Self, OpError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let flock = EnvFlock::acquire(&dev_store_lock_path(path))
+            .map_err(|source| OpError::Store(source.into()))?;
+        Ok(Self { _flock: flock })
+    }
+
+    /// [`dev_store_put`] under the already-held lock: the same reserved
+    /// credential-namespace refusal, without re-taking the flock.
+    pub(super) fn put(&self, path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
+        if let Some(rel) =
+            crate::credentials::store_paths::split_store_uri(uri).map(|(_env, rel)| rel)
+        {
+            reject_reserved_credential_rel_path(&rel)?;
+        }
+        dev_store_write_unlocked(path, uri, value)
+    }
+}
+
+/// One dev-store write. The caller holds [`DevStoreWriteLock`].
+fn dev_store_write_unlocked(path: &Path, uri: &str, value: &str) -> Result<(), OpError> {
     let io_err = |message: String| OpError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(message),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| OpError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let _write_lock = EnvFlock::acquire(&dev_store_lock_path(path))
-        .map_err(|source| OpError::Store(source.into()))?;
     let store = DevStore::with_path(path.to_path_buf())
         .map_err(|e| io_err(format!("open dev store: {e}")))?;
     std::thread::scope(|scope| {
@@ -934,7 +1252,7 @@ pub(super) fn put_credential_material(
         env_dir,
         std::env::var_os(DEV_SECRETS_PATH_ENV).map(PathBuf::from),
     );
-    dev_store_put(&dev_path, &store_uri, value)
+    dev_store_put_credential(&dev_path, &store_uri, value)
 }
 
 /// Whether the env's dev store already holds a non-empty value at `rel_path`
@@ -973,7 +1291,7 @@ fn dev_store_contains(path: &Path, uri: &str) -> Result<bool, OpError> {
 /// error — the only hard failure is being unable to open the store file). Same
 /// dedicated-thread runtime hop as [`dev_store_put`] (the caller may sit on a
 /// current-thread runtime where `block_in_place` panics).
-fn dev_store_get_value(path: &Path, uri: &str) -> Result<Option<String>, OpError> {
+pub(super) fn dev_store_get_value(path: &Path, uri: &str) -> Result<Option<String>, OpError> {
     let io_err = |message: String| OpError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other(message),
@@ -1106,7 +1424,10 @@ fn list_schema() -> Value {
         "type": "object",
         "required": ["environment_id"],
         "additionalProperties": false,
-        "properties": {"environment_id": {"type": "string"}}
+        "properties": {
+            "environment_id": {"type": "string"},
+            "prefix": {"type": ["string", "null"], "description": "Optional <tenant>/<team>/<pack>/[<name-prefix>]. When set, the outcome also lists `stored_keys` — the dev store's live key names under it (never values). Dev-store backend only."}
+        }
     })
 }
 
@@ -1137,6 +1458,23 @@ fn get_schema() -> Value {
             "environment_id": {"type": "string"},
             "path": {"type": "string"},
             "reveal": {"type": "boolean", "default": false, "description": "Include the decrypted value in the outcome. Default false — presence + metadata only."}
+        }
+    })
+}
+
+fn delete_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "SecretsDeletePayload",
+        "type": "object",
+        "required": ["environment_id"],
+        "oneOf": [{"required": ["path"]}, {"required": ["prefix"]}],
+        "additionalProperties": false,
+        "properties": {
+            "environment_id": {"type": "string"},
+            "path": {"type": "string", "description": "One key, <tenant>/<team>/<pack>/<name> — validated exactly like `put`. Deleting a missing key succeeds with `deleted: false`."},
+            "prefix": {"type": "string", "description": "Every live key under <tenant>/<team>/<pack>/[<name-prefix>], removed in one atomic rewrite. Refused when it covers the deployer's own bound credential."},
+            "idempotency_key": {"type": ["string", "null"], "description": "Caller-supplied idempotency key; minted per invocation when absent."}
         }
     })
 }
@@ -1237,7 +1575,9 @@ mod tests {
         let store_uri =
             secret_ref_to_store_uri(&secret_ref).expect("documented ref is store-aligned");
         let dev_path = resolve_dev_store_path(&store.env_dir(&env_id).unwrap(), None);
-        dev_store_put(&dev_path, &store_uri, "sa-bearer-doc").unwrap();
+        // The credential sink's writer: this path is the deployer's own reserved
+        // namespace, which the runtime writer (`dev_store_put`) refuses.
+        dev_store_put_credential(&dev_path, &store_uri, "sa-bearer-doc").unwrap();
         assert_eq!(
             resolve_credentials_token(&store, &env, &env_id).unwrap(),
             Some("sa-bearer-doc".to_string())
@@ -1254,6 +1594,7 @@ mod tests {
             &OpFlags::default(),
             Some(SecretsListPayload {
                 environment_id: "local".to_string(),
+                prefix: None,
             }),
         )
         .unwrap();
@@ -1277,6 +1618,7 @@ mod tests {
             &OpFlags::default(),
             Some(SecretsListPayload {
                 environment_id: "local".to_string(),
+                prefix: None,
             }),
         )
         .unwrap_err();
@@ -1571,6 +1913,78 @@ mod tests {
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
     }
 
+    /// The deployer's credential namespace is reserved: the runtime-seed
+    /// denylist strips those paths unconditionally, so runtime material written
+    /// there would be stored and audited as present, then silently vanish from
+    /// the workload. Reject at the write surface so the collision cannot exist.
+    #[test]
+    fn put_rejects_the_reserved_deployer_credential_paths() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            let err = put(
+                &store,
+                &OpFlags::default(),
+                Some(SecretsPutPayload {
+                    environment_id: "local".to_string(),
+                    path: (*path).to_string(),
+                    value: "v".to_string(),
+                    idempotency_key: None,
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")),
+                "runtime material must not be writable at the reserved deployer \
+                 credential path `{path}`; got {err:?}"
+            );
+        }
+    }
+
+    /// The reservation lives in the validator shared by `op secrets put`, `op
+    /// updates enroll` and `env apply`'s manifest validation, so no write
+    /// surface can drift from it. The credentials bootstrap's own sink writes
+    /// through `dev_store_put` and is deliberately unaffected.
+    #[test]
+    fn the_shared_validator_reserves_deployer_credential_paths() {
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            let err = validate_dev_store_secret_path(path).unwrap_err();
+            assert!(
+                matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")),
+                "`{path}` must be reserved in the shared validator; got {err:?}"
+            );
+        }
+        // A neighbouring path in the same category is still writable — the
+        // reservation is exact, not a prefix ban.
+        validate_dev_store_secret_path("default/_/k8s-deployer/some_runtime_value")
+            .expect("only the exact reserved paths are refused");
+    }
+
+    /// A store URI's last segment may carry an `@version`, and the dev-store's
+    /// exclusion filter matches by versionless identity — so a version-qualified
+    /// ref names the SAME key. Comparing raw strings would let
+    /// `…/deployer_token@1` through: accepted, written over the live credential's
+    /// key, then stripped from the seed anyway.
+    #[test]
+    fn the_reservation_matches_version_qualified_refs() {
+        for path in crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS {
+            for qualified in [format!("{path}@1"), format!("{path}@v2")] {
+                assert!(
+                    crate::credentials::store_paths::is_reserved_rel_path(&qualified),
+                    "`{qualified}` names the same key as the reserved `{path}` and \
+                     must be refused"
+                );
+                let err = reject_reserved_credential_rel_path(&qualified).unwrap_err();
+                assert!(matches!(&err, OpError::InvalidArgument(msg) if msg.contains("reserved")));
+            }
+        }
+        // Version stripping must not over-match: a different name is writable.
+        assert!(!crate::credentials::store_paths::is_reserved_rel_path(
+            "default/_/k8s-deployer/other@1"
+        ));
+    }
+
     #[test]
     fn put_rejects_wrong_depth_path() {
         // `DevStore::put` only accepts the 5-segment `secrets://` shape; the
@@ -1656,6 +2070,54 @@ mod tests {
             dev_store_key(&env_id, "acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3"),
             "secrets://default/acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3"
         );
+    }
+
+    #[test]
+    fn an_llm_key_is_written_under_the_default_env_segment() {
+        // greentic-runner reads an agent's LLM key at
+        // `secrets://default/<tenant>/_/llm/<credential_ref>`, and greentic-start
+        // canonicalizes that name before lookup (its carve-out is mcp/a2a
+        // only), so the canonical name under `default` is the key it hits.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "default/_/llm/ff308b9c_951a_40b8"),
+            "secrets://default/default/_/llm/ff308b9c_951a_40b8"
+        );
+    }
+
+    #[test]
+    fn a_knowledge_key_is_written_under_the_default_env_segment() {
+        // greentic-runner-host's `ChronicleIndexKnowledge` reads the shared
+        // knowledge index's two credentials through
+        // `greentic_aw_runtime::scoped_secrets`, whose env segment is the
+        // hardcoded `default`. Keyed by the environment id, both keys sat one
+        // segment from the read: the index-bound worker deployed green and
+        // answered every turn with no retrieved knowledge.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "default/_/knowledge/chronicle_index_key"),
+            "secrets://default/default/_/knowledge/chronicle_index_key"
+        );
+        assert_eq!(
+            dev_store_key(&env_id, "default/general/knowledge/embedding_key"),
+            "secrets://default/default/general/knowledge/embedding_key"
+        );
+    }
+
+    #[test]
+    fn a_knowledge_name_must_still_be_canonical() {
+        // Not a verbatim category: greentic-start canonicalizes the name
+        // before lookup, exactly as it does for `llm`.
+        assert!(validate_dev_store_secret_path("default/_/knowledge/embedding-key").is_err());
+        assert!(validate_dev_store_secret_path("default/_/knowledge/embedding_key").is_ok());
+    }
+
+    #[test]
+    fn an_llm_name_must_still_be_canonical() {
+        // Not a verbatim category: a hyphenated name would be stored where
+        // the canonicalizing reader never looks, so it is refused.
+        assert!(validate_dev_store_secret_path("default/_/llm/ff308b9c-951a").is_err());
+        assert!(validate_dev_store_secret_path("default/_/llm/ff308b9c_951a").is_ok());
     }
 
     #[test]
@@ -1753,6 +2215,141 @@ mod tests {
             get_outcome.result.get("value").and_then(|v| v.as_str()),
             Some("t0k")
         );
+    }
+
+    #[test]
+    fn an_a2a_key_is_written_under_the_default_env_segment() {
+        // greentic-start reads `secrets://default/<tenant>/<team>/a2a/<id>`
+        // (the same carve-out as MCP), and greentic-designer-admin writes it
+        // verbatim. Keying an a2a secret by the environment id instead stores
+        // it where no lookup ever goes.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3"),
+            "secrets://default/acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3"
+        );
+    }
+
+    #[test]
+    fn the_a2a_category_is_the_third_segment_not_a_substring() {
+        // `a2a` anywhere but the pack position is an ordinary key. A tenant
+        // literally named `a2a` must not move every one of its secrets.
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "a2a/_/messaging-telegram/bot_token"),
+            "secrets://local/a2a/_/messaging-telegram/bot_token"
+        );
+    }
+
+    #[test]
+    fn an_a2a_name_keeps_its_hyphenated_uuid() {
+        // greentic-designer-admin keys an A2A agent by its hyphenated UUID
+        // and greentic-runner reads it verbatim. Canonicalizing turns the
+        // lookup into `…/a2a/ff308b9c_951a_…`, which resolves nothing.
+        validate_dev_store_secret_path("acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3")
+            .expect("an a2a name must reach the store byte-for-byte");
+    }
+
+    #[test]
+    fn an_a2a_path_still_rejects_a_literal_default_team() {
+        // The carve-out covers the NAME and the env segment, never the team:
+        // the runtime reads the default team as `_`, so a literal `default`
+        // would be written under a key no lookup uses.
+        let err =
+            validate_dev_store_secret_path("acme/default/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3")
+                .expect_err("the team segment keeps its rule");
+        assert!(format!("{err}").contains("team segment"), "{err}");
+    }
+
+    #[test]
+    fn an_a2a_path_still_needs_four_segments() {
+        validate_dev_store_secret_path("acme/_/a2a")
+            .expect_err("shape is checked before the category");
+    }
+
+    #[test]
+    fn a_put_and_a_get_agree_on_an_a2a_key() {
+        // The write and the read must derive the same key. They were two
+        // independent `format!` calls; a carve-out applied to one of them
+        // would store a credential that `op secrets get` then reports as
+        // absent.
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&env_with_secrets()).unwrap();
+        let path = "acme/sales/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        let put_outcome = put(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsPutPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                value: "t0k".to_string(),
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+        let get_outcome = get(
+            &store,
+            &OpFlags::default(),
+            Some(SecretsGetPayload {
+                environment_id: "local".to_string(),
+                path: path.to_string(),
+                reveal: true,
+            }),
+        )
+        .unwrap();
+
+        let put_uri = put_outcome.result.get("store_uri").and_then(|v| v.as_str());
+        assert_eq!(put_uri, Some(format!("secrets://default/{path}").as_str()));
+        assert_eq!(
+            put_uri,
+            get_outcome.result.get("store_uri").and_then(|v| v.as_str())
+        );
+        assert_eq!(
+            get_outcome.result.get("value").and_then(|v| v.as_str()),
+            Some("t0k")
+        );
+    }
+
+    #[test]
+    fn a_sorla_route_document_is_keyed_verbatim_under_the_default_segment() {
+        // greentic-runner reads `secrets://default/<tenant>/_/sorla/<sor>`
+        // verbatim (`sorla_route::resolve_route`), where `<sor>` is a
+        // hyphenated capability-URI pack segment — including the
+        // `<sor>.unit-<slug>-<hex>` per-unit form — never canonicalized to
+        // underscores. Keying a SoRLa route document by the environment id
+        // instead stores it where no lookup ever goes.
+        let env = EnvId::try_from("prod").expect("env id");
+        assert_eq!(
+            dev_store_key(&env, "default/_/sorla/landlord-tenant-sor"),
+            "secrets://default/default/_/sorla/landlord-tenant-sor"
+        );
+        assert_eq!(
+            dev_store_key(
+                &env,
+                "default/_/sorla/landlord-tenant-sor.unit-abc-0123456789ab"
+            ),
+            "secrets://default/default/_/sorla/landlord-tenant-sor.unit-abc-0123456789ab"
+        );
+    }
+
+    #[test]
+    fn a_hyphenated_sorla_name_passes_validation() {
+        validate_dev_store_secret_path("default/_/sorla/landlord-tenant-sor")
+            .expect("verbatim category");
+    }
+
+    #[test]
+    fn a_secret_merely_named_sorla_is_still_canonical() {
+        // `sorla` anywhere but the pack position is an ordinary key. A tenant
+        // literally named `sorla`, or a secret named `sorla`, must not skip
+        // canonicalization.
+        let env = EnvId::try_from("prod").expect("env id");
+        assert_eq!(
+            dev_store_key(&env, "default/_/somepack/sorla"),
+            "secrets://prod/default/_/somepack/sorla"
+        );
+        assert!(validate_dev_store_secret_path("sorla/_/somepack/Bad-Name").is_err());
     }
 
     #[test]

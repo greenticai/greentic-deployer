@@ -199,7 +199,7 @@ enum BundleUploadSubcommand {
 
 #[derive(Parser)]
 struct BundleUploadArgs {
-    /// Cloud storage target URL: s3://bucket/prefix/, gs://..., https://*.blob.core.windows.net/...
+    /// Cloud storage target URL: s3://bucket/prefix/, gs://..., oci://host/project/repo/image:tag, https://*.blob.core.windows.net/...
     #[arg(long)]
     target: String,
     /// Path to local .gtbundle file.
@@ -208,6 +208,16 @@ struct BundleUploadArgs {
     /// Presigned URL expiry in seconds (S3 hard-caps at 604800).
     #[arg(long, default_value_t = 604800)]
     presign_expires: u64,
+    /// Config file declaring `[environment] connection`. When it says
+    /// `offline`, the upload is refused before any network call — this verb
+    /// had no way to be told that, so an air-gapped caller could only find out
+    /// by waiting for a connection to time out.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Upload anyway on an offline environment. "Offline" means no internet,
+    /// so a reachable in-network registry or bucket is a real case.
+    #[arg(long)]
+    allow_remote_in_offline: bool,
 }
 
 #[derive(Parser)]
@@ -218,6 +228,13 @@ struct BundleRefreshArgs {
     /// Presigned URL expiry in seconds.
     #[arg(long, default_value_t = 604800)]
     presign_expires: u64,
+    /// See `BundleUploadArgs::config`. Re-issuing a presigned URL is a call to
+    /// the same provider, so it is gated the same way.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// See `BundleUploadArgs::allow_remote_in_offline`.
+    #[arg(long)]
+    allow_remote_in_offline: bool,
 }
 
 #[derive(Parser)]
@@ -1254,6 +1271,11 @@ fn default_packs_dir() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Before anything opens a TLS connection. Both `ring` and `aws-lc-rs` are
+    // linked, so rustls refuses to pick one on its own and the first handshake
+    // panics — previously on every GCP path, because the only installer sat
+    // inside the Kubernetes client.
+    greentic_deployer::crypto::install_default_crypto_provider();
     let cli = Cli::parse();
     match cli.command {
         TopLevelCommand::TargetRequirements(args) => run_target_requirements(args),
@@ -1264,7 +1286,16 @@ fn main() -> Result<()> {
         TopLevelCommand::Aws(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Aws(command),
         ),
-        TopLevelCommand::BundleUpload(cmd) => run_bundle_upload(cmd),
+        TopLevelCommand::BundleUpload(cmd) => {
+            // run_bundle_upload already wrote the JSON error envelope to
+            // stderr; swallow the error here so anyhow doesn't re-render it
+            // as plain `Error: …` text and double up (same pattern as the
+            // `Op` arm below).
+            match run_bundle_upload(cmd) {
+                Ok(()) => Ok(()),
+                Err(_) => std::process::exit(1),
+            }
+        }
         TopLevelCommand::Azure(command) => cli_builtin_dispatch::dispatch_builtin_backend_command(
             BuiltinBackendCommand::Azure(command),
         ),
@@ -1354,6 +1385,13 @@ fn run_sorx(command: SorxCommand) -> Result<()> {
 fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
     use greentic_deployer::bundle_upload::{UploadOptions, from_url};
 
+    // Captured before `cmd.command` is moved into the async block below, so
+    // it is still available in the error arm to label the JSON envelope.
+    let op: &'static str = match &cmd.command {
+        BundleUploadSubcommand::Upload(_) => "upload",
+        BundleUploadSubcommand::RefreshUrl(_) => "refresh-url",
+    };
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1367,21 +1405,79 @@ fn run_bundle_upload(cmd: BundleUploadCommand) -> Result<()> {
         },
     };
 
-    let result = runtime.block_on(async {
-        match cmd.command {
-            BundleUploadSubcommand::Upload(args) => {
-                let uploader = from_url(&args.target)?;
-                uploader.upload(&args.bundle, &opts).await
-            }
-            BundleUploadSubcommand::RefreshUrl(args) => {
-                let uploader = from_url(&args.object_ref)?;
-                uploader.refresh_url(&args.object_ref, &opts).await
-            }
-        }
-    })?;
+    // Checked BEFORE the runtime does any work: an operator who declared the
+    // environment offline gets an answer that names the cause, instead of the
+    // provider client's DNS or TCP failure — which reads as "the registry is
+    // down" and sends them off to check credentials and targets.
+    let offline_check =
+        {
+            use greentic_deployer::bundle_upload::BundleUploadError;
+            use greentic_types::ConnectionKind;
 
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+            let (connection_path, target, allow) = match &cmd.command {
+                BundleUploadSubcommand::Upload(args) => (
+                    args.config.as_ref(),
+                    args.target.as_str(),
+                    args.allow_remote_in_offline,
+                ),
+                BundleUploadSubcommand::RefreshUrl(args) => (
+                    args.config.as_ref(),
+                    args.object_ref.as_str(),
+                    args.allow_remote_in_offline,
+                ),
+            };
+            match greentic_deployer::config::resolve_connection(connection_path) {
+                // An unreadable or malformed --config is surfaced rather than
+                // ignored: silently treating it as "online" would be the same
+                // failure this flag exists to prevent.
+                Err(err) => Some(BundleUploadError::Other(err.to_string())),
+                Ok(connection) => (matches!(connection, Some(ConnectionKind::Offline)) && !allow)
+                    .then(|| BundleUploadError::OfflineDisallowed {
+                        target: target.to_string(),
+                    }),
+            }
+        };
+
+    let result = if let Some(err) = offline_check {
+        Err(err)
+    } else {
+        runtime.block_on(async {
+            match cmd.command {
+                BundleUploadSubcommand::Upload(args) => {
+                    let uploader = from_url(&args.target)?;
+                    uploader.upload(&args.bundle, &opts).await
+                }
+                BundleUploadSubcommand::RefreshUrl(args) => {
+                    let uploader = from_url(&args.object_ref)?;
+                    uploader.refresh_url(&args.object_ref, &opts).await
+                }
+            }
+        })
+    };
+
+    match result {
+        Ok(value) => {
+            println!("{}", serde_json::to_string(&value)?);
+            Ok(())
+        }
+        Err(err) => {
+            // Print the same JSON error envelope shape `op` uses, then return
+            // the error like an honest `Result`-returning function. The call
+            // site in `main()` swallows it so anyhow doesn't re-render it as
+            // plain `Error: …` text on stderr (which would double it up) —
+            // the same split `dispatch_op` / the `Op` arm use.
+            let envelope = serde_json::json!({
+                "op": op,
+                "noun": "bundle-upload",
+                "error": {
+                    "kind": err.message_key(),
+                    "message": err.to_string(),
+                }
+            });
+            eprintln!("{envelope}");
+            Err(err.into())
+        }
+    }
 }
 
 fn run_target_requirements(args: TargetRequirementsArgs) -> Result<()> {

@@ -9,6 +9,7 @@ pub fn from_url(url: &str) -> BundleUploadResult<Box<dyn BundleUploader>> {
     match parsed.scheme() {
         "s3" => from_s3_url(url),
         "gs" => from_gs_url(url),
+        "oci" => from_oci_url(url),
         "https" if is_azure_blob_host(parsed.host_str().unwrap_or("")) => from_azure_url(url),
         other => Err(BundleUploadError::InvalidUrl(format!(
             "{other}://... (full url: {url})"
@@ -60,6 +61,24 @@ fn from_azure_url(_url: &str) -> BundleUploadResult<Box<dyn BundleUploader>> {
     Err(BundleUploadError::FeatureNotEnabled {
         scheme: "https (azure-blob)".to_string(),
         feature: "bundle-upload-azure".to_string(),
+    })
+}
+
+/// The real target does not mint a token here: the credential is short-lived,
+/// so it is minted per upload inside `OciBundleUploader::upload` rather than
+/// once at dispatch time.
+#[cfg(feature = "deploy-gcp-cloudrun")]
+fn from_oci_url(url: &str) -> BundleUploadResult<Box<dyn BundleUploader>> {
+    Ok(Box::new(crate::bundle_upload::oci::OciBundleUploader::new(
+        crate::bundle_upload::oci::OciTarget::parse(url)?,
+    )))
+}
+
+#[cfg(not(feature = "deploy-gcp-cloudrun"))]
+fn from_oci_url(_url: &str) -> BundleUploadResult<Box<dyn BundleUploader>> {
+    Err(BundleUploadError::FeatureNotEnabled {
+        scheme: "oci".to_string(),
+        feature: "deploy-gcp-cloudrun".to_string(),
     })
 }
 
@@ -119,5 +138,20 @@ mod tests {
         assert!(is_azure_blob_host("bar.example.blob.core.windows.net"));
         assert!(!is_azure_blob_host("example.com"));
         assert!(!is_azure_blob_host("blob.core.windows.net.evil.com"));
+    }
+
+    #[test]
+    fn accepts_an_oci_url_with_the_gcp_feature() {
+        let result = from_url("oci://asia-southeast1-docker.pkg.dev/p/greentic/w:abc123");
+        #[cfg(feature = "deploy-gcp-cloudrun")]
+        assert!(
+            result.is_ok(),
+            "oci:// must resolve to a backend: {result:?}"
+        );
+        #[cfg(not(feature = "deploy-gcp-cloudrun"))]
+        assert!(matches!(
+            result.unwrap_err(),
+            BundleUploadError::FeatureNotEnabled { .. }
+        ));
     }
 }

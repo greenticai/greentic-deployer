@@ -24,9 +24,17 @@
 //!   per-verb outcome types.
 //! - [`conformance`] — [`run_conformance`]: the bench K8s/AWS slices
 //!   call from their own integration tests.
+//! - [`drain`] — enforced drain (P5-R2): policy, evidence, probe loop.
+//! - [`capabilities`] — adapter capability flags (P5-R3).
 
+pub mod capabilities;
 pub mod conformance;
+pub mod drain;
 pub mod trait_def;
+
+pub use capabilities::is_valid_runtime_pin;
+pub use capabilities::{AdapterCapabilities, Capability, CapabilityMissing, CapabilityReport};
+pub use drain::{DrainEvidence, DrainPolicy, DrainProbe};
 
 pub use conformance::{ConformanceFailure, run_conformance};
 pub use trait_def::{

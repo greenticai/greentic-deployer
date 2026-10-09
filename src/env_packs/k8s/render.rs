@@ -20,22 +20,25 @@ use super::K8sDeployerHandler;
 use super::manifests::{self, K8sParams, has_cluster_presence};
 use crate::env_packs::render::{ManifestRenderer, RenderError};
 
-impl ManifestRenderer for K8sDeployerHandler {
-    fn render_environment(
+impl K8sDeployerHandler {
+    /// [`ManifestRenderer::render_environment`] with an explicit dev-store
+    /// seed. The SoR reconcile uses it to render the dev-store Secret (and the
+    /// router/worker `dev-store-hash`) from the seed as it stands AFTER the
+    /// route documents were written.
+    pub(super) fn render_environment_with_dev_secrets(
         &self,
         env: &Environment,
         answers: Option<&serde_json::Value>,
+        dev_secrets_data: Option<String>,
     ) -> Result<Vec<Value>, RenderError> {
         let mut params =
             K8sParams::from_answers(env, answers).map_err(RenderError::InvalidAnswers)?;
-        // The reconcile call site owns the filesystem read; inject the dev-store
-        // bytes it captured so the env-level Secret carries the operator's
-        // secrets. `None` on the preview path → an empty Secret.
-        params.dev_secrets_data = self.dev_secrets_data.clone();
+        params.dev_secrets_data = dev_secrets_data;
         // The CLI resolves the env's `Secrets`-slot binding into a backend and
         // injects it; render/reconcile both set it, so the rendered worker
         // identity (dev-store Secret vs. Vault SA) matches the env's binding.
         params.secrets_backend = self.secrets_backend.clone();
+        params.store_label = self.store_label.clone();
         let mut objects = manifests::render_environment_manifests(env, &params);
         for revision in &env.revisions {
             if has_cluster_presence(revision.lifecycle) {
@@ -43,6 +46,19 @@ impl ManifestRenderer for K8sDeployerHandler {
             }
         }
         Ok(objects)
+    }
+}
+
+impl ManifestRenderer for K8sDeployerHandler {
+    fn render_environment(
+        &self,
+        env: &Environment,
+        answers: Option<&serde_json::Value>,
+    ) -> Result<Vec<Value>, RenderError> {
+        // The reconcile call site owns the filesystem read; inject the dev-store
+        // bytes it captured so the env-level Secret carries the operator's
+        // secrets. `None` on the preview path → an empty Secret.
+        self.render_environment_with_dev_secrets(env, answers, self.dev_secrets_data.clone())
     }
 }
 

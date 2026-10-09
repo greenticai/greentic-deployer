@@ -34,13 +34,18 @@ use k8s_openapi::api::authentication::v1::{SelfSubjectReview, TokenRequest, Toke
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
-use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
-use kube::config::KubeConfigOptions;
+use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams, Preconditions,
+};
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use serde_json::Value;
 
 use super::bootstrap::DEPLOYER_IDENTITY_BEARER_KEY;
-use super::cluster::{K8sCluster, K8sClusterError, ObjectRef, RolloutStatus, manifest_field};
+use super::cluster::{
+    K8sCluster, K8sClusterError, LabeledObject, ObjectRef, RolloutStatus, ServiceStatus,
+    manifest_field,
+};
 use super::credentials::{
     AccessDecision, ClusterIdentity, K8sBootstrapClient, K8sClientError, K8sOperation,
     K8sValidatorClient, MintedToken, OperationDecision,
@@ -70,11 +75,66 @@ pub const FIELD_MANAGER: &str = "greentic-deployer";
 /// All failures fold into [`K8sClientError::NoClusterAccess`] — the
 /// operator's fix path is the same regardless (fix kubeconfig / cluster
 /// access).
+/// Connect using a kubeconfig supplied BY VALUE, not the ambient chain.
+///
+/// # Why this exists
+///
+/// [`connect`] resolves through `Config::from_kubeconfig`, which reads
+/// `$KUBECONFIG` / `~/.kube/config` and looks the context up THERE. That is
+/// right for an operator at a terminal and wrong for `credentials bootstrap`,
+/// whose whole contract is that the caller HANDS IT the admin kubeconfig
+/// (`admin_material_inline` / `admin_material_path`).
+///
+/// Until this existed, the bootstrap path accepted that material, reported
+/// `admin_credential_consumed_at`, and then authenticated from the ambient
+/// chain anyway — so a caller with no ambient kubeconfig failed with
+/// "failed to load current context", and a caller whose ambient kubeconfig
+/// happened to contain a context of the same name silently succeeded against
+/// THAT cluster. Both were measured against this binary before the fix; the
+/// second is the one worth remembering, because it reports success.
+///
+/// `context` is looked up inside the SUPPLIED document. `None` uses that
+/// document's own `current-context`.
+pub async fn connect_with_kubeconfig(
+    kubeconfig_yaml: &str,
+    context: Option<&str>,
+) -> Result<kube::Client, K8sClientError> {
+    crate::crypto::install_default_crypto_provider();
+    let config = config_from_supplied_kubeconfig(kubeconfig_yaml, context).await?;
+    kube::Client::try_from(config).map_err(|e| K8sClientError::NoClusterAccess(e.to_string()))
+}
+
+/// The half of [`connect_with_kubeconfig`] that resolves a `Config` from the
+/// SUPPLIED document. Separated so it can be tested without a cluster: this
+/// performs no network I/O, and the property worth pinning — that the
+/// ambient chain is not consulted — is observable here as a resolved
+/// `cluster_url`.
+async fn config_from_supplied_kubeconfig(
+    kubeconfig_yaml: &str,
+    context: Option<&str>,
+) -> Result<kube::Config, K8sClientError> {
+    let doc = Kubeconfig::from_yaml(kubeconfig_yaml).map_err(|e| {
+        // Never quote the document: it carries client certificates and bearer
+        // tokens, and this string reaches the operator.
+        K8sClientError::NoClusterAccess(format!("supplied kubeconfig is not readable: {e}"))
+    })?;
+    let options = KubeConfigOptions {
+        context: context.map(str::to_string),
+        ..Default::default()
+    };
+    kube::Config::from_custom_kubeconfig(doc, &options)
+        .await
+        .map_err(|e| {
+            let named = context.unwrap_or("<current-context>");
+            K8sClientError::NoClusterAccess(format!("supplied kubeconfig, context `{named}`: {e}"))
+        })
+}
+
 pub async fn connect(
     kubeconfig_context: Option<&str>,
     bound_token: Option<&str>,
 ) -> Result<kube::Client, K8sClientError> {
-    install_default_crypto_provider();
+    crate::crypto::install_default_crypto_provider();
     let mut config = match kubeconfig_context {
         Some(context) => kube::Config::from_kubeconfig(&KubeConfigOptions {
             context: Some(context.to_string()),
@@ -90,22 +150,6 @@ pub async fn connect(
     };
     apply_bound_token(&mut config, bound_token);
     kube::Client::try_from(config).map_err(|e| K8sClientError::NoClusterAccess(e.to_string()))
-}
-
-/// Pin a process-default rustls `CryptoProvider` before any TLS handshake.
-///
-/// rustls 0.23 refuses to auto-select a provider when more than one is
-/// compiled in, and this workspace links both: `ring` (kube's bundled TLS)
-/// and `aws-lc-rs` (the AWS SDK's). Without an explicit default the first
-/// real cluster connection panics inside rustls — a failure invisible to the
-/// unit tests, which drive a pre-built `kube::Client` over a `tower-test`
-/// mock and never open a socket. Install `ring` (kube's choice) once; if a
-/// provider is already set (another caller, or a future dependency default),
-/// that one wins and this is a no-op.
-fn install_default_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
 }
 
 /// Override the resolved config's auth with a bound ServiceAccount token.
@@ -170,6 +214,8 @@ fn api_route_for(api_version: &str, kind: &str) -> Result<(ApiResource, Scope), 
         ("apps/v1", "Deployment") => ("deployments", Scope::Namespaced),
         ("policy/v1", "PodDisruptionBudget") => ("poddisruptionbudgets", Scope::Namespaced),
         ("networking.k8s.io/v1", "NetworkPolicy") => ("networkpolicies", Scope::Namespaced),
+        // Optional managed Ingress (`ingress_host` answer, `manifests::ingress`).
+        ("networking.k8s.io/v1", "Ingress") => ("ingresses", Scope::Namespaced),
         // RBAC kinds the bootstrap `--bind` path applies (via
         // `KubeBootstrapClient::apply_rbac` → `KubeCluster::apply`); the
         // steady-state reconcile renderer does not emit these.
@@ -310,6 +356,14 @@ impl K8sCluster for KubeCluster {
                     incoming_env: inc.to_string(),
                 });
             }
+            // Never adopt an operator's object of a never-adopted kind (the
+            // Ingress): the env-label check above passes an unlabeled one.
+            let existing_labels = existing
+                .metadata
+                .labels
+                .as_ref()
+                .map(|labels| serde_json::json!(labels));
+            super::cluster::refuse_adoption(manifest, existing_labels.as_ref())?;
         }
 
         // Server-side apply IS the trait's upsert contract: same manifest
@@ -335,6 +389,57 @@ impl K8sCluster for KubeCluster {
         }
     }
 
+    async fn delete_if_labeled(
+        &self,
+        object: &ObjectRef,
+        labels: &[(&str, &str)],
+    ) -> Result<bool, K8sClusterError> {
+        let (resource, scope) = api_route_for(&object.api_version, &object.kind)?;
+        let namespace = object.namespace.as_deref().unwrap_or_default();
+        let api = dynamic_api(&self.client, &resource, scope, namespace);
+        // 404 = absent; 403 = this identity may not read it (an env bound
+        // before these verbs existed), so it cannot prove ownership.
+        let existing = match api.get_opt(&object.name).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => return Ok(false),
+            Err(kube::Error::Api(status)) if status.code == 404 => return Ok(false),
+            Err(kube::Error::Api(status)) if status.code == 403 => {
+                tracing::warn!(
+                    object = %object,
+                    "cannot verify removal of a deployer-managed {}: this identity may not \
+                     read it (403). If one was rendered earlier it may still be serving; \
+                     re-bootstrap the env's credentials or delete it by hand",
+                    object.kind
+                );
+                return Ok(false);
+            }
+            Err(e) => return Err(map_cluster_error(e)),
+        };
+        let owned = labels.iter().all(|(key, value)| {
+            existing
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(*key))
+                .map(String::as_str)
+                == Some(*value)
+        });
+        if !owned {
+            return Ok(false);
+        }
+        // Pin the delete to the object whose labels were just read, so a
+        // replacement created in between is never removed.
+        let params = DeleteParams::default().preconditions(Preconditions {
+            uid: existing.metadata.uid.clone(),
+            resource_version: None,
+        });
+        match api.delete(&object.name, &params).await {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(status)) if matches!(status.code, 404 | 409) => Ok(false),
+            Err(e) => Err(map_cluster_error(e)),
+        }
+    }
+
     async fn get_rollout_status(
         &self,
         deployment: &ObjectRef,
@@ -352,6 +457,81 @@ impl K8sCluster for KubeCluster {
             updated_replicas: status.and_then(|s| s.updated_replicas).unwrap_or(0),
             available_replicas: status.and_then(|s| s.available_replicas).unwrap_or(0),
         })
+    }
+
+    async fn get_service_status(
+        &self,
+        service: &ObjectRef,
+    ) -> Result<ServiceStatus, K8sClusterError> {
+        // Read through the typed core/v1 API so `.spec.ports[].nodePort` and
+        // `.status.loadBalancer` parse without a hand-written schema — the same
+        // reason `get_rollout_status` reads a typed Deployment.
+        let namespace = service.namespace.as_deref().unwrap_or_default();
+        let api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let svc = api.get(&service.name).await.map_err(map_cluster_error)?;
+        let spec = svc.spec.as_ref();
+        // The rendered Service declares exactly one port, named `http`. Prefer
+        // it by NAME and fall back to the first port, so an object an operator
+        // has since added a port to still reports the one Greentic serves on
+        // rather than whichever the API server happened to order first.
+        let port = spec.and_then(|s| {
+            s.ports.as_ref().and_then(|ports| {
+                ports
+                    .iter()
+                    .find(|p| p.name.as_deref() == Some("http"))
+                    .or_else(|| ports.first())
+            })
+        });
+        // `.status.loadBalancer.ingress` is empty until the cloud controller
+        // provisions the load balancer — that absence is a real state
+        // (`RouterAddress::Pending`), not a failure to read.
+        let ingress = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_ref())
+            .and_then(|ingress| ingress.first());
+        Ok(ServiceStatus {
+            service_type: spec.and_then(|s| s.type_.clone()).unwrap_or_default(),
+            node_port: port.and_then(|p| p.node_port),
+            ingress_hostname: ingress.and_then(|i| i.hostname.clone()),
+            ingress_ip: ingress.and_then(|i| i.ip.clone()),
+        })
+    }
+
+    async fn list(
+        &self,
+        namespace: &str,
+        label_selector: &str,
+    ) -> Result<Vec<LabeledObject>, K8sClusterError> {
+        super::kube_ops::list_labeled(&self.client, namespace, label_selector).await
+    }
+
+    async fn scale_deployment(
+        &self,
+        deployment: &ObjectRef,
+        replicas: i32,
+    ) -> Result<bool, K8sClusterError> {
+        super::kube_ops::scale_deployment(&self.client, deployment, replicas).await
+    }
+
+    async fn get_rollout_status_opt(
+        &self,
+        deployment: &ObjectRef,
+    ) -> Result<Option<RolloutStatus>, K8sClusterError> {
+        super::kube_ops::rollout_status_opt(&self.client, deployment).await
+    }
+
+    async fn get_object(&self, object: &ObjectRef) -> Result<Option<Value>, K8sClusterError> {
+        let (resource, scope) = api_route_for(&object.api_version, &object.kind)?;
+        let namespace = object.namespace.as_deref().unwrap_or_default();
+        let api = dynamic_api(&self.client, &resource, scope, namespace);
+        match api.get_opt(&object.name).await.map_err(map_cluster_error)? {
+            None => Ok(None),
+            Some(found) => serde_json::to_value(found)
+                .map(Some)
+                .map_err(|e| K8sClusterError::Api(format!("decoding `{object}`: {e}"))),
+        }
     }
 }
 
@@ -839,13 +1019,13 @@ mod tests {
         let cluster = KubeCluster::new(client);
         let manifest = json!({
             "apiVersion": "networking.k8s.io/v1",
-            "kind": "Ingress",
+            "kind": "IngressClass",
             "metadata": {"name": "x", "namespace": "ns"},
         });
         let err = cluster.apply(&manifest).await.unwrap_err();
         assert!(
             matches!(err, K8sClusterError::InvalidManifest(ref msg)
-                if msg.contains("unsupported object `networking.k8s.io/v1/Ingress`")),
+                if msg.contains("unsupported object `networking.k8s.io/v1/IngressClass`")),
             "no request may be guessed for an unrendered kind, got {err:?}"
         );
     }
@@ -918,6 +1098,95 @@ mod tests {
             ),
         );
         result.unwrap();
+    }
+
+    fn ingress_ref() -> ObjectRef {
+        ObjectRef {
+            api_version: "networking.k8s.io/v1".into(),
+            kind: "Ingress".into(),
+            namespace: Some("gtc-zain".into()),
+            name: "gtc-router".into(),
+        }
+    }
+
+    const OWNER: &[(&str, &str)] = &[
+        ("app.kubernetes.io/managed-by", "greentic"),
+        ("greentic.ai/env", "zain"),
+    ];
+
+    fn ingress_body(labels: Value) -> Value {
+        json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "gtc-router", "namespace": "gtc-zain", "uid": "u-1", "labels": labels},
+        })
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_deletes_an_owned_object_pinned_to_its_uid() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let responder = async {
+            let get = respond_json(
+                &mut handle,
+                200,
+                ingress_body(
+                    json!({"app.kubernetes.io/managed-by": "greentic", "greentic.ai/env": "zain"}),
+                ),
+            )
+            .await;
+            assert_eq!(get.method(), "GET");
+            let delete = respond_json(
+                &mut handle,
+                200,
+                json!({"kind": "Status", "status": "Success"}),
+            )
+            .await;
+            assert_eq!(delete.method(), "DELETE");
+            assert_eq!(
+                delete.uri().path(),
+                "/apis/networking.k8s.io/v1/namespaces/gtc-zain/ingresses/gtc-router"
+            );
+            request_body_json(delete).await
+        };
+        let (result, body) = tokio::join!(cluster.delete_if_labeled(&object, OWNER), responder);
+        assert!(result.unwrap());
+        assert_eq!(body["preconditions"]["uid"], "u-1");
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_leaves_an_unlabeled_object_alone() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let (result, request) = tokio::join!(
+            cluster.delete_if_labeled(&object, OWNER),
+            respond_json(
+                &mut handle,
+                200,
+                ingress_body(json!({"greentic.ai/env": "zain"}))
+            ),
+        );
+        assert_eq!(request.method(), "GET");
+        assert!(!result.unwrap(), "no DELETE may follow");
+    }
+
+    #[tokio::test]
+    async fn delete_if_labeled_treats_a_forbidden_read_as_nothing_to_remove() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let object = ingress_ref();
+        let (result, _request) = tokio::join!(
+            cluster.delete_if_labeled(&object, OWNER),
+            respond_json(
+                &mut handle,
+                403,
+                json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                       "message": "forbidden", "reason": "Forbidden", "code": 403}),
+            ),
+        );
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
@@ -1272,6 +1541,44 @@ mod tests {
     // ── ownership guard ────────────────────────────────────────────
 
     #[tokio::test]
+    async fn apply_refuses_to_adopt_an_operator_created_ingress() {
+        let (client, mut handle) = mock_client();
+        let cluster = KubeCluster::new(client);
+        let labels = json!({
+            "app.kubernetes.io/managed-by": "greentic",
+            "app.kubernetes.io/component": "router-ingress",
+            "greentic.ai/env": "zain",
+        });
+        let manifest = json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": "gtc-router", "namespace": "gtc-zain", "labels": labels},
+        });
+        // Existing Ingress carries no env label, so the env guard passes it.
+        let (result, get) = tokio::join!(
+            cluster.apply(&manifest),
+            respond_json(&mut handle, 200, ingress_body(json!({"team": "ops"}))),
+        );
+        assert_eq!(get.method(), "GET");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, K8sClusterError::UnmanagedObject { kind, object, .. }
+                if kind == "Ingress" && object == "gtc-router"),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("ingress_host"), "{err}");
+
+        // Our own (fully labelled) Ingress re-applies normally.
+        let respond = async {
+            let _get = respond_json(&mut handle, 200, ingress_body(labels.clone())).await;
+            respond_json(&mut handle, 200, manifest.clone()).await
+        };
+        let (result, patch) = tokio::join!(cluster.apply(&manifest), respond);
+        result.unwrap();
+        assert_eq!(patch.method(), "PATCH");
+    }
+
+    #[tokio::test]
     async fn apply_rejects_a_foreign_owned_object() {
         let (client, mut handle) = mock_client();
         let cluster = KubeCluster::new(client);
@@ -1541,5 +1848,102 @@ rules:
             respond
         );
         assert_eq!(result.expect("absent secret is Ok(None)"), None);
+    }
+}
+
+/// The supplied kubeconfig must be the one that authenticates — never the
+/// ambient chain.
+///
+/// These pin the pair that measured the bug: `credentials bootstrap` accepted
+/// `admin_material_inline`, reported `admin_credential_consumed_at`, and then
+/// resolved through `$KUBECONFIG` / `~/.kube/config` anyway. A caller with no
+/// ambient kubeconfig failed; a caller whose ambient kubeconfig happened to
+/// hold a same-named context silently authenticated against THAT cluster.
+///
+/// The regression guard is the FIRST test's URL assertion, not a test that
+/// manipulates `$KUBECONFIG` (this crate is `#![forbid(unsafe_code)]`, and
+/// `set_var` is unsafe on this edition). Reintroducing the ambient chain
+/// makes that assertion fail wherever no ambient kubeconfig resolves to the
+/// same cluster — which is every CI runner and every container.
+#[cfg(test)]
+mod supplied_kubeconfig_tests {
+    use super::*;
+
+    fn kubeconfig(context: &str, server: &str) -> String {
+        format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             clusters:\n\
+             - name: c\n  \
+               cluster:\n    \
+                 server: {server}\n\
+             contexts:\n\
+             - name: {context}\n  \
+               context:\n    \
+                 cluster: c\n    \
+                 user: u\n\
+             current-context: {context}\n\
+             users:\n\
+             - name: u\n  \
+               user:\n    \
+                 token: t\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn the_supplied_document_is_what_answers() {
+        let cfg = config_from_supplied_kubeconfig(
+            &kubeconfig("supplied", "https://supplied.example:6443"),
+            Some("supplied"),
+        )
+        .await
+        .expect("the supplied context resolves");
+        assert_eq!(
+            cfg.cluster_url.to_string(),
+            "https://supplied.example:6443/"
+        );
+    }
+
+    /// `None` means the supplied document's OWN `current-context`, not the
+    /// ambient one — the distinction a caller relies on when it hands over a
+    /// kubeconfig without naming a context.
+    #[tokio::test]
+    async fn no_context_uses_the_supplied_documents_own_current_context() {
+        let cfg = config_from_supplied_kubeconfig(
+            &kubeconfig("only-one", "https://supplied.example:6443"),
+            None,
+        )
+        .await
+        .expect("current-context resolves");
+        assert_eq!(
+            cfg.cluster_url.to_string(),
+            "https://supplied.example:6443/"
+        );
+    }
+
+    /// A context the supplied document does not define is refused. It must not
+    /// be searched for anywhere else.
+    #[tokio::test]
+    async fn a_context_absent_from_the_supplied_document_is_refused() {
+        let err = config_from_supplied_kubeconfig(
+            &kubeconfig("supplied", "https://supplied.example:6443"),
+            Some("somewhere-else"),
+        )
+        .await
+        .expect_err("an undefined context must not resolve");
+        assert!(err.to_string().contains("somewhere-else"), "{err}");
+    }
+
+    /// An unreadable document is refused, and the refusal never quotes it — a
+    /// kubeconfig carries client certificates and bearer tokens, and this
+    /// string reaches the operator.
+    #[tokio::test]
+    async fn an_unreadable_document_is_refused_without_quoting_it() {
+        let err = config_from_supplied_kubeconfig("NOT-A-KUBECONFIG: [", Some("any"))
+            .await
+            .expect_err("garbage must not resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("not readable"), "{msg}");
+        assert!(!msg.contains("NOT-A-KUBECONFIG"), "document leaked: {msg}");
     }
 }

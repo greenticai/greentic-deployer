@@ -403,6 +403,8 @@ pub fn doctor(store: &LocalFsStore, flags: &OpFlags, env_id: &str) -> Result<OpO
                 "version_skew": extension_report.version_skew,
             },
             "stale_revisions": stale_revisions,
+            // P5-R3: what the bound deployer can do (`null` when unresolved).
+            "deployer_capabilities": super::env_drain::doctor_capabilities(&registry, &env),
             "has_runtime": runtime.is_some(),
             "checked_at": Utc::now(),
         }),
@@ -763,6 +765,10 @@ pub fn render(
         let secrets_backend = resolve_secrets_backend(store, &env)?;
         crate::env_packs::k8s::K8sDeployerHandler::default()
             .with_secrets_backend(secrets_backend)
+            .with_store_label(super::env_drain::k8s_store_label(
+                store,
+                &env.environment_id,
+            ))
             .render_environment(&env, answers.as_ref())
             .map_err(|e| OpError::Conflict(e.to_string()))?
     } else {
@@ -865,6 +871,20 @@ pub fn reconcile(
     // resolves `secret://` refs against — dev-store (values shipped in via the
     // Secret above) or Vault (pod identity + `VAULT_*` env, no values shipped).
     let secrets_backend = resolve_secrets_backend(store, &env)?;
+    // SoR units (SoRLa storage phase 3): resolved, and refused if unworkable,
+    // before any cluster call; their route documents are written
+    // mid-reconcile, after the SoRs are Available and before any worker rolls.
+    // An env with no SoR units never parses the answers here, so it fails
+    // exactly where and how it did before SoR units existed.
+    let prepared = super::env_sor::prepare(store, &env, answers.as_ref(), &secrets_backend)?;
+    // The publisher exists only when there is a SoR phase to publish for.
+    let publisher = prepared
+        .as_ref()
+        .map(|_| super::env_sor::StoreRoutePublisher::new(store, &env));
+    let sor = prepared
+        .as_ref()
+        .zip(publisher.as_ref())
+        .map(|(p, publisher)| p.as_reconcile(publisher));
     let report = reconcile_k8s_cluster(
         &env,
         answers.as_ref(),
@@ -872,33 +892,86 @@ pub fn reconcile(
         dev_secrets,
         secrets_backend,
         false,
+        sor.as_ref(),
+        super::env_drain::k8s_store_label(store, &env_id),
     )?;
+    if let Some(prepared) = &prepared {
+        super::env_sor::record_applied(store, &env_id, prepared)?;
+    }
 
-    Ok(OpOutcome::new(
-        NOUN,
-        "reconcile",
-        json!({
-            "environment_id": env.environment_id.as_str(),
-            "kind": descriptor.as_str(),
-            "answers_ref": answers_ref_wire,
-            // Identity the cluster was mutated as: "bound" = the env's
-            // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
-            // the CLI's kubeconfig / in-cluster identity (no bound credential).
-            // Surfaced so a live mutation is never silent about which identity
-            // it ran as.
-            "identity": identity,
-            "applied_count": report.applied.len(),
-            "pruned_count": report.pruned.len(),
-            "applied": report.applied,
-            "pruned": report.pruned,
-        }),
-    ))
+    let mut result = reconcile_result_json(
+        &env,
+        descriptor.as_str(),
+        &answers_ref_wire,
+        identity,
+        &report,
+    );
+    attach_public_base_url(&mut result, &env, answers.as_ref());
+    Ok(OpOutcome::new(NOUN, "reconcile", result))
+}
+
+/// Add `public_base_url` beside `router_address` when the binding's answers
+/// configure a managed Ingress (`ingress_host`). Absent otherwise, so a
+/// reconcile that never answered it emits exactly the keys it emitted before.
+/// Derived from the answers, not read back from the cluster: the URL is the
+/// host the Ingress was rendered for, whatever the controller's status says.
+fn attach_public_base_url(result: &mut Value, env: &Environment, answers: Option<&Value>) {
+    if let Some(url) =
+        crate::env_packs::k8s::manifests::ingress::public_base_url_from_answers(env, answers)
+    {
+        result["public_base_url"] = json!(url);
+    }
+}
+
+/// The `op env reconcile` result object. `sor_units` appears only when the
+/// env has SoR units, so every other env's output is unchanged; each entry is
+/// `{unit_id, sor, service, url, ready}` and never carries a secret value.
+fn reconcile_result_json(
+    env: &Environment,
+    kind: &str,
+    answers_ref_wire: &Value,
+    identity: &str,
+    report: &crate::env_packs::k8s::ReconcileReport,
+) -> Value {
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": kind,
+        "answers_ref": answers_ref_wire,
+        // Identity the cluster was mutated as: "bound" = the env's
+        // credentials_ref resolved to a ServiceAccount bearer; "ambient" =
+        // the CLI's kubeconfig / in-cluster identity (no bound credential).
+        // Surfaced so a live mutation is never silent about which identity
+        // it ran as.
+        "identity": identity,
+        "applied_count": report.applied.len(),
+        "pruned_count": report.pruned.len(),
+        "applied": report.applied,
+        "pruned": report.pruned,
+        // Where the router is reachable from outside the cluster, for an
+        // env whose `service_type` answer asked to be exposed. Absent
+        // (`null`, dropped by `skip_serializing_if`) for the default
+        // `ClusterIP`, so a reconcile that never answered `service_type`
+        // emits exactly the fields it emitted before this shipped. A
+        // present value distinguishes an assigned address from one still
+        // being provisioned — see `RouterAddress`.
+        "router_address": report.router_address,
+    });
+    if !report.sor_units.is_empty() {
+        result["sor_units"] = json!(report.sor_units);
+    }
+    // Stale SoR inputs outside their unit's own segment are never deleted;
+    // named here (paths only) so an operator can remove them by hand.
+    if !report.sor_skipped_input_refs.is_empty() {
+        result["sor_skipped_input_refs"] = json!(report.sor_skipped_input_refs);
+    }
+    result
 }
 
 /// Connect to the cluster (binding's `kubeconfig_context`, with `bound_token`
 /// overriding the ambient identity when the env has a resolved credential) and
 /// converge desired state. Requires the `k8s-client` feature.
 #[cfg(feature = "k8s-client")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_k8s_cluster(
     env: &Environment,
     answers: Option<&Value>,
@@ -906,6 +979,8 @@ pub(crate) fn reconcile_k8s_cluster(
     dev_secrets: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     wait_for_rollout: bool,
+    sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
+    store_label: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
     use crate::env_packs::k8s::kube_client::connect;
@@ -931,9 +1006,10 @@ pub(crate) fn reconcile_k8s_cluster(
             Arc::new(KubeCluster::new(client)),
             dev_secrets,
         )
-        .with_secrets_backend(secrets_backend);
+        .with_secrets_backend(secrets_backend)
+        .with_store_label(store_label);
         handler
-            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout)
+            .reconcile_and_wait(env, answers, manage_namespace, wait_for_rollout, sor)
             .await
             .map_err(|e| OpError::Conflict(e.to_string()))
     })
@@ -941,6 +1017,7 @@ pub(crate) fn reconcile_k8s_cluster(
 
 /// `k8s-client`-less builds cannot talk to a cluster.
 #[cfg(not(feature = "k8s-client"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_k8s_cluster(
     _env: &Environment,
     _answers: Option<&Value>,
@@ -948,6 +1025,8 @@ pub(crate) fn reconcile_k8s_cluster(
     _dev_secrets: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
     _wait_for_rollout: bool,
+    _sor: Option<&crate::env_packs::k8s::SorReconcile<'_>>,
+    _store_label: Option<String>,
 ) -> Result<crate::env_packs::k8s::ReconcileReport, OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -966,20 +1045,147 @@ pub(crate) fn read_dev_secrets_b64(
     env_id: &EnvId,
 ) -> Result<Option<String>, OpError> {
     use base64::Engine as _;
+    Ok(read_dev_secrets_bytes(store, env_id)?
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+use crate::credentials::store_paths::BOUND_CREDENTIAL_STORE_PATHS;
+
+/// Store URIs in the env dev-store that are control-plane material and must
+/// NEVER be staged into a runtime seed — the bound deployer credential. A
+/// dev-store-backed env persists that credential in the same `.dev.secrets.env`
+/// the seed is built from (`put_credential_material` writes it at exactly this
+/// URI), so a workload holding the shared dev master key could otherwise decrypt
+/// the credential that deployed it.
+///
+/// The denylist is the union of two sources, and needs both:
+///
+/// * **`credentials_ref`** — covers a credential bound at a custom URI.
+/// * **`BOUND_CREDENTIAL_STORE_PATHS`, unconditionally** — covers the *orphan* a
+///   crashed bootstrap leaves behind, which `credentials_ref` by definition does
+///   not name. This is the seed-time half of the invariant in
+///   [`credentials::store_paths`](crate::credentials::store_paths); see that
+///   module doc for why the window exists and why the list is unconditional.
+///   No record of what was written is needed: the minting handlers derive their
+///   ref from those very constants, so the landing URI is deterministic per env.
+///
+/// Fail-open on a non-store-alignable `credentials_ref` is safe, not a leak: the
+/// credential can only be present in the dev-store if its ref *is*
+/// store-alignable (that is what lets `put_credential_material` write it), so an
+/// un-alignable ref provably points somewhere else (e.g. Vault) and there is
+/// nothing in this file to strip.
+fn staging_excluded_uris(env: &Environment) -> Vec<String> {
+    use greentic_deploy_spec::SecretRef;
+
+    let mut uris: Vec<String> = BOUND_CREDENTIAL_STORE_PATHS
+        .iter()
+        .filter_map(|path| {
+            SecretRef::try_new(format!("secret://{}/{path}", env.environment_id.as_str())).ok()
+        })
+        .filter_map(|bound| super::secrets::secret_ref_to_store_uri(&bound).ok())
+        .collect();
+    if let Some(cred) = env
+        .credentials_ref
+        .as_ref()
+        .and_then(|cred| super::secrets::secret_ref_to_store_uri(cred).ok())
+        && !uris.contains(&cred)
+    {
+        uris.push(cred);
+    }
+    uris
+}
+
+/// Read the env's local dev-store as raw bytes (the encrypted `.dev.secrets.env`
+/// file) for staging into a runtime seed. `Ok(None)` when no dev-store file
+/// exists yet; a present-but-unreadable store is surfaced rather than silently
+/// shipping nothing. The Cloud Run deploy stages these bytes verbatim as a
+/// Secret Manager version, so it needs the raw file, not the k8s path's
+/// base64-in-a-K8s-Secret.
+///
+/// Any control-plane material (`staging_excluded_uris`) is hard-excluded from
+/// the returned bytes via a filtered copy, so the staged seed cannot resolve the
+/// bound deployer credential even with the shared dev master key. The operator's
+/// on-disk store is never modified. Every SoR input — each declared unit's,
+/// and each one the applied ledger records for a retired or re-pointed unit —
+/// is excluded the same way (see `env_sor::sor_input_uris`).
+///
+/// **Concurrency.** The exclusion is derived from a fresh env load and the
+/// dev-store is snapshotted inside a single `store.transact` critical section,
+/// under the same per-env flock the credential writer holds. A bootstrap /
+/// rotation persists the dev-store credential and then `credentials_ref` under
+/// that flock (see `credentials::bootstrap`), so serializing here guarantees the
+/// exclusion is consistent with the bytes read: if the snapshot contains the
+/// credential, the reloaded env already names it and it is stripped. Reloading
+/// the authoritative env — rather than trusting the caller's possibly-stale
+/// snapshot — is what closes the stale-state window, so this takes `env_id`, not
+/// an `&Environment`. MUST NOT be called from within an open `transact` for the
+/// same env (the flock is not re-entrant); all current callers pass an unlocked
+/// env.
+/// The dev-store file a runtime seed is staged FROM. One resolution for every
+/// reader and writer of the seed (staging, and the Cloud Run generated-secret
+/// pre-mint), so they can never disagree about which file that is. It
+/// deliberately ignores `GREENTIC_DEV_SECRETS_PATH`: the seed is the env's own
+/// store, not whatever an operator's shell points the CLI at.
+pub(crate) fn staged_dev_store_path(env_dir: &std::path::Path) -> std::path::PathBuf {
+    super::secrets::resolve_dev_store_path(env_dir, None)
+}
+
+pub(crate) fn read_dev_secrets_bytes(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+) -> Result<Option<Vec<u8>>, OpError> {
     let env_dir = store
         .env_dir(env_id)
         .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
-    let path = super::secrets::resolve_dev_store_path(&env_dir, None);
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(
-            base64::engine::general_purpose::STANDARD.encode(bytes),
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(OpError::Conflict(format!(
-            "reading dev-store at {}: {e}",
-            path.display()
-        ))),
-    }
+    let src = staged_dev_store_path(&env_dir);
+
+    store.transact(env_id, |locked| -> Result<Option<Vec<u8>>, OpError> {
+        let env = locked
+            .load()
+            .map_err(|e| OpError::Conflict(format!("reloading env for staging: {e}")))?;
+        let mut exclude = staging_excluded_uris(&env);
+        let sor_units = locked
+            .load_sor_units()
+            .map_err(|e| OpError::Conflict(format!("reading SoR units for staging: {e}")))?;
+        let sor_ledger = locked
+            .load_sor_ledger()
+            .map_err(|e| OpError::Conflict(format!("reading the SoR ledger for staging: {e}")))?;
+        exclude.extend(super::env_sor::sor_input_uris(
+            env_id,
+            &sor_units,
+            &sor_ledger,
+        ));
+
+        // A dev-store file may not exist yet — guarded no-op (a missing file
+        // stages nothing; the worker's staging init is then a no-op).
+        if !src.exists() {
+            return Ok(None);
+        }
+
+        // Always stage through a filtered copy — even with nothing to exclude —
+        // so the read takes the DevStore advisory lock and never observes a
+        // torn write, and so the deployer credential (H3) is hard-excluded: the
+        // workload still receives every runtime secret, but no residual
+        // ciphertext for the credential survives in the staged bytes. The
+        // operator's on-disk store is never modified.
+        let staged_dir = tempfile::tempdir()
+            .map_err(|e| OpError::Conflict(format!("staging dev-store copy: {e}")))?;
+        let staged = staged_dir.path().join(".dev.secrets.env");
+        let exclude_refs: Vec<&str> = exclude.iter().map(String::as_str).collect();
+        greentic_secrets_lib::DevStore::copy_excluding(&src, &staged, &exclude_refs).map_err(
+            |e| {
+                OpError::Conflict(format!(
+                    "staging dev-store (excluding control-plane material): {e}"
+                ))
+            },
+        )?;
+        std::fs::read(&staged).map(Some).map_err(|e| {
+            OpError::Conflict(format!(
+                "reading staged dev-store at {}: {e}",
+                staged.display()
+            ))
+        })
+    })
 }
 
 /// `op env apply-revision <env_id> <revision_id> [--kind <descriptor>]` — bring
@@ -1044,7 +1250,7 @@ pub fn apply_revision(
     // paths; any other registered deployer (e.g. local-process) does not.
     let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
     let is_k8s = descriptor.path() == k8s_path;
-    if !is_k8s && !is_aws_ecs_kind(&descriptor) {
+    if !is_k8s && !is_aws_ecs_kind(&descriptor) && !is_cloudrun_kind(&descriptor) {
         return Err(unsupported_apply_kind(&descriptor));
     }
 
@@ -1071,14 +1277,20 @@ pub fn apply_revision(
     // use; the lifecycle→presence predicate is backend-agnostic.
     let present = crate::env_packs::k8s::manifests::has_cluster_presence(revision.lifecycle);
     let action = if present { "warmed" } else { "archived" };
+    let verb = if present {
+        RevisionVerb::Warm
+    } else {
+        RevisionVerb::Archive
+    };
     let lifecycle = revision.lifecycle;
 
     // Backend dispatch: connect as the bound identity (fail-closed when a ref is
     // bound but unresolvable, never a silent ambient fall-back) and drive the
     // single revision's verb. Returns the identity used + the live resource name
-    // (K8s worker Deployment / ECS service) for the outcome. The applicability
-    // gate above guarantees the `else` arm is AWS-ECS.
-    let (identity, worker_name): (&'static str, String) = if is_k8s {
+    // (K8s worker Deployment / ECS service / Cloud Run service) for the outcome.
+    // The applicability gate above guarantees the `else` arm is AWS-ECS or Cloud
+    // Run; `apply_revision_non_k8s` dispatches between them.
+    let (identity, worker_name, endpoint_url): (&'static str, String, Option<String>) = if is_k8s {
         let worker_name = crate::env_packs::k8s::manifests::worker_name(revision);
         let bound_token =
             crate::env_packs::k8s::resolve_bound_identity(store, &env, &env_id, answers.as_ref())?;
@@ -1094,53 +1306,183 @@ pub fn apply_revision(
         apply_revision_k8s_cluster(
             &env,
             revision_id,
-            present,
+            verb,
             answers.as_ref(),
             bound_token,
             secrets_backend,
+            args.force_drain,
+            None,
+            super::env_drain::k8s_store_label(store, &env_id),
         )?;
-        (identity, worker_name)
+        (identity, worker_name, None)
     } else {
         apply_revision_non_k8s(
             store,
             &env,
             &env_id,
             revision_id,
-            present,
+            verb,
             answers.as_ref(),
             &descriptor,
+            args.force_drain,
+            None,
         )?
     };
 
-    Ok(OpOutcome::new(
-        NOUN,
-        "apply-revision",
-        json!({
-            "environment_id": env.environment_id.as_str(),
-            "kind": descriptor.as_str(),
-            "revision_id": revision_id.to_string(),
-            "lifecycle": lifecycle,
-            // Which Deployer verb the recorded lifecycle drove.
-            "action": action,
-            "worker_name": worker_name,
-            "answers_ref": answers_ref_wire,
-            // Identity the cluster was mutated as — see `reconcile`.
-            "identity": identity,
-        }),
-    ))
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": descriptor.as_str(),
+        "revision_id": revision_id.to_string(),
+        "lifecycle": lifecycle,
+        // Which Deployer verb the recorded lifecycle drove.
+        "action": action,
+        "worker_name": worker_name,
+        "answers_ref": answers_ref_wire,
+        // Identity the cluster was mutated as — see `reconcile`.
+        "identity": identity,
+    });
+    // Cloud Run discovers a live `*.run.app` URL for the Service and returns it
+    // here (the "one command → live URL" milestone). The K8s / AWS-ECS paths
+    // have no deployer-discovered endpoint (operator-supplied ingress / ALB), so
+    // surface the field only when present — their outcomes stay byte-identical.
+    if let Some(url) = endpoint_url {
+        result["endpoint_url"] = json!(url);
+    }
+    // An archive that skipped the drain gate says so in its outcome.
+    if !present && args.force_drain {
+        result["force_drain"] = json!(true);
+    }
+    Ok(OpOutcome::new(NOUN, "apply-revision", result))
+}
+
+/// Which `Deployer` verb a single-revision provider call drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RevisionVerb {
+    Warm,
+    Drain,
+    Archive,
+}
+
+/// Outcome of [`provider_revision_step`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderStep {
+    /// The env's bound deployer ran the verb (`kind` = its descriptor).
+    Done { kind: String },
+    /// Nothing provider-side exists to act on: the env has no deployer
+    /// binding at all.
+    Unavailable(String),
+}
+
+/// Refuse up front when the env's BOUND deployer lacks a capability a
+/// provider-side removal needs (P5-R3): `remove` always — removing a store
+/// record the adapter cannot tear down could orphan a running workload — and
+/// `drain` when `needs_drain` (the removal confirms each revision drained
+/// before tearing it down). The refusal is the typed
+/// [`OpError::CapabilityMissing`], naming the adapter and the capability, and
+/// is read off the adapter's own [`Deployer::capabilities`] rather than a
+/// list of kinds here.
+///
+/// `Ok(false)` = no deployer bound (nothing provider-side to act on);
+/// `Ok(true)` = capable.
+///
+/// [`Deployer::capabilities`]: crate::env_packs::deployer::Deployer::capabilities
+pub(crate) fn deployer_supports_remove(
+    env: &Environment,
+    registry: &crate::env_packs::EnvPackRegistry,
+    needs_drain: bool,
+) -> Result<bool, OpError> {
+    use crate::env_packs::deployer::Capability;
+    let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) else {
+        return Ok(false);
+    };
+    let descriptor = &binding.kind;
+    let capabilities = super::env_drain::deployer_of(registry, descriptor)?.capabilities();
+    capabilities.require(descriptor.path(), Capability::Remove)?;
+    if needs_drain {
+        capabilities.require(descriptor.path(), Capability::Drain)?;
+    }
+    Ok(true)
+}
+
+/// Drive ONE revision's provider-side `Deployer` verb through the env's
+/// bound deployer, with the same identity and answer resolution as
+/// `op env apply-revision`. Used by `op bundles retire` (drain, then
+/// teardown) — unlike `apply-revision` the verb is chosen by the caller, not
+/// derived from the recorded lifecycle.
+pub(crate) fn provider_revision_step(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    verb: RevisionVerb,
+    force_drain: bool,
+    drain_window: Option<std::time::Duration>,
+) -> Result<ProviderStep, OpError> {
+    let env = store.load(env_id)?;
+    if !deployer_supports_remove(&env, registry, verb == RevisionVerb::Drain)? {
+        return Ok(ProviderStep::Unavailable(
+            "env has no deployer binding".to_string(),
+        ));
+    }
+    let descriptor = resolve_live_deployer_kind(&env, None)?;
+    registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+    let is_k8s = descriptor.path() == crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
+    if !env.revisions.iter().any(|r| r.revision_id == revision_id) {
+        return Err(OpError::NotFound(format!(
+            "revision `{revision_id}` not found in env `{env_id}`"
+        )));
+    }
+    let (answers, _) = load_render_answers(store, &env, &descriptor)?;
+    if is_k8s {
+        let bound_token =
+            crate::env_packs::k8s::resolve_bound_identity(store, &env, env_id, answers.as_ref())?;
+        let secrets_backend = resolve_secrets_backend(store, &env)?;
+        apply_revision_k8s_cluster(
+            &env,
+            revision_id,
+            verb,
+            answers.as_ref(),
+            bound_token,
+            secrets_backend,
+            force_drain,
+            drain_window,
+            super::env_drain::k8s_store_label(store, env_id),
+        )?;
+    } else {
+        apply_revision_non_k8s(
+            store,
+            &env,
+            env_id,
+            revision_id,
+            verb,
+            answers.as_ref(),
+            &descriptor,
+            force_drain,
+            drain_window,
+        )?;
+    }
+    Ok(ProviderStep::Done {
+        kind: descriptor.as_str().to_string(),
+    })
 }
 
 /// Connect to the cluster and dispatch the single revision's Deployer verb:
 /// `warm_revision` when present, `archive_revision` when absent. Requires the
 /// `k8s-client` feature.
 #[cfg(feature = "k8s-client")]
+#[allow(clippy::too_many_arguments)]
 fn apply_revision_k8s_cluster(
     env: &Environment,
     revision_id: RevisionId,
-    present: bool,
+    verb: RevisionVerb,
     answers: Option<&Value>,
     bound_token: Option<String>,
     secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+    force_drain: bool,
+    drain_window: Option<std::time::Duration>,
+    store_label: Option<String>,
 ) -> Result<(), OpError> {
     use crate::env_packs::deployer::Deployer;
     use crate::env_packs::k8s::async_bridge::run_k8s_async;
@@ -1156,32 +1498,60 @@ fn apply_revision_k8s_cluster(
         let client = connect(kubeconfig_context.as_deref(), bound_token.as_deref())
             .await
             .map_err(|e| OpError::Conflict(format!("cannot reach the cluster: {e}")))?;
-        let handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
-            .with_secrets_backend(secrets_backend);
-        let result = if present {
-            handler
+        let mut handler = K8sDeployerHandler::with_cluster(Arc::new(KubeCluster::new(client)))
+            .with_secrets_backend(secrets_backend)
+            .with_store_label(store_label);
+        // `op bundles retire --drain-seconds`: replace every revision's own
+        // window for this drain. Absent = the env-derived policy, unchanged.
+        if drain_window.is_some() {
+            let policy = handler.drain_policy.with_window_override(drain_window);
+            handler = handler.with_drain_policy(policy);
+        }
+        match verb {
+            RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
                 .await
                 .map(|_| ())
-        } else {
-            handler
-                .archive_revision(env, revision_id, answers)
+                .map_err(|e| OpError::Conflict(e.to_string())),
+            // P5-R2: the enforced drain (typed `not-drained` on failure).
+            RevisionVerb::Drain => handler
+                .drain_revision(env, revision_id, answers)
                 .await
                 .map(|_| ())
-        };
-        result.map_err(|e| OpError::Conflict(e.to_string()))
+                .map_err(super::env_drain::drain_error),
+            RevisionVerb::Archive => {
+                // P5-R2: archive only a drained revision (or --force-drain).
+                super::env_drain::archive_drain_gate(
+                    &handler,
+                    env,
+                    revision_id,
+                    answers,
+                    force_drain,
+                )
+                .await?;
+                handler
+                    .archive_revision(env, revision_id, answers)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| OpError::Conflict(e.to_string()))
+            }
+        }
     })
 }
 
 /// `k8s-client`-less builds cannot talk to a cluster.
 #[cfg(not(feature = "k8s-client"))]
+#[allow(clippy::too_many_arguments)]
 fn apply_revision_k8s_cluster(
     _env: &Environment,
     _revision_id: RevisionId,
-    _present: bool,
+    _verb: RevisionVerb,
     _answers: Option<&Value>,
     _bound_token: Option<String>,
     _secrets_backend: crate::env_packs::k8s::manifests::SecretsBackend,
+    _force_drain: bool,
+    _drain_window: Option<std::time::Duration>,
+    _store_label: Option<String>,
 ) -> Result<(), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `k8s-client` feature; \
@@ -1203,51 +1573,90 @@ fn is_aws_ecs_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
     false
 }
 
+/// True when the descriptor is the GCP Cloud Run deployer kind. `false` on
+/// builds without the GCP env-pack compiled in (`creds-gcp` off) — the kind
+/// cannot be served, so the applicability gate rejects it. Mirrors
+/// [`is_aws_ecs_kind`].
+#[cfg(feature = "creds-gcp")]
+pub(crate) fn is_cloudrun_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+    descriptor.path() == crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler::DESCRIPTOR_PATH
+}
+
+#[cfg(not(feature = "creds-gcp"))]
+pub(crate) fn is_cloudrun_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+    false
+}
+
 /// Conflict for a deployer kind with no live single-revision apply path
-/// (anything other than K8s / AWS-ECS — e.g. the local-process deployer, which
-/// runs in-process and has nothing to apply to a remote target).
+/// (anything other than K8s / AWS-ECS / Cloud Run — e.g. the local-process
+/// deployer, which runs in-process and has nothing to apply to a remote target).
 fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> OpError {
     OpError::Conflict(format!(
-        "env apply-revision is only supported for the `{}` (K8s) and \
-         `greentic.deployer.aws-ecs` (AWS-ECS) deployer env-packs today; `{}` has no live \
-         single-revision apply path",
+        "env apply-revision is only supported for the `{}` (K8s), \
+         `greentic.deployer.aws-ecs` (AWS-ECS), and `greentic.deployer.gcp-cloudrun` \
+         (Cloud Run) deployer env-packs today; `{}` has no live single-revision apply path",
         crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH,
         descriptor.path()
     ))
 }
 
-/// Dispatch `apply-revision` for a non-K8s deployer. Today only the AWS-ECS
-/// env-pack has a live deploy path; every other registered kind is rejected.
-/// Returns `(identity, worker_name)` — the AWS analogue of the K8s
-/// `(bound|ambient, worker Deployment name)`.
-#[cfg(feature = "creds-aws")]
+/// Dispatch `apply-revision` for a non-K8s deployer. Today the AWS-ECS and GCP
+/// Cloud Run env-packs have live deploy paths; every other registered kind is
+/// rejected. Returns `(identity, worker_name, endpoint_url)` — the analogue of
+/// the K8s `(bound|ambient, worker Deployment name)`, plus the live endpoint URL
+/// when the backend discovers one (Cloud Run's `*.run.app`; `None` for AWS-ECS).
+#[cfg(any(feature = "creds-aws", feature = "creds-gcp"))]
 #[allow(clippy::too_many_arguments)]
 fn apply_revision_non_k8s(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
     revision_id: RevisionId,
-    present: bool,
+    verb: RevisionVerb,
     answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
-) -> Result<(&'static str, String), OpError> {
-    if descriptor.path() != crate::env_packs::aws::AwsEcsDeployerHandler::DESCRIPTOR_PATH {
-        return Err(unsupported_apply_kind(descriptor));
+    force_drain: bool,
+    drain_window: Option<std::time::Duration>,
+) -> Result<(&'static str, String, Option<String>), OpError> {
+    // AWS-ECS has no drain capability, so its archive is not gated.
+    let _ = (force_drain, drain_window);
+    #[cfg(feature = "creds-aws")]
+    {
+        if is_aws_ecs_kind(descriptor) {
+            return apply_revision_aws_ecs(store, env, env_id, revision_id, verb, answers);
+        }
     }
-    apply_revision_aws_ecs(store, env, env_id, revision_id, present, answers)
+    #[cfg(feature = "creds-gcp")]
+    {
+        if is_cloudrun_kind(descriptor) {
+            return apply_revision_cloudrun(
+                store,
+                env,
+                env_id,
+                revision_id,
+                verb,
+                answers,
+                force_drain,
+                drain_window,
+            );
+        }
+    }
+    Err(unsupported_apply_kind(descriptor))
 }
 
-#[cfg(not(feature = "creds-aws"))]
+#[cfg(not(any(feature = "creds-aws", feature = "creds-gcp")))]
 #[allow(clippy::too_many_arguments)]
 fn apply_revision_non_k8s(
     _store: &LocalFsStore,
     _env: &Environment,
     _env_id: &EnvId,
     _revision_id: RevisionId,
-    _present: bool,
+    _verb: RevisionVerb,
     _answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
-) -> Result<(&'static str, String), OpError> {
+    _force_drain: bool,
+    _drain_window: Option<std::time::Duration>,
+) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(unsupported_apply_kind(descriptor))
 }
 
@@ -1352,17 +1761,18 @@ async fn resolve_ecs_handler(
 
 /// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
 /// when present, `archive_revision` when absent (mirrors
-/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name)`.
-/// Requires the `deploy-aws-ecs` feature.
+/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name, None)` —
+/// AWS-ECS has no deployer-discovered endpoint (the ALB DNS is operator infra),
+/// so the endpoint slot is always `None`. Requires the `deploy-aws-ecs` feature.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
 fn apply_revision_aws_ecs(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
     revision_id: RevisionId,
-    present: bool,
+    verb: RevisionVerb,
     answers: Option<&Value>,
-) -> Result<(&'static str, String), OpError> {
+) -> Result<(&'static str, String, Option<String>), OpError> {
     use crate::env_packs::aws::credentials::run_aws_async;
     use crate::env_packs::aws::real_target::service_name;
     use crate::env_packs::deployer::Deployer;
@@ -1378,20 +1788,24 @@ fn apply_revision_aws_ecs(
 
     run_aws_async(async move {
         let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
-        if present {
-            handler
+        match verb {
+            RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
                 .await
-                .map_err(|e| OpError::Conflict(e.to_string()))?;
-        } else {
-            handler
+                .map(|_| ()),
+            RevisionVerb::Drain => handler
+                .drain_revision(env, revision_id, answers)
+                .await
+                .map(|_| ()),
+            RevisionVerb::Archive => handler
                 .archive_revision(env, revision_id, answers)
                 .await
-                .map_err(|e| OpError::Conflict(e.to_string()))?;
+                .map(|_| ()),
         }
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
         Ok::<(), OpError>(())
     })?;
-    Ok((identity, worker_name))
+    Ok((identity, worker_name, None))
 }
 
 #[cfg(all(feature = "creds-aws", not(feature = "deploy-aws-ecs")))]
@@ -1400,12 +1814,413 @@ fn apply_revision_aws_ecs(
     _env: &Environment,
     _env_id: &EnvId,
     _revision_id: RevisionId,
-    _present: bool,
+    _verb: RevisionVerb,
     _answers: Option<&Value>,
-) -> Result<(&'static str, String), OpError> {
+) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(OpError::Conflict(
         "this build was compiled without the `deploy-aws-ecs` feature; \
          `op env apply-revision` for an aws-ecs env needs it to talk to AWS"
+            .to_string(),
+    ))
+}
+
+/// Resolve the bound deployer credential (or the ambient ADC chain) and parse
+/// the Cloud Run construction inputs from the binding answers. Returns
+/// `(identity_label, params, credentials)` — the GCP analogue of
+/// [`aws_ecs_target_inputs`], shared by `apply-revision` and `apply-traffic` so
+/// both honor the same credential resolution.
+///
+/// Fails closed (before any GCP call) when a `credentials_ref` is bound but
+/// unreadable (via `resolve_bound_credentials`); a `None` credential means "no
+/// ref bound", so the target falls back to the ambient ADC chain — the same
+/// bound-or-ambient model the AWS path uses.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+pub(crate) fn cloudrun_target_inputs(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams,
+        Option<crate::env_packs::gcp_cloudrun::bound_session::GcpCredentialMaterial>,
+    ),
+    OpError,
+> {
+    use crate::env_packs::gcp_cloudrun::bound_session::resolve_bound_credentials;
+    use crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams;
+
+    let credentials = resolve_bound_credentials(store, env, env_id)?;
+    let identity = if credentials.is_some() {
+        "bound"
+    } else {
+        "ambient"
+    };
+    let params = GcpCloudRunParams::from_answers(env, answers)
+        .map_err(|e| OpError::Conflict(format!("invalid gcp-cloudrun binding answers: {e}")))?;
+    Ok((identity, params, credentials))
+}
+
+/// Build the region-pinned Cloud Run + Secret Manager clients (with the bound
+/// credential injected, else ambient ADC) and wrap them in a handler — the GCP
+/// analogue of [`resolve_ecs_handler`]. The Service's `*.run.app` URL rides back
+/// on the warm outcome (read from the upsert response), so the caller needs no
+/// separate handle on the target.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+pub(crate) async fn resolve_cloudrun_handler(
+    project: &str,
+    region: &str,
+    credentials: Option<crate::env_packs::gcp_cloudrun::bound_session::GcpCredentialMaterial>,
+    dev_secrets: Option<Vec<u8>>,
+) -> Result<crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler, OpError> {
+    use crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler;
+    use crate::env_packs::gcp_cloudrun::real_target::RealCloudRunTarget;
+    use std::sync::Arc;
+
+    let target = RealCloudRunTarget::resolve(project, region, credentials)
+        .await
+        .map_err(|e| {
+            OpError::Conflict(format!(
+                "cannot initialize the GCP Cloud Run deployer client: {e}"
+            ))
+        })?;
+    Ok(GcpCloudRunDeployerHandler::with_target_and_dev_secrets(
+        Arc::new(target),
+        dev_secrets,
+    ))
+}
+
+/// Store-injected teardown of a Cloud Run env's owned Services, run under the
+/// destroy flock before the local state is purged (plan item 5b). Deletes the
+/// Service for each of the env's deployments — idempotent, an already-gone
+/// Service is not an error — so a retried `destroy` after a partial failure
+/// converges. Version-pinned Secret Manager teardown lands with secret *staging*
+/// in a later slice (the deploy path stages no secrets yet).
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+struct CloudRunProviderTeardown;
+
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
+    fn teardown(
+        &self,
+        ctx: crate::environment::ProviderTeardownCtx<'_>,
+    ) -> Result<Value, crate::environment::StoreError> {
+        use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
+        use crate::env_packs::gcp_cloudrun::deploy_target::{CloudRunTarget, ServiceRef};
+        use crate::env_packs::gcp_cloudrun::deployer::{
+            SecretOwnership, environment_secret_name, secret_ownership, service_name,
+        };
+        use crate::env_packs::gcp_cloudrun::real_target::RealCloudRunTarget;
+        use crate::environment::StoreError;
+
+        // Resolve project/region + bound credentials from the same answers the
+        // deploy path uses (fails closed on an unreadable bound credential). Any
+        // error becomes `ProviderTeardown`, leaving the env intact for retry.
+        let (_identity, params, credentials) =
+            cloudrun_target_inputs(ctx.store, ctx.env, ctx.env_id, ctx.answers)
+                .map_err(|e| StoreError::ProviderTeardown(e.to_string()))?;
+        let deployment_ids = ctx.deployment_ids.to_vec();
+        let project = params.project.clone();
+        let region = params.region.clone();
+        // The env-level seed secrets warm staged (plan D6) are per-env, not
+        // per-deployment — delete them once, after the Services.
+        let secret_name = environment_secret_name(&params.secret_prefix);
+        let redis_secret = crate::env_packs::gcp_cloudrun::redis_secret::redis_url_secret_name(
+            &params.secret_prefix,
+        );
+        let env_id = ctx.env_id.as_str().to_string();
+        let sor_credentials = credentials.clone();
+
+        let (deleted_services, deleted_secrets, skipped_secrets) = run_gcp_async(async move {
+            let target = RealCloudRunTarget::resolve(&params.project, &params.region, credentials)
+                .await
+                .map_err(|e| {
+                    StoreError::ProviderTeardown(format!(
+                        "cannot initialize the GCP Cloud Run deployer client: {e}"
+                    ))
+                })?;
+            let mut deleted = Vec::with_capacity(deployment_ids.len());
+            for deployment_id in deployment_ids {
+                let service = ServiceRef {
+                    deployment_id,
+                    project: params.project.clone(),
+                    region: params.region.clone(),
+                };
+                target.delete_service(&service).await.map_err(|e| {
+                    StoreError::ProviderTeardown(format!(
+                        "deleting Cloud Run service for deployment `{deployment_id}`: {e}"
+                    ))
+                })?;
+                deleted.push(service_name(deployment_id));
+            }
+            // Only delete a secret this env owns (H1). Another env resolving to
+            // the same `secret_prefix` still has live revisions mounting it, so
+            // deleting it here would break their cold starts. Skipping is not a
+            // teardown failure — a secret that was never ours leaves nothing of
+            // ours behind — so the destroy proceeds and reports the skip.
+            let ownership = secret_ownership(&target, &secret_name, &env_id)
+                .await
+                .map_err(|e| StoreError::ProviderTeardown(e.to_string()))?;
+            // Deleted or skipped, never both.
+            let (mut deleted_secrets, mut skipped_secrets) = match ownership {
+                SecretOwnership::Conflict { owner } => (
+                    vec![],
+                    vec![json!({
+                        "secret": secret_name,
+                        "owned_by": owner,
+                        "reason": "belongs to another environment; left intact",
+                    })],
+                ),
+                SecretOwnership::Absent | SecretOwnership::Ours | SecretOwnership::Legacy => {
+                    target.delete_secret(&secret_name).await.map_err(|e| {
+                        StoreError::ProviderTeardown(format!(
+                            "deleting Secret Manager secret `{secret_name}`: {e}"
+                        ))
+                    })?;
+                    (vec![secret_name], vec![])
+                }
+            };
+            // The Redis URL's own secret: deleted only when THIS env stamped
+            // it (it post-dates ownership stamping, so an unstamped one is not
+            // ours); absent — the env never answered `redis_url` — adds nothing.
+            match secret_ownership(&target, &redis_secret, &env_id)
+                .await
+                .map_err(|e| StoreError::ProviderTeardown(e.to_string()))?
+            {
+                SecretOwnership::Absent => {}
+                SecretOwnership::Ours => {
+                    target.delete_secret(&redis_secret).await.map_err(|e| {
+                        StoreError::ProviderTeardown(format!(
+                            "deleting Secret Manager secret `{redis_secret}`: {e}"
+                        ))
+                    })?;
+                    deleted_secrets.push(redis_secret);
+                }
+                SecretOwnership::Conflict { owner } => skipped_secrets.push(json!({
+                    "secret": redis_secret,
+                    "owned_by": owner,
+                    "reason": "belongs to another environment; left intact",
+                })),
+                SecretOwnership::Legacy => skipped_secrets.push(json!({
+                    "secret": redis_secret,
+                    "reason": "carries no owner stamp, so this deployer did not create it; left intact",
+                })),
+            }
+            Ok::<_, StoreError>((deleted, deleted_secrets, skipped_secrets))
+        })?;
+
+        // SoR units after the workers: nothing calls a SoR that is already gone.
+        let sor =
+            super::env_cloudrun_sor::teardown_sor_units(ctx.store, ctx.env_id, sor_credentials)
+                .map_err(StoreError::ProviderTeardown)?;
+
+        let mut result = json!({
+            "provider": "gcp-cloudrun",
+            "project": project,
+            "region": region,
+            "deleted_services": deleted_services,
+            "deleted_secrets": deleted_secrets,
+            "skipped_secrets": skipped_secrets,
+        });
+        // Omitted (never an empty object) when the ledger held no SoR unit, so a
+        // plain Cloud Run destroy's output is unchanged from before SoR units
+        // existed.
+        if let Some(sor) = sor {
+            result["sor"] = sor;
+        }
+        Ok(result)
+    }
+}
+
+/// Whether `warm_revision` should stage the local dev-store as Cloud Run seed
+/// material: the env has a `Secrets`-slot pack AND resolves `secret://` against
+/// the dev-store backend, never Vault. Mirrors the k8s render gate
+/// (`SecretsBackend::DevStore` + `env_uses_dev_secrets`). Staging a Vault-backed
+/// env's dev-store would ship operator-local material — including any bound
+/// deployer credentials persisted there — into the runtime seed.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn cloudrun_stages_dev_secrets(env: &Environment) -> bool {
+    env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets) && secrets_backend_is_dev_store(env)
+}
+
+/// Connect to GCP and drive the single revision's Cloud Run verb: `warm_revision`
+/// when present, `archive_revision` when absent (mirrors `apply_revision_aws_ecs`).
+/// Returns `(identity, Cloud Run service name, endpoint_url)` — the Service's
+/// live `*.run.app` URL is discovered after a successful warm (`None` on
+/// archive). Requires the `deploy-gcp-cloudrun` feature.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+#[allow(clippy::too_many_arguments)]
+fn apply_revision_cloudrun(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    verb: RevisionVerb,
+    answers: Option<&Value>,
+    force_drain: bool,
+    drain_window: Option<std::time::Duration>,
+) -> Result<(&'static str, String, Option<String>), OpError> {
+    use crate::env_packs::deployer::Deployer;
+    use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
+    use crate::env_packs::gcp_cloudrun::deployer::service_name;
+
+    let revision = env
+        .revisions
+        .iter()
+        .find(|r| r.revision_id == revision_id)
+        .expect("revision presence checked by the caller");
+    let worker_name = service_name(revision.deployment_id);
+    let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
+
+    // Read the env's encrypted dev-store (this process owns the filesystem) so
+    // `warm_revision` can stage it under the seed secret — but only when the env
+    // resolves `secret://` against the dev-store backend, never Vault, and only
+    // on the warm path (`present`). Keeps operator-local Vault material and any
+    // bound deployer credentials in the dev-store out of the runtime seed.
+    //
+    // A multi-instance warm additionally pre-mints every generated secret the
+    // revision's packs declare into the dev store BEFORE staging, and checks the
+    // staged bytes carry them (`shared_state::gate` refuses otherwise). A
+    // single-instance warm stages exactly as before.
+    let (dev_secrets, generated_secret_seed) = cloudrun_seed_material(
+        store,
+        env,
+        env_id,
+        revision,
+        verb == RevisionVerb::Warm,
+        &params,
+    )?;
+
+    let endpoint_url = run_gcp_async(async move {
+        let mut handler =
+            resolve_cloudrun_handler(&params.project, &params.region, credentials, dev_secrets)
+                .await?
+                .with_generated_secret_seed(generated_secret_seed);
+        // `op bundles retire --drain-seconds`: replace every revision's own
+        // window for this drain. Absent = the env-derived policy, unchanged.
+        if drain_window.is_some() {
+            let policy = handler.drain_policy.with_window_override(drain_window);
+            handler = handler.with_drain_policy(policy);
+        }
+        if verb == RevisionVerb::Warm {
+            // The Service's live `*.run.app` URL rides back on the warm outcome
+            // (read from the upsert response — no extra round-trip): the "one
+            // command → live URL" milestone.
+            let outcome = handler
+                .warm_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+            Ok::<Option<String>, OpError>(outcome.endpoint_url)
+        } else if verb == RevisionVerb::Drain {
+            handler
+                .drain_revision(env, revision_id, answers)
+                .await
+                .map_err(super::env_drain::drain_error)?;
+            Ok::<Option<String>, OpError>(None)
+        } else {
+            // P5-R2: archive only a revision the live Service routes 0 % to
+            // (or under --force-drain).
+            super::env_drain::archive_drain_gate(&handler, env, revision_id, answers, force_drain)
+                .await?;
+            handler
+                .archive_revision(env, revision_id, answers)
+                .await
+                .map_err(|e| OpError::Conflict(e.to_string()))?;
+            Ok::<Option<String>, OpError>(None)
+        }
+    })?;
+    Ok((identity, worker_name, endpoint_url))
+}
+
+/// The dev-store bytes a Cloud Run warm stages, and what is known about the
+/// generated secrets in them (for the multi-instance gate).
+///
+/// Pre-minting runs only for a warm whose scaling can run several instances
+/// (`shared_state::runs_multiple_instances` — the EFFECTIVE ceiling, so
+/// `max_instances = 0` counts) AND whose answers could pass the gate at all
+/// (`multi_instance_safe`): a deploy the gate is certain to refuse must not
+/// write into the operator's dev store first. Everything else stages exactly as
+/// before. For a pre-minting warm, an env with no staged dev-store seed has
+/// nowhere to pre-mint into, so the gate refuses rather than let each instance
+/// mint its own.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn cloudrun_seed_material(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision: &greentic_deploy_spec::Revision,
+    warm: bool,
+    params: &crate::env_packs::gcp_cloudrun::deployer::GcpCloudRunParams,
+) -> Result<
+    (
+        Option<Vec<u8>>,
+        crate::env_packs::gcp_cloudrun::shared_state::GeneratedSecretSeed,
+    ),
+    OpError,
+> {
+    use crate::env_packs::gcp_cloudrun::shared_state::{
+        GeneratedSecretSeed, multi_instance_safe, runs_multiple_instances,
+    };
+
+    if !warm {
+        return Ok((None, GeneratedSecretSeed::Unverified));
+    }
+    let stages = cloudrun_stages_dev_secrets(env);
+    if !(runs_multiple_instances(params) && multi_instance_safe(params)) {
+        let bytes = if stages {
+            read_dev_secrets_bytes(store, env_id)?
+        } else {
+            None
+        };
+        return Ok((bytes, GeneratedSecretSeed::Unverified));
+    }
+    if stages {
+        let env_dir = store
+            .env_dir(env_id)
+            .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
+        let dev_path = staged_dev_store_path(&env_dir);
+        let (seed, staged) = super::cloudrun_generated_secrets::premint_and_stage(
+            store,
+            env,
+            revision,
+            &dev_path,
+            || read_dev_secrets_bytes(store, env_id),
+        )?;
+        return Ok((staged, seed));
+    }
+    // Cloud Run renders no `GREENTIC_SECRETS_BACKEND`, so the runtime always
+    // resolves (and mints into) its per-instance dev store. Without a staged
+    // dev-store seed there is nowhere to pre-mint into.
+    Ok((
+        None,
+        GeneratedSecretSeed::Unestablished(
+            "the environment does not stage a dev-store seed (no dev-store Secrets pack is \
+             bound), so generated secrets cannot be pre-minted and each Cloud Run instance \
+             would mint its own at boot; bind `greentic.secrets.dev-store`"
+                .to_string(),
+        ),
+    ))
+}
+
+/// `deploy-gcp-cloudrun`-less builds recognize the cloudrun kind (the dispatch
+/// arm is `creds-gcp`-gated) but cannot talk to Cloud Run — the analogue of the
+/// AWS `#[cfg(not(deploy-aws-ecs))]` "compiled without the cloud feature" stub.
+#[cfg(all(feature = "creds-gcp", not(feature = "deploy-gcp-cloudrun")))]
+#[allow(clippy::too_many_arguments)]
+fn apply_revision_cloudrun(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _revision_id: RevisionId,
+    _verb: RevisionVerb,
+    _answers: Option<&Value>,
+    _force_drain: bool,
+    _drain_window: Option<std::time::Duration>,
+) -> Result<(&'static str, String, Option<String>), OpError> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `deploy-gcp-cloudrun` feature; \
+         `op env apply-revision` for a cloudrun env needs it to talk to Cloud Run"
             .to_string(),
     ))
 }
@@ -1442,16 +2257,17 @@ pub fn apply_traffic(
     let env = store.load(&env_id)?;
     let descriptor = resolve_live_deployer_kind(&env, args.kind.as_deref())?;
 
-    // AWS-ECS only: the ALB listener is the live router, so the split must be
-    // pushed to it. K8s serves splits from its in-process router (runtime
-    // config), so there is no listener to write — `op traffic set` suffices.
-    // Gate on the typed-const-backed helper (not a literal) so the path can't
-    // drift from `AwsEcsDeployerHandler::DESCRIPTOR_PATH`.
-    if !is_aws_ecs_kind(&descriptor) {
+    // AWS-ECS and GCP Cloud Run have a live router (ALB listener / Cloud Run
+    // traffic weights) the split must be pushed to. K8s and the local deployer
+    // serve splits from their in-process router (runtime config), so there is no
+    // listener to write — `op traffic set` suffices. Gate on the typed-const
+    // helpers (not literals) so the paths can't drift from the descriptor consts.
+    if !is_aws_ecs_kind(&descriptor) && !is_cloudrun_kind(&descriptor) {
         return Err(OpError::Conflict(format!(
             "env apply-traffic is only supported for the `greentic.deployer.aws-ecs` (AWS-ECS) \
-             deployer env-pack; `{}` serves traffic splits from its runtime router — record the \
-             split with `op traffic set` and the runtime applies it",
+             and `greentic.deployer.gcp-cloudrun` (Cloud Run) deployer env-packs; `{}` serves \
+             traffic splits from its runtime router — record the split with `op traffic set` and \
+             the runtime applies it",
             descriptor.path()
         )));
     }
@@ -1474,8 +2290,16 @@ pub fn apply_traffic(
     // with no routing condition it REPLACES the listener's default action
     // (whole-listener ownership), assuming the `alb_listener_arn` is dedicated to
     // this deployment — see the `op env apply-traffic` help WARNING.
-    let (identity, outcome) =
-        apply_traffic_aws_ecs(store, &env, &env_id, deployment_id, answers.as_ref())?;
+    // Dispatch to the resolved kind's live router (AWS-ECS ALB listener or Cloud
+    // Run traffic weights); the gate above admitted only those two kinds.
+    let (identity, outcome) = apply_traffic_non_k8s(
+        store,
+        &env,
+        &env_id,
+        deployment_id,
+        answers.as_ref(),
+        &descriptor,
+    )?;
 
     Ok(OpOutcome::new(
         NOUN,
@@ -1499,6 +2323,230 @@ pub fn apply_traffic(
                 .collect::<Vec<_>>(),
         }),
     ))
+}
+
+/// The revisions a Cloud Run bring-up warms: per deployment, the ones its
+/// recorded traffic split names; for a deployment with no split yet, only its
+/// newest present revision.
+///
+/// It used to be every revision with cluster presence. A superseded revision
+/// stays `Ready` — `deploy` never drains it — so after a blue-green re-stage
+/// the bring-up re-warmed the OLD revision too, under the CURRENT deployer
+/// answers. When those answers had changed (a new `runtime_image_digest`,
+/// say), that warm met the old revision's intent label and failed with "stage
+/// a NEW revision" — after the new revision had already been staged. A revision
+/// that carries no traffic has nothing to warm for.
+pub(crate) fn cloudrun_revisions_to_warm(
+    env: &Environment,
+) -> Vec<&greentic_deploy_spec::Revision> {
+    use greentic_deploy_spec::{DeploymentId, Revision};
+    use std::collections::{BTreeMap, BTreeSet};
+    let present =
+        |r: &&Revision| crate::env_packs::k8s::manifests::has_cluster_presence(r.lifecycle);
+    let routed: BTreeSet<RevisionId> = env
+        .traffic_splits
+        .iter()
+        .flat_map(|s| s.entries.iter().map(|e| e.revision_id))
+        .collect();
+    let with_split: BTreeSet<DeploymentId> =
+        env.traffic_splits.iter().map(|s| s.deployment_id).collect();
+    let mut newest_unsplit: BTreeMap<DeploymentId, &Revision> = BTreeMap::new();
+    for revision in env.revisions.iter().filter(present) {
+        if with_split.contains(&revision.deployment_id) {
+            continue;
+        }
+        let slot = newest_unsplit
+            .entry(revision.deployment_id)
+            .or_insert(revision);
+        if revision.sequence > slot.sequence {
+            *slot = revision;
+        }
+    }
+    env.revisions
+        .iter()
+        .filter(present)
+        .filter(|r| {
+            routed.contains(&r.revision_id)
+                || newest_unsplit
+                    .get(&r.deployment_id)
+                    .is_some_and(|n| n.revision_id == r.revision_id)
+        })
+        .collect()
+}
+
+/// One-command Cloud Run bring-up for `op env up`.
+///
+/// After the deployer-agnostic `env_apply::apply`, `op env up` calls this to
+/// finish a Cloud Run environment. Returns `Some(outcome)` — carrying the
+/// discovered `*.run.app` URL — when the env's live deployer is Cloud Run, or
+/// `None` for any other kind so `op env up` falls through to its k8s
+/// convergence phases. Keeping the deployer-kind decision here keeps `env_up.rs`
+/// free of Cloud-Run-specific knowledge.
+///
+/// Cloud Run is imperative (no declarative cluster reconcile), so bring-up warms
+/// every revision that carries traffic ([`cloudrun_revisions_to_warm`]) via the
+/// same `apply-revision` verb, then pushes each
+/// recorded traffic split via `apply-traffic`. Ordering is warm-then-route so a
+/// split never references a revision whose Cloud Run revision does not yet exist.
+/// Archived revisions are left in place (they carry no traffic and cost nothing
+/// at scale-to-zero); archival convergence stays with the granular
+/// `op env apply-revision <id>` verb.
+///
+/// Known limitations (tracked hardening, not this slice): the underlying warm is
+/// not yet content-idempotent, so a second `op env up` (or a retried one) can
+/// fail re-pinning an immutable Cloud Run revision (H2); and the env is read into
+/// one snapshot for the whole bring-up, so a concurrent `op traffic set` during a
+/// long multi-revision warm is not observed (same converge-from-snapshot model as
+/// the k8s reconcile). Both are acceptable for a bring-up and neither affects the
+/// primary fresh single-revision flow.
+pub(crate) fn cloudrun_env_up(
+    store: &LocalFsStore,
+    registry: &crate::env_packs::EnvPackRegistry,
+    env_id: &EnvId,
+) -> Result<Option<serde_json::Value>, OpError> {
+    let env = store.load(env_id)?;
+    let descriptor = resolve_live_deployer_kind(&env, None)?;
+    if !is_cloudrun_kind(&descriptor) {
+        return Ok(None);
+    }
+
+    // Parity with `apply-revision` / `apply-traffic`: confirm the kind is
+    // registered before driving it.
+    let _handler = registry
+        .resolve_for_slot(CapabilitySlot::Deployer, &descriptor)
+        .map_err(|e| OpError::Conflict(e.to_string()))?;
+
+    let (answers, _answers_ref_wire) = load_render_answers(store, &env, &descriptor)?;
+
+    // Preflight (side-effect-free, before any warm): Cloud Run's integer
+    // `percent` cannot represent basis-point weights that are not whole multiples
+    // of 100 bps (plan D1 — the same invariant `split_to_traffic_targets` enforces
+    // at apply time). Reject a non-representable split up front so it fails BEFORE
+    // warming creates live revisions we would then be unable to route to.
+    for split in &env.traffic_splits {
+        for entry in &split.entries {
+            if entry.weight_bps % 100 != 0 {
+                return Err(OpError::Conflict(format!(
+                    "traffic split for deployment `{}` weights revision `{}` at {} bps; \
+                     Cloud Run weights must be whole multiples of 100 bps (1%)",
+                    split.deployment_id, entry.revision_id, entry.weight_bps,
+                )));
+            }
+        }
+    }
+
+    // 0. SoR units (SoRLa phase 3E): every sorx service up and ready, and its
+    //    route document in the dev store, BEFORE any worker is warmed — each
+    //    warm stages the dev store as that revision's seed, and a Cloud Run
+    //    revision keeps the seed it was created with.
+    let sor = super::env_cloudrun_sor::sor_up(store, &env, env_id, answers.as_ref())?;
+
+    // 1. Warm every revision that carries traffic (bring-up only — see the
+    //    archival note in the doc comment). Each Cloud Run warm returns its Service's `*.run.app`
+    //    URL; a deployment's revisions share one Service, so endpoints are keyed
+    //    by deployment rather than collapsed to a single last-wins URL.
+    let mut warmed: Vec<String> = Vec::new();
+    let mut endpoints: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for revision in cloudrun_revisions_to_warm(&env) {
+        let (_identity, service_name, url) = apply_revision_non_k8s(
+            store,
+            &env,
+            env_id,
+            revision.revision_id,
+            RevisionVerb::Warm,
+            answers.as_ref(),
+            &descriptor,
+            false,
+            None,
+        )?;
+        if let Some(url) = url {
+            endpoints.insert(revision.deployment_id.to_string(), url);
+        }
+        warmed.push(service_name);
+    }
+
+    // 2. Push each recorded traffic split to the live Cloud Run router. A fresh
+    //    single-revision env may record none — the warm already routes 100% to
+    //    its sole revision — so this is a no-op there and load-bearing only for
+    //    multi-revision splits.
+    for split in &env.traffic_splits {
+        apply_traffic_non_k8s(
+            store,
+            &env,
+            env_id,
+            split.deployment_id,
+            answers.as_ref(),
+            &descriptor,
+        )?;
+    }
+
+    // 3. Only now retire what the manifest no longer declares — the previous
+    //    worker revisions have stopped taking traffic. The ledger narrows only
+    //    after this succeeds.
+    let sor_notes = match &sor {
+        Some(run) => {
+            super::env_cloudrun_sor::sor_finish(store, &env, env_id, answers.as_ref(), run)?
+        }
+        None => Vec::new(),
+    };
+
+    let mut result = json!({
+        "environment_id": env.environment_id.as_str(),
+        "kind": descriptor.as_str(),
+        "warmed": warmed,
+        "applied_splits": env.traffic_splits.len(),
+        // One `*.run.app` URL per deployment — an env may front several Services.
+        "endpoints": endpoints
+            .iter()
+            .map(|(deployment_id, url)| json!({"deployment_id": deployment_id, "url": url}))
+            .collect::<Vec<_>>(),
+    });
+    // Convenience single-URL field for the common one-deployment env; omitted for
+    // zero or multiple live Services (callers read `endpoints` for the general case).
+    if endpoints.len() == 1
+        && let Some(url) = endpoints.values().next()
+    {
+        result["endpoint_url"] = json!(url);
+    }
+    if let Some(run) = &sor {
+        super::env_cloudrun_sor::add_sor_result(&mut result, run, sor_notes);
+    }
+    Ok(Some(result))
+}
+
+/// Dispatch `apply-traffic` for a non-K8s deployer between the AWS-ECS and GCP
+/// Cloud Run live routers — the routing-side parallel of [`apply_revision_non_k8s`].
+/// The applicability gate in [`apply_traffic`] admits only these two kinds.
+///
+/// `apply_traffic_aws_ecs` is a total function (its `#[cfg(not(deploy-aws-ecs))]`
+/// body is the "compiled without the cloud feature" stub), so AWS-ECS is the
+/// fallthrough and only the `creds-gcp`-gated Cloud Run arm needs special-casing
+/// — no build-matrix split is required here.
+fn apply_traffic_non_k8s(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    deployment_id: greentic_deploy_spec::DeploymentId,
+    answers: Option<&Value>,
+    descriptor: &greentic_deploy_spec::PackDescriptor,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    #[cfg(feature = "creds-gcp")]
+    {
+        if is_cloudrun_kind(descriptor) {
+            return apply_traffic_cloudrun(store, env, env_id, deployment_id, answers);
+        }
+    }
+    // `descriptor` selects the kind only when the cloudrun arm is compiled in.
+    #[cfg(not(feature = "creds-gcp"))]
+    let _ = descriptor;
+    apply_traffic_aws_ecs(store, env, env_id, deployment_id, answers)
 }
 
 /// Connect to AWS and push one deployment's recorded traffic split to its ALB
@@ -1553,6 +2601,64 @@ fn apply_traffic_aws_ecs(
     Err(OpError::Conflict(
         "this build was compiled without the `deploy-aws-ecs` feature; \
          `op env apply-traffic` needs it to talk to AWS"
+            .to_string(),
+    ))
+}
+
+/// Push one deployment's recorded traffic split to its live Cloud Run Service
+/// (native `traffic[]` weights) via `apply_traffic_split`. A no-op live when the
+/// Service does not yet exist (the recorded split's invariants are still
+/// enforced first). Returns the identity used + the enforced split. Requires the
+/// `deploy-gcp-cloudrun` feature.
+#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+fn apply_traffic_cloudrun(
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    deployment_id: greentic_deploy_spec::DeploymentId,
+    answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    use crate::env_packs::deployer::Deployer;
+    use crate::env_packs::gcp_cloudrun::credentials::run_gcp_async;
+
+    let (identity, params, credentials) = cloudrun_target_inputs(store, env, env_id, answers)?;
+    let outcome = run_gcp_async(async move {
+        // Traffic reweight never warms a revision, so it stages no seed secret.
+        let handler =
+            resolve_cloudrun_handler(&params.project, &params.region, credentials, None).await?;
+        handler
+            .apply_traffic_split(env, deployment_id, answers)
+            .await
+            .map_err(|e| OpError::Conflict(e.to_string()))
+    })?;
+    Ok((identity, outcome))
+}
+
+/// `deploy-gcp-cloudrun`-less builds recognize the cloudrun kind but cannot talk
+/// to Cloud Run — the analogue of the AWS `#[cfg(not(deploy-aws-ecs))]` stub.
+#[cfg(all(feature = "creds-gcp", not(feature = "deploy-gcp-cloudrun")))]
+fn apply_traffic_cloudrun(
+    _store: &LocalFsStore,
+    _env: &Environment,
+    _env_id: &EnvId,
+    _deployment_id: greentic_deploy_spec::DeploymentId,
+    _answers: Option<&Value>,
+) -> Result<
+    (
+        &'static str,
+        crate::env_packs::deployer::TrafficSplitOutcome,
+    ),
+    OpError,
+> {
+    Err(OpError::Conflict(
+        "this build was compiled without the `deploy-gcp-cloudrun` feature; \
+         `op env apply-traffic` for a cloudrun env needs it to talk to Cloud Run"
             .to_string(),
     ))
 }
@@ -2026,22 +3132,33 @@ pub fn init(
     })
 }
 
-/// `op env destroy <env_id> --confirm`. Removes the env's on-disk state.
+/// `op env destroy <env_id> --confirm`. Irreversibly removes the env's
+/// on-disk state via [`LocalFsStore::destroy_environment`] (mechanics,
+/// failure contract, and concurrency notes documented there).
 ///
 /// Force-free safety net: the caller must pass `confirm = true`. The
 /// `--confirm` flag is the operator-binary's responsibility; this library
 /// just enforces the gate.
+///
+/// CLI-layer specifics: the audit event appends AFTER the mutation
+/// closure, so it lands in a recreated `<env_id>/audit/events.jsonl`
+/// holding only the destroy event (fail-closed via `mark_committed`); a
+/// later `init` continues the same trail. Destroying `local` is allowed —
+/// `gtc setup`/`gtc start` re-create it on next launch. Dev-store secrets
+/// redirected outside the env dir via `GREENTIC_DEV_SECRETS_PATH` are not
+/// touched.
 pub fn destroy(
     store: &LocalFsStore,
     flags: &OpFlags,
     env_id: &str,
     confirm: bool,
+    force_local: bool,
 ) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(
             NOUN,
             "destroy",
-            json!({ "input_schema": "env_id positional + confirm flag" }),
+            json!({ "input_schema": "env_id positional + confirm flag + optional --force-local" }),
         ));
     }
     if !confirm {
@@ -2058,16 +3175,47 @@ pub fn destroy(
         target: json!({"environment_id": env_id.as_str(), "confirm": confirm}),
         idempotency_key: None,
     };
-    audit_and_record(store, ctx, |_committed| {
-        if !store.exists(&env_id)? {
-            return Err(OpError::NotFound(format!("environment `{env_id}`")));
+    // Provider-resource teardown callback. The store recognizes a
+    // resource-owning deployer (e.g. Cloud Run) by descriptor string even in a
+    // feature-reduced binary and refuses-not-purges when it cannot tear the
+    // resources down; the teardown implementation is only wired when the provider
+    // feature is compiled in. `--force-local` skips teardown and purges local
+    // state only.
+    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+    let cloudrun_teardown = CloudRunProviderTeardown;
+    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+    let teardown: Option<&dyn crate::environment::ProviderTeardown> = Some(&cloudrun_teardown);
+    #[cfg(not(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun")))]
+    let teardown: Option<&dyn crate::environment::ProviderTeardown> = None;
+
+    audit_and_record(store, ctx, |committed| {
+        // No pre-check: destroy_environment_with_teardown handles NotFound
+        // internally, reaps stale tombstones when the env is already gone, and
+        // classifies + tears down provider resources under the same destroy flock.
+        let result = store
+            .destroy_environment_with_teardown(&env_id, teardown, force_local)
+            .inspect_err(|err| {
+                if err.is_committed_after_save() {
+                    committed.mark_committed();
+                }
+            })
+            .map_err(super::map_store_err_preserving_noun)?;
+        let mut payload = json!({
+            "environment_id": env_id.as_str(),
+            "outcome": "destroyed",
+            "removed_path": result.removed_path.display().to_string(),
+        });
+        let payload_obj = payload
+            .as_object_mut()
+            .expect("payload constructed as object");
+        if result.reaped_tombstones > 0 {
+            payload_obj.insert("reaped_tombstones".into(), json!(result.reaped_tombstones));
         }
-        // The A2 trait does not yet expose a remove API. Destructive removal
-        // ships with the bundle-deployment retention path (B-phase); A7 wires
-        // the audit + authorize surface so the destroy intent is logged today.
-        Err(OpError::NotYetImplemented(
-            "`op env destroy` requires the retention path (B-phase); use the LocalFsStore root path returned by `op env show` for manual cleanup".to_string(),
-        ))
+        if let Some(teardown_report) = result.provider_teardown {
+            payload_obj.insert("provider_teardown".into(), teardown_report);
+        }
+        let outcome = OpOutcome::new(NOUN, "destroy", payload);
+        Ok((outcome, super::AuditGens::NONE))
     })
 }
 
@@ -3312,17 +4460,241 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store.save(&make_env("local")).unwrap();
-        let err = destroy(&store, &OpFlags::default(), "local", false).unwrap_err();
+        let err = destroy(&store, &OpFlags::default(), "local", false, false).unwrap_err();
         assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
     }
 
     #[test]
-    fn destroy_with_confirm_returns_not_yet_implemented() {
+    fn destroy_with_confirm_removes_env_state() {
         let dir = tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        store.save(&make_env("local")).unwrap();
-        let err = destroy(&store, &OpFlags::default(), "local", true).unwrap_err();
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+        store.save(&make_env("doomed")).unwrap();
+        // Seed sidecars beyond environment.json so the test proves the whole
+        // tree goes, not just the file `exists()` checks.
+        let env_dir = dir.path().join("doomed");
+        std::fs::write(env_dir.join("trust-root.json"), b"{}").unwrap();
+        let nested = env_dir.join("env-packs").join("messaging");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("answers.json"), b"{}").unwrap();
+
+        let outcome = destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
+        assert_eq!(outcome.noun, "env");
+        assert_eq!(outcome.op, "destroy");
+        assert_eq!(outcome.result["environment_id"], "doomed");
+        assert_eq!(outcome.result["outcome"], "destroyed");
+        assert_eq!(
+            outcome.result["removed_path"],
+            env_dir.display().to_string()
+        );
+
+        // Live state is gone; only the post-verb audit residue may remain.
+        assert!(!env_dir.join("environment.json").exists());
+        assert!(!env_dir.join("trust-root.json").exists());
+        assert!(!env_dir.join("env-packs").exists());
+        assert!(!store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
+        assert!(store.list().unwrap().is_empty());
+        // A clean purge emits no reaped_tombstones key.
+        assert!(
+            outcome.result.get("reaped_tombstones").is_none(),
+            "clean destroy must not include reaped_tombstones"
+        );
+        // A clean purge leaves no tombstone sibling behind.
+        let tombstones: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+            .collect();
+        assert!(tombstones.is_empty(), "got {tombstones:?}");
+    }
+
+    #[test]
+    fn destroy_missing_env_errors_not_found() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let err = destroy(&store, &OpFlags::default(), "ghost", true, false).unwrap_err();
+        assert!(matches!(err, OpError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn destroy_leaves_sibling_envs_untouched() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("doomed")).unwrap();
+        store.save(&make_env("survivor")).unwrap();
+        destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
+        let survivor = EnvId::try_from("survivor").unwrap();
+        assert!(store.exists(&survivor).unwrap());
+        store.load(&survivor).expect("survivor still loads");
+        assert_eq!(store.list().unwrap(), vec![survivor]);
+    }
+
+    /// `is_cloudrun_kind` recognizes only the Cloud Run descriptor path.
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn is_cloudrun_kind_recognizes_only_cloudrun() {
+        use greentic_deploy_spec::PackDescriptor;
+        let cr = PackDescriptor::try_new("greentic.deployer.gcp-cloudrun@1.0.0").unwrap();
+        let k8s = PackDescriptor::try_new("greentic.deployer.k8s@1.0.0").unwrap();
+        assert!(is_cloudrun_kind(&cr));
+        assert!(!is_cloudrun_kind(&k8s));
+    }
+
+    #[test]
+    fn destroy_schema_flag_short_circuits_without_touching_store() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("doomed")).unwrap();
+        let flags = OpFlags {
+            schema_only: true,
+            answers: None,
+        };
+        // No --confirm needed for a schema dump.
+        let outcome = destroy(&store, &flags, "doomed", false, false).unwrap();
+        assert_eq!(outcome.op, "destroy");
+        assert!(store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
+    }
+
+    #[test]
+    fn destroy_records_audit_event_in_recreated_residue_log() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // Create via the CLI verb so a `create` audit event exists first —
+        // proving destroy takes prior history with the env.
+        create(
+            &store,
+            &OpFlags::default(),
+            Some(EnvCreatePayload {
+                environment_id: "doomed".to_string(),
+                name: "doomed".to_string(),
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+                public_base_url: None,
+            }),
+        )
+        .unwrap();
+        destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
+        // The audit event appends AFTER the mutation closure, so it lands in
+        // a recreated `<env_id>/audit/` residue dir; only the destroy event
+        // survives (the create event went with the env).
+        let log = dir.path().join("doomed").join("audit").join("events.jsonl");
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines.len(), 1, "only the destroy event survives: {raw}");
+        let event: crate::environment::AuditEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(event.env_id, "doomed");
+        assert_eq!(event.noun, "env");
+        assert_eq!(event.verb, "destroy");
+        assert!(matches!(event.result, crate::environment::AuditResult::Ok));
+    }
+
+    #[test]
+    fn destroy_then_init_yields_fresh_env_and_reseeded_trust_root() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let first = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
+        assert!(first.result["trust_root"].is_object());
+        let env_dir = dir.path().join("local");
+        assert!(env_dir.join("trust-root.json").exists());
+
+        destroy(&store, &OpFlags::default(), "local", true, false).unwrap();
+        assert!(!env_dir.join("trust-root.json").exists());
+
+        let second = init(&store, &OpFlags::default(), EnvInitPayload::default()).unwrap();
+        assert_eq!(second.result["outcome"], "created");
+        // The seed gate is trust-root.json presence; destroy removed it, so
+        // re-init runs the seed path again. The operator key is unchanged,
+        // so this asserts the PATH was taken, not that key material differs.
+        assert!(second.result["trust_root"].is_object());
+        // Audit continuity: the residue log bridges destroy → init.
+        let raw = std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let verbs: Vec<String> = raw
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<crate::environment::AuditEvent>(l)
+                    .unwrap()
+                    .verb
+            })
+            .collect();
+        assert_eq!(verbs, vec!["destroy".to_string(), "init".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destroy_cleanup_failure_is_committed_and_audited() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.save(&make_env("doomed")).unwrap();
+        let env_dir = dir.path().join("doomed");
+        // A write-protected dir with a child makes remove_dir_all fail after
+        // the (committing) rename already happened.
+        let blocked = env_dir.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("child"), b"x").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap_err();
+
+        // The tombstone survives the failed purge; restore permissions so
+        // TempDir::drop can clean up.
+        let tombstone = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().contains(".destroyed~"))
+            .expect("tombstone must remain after failed purge");
+        std::fs::set_permissions(
+            tombstone.path().join("blocked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        // CommittedAfterSave was unwrapped by the noun-preserving mapper to
+        // the inner Io (surfacing as `store`)...
+        assert!(matches!(err, OpError::Store(_)), "got {err:?}");
+        // ...the rename committed (the canonical path no longer holds the env)...
+        assert!(!env_dir.join("environment.json").exists());
+        assert!(!store.exists(&EnvId::try_from("doomed").unwrap()).unwrap());
+        // ...and mark_committed fired, so the fail-closed audit boundary
+        // still appended the (error-result) destroy event.
+        let raw = std::fs::read_to_string(env_dir.join("audit").join("events.jsonl")).unwrap();
+        let event: crate::environment::AuditEvent = serde_json::from_str(raw.trim_end()).unwrap();
+        assert_eq!(event.verb, "destroy");
+        assert!(matches!(
+            event.result,
+            crate::environment::AuditResult::Error { .. }
+        ));
+
+        // Re-running destroy reaps the stale tombstone (permissions already
+        // restored above).
+        let outcome = destroy(&store, &OpFlags::default(), "doomed", true, false).unwrap();
+        assert_eq!(outcome.result["outcome"], "destroyed");
+        assert_eq!(outcome.result["reaped_tombstones"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destroy_refuses_symlinked_env_root() {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // The real env tree lives under a different root; the store path is
+        // a symlink to it.
+        let target = tempdir().unwrap();
+        let real_store = LocalFsStore::new(target.path());
+        real_store.save(&make_env("linked")).unwrap();
+        std::os::unix::fs::symlink(target.path().join("linked"), dir.path().join("linked"))
+            .unwrap();
+
+        let err = destroy(&store, &OpFlags::default(), "linked", true, false).unwrap_err();
+        assert!(matches!(err, OpError::InvalidArgument(_)), "got {err:?}");
+        // The link target is untouched.
+        assert!(
+            target
+                .path()
+                .join("linked")
+                .join("environment.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -4028,6 +5400,183 @@ mod tests {
         assert!(outcome.result.get("input_schema").is_some());
     }
 
+    /// `op env render` does not show SoR objects (amendment 6), and nothing a
+    /// SoR unit reads — its inputs or its route document — reaches its output.
+    #[test]
+    fn render_shows_no_sor_object_and_no_sor_secret_value() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = store_with_k8s_env(dir.path());
+        let env_id = EnvId::try_from("zain").unwrap();
+        let mut env = store.load(&env_id).unwrap();
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            "greentic.secrets.dev-store@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let render_now = || {
+            render(
+                &store,
+                &builtins(),
+                &OpFlags::default(),
+                render_args("zain", None, None),
+            )
+            .unwrap()
+            .result
+        };
+        let before = render_now();
+        let mut unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        unit.postgres_ca_ref = Some("default/_/sor-landlord/postgres_ca".into());
+        crate::cli::env_sor::set_sor_units(&store, &env_id, std::slice::from_ref(&unit)).unwrap();
+        let kind = crate::cli::secrets::DEV_STORE_KIND_PATH;
+        for rel in unit.input_refs() {
+            crate::cli::secrets::put_env_secret(
+                &store,
+                &env,
+                &env_id,
+                kind,
+                rel,
+                "SOR-INPUT-SECRET",
+            )
+            .unwrap();
+        }
+        crate::cli::secrets::put_env_secret(
+            &store,
+            &env,
+            &env_id,
+            kind,
+            "default/_/sorla/landlord-tenant-sor",
+            r#"{"token":"ROUTE-TOKEN-SECRET"}"#,
+        )
+        .unwrap();
+
+        let after = render_now();
+        let text = serde_json::to_string(&after).unwrap();
+        for needle in [
+            "gtc-sor",
+            "landlord",
+            "sorx",
+            "SOR-INPUT-SECRET",
+            "ROUTE-TOKEN-SECRET",
+        ] {
+            assert!(!text.contains(needle), "render leaked `{needle}`");
+        }
+        assert_eq!(
+            before, after,
+            "declaring a SoR unit changes nothing `op env render` shows"
+        );
+    }
+
+    #[test]
+    fn the_reconcile_envelope_reports_public_base_url_only_for_a_managed_ingress() {
+        let env = make_env("local");
+        let report = crate::env_packs::k8s::ReconcileReport::default();
+        let base = || {
+            reconcile_result_json(
+                &env,
+                "greentic.deployer.k8s@1.0.0",
+                &Value::Null,
+                "ambient",
+                &report,
+            )
+        };
+        let mut plain = base();
+        attach_public_base_url(&mut plain, &env, None);
+        assert_eq!(plain, base(), "no answers: envelope unchanged");
+        let mut unanswered = base();
+        attach_public_base_url(
+            &mut unanswered,
+            &env,
+            Some(&json!({"service_type": "NodePort"})),
+        );
+        assert!(unanswered.get("public_base_url").is_none());
+
+        let mut tls = base();
+        attach_public_base_url(
+            &mut tls,
+            &env,
+            Some(&json!({"ingress_host": "chat.example.com", "ingress_cert_manager_issuer": "le"})),
+        );
+        assert_eq!(tls["public_base_url"], "https://chat.example.com");
+        assert!(tls.get("router_address").is_some(), "beside router_address");
+
+        let mut http = base();
+        attach_public_base_url(
+            &mut http,
+            &env,
+            Some(&json!({"ingress_host": "chat.example.com"})),
+        );
+        assert_eq!(http["public_base_url"], "http://chat.example.com");
+    }
+
+    #[test]
+    fn the_reconcile_envelope_lists_sor_units_only_when_there_are_some() {
+        use crate::env_packs::k8s::{ReconcileReport, SorUnitStatus};
+        let env = make_env("local");
+        let mut report = ReconcileReport::default();
+        let plain = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert!(
+            plain.get("sor_units").is_none(),
+            "byte-identical for an env without SoR units"
+        );
+        assert_eq!(
+            plain,
+            json!({
+                "environment_id": "local",
+                "kind": "greentic.deployer.k8s@1.0.0",
+                "answers_ref": null,
+                "identity": "ambient",
+                "applied_count": 0,
+                "pruned_count": 0,
+                "applied": [],
+                "pruned": [],
+                "router_address": null,
+            }),
+            "every pre-existing key is unchanged"
+        );
+        report.sor_units.push(SorUnitStatus {
+            unit_id: "landlord".into(),
+            sor: "landlord-tenant-sor".into(),
+            service: "gtc-sor-landlord".into(),
+            url: "http://gtc-sor-landlord.gtc-local.svc.cluster.local:8787".into(),
+            ready: true,
+        });
+        let with = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert_eq!(with["sor_units"][0]["unit_id"], "landlord");
+        assert_eq!(with["sor_units"][0]["ready"], true);
+        let entry = with["sor_units"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["ready", "service", "sor", "unit_id", "url"]);
+        assert!(with.get("sor_skipped_input_refs").is_none());
+
+        report.sor_skipped_input_refs = vec!["default/_/worker/api_token".into()];
+        let skipped = reconcile_result_json(
+            &env,
+            "greentic.deployer.k8s@1.0.0",
+            &Value::Null,
+            "ambient",
+            &report,
+        );
+        assert_eq!(
+            skipped["sor_skipped_input_refs"],
+            json!(["default/_/worker/api_token"]),
+            "a stale ref reconcile would not delete is named by path"
+        );
+    }
+
     // -- reconcile ----------------------------------------------------------
 
     use crate::cli::dispatch::EnvReconcileArgs;
@@ -4109,6 +5658,7 @@ mod tests {
             env_id: env_id.to_string(),
             revision_id: revision_id.to_string(),
             kind: kind.map(str::to_string),
+            force_drain: false,
         }
     }
 
@@ -4135,8 +5685,76 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            OpError::Conflict(msg) => assert!(
+                msg.contains("only supported for") && msg.contains("gcp-cloudrun"),
+                "{msg}"
+            ),
             other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    /// The Cloud Run kind is admitted past the applicability gate (unlike an
+    /// unsupported deployer): a cloudrun env with a revision id that is not
+    /// staged surfaces `NotFound(revision)` — the post-gate lookup — not the
+    /// `unsupported` conflict. Proves the gate recognizes cloudrun.
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn apply_revision_admits_cloudrun_past_gate() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::NotFound(msg) => assert!(msg.contains("revision"), "{msg}"),
+            other => {
+                panic!("expected NotFound(revision) — the gate should admit cloudrun, got {other}")
+            }
+        }
+    }
+
+    /// The GCP Cloud Run deployer kind IS admitted past the applicability gate
+    /// (this live-wiring slice): with a bogus revision id the verb falls through
+    /// to the per-revision lookup and returns `NotFound`, where PR-2 rejected the
+    /// whole kind with a stub `Conflict`. Proves the gate no longer hard-rejects
+    /// cloudrun — no GCP call is reached (the revision lookup fails first), so the
+    /// test is deterministic without credentials (mirrors
+    /// `apply_revision_admits_aws_ecs_kind`).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn apply_revision_admits_cloudrun_kind() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = apply_revision(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_revision_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::NotFound(msg) => assert!(msg.contains("revision"), "{msg}"),
+            other => panic!("expected NotFound(revision), got {other}"),
         }
     }
 
@@ -4230,8 +5848,183 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            OpError::Conflict(msg) => assert!(msg.contains("only supported for"), "{msg}"),
+            OpError::Conflict(msg) => assert!(
+                msg.contains("only supported for") && msg.contains("gcp-cloudrun"),
+                "{msg}"
+            ),
             other => panic!("expected Conflict, got {other}"),
+        }
+    }
+
+    /// A cloudrun env IS admitted past the apply-traffic gate (Cloud Run has a
+    /// native traffic-weight router, like the ALB listener) and reaches the live
+    /// dispatch (this live-wiring slice). With no recorded split for the target
+    /// deployment the pure `enforce_split_invariants` precondition fires first —
+    /// before any Cloud Run API call — so the test is deterministic without
+    /// credentials (mirrors `apply_traffic_admits_aws_ecs_but_requires_launch_config`,
+    /// where the AWS launch-config check fires first).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn apply_traffic_admits_cloudrun_but_requires_recorded_split() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let err = apply_traffic(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            apply_traffic_args("local", "00000000000000000000000000", None),
+        )
+        .unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("TrafficSplit"), "{msg}"),
+            other => panic!("expected Conflict(no recorded split), got {other}"),
+        }
+    }
+
+    /// `cloudrun_env_up` is `op env up`'s deployer-dispatch gate: it returns
+    /// `None` for any non-Cloud-Run deployer so `op env up` falls through to its
+    /// k8s convergence phases. A k8s-deployer env is the negative case (no GCP
+    /// call, deterministic without credentials).
+    #[test]
+    fn cloudrun_env_up_is_none_for_non_cloudrun_deployer() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.k8s@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let out = cloudrun_env_up(&store, &reg, &env_id).unwrap();
+        assert!(
+            out.is_none(),
+            "non-cloudrun deployer must fall through: {out:?}"
+        );
+    }
+
+    /// A Cloud Run env IS dispatched into the bring-up arm. With zero present
+    /// revisions the warm loop and the (empty) traffic loop do nothing — no Cloud
+    /// Run API call — so the arm returns `Some` deterministically without
+    /// credentials, proving `op env up` routes cloudrun envs here (mirrors
+    /// `apply_traffic_admits_cloudrun_but_requires_recorded_split`).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn cloudrun_env_up_dispatches_to_cloudrun_arm_for_empty_env() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let out = cloudrun_env_up(&store, &reg, &env_id)
+            .unwrap()
+            .expect("cloudrun deployer must dispatch into the bring-up arm");
+        assert!(
+            out.get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("gcp-cloudrun"),
+            "dispatched under the cloudrun kind: {out:?}"
+        );
+        assert_eq!(
+            out.get("warmed").and_then(|v| v.as_array()).map(Vec::len),
+            Some(0),
+            "no present revisions to warm"
+        );
+        assert_eq!(out.get("applied_splits").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            out.get("endpoints")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0),
+            "no revision warmed → no endpoints"
+        );
+        assert!(
+            out.get("endpoint_url").is_none(),
+            "no revision warmed → no single-deployment URL: {out:?}"
+        );
+    }
+
+    /// The bring-up preflights traffic representability BEFORE warming: a
+    /// store-valid split whose weights are not whole multiples of 100 bps (plan
+    /// D1) is rejected up front, so `op env up` never creates live Cloud Run
+    /// revisions it cannot then route to. Deterministic — the preflight fires
+    /// before any GCP call (Codex adversarial-review finding).
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn cloudrun_env_up_rejects_non_representable_split_before_warming() {
+        use crate::cli::tests_common::{
+            make_binding, make_bundle_deployment, make_revision, make_traffic_split,
+        };
+        use greentic_deploy_spec::{RevisionLifecycle, TrafficSplitEntry};
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Deployer,
+            "greentic.deployer.gcp-cloudrun@1.0.0",
+        ));
+        let deployment = make_bundle_deployment("local", "demo-bundle");
+        let r1 = make_revision(
+            "local",
+            "demo-bundle",
+            &deployment.deployment_id,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        let r2 = make_revision(
+            "local",
+            "demo-bundle",
+            &deployment.deployment_id,
+            2,
+            RevisionLifecycle::Ready,
+        );
+        // 3333 / 6667 bps sums to 10000 (spec-valid) but 3333 % 100 != 0, so Cloud
+        // Run's integer percent cannot represent it — the adapter must reject it.
+        let mut split = make_traffic_split(
+            "local",
+            "demo-bundle",
+            &deployment.deployment_id,
+            &r1.revision_id,
+            "01J000000000000000000000AA",
+        );
+        split.entries = vec![
+            TrafficSplitEntry {
+                revision_id: r1.revision_id,
+                weight_bps: 3333,
+            },
+            TrafficSplitEntry {
+                revision_id: r2.revision_id,
+                weight_bps: 6667,
+            },
+        ];
+        env.bundles.push(deployment);
+        env.revisions.push(r1);
+        env.revisions.push(r2);
+        env.traffic_splits.push(split);
+        store.save(&env).unwrap();
+        let env_id = EnvId::try_from("local").unwrap();
+        let err = cloudrun_env_up(&store, &reg, &env_id).unwrap_err();
+        match err {
+            OpError::Conflict(msg) => assert!(msg.contains("100 bps"), "{msg}"),
+            other => panic!("expected Conflict(non-representable split), got {other}"),
         }
     }
 
@@ -4416,6 +6209,60 @@ mod tests {
         match err {
             OpError::Conflict(msg) => assert!(msg.contains("bound to deployer"), "{msg}"),
             other => panic!("expected Conflict (unbound deployer), got {other}"),
+        }
+    }
+
+    /// An env with no SoR units must fail on bad deployer answers exactly as it
+    /// did before SoR units existed: through the cluster path as a `Conflict`,
+    /// never the SoR preparation's `invalid-argument`. With a SoR unit
+    /// declared, the namespace IS resolved up front and the answers refused.
+    #[test]
+    fn reconcile_without_sor_units_keeps_the_pre_sor_answers_error() {
+        use crate::cli::tests_common::make_binding;
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let reg = builtins();
+        let mut env = make_env("local");
+        let mut binding = make_binding(CapabilitySlot::Deployer, "greentic.deployer.k8s@1.0.0");
+        binding.answers_ref = Some(PathBuf::from("env-packs/deployer/answers.json"));
+        env.packs.push(binding);
+        store.save(&env).unwrap();
+        let env_dir = store.env_dir(&env.environment_id).unwrap();
+        std::fs::create_dir_all(env_dir.join("env-packs/deployer")).unwrap();
+        // An invalid namespace, and a kubeconfig context that cannot exist, so
+        // the cluster path fails without any network call.
+        std::fs::write(
+            env_dir.join("env-packs/deployer/answers.json"),
+            r#"{"namespace": "NOT_A_DNS_LABEL", "kubeconfig_context": "no-such-context-sor-f2"}"#,
+        )
+        .unwrap();
+
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match &err {
+            OpError::Conflict(msg) => assert!(!msg.contains("invalid deployer answers"), "{msg}"),
+            other => panic!("expected the pre-SoR Conflict, got {other:?}"),
+        }
+
+        let unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        crate::cli::env_sor::set_sor_units(&store, &env.environment_id, &[unit]).unwrap();
+        let err = reconcile(
+            &store,
+            &reg,
+            &OpFlags::default(),
+            reconcile_args("local", None),
+        )
+        .unwrap_err();
+        match &err {
+            OpError::InvalidArgument(msg) => {
+                assert!(msg.contains("invalid deployer answers"), "{msg}")
+            }
+            other => panic!("expected invalid-argument with a SoR unit, got {other:?}"),
         }
     }
 
@@ -4713,6 +6560,30 @@ mod tests {
             crate::defaults::VAULT_SECRETS_PACK,
         ));
         assert!(!secrets_backend_is_dev_store(&env));
+    }
+
+    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+    #[test]
+    fn cloudrun_stages_dev_secrets_only_for_the_dev_store_backend() {
+        // No Secrets pack → nothing resolves `secret://`, so no seed material.
+        assert!(!cloudrun_stages_dev_secrets(&make_env("local")));
+
+        // Dev-store Secrets binding → stage the local dev-store.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::LOCAL_SECRETS_PACK,
+        ));
+        assert!(cloudrun_stages_dev_secrets(&env));
+
+        // Vault Secrets binding → NEVER upload the local dev-store: the values
+        // (and any bound deployer credentials in it) stay operator-local.
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            CapabilitySlot::Secrets,
+            crate::defaults::VAULT_SECRETS_PACK,
+        ));
+        assert!(!cloudrun_stages_dev_secrets(&env));
     }
 
     #[test]
@@ -5035,5 +6906,296 @@ mod tests {
                  not left at its original 7,000"
             );
         }
+    }
+
+    /// The store URI a minting env-pack's bootstrap lands its bound credential at.
+    fn known_credential_store_uri(env_id: &str, path: &str) -> String {
+        use greentic_deploy_spec::SecretRef;
+
+        let bound = SecretRef::try_new(format!("secret://{env_id}/{path}")).unwrap();
+        crate::cli::secrets::secret_ref_to_store_uri(&bound).unwrap()
+    }
+
+    /// The H1-orphan window: `bootstrap` writes the credential material (W1) and
+    /// crashes before persisting `credentials_ref` (W2). The env names nothing,
+    /// so a `credentials_ref`-keyed denylist alone yields an empty exclusion and
+    /// the next seed would ship the credential. The well-known paths must be
+    /// excluded regardless.
+    #[test]
+    fn staging_excluded_uris_excludes_known_deployer_paths_without_a_credentials_ref() {
+        let env = make_env("cred");
+        assert!(
+            env.credentials_ref.is_none(),
+            "sanity: this pins the crashed-bootstrap shape"
+        );
+
+        let excluded = staging_excluded_uris(&env);
+        assert!(
+            !BOUND_CREDENTIAL_STORE_PATHS.is_empty(),
+            "sanity: at least the always-compiled k8s path is present"
+        );
+        for path in BOUND_CREDENTIAL_STORE_PATHS {
+            assert!(
+                excluded.contains(&known_credential_store_uri("cred", path)),
+                "an env with NO credentials_ref must still exclude `{path}` — a crashed \
+                 bootstrap can have orphaned material there that nothing names"
+            );
+        }
+    }
+
+    /// The exclusion is a union, not a replacement: a credential bound at a
+    /// custom URI must survive alongside the unconditional well-known paths.
+    #[test]
+    fn staging_excluded_uris_unions_the_bound_credential_with_the_known_paths() {
+        use greentic_deploy_spec::SecretRef;
+
+        let mut env = make_env("cred");
+        let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
+        env.credentials_ref = Some(cred_ref.clone());
+
+        let excluded = staging_excluded_uris(&env);
+        assert!(
+            excluded.contains(&crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap()),
+            "the custom bound credential must still be excluded"
+        );
+        for path in BOUND_CREDENTIAL_STORE_PATHS {
+            assert!(
+                excluded.contains(&known_credential_store_uri("cred", path)),
+                "the well-known `{path}` must be excluded alongside the bound ref"
+            );
+        }
+    }
+
+    /// A credential bound at exactly a well-known path must not be listed twice.
+    #[test]
+    fn staging_excluded_uris_does_not_duplicate_a_credential_bound_at_a_known_path() {
+        use greentic_deploy_spec::SecretRef;
+
+        let path = BOUND_CREDENTIAL_STORE_PATHS[0];
+        let mut env = make_env("cred");
+        env.credentials_ref = Some(SecretRef::try_new(format!("secret://cred/{path}")).unwrap());
+
+        let excluded = staging_excluded_uris(&env);
+        let uri = known_credential_store_uri("cred", path);
+        assert_eq!(
+            excluded.iter().filter(|u| **u == uri).count(),
+            1,
+            "the same store URI must appear once, not once per source"
+        );
+    }
+
+    #[test]
+    fn the_worker_seed_excludes_every_sor_input_but_keeps_the_route_document() {
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let mut unit = crate::env_packs::k8s::manifests::sor::tests::unit();
+        unit.postgres_ca_ref = Some("default/_/sor-landlord/postgres_ca".into());
+        crate::cli::env_sor::set_sor_units(&store, &env_id, std::slice::from_ref(&unit)).unwrap();
+        let kind = crate::cli::secrets::DEV_STORE_KIND_PATH;
+        for rel in unit.input_refs() {
+            crate::cli::secrets::put_env_secret(&store, &env, &env_id, kind, rel, "SOR-INPUT")
+                .unwrap();
+        }
+        let route = "default/_/sorla/landlord-tenant-sor";
+        crate::cli::secrets::put_env_secret(&store, &env, &env_id, kind, route, "{\"url\":\"u\"}")
+            .unwrap();
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a seed");
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let read = |uri: &str| -> Result<Vec<u8>, ()> {
+            let dev = DevStore::with_path(staged_path.clone()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { dev.get(uri).await.map_err(|_| ()) })
+        };
+        for rel in unit.input_refs() {
+            let uri = crate::cli::secrets::dev_store_key(&env_id, rel);
+            assert!(read(&uri).is_err(), "`{rel}` must not reach any worker");
+        }
+        assert!(
+            read(&crate::cli::secrets::dev_store_key(&env_id, route)).is_ok(),
+            "the route document is exactly what the workers need"
+        );
+    }
+
+    /// End-to-end proof of the orphan fix: material sits in the dev-store at a
+    /// well-known deployer path while `credentials_ref` is `None` (bootstrap
+    /// crashed between W1 and W2). The staged seed must not resolve it.
+    #[test]
+    fn read_dev_secrets_bytes_strips_an_orphaned_credential_the_env_never_named() {
+        use greentic_deploy_spec::SecretRef;
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("cred");
+        assert!(env.credentials_ref.is_none());
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // W1 landed; W2 never did — the env names no credential.
+        let orphan_path = BOUND_CREDENTIAL_STORE_PATHS[0];
+        let orphan_ref = SecretRef::try_new(format!("secret://cred/{orphan_path}")).unwrap();
+        crate::cli::secrets::put_credential_material(&env_dir, &orphan_ref, "ORPHANED-TOKEN")
+            .unwrap();
+        let dev_path = crate::cli::secrets::resolve_dev_store_path(&env_dir, None);
+        let runtime_uri = "secrets://cred/acme/_/kv/runtime-token";
+        crate::cli::secrets::dev_store_put(&dev_path, runtime_uri, "runtime-value").unwrap();
+
+        let orphan_uri = crate::cli::secrets::secret_ref_to_store_uri(&orphan_ref).unwrap();
+        assert_eq!(
+            crate::cli::tests_common::dev_store_read(&dev_path, &orphan_uri),
+            b"ORPHANED-TOKEN",
+            "sanity: the source store holds the orphan before staging"
+        );
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a dev-store-backed env stages some bytes");
+
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let read_uri = |uri: &str| -> Result<Vec<u8>, ()> {
+            let dev = DevStore::with_path(staged_path.clone()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { dev.get(uri).await.map_err(|_| ()) })
+        };
+        assert_eq!(
+            read_uri(runtime_uri).unwrap(),
+            b"runtime-value",
+            "runtime material must still reach the workload"
+        );
+        assert!(
+            read_uri(&orphan_uri).is_err(),
+            "the staged seed must not resolve a credential orphaned by a crashed bootstrap"
+        );
+    }
+
+    #[test]
+    fn read_dev_secrets_bytes_strips_the_deployer_credential_from_the_seed() {
+        use greentic_deploy_spec::SecretRef;
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("cred");
+        let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
+        env.credentials_ref = Some(cred_ref.clone());
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // Write the deployer credential (at the URI the exclusion computes) plus a
+        // runtime secret into the env dev-store, exactly as the real flows do.
+        // `put_credential_material` succeeding also proves the ref is
+        // store-alignable (it computes the same store URI internally).
+        crate::cli::secrets::put_credential_material(&env_dir, &cred_ref, "DEPLOYER-SA-KEY")
+            .unwrap();
+        let dev_path = crate::cli::secrets::resolve_dev_store_path(&env_dir, None);
+        let runtime_uri = "secrets://cred/acme/_/kv/runtime-token";
+        crate::cli::secrets::dev_store_put(&dev_path, runtime_uri, "runtime-value").unwrap();
+
+        let cred_store_uri = crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap();
+        assert_eq!(
+            crate::cli::tests_common::dev_store_read(&dev_path, &cred_store_uri),
+            b"DEPLOYER-SA-KEY",
+            "sanity: the source store holds the credential before staging"
+        );
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a dev-store-backed env stages some bytes");
+
+        // Load the staged bytes as the workload would: the runtime secret
+        // resolves, but the deployer credential is gone.
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let read_uri = |uri: &str| -> Result<Vec<u8>, ()> {
+            let dev = DevStore::with_path(staged_path.clone()).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { dev.get(uri).await.map_err(|_| ()) })
+        };
+        assert_eq!(read_uri(runtime_uri).unwrap(), b"runtime-value");
+        assert!(
+            read_uri(&cred_store_uri).is_err(),
+            "the staged seed must not resolve the deployer credential"
+        );
+
+        // The operator's real store is untouched — the credential still resolves.
+        assert_eq!(
+            crate::cli::tests_common::dev_store_read(&dev_path, &cred_store_uri),
+            b"DEPLOYER-SA-KEY",
+            "the operator's real dev-store must not be modified by staging"
+        );
+    }
+
+    // Regression for the stale-environment-state race: staging must derive the
+    // exclusion from a *fresh* env load, not the state a caller loaded earlier.
+    // Deterministic stand-in for "reconcile loads an uncredentialed env, a
+    // concurrent bootstrap binds the credential, staging still excludes it":
+    // persist the env uncredentialed, then land the credential + `credentials_ref`
+    // (bootstrap's dev-store-then-ref order), then stage. If the helper trusted a
+    // stale snapshot it would ship the credential; reloading strips it.
+    #[test]
+    fn read_dev_secrets_bytes_reloads_env_so_a_late_bound_credential_is_still_stripped() {
+        use greentic_deploy_spec::SecretRef;
+        use greentic_secrets_lib::{DevStore, SecretsStore};
+
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+
+        // The env is persisted with NO bound credential — the world a reconcile
+        // would have loaded before the bind landed.
+        let env = make_env("cred");
+        assert!(env.credentials_ref.is_none());
+        store.save(&env).unwrap();
+        let env_id = env.environment_id.clone();
+        let env_dir = store.env_dir(&env_id).unwrap();
+
+        // The bind lands afterwards: credential material into the dev-store,
+        // then `credentials_ref` persisted (bootstrap's on-flock order).
+        let cred_ref = SecretRef::try_new("secret://cred/default/_/gcp-deployer/sa_key").unwrap();
+        crate::cli::secrets::put_credential_material(&env_dir, &cred_ref, "LATE-SA-KEY").unwrap();
+        let mut bound = store.load(&env_id).unwrap();
+        bound.credentials_ref = Some(cred_ref.clone());
+        store.save(&bound).unwrap();
+
+        let staged = read_dev_secrets_bytes(&store, &env_id)
+            .unwrap()
+            .expect("a dev-store-backed env stages some bytes");
+
+        let staged_dir = tempdir().unwrap();
+        let staged_path = staged_dir.path().join(".dev.secrets.env");
+        std::fs::write(&staged_path, &staged).unwrap();
+        let cred_store_uri = crate::cli::secrets::secret_ref_to_store_uri(&cred_ref).unwrap();
+        let dev = DevStore::with_path(staged_path).unwrap();
+        let resolved = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { dev.get(&cred_store_uri).await });
+        assert!(
+            resolved.is_err(),
+            "staging must reload the env and strip a credential bound after the caller's load"
+        );
     }
 }

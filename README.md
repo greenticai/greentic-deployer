@@ -25,6 +25,34 @@ which materialize handoff manifests/scripts from a provider pack rather than
 managing a live environment store. The guide opens with how to choose between
 the two.
 
+## Google Cloud Run deployment (env-pack model)
+
+The scale-to-zero sibling of the K8s path: **an idle environment bills no
+compute**. Same store, same `op env …` surface, no cluster to run.
+
+- **[docs/cloudrun-deployment.md](docs/cloudrun-deployment.md)** — mental model
+  (why Cloud Run is imperative, not reconciled), what lands in your project, the
+  one-file/one-command quickstart, the Secret Manager seed contract, access
+  modes (Cloud Run is private by default), **the zero-idle-cost claim and how to
+  verify it**, the config reference, known gaps, and troubleshooting.
+- **[docs/cloudrun-internals.md](docs/cloudrun-internals.md)** — how the deployer
+  is built: module map, the `CloudRunTarget` seam, credential resolution, and the
+  deploy-time invariants. Read before changing it.
+- **[examples/cloudrun-demo/](examples/cloudrun-demo/)** — a runnable,
+  live-verified walkthrough, as a narrated script and as commands you type.
+
+```bash
+greentic-deployer op --answers cloudrun.env.json env up --yes   # → JSON envelope with a *.run.app URL
+```
+
+`--answers` is a **global** flag: it goes before `env up`, not after. Verify the
+binary actually has the Cloud Run deployer compiled in first — a build without it
+still prints a perfectly green plan (guide §3.0).
+
+Note the name collision: the `gcp` **adapter family** listed below is the older
+terraform-backed `iac-only` deployment-pack path and is unrelated to this
+env-pack deployer (`greentic.deployer.gcp-cloudrun@1.0.0`).
+
 ## Concepts
 
 - **Application packs** (`kind: application` or `mixed`) describe flows, components, tools, secrets, tenant bindings, and deployment hints.
@@ -336,7 +364,7 @@ Deployment packs own:
 
 The deployer library does not own target-specific prompts or provider execution logic.
 
-See [docs/deployment-packs.md](/projects/ai/greentic-ng/greentic-deployer/docs/deployment-packs.md) for the runtime contract and authoring model.
+See [docs/deployment-packs.md](docs/deployment-packs.md) for the runtime contract and authoring model.
 
 ## Embedding
 
@@ -550,10 +578,49 @@ greentic-deployer bundle-upload refresh-url \
   --object-ref s3://my-bundle-bucket/path/abc123.gtbundle
 ```
 
+`oci://` targets push the bundle to an OCI registry (Google Artifact Registry)
+instead of object storage, authenticating with Application Default
+Credentials. A tag is required — an untagged reference or a digest reference
+(`@sha256:...`) is rejected, since a registry resolves `@sha256:...` against
+the manifest digest, not the bundle's content digest returned below:
+
+```bash
+greentic-deployer bundle-upload upload \
+  --target oci://asia-southeast1-docker.pkg.dev/my-project/greentic/worker-a:abc123 \
+  --bundle ./dist/bundle-warmed-0.5.18.gtbundle
+```
+
+JSON output:
+
+```json
+{
+  "url": "oci://asia-southeast1-docker.pkg.dev/my-project/greentic/worker-a:abc123",
+  "digest": "sha256:abc...",
+  "expires_at": null,
+  "object_ref": "oci://asia-southeast1-docker.pkg.dev/my-project/greentic/worker-a:abc123"
+}
+```
+
+`expires_at` is always `null` for `oci://` — an OCI reference is not
+presigned and does not expire. `bundle-upload refresh-url` on an `oci://`
+reference always fails: there is no fresh reference to re-issue, and
+recomputing the digest would require an extra registry round-trip this
+command does not perform.
+
 Cargo features:
 
 - `bundle-upload-aws` — default-on. S3 implementation.
 - `bundle-upload-gcp` — off. GCS stub.
 - `bundle-upload-azure` — off. Azure Blob stub.
+- `deploy-gcp-cloudrun` — default-on. `oci://` implementation (pushes to
+  Google Artifact Registry).
 
 Design + plan: `docs/superpowers/specs/2026-05-07-gtc-bundle-upload-flag-design.md`
+
+## Dev builds
+
+Every Dev Publish run on `develop` creates a GitHub prerelease tagged
+`v1.2.<run-id>` carrying prebuilt `greentic-deployer-dev` archives, which is what
+`gtc install --channel dev` installs. The binary inside reports that same
+`1.2.<run-id>` from `--version`, so any dev binary can be traced back to the
+release and the CI run that built it.

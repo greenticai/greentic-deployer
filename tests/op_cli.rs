@@ -126,6 +126,93 @@ fn op_env_create_then_list_roundtrips_against_tempdir_store() {
 }
 
 #[test]
+fn op_env_create_destroy_list_roundtrips_against_tempdir_store() {
+    let dir = tempdir().expect("tempdir");
+    let payload_path = dir.path().join("payload.json");
+    std::fs::write(
+        &payload_path,
+        r#"{"environment_id":"doomed","name":"doomed"}"#,
+    )
+    .expect("write payload");
+
+    // create
+    let create = Command::new(deployer_bin())
+        .args([
+            "op",
+            "--store-root",
+            dir.path().to_str().unwrap(),
+            "--answers",
+            payload_path.to_str().unwrap(),
+            "env",
+            "create",
+        ])
+        .output()
+        .expect("spawn create");
+    assert!(
+        create.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // destroy
+    let destroy = Command::new(deployer_bin())
+        .args([
+            "op",
+            "--store-root",
+            dir.path().to_str().unwrap(),
+            "env",
+            "destroy",
+            "doomed",
+            "--confirm",
+        ])
+        .output()
+        .expect("spawn destroy");
+    assert!(
+        destroy.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&destroy.stderr)
+    );
+    let destroy_stdout = String::from_utf8_lossy(&destroy.stdout);
+    let destroy_json: serde_json::Value =
+        serde_json::from_str(destroy_stdout.trim()).expect("destroy stdout is json");
+    assert_eq!(destroy_json["noun"], "env");
+    assert_eq!(destroy_json["op"], "destroy");
+    assert_eq!(destroy_json["result"]["environment_id"], "doomed");
+    assert_eq!(destroy_json["result"]["outcome"], "destroyed");
+    assert!(
+        destroy_json["result"]["removed_path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("doomed")),
+        "removed_path should point at the env dir: {}",
+        destroy_json["result"]
+    );
+
+    // list no longer shows the env
+    let list = Command::new(deployer_bin())
+        .args([
+            "op",
+            "--store-root",
+            dir.path().to_str().unwrap(),
+            "env",
+            "list",
+        ])
+        .output()
+        .expect("spawn list");
+    assert!(
+        list.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_json: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&list.stdout).trim())
+            .expect("list stdout is json");
+    let envs = list_json["result"]["environments"]
+        .as_array()
+        .expect("environments array");
+    assert!(envs.is_empty(), "env must be gone after destroy: {envs:?}");
+}
+
+#[test]
 fn op_env_show_missing_emits_json_error_envelope() {
     let dir = tempdir().expect("tempdir");
     let out = Command::new(deployer_bin())

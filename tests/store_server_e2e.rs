@@ -61,6 +61,7 @@ fn stage_payload(deployment_id: DeploymentId) -> StageRevisionPayload {
         config_digest: "sha256:00".to_string(),
         signature_sidecar_ref: PathBuf::from("rev.sig"),
         drain_seconds: 30,
+        runtime_image_digest: None,
     }
 }
 
