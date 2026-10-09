@@ -866,11 +866,27 @@ pub fn reconcile(
     // Capture the env's local dev-store so reconcile delivers the operator's
     // secrets to the worker (the K8s "no runtime secrets" gap). `None` when the
     // env has no dev-store file yet — the worker's staging init is then a no-op.
-    let dev_secrets = read_dev_secrets_b64(store, &env_id)?;
     // Resolve the env's `Secrets`-slot binding into the backend the worker
     // resolves `secret://` refs against — dev-store (values shipped in via the
     // Secret above) or Vault (pod identity + `VAULT_*` env, no values shipped).
     let secrets_backend = resolve_secrets_backend(store, &env)?;
+    // Mint each declared `generated` secret (the webchat `jwt_signing_key`)
+    // ONCE, into the dev store the Secret is built from. Left to boot, every
+    // router replica mints its own and rejects the others' tokens.
+    if matches!(
+        secrets_backend,
+        crate::env_packs::k8s::manifests::SecretsBackend::DevStore
+    ) {
+        let env_dir = store
+            .env_dir(&env_id)
+            .map_err(|e| OpError::Conflict(format!("resolving env dir: {e}")))?;
+        super::cloudrun_generated_secrets::premint_for_env(
+            store,
+            &env,
+            &staged_dev_store_path(&env_dir),
+        )?;
+    }
+    let dev_secrets = read_dev_secrets_b64(store, &env_id)?;
     // SoR units (SoRLa storage phase 3): resolved, and refused if unworkable,
     // before any cluster call; their route documents are written
     // mid-reconcile, after the SoRs are Available and before any worker rolls.
