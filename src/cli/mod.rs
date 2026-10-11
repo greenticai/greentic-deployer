@@ -42,7 +42,6 @@ pub mod bundle_fetch;
 pub mod bundle_stage;
 pub mod bundles;
 pub mod bundles_retire;
-#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
 pub(crate) mod cloudrun_generated_secrets;
 pub mod config;
 pub mod credentials;
