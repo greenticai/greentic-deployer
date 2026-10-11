@@ -103,6 +103,9 @@ Example spec:
 
 - [examples/single-vm.deployment.yaml](examples/single-vm.deployment.yaml)
 
+Specifications reject unsupported fields and unsafe renderer values; see
+[HOME-03 validation and migration notes](docs/home-03-spec-validation.md).
+
 Plan:
 
 ```bash

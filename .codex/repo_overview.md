@@ -1,5 +1,41 @@
 # Repository Overview
 
+## HOME-03 pre-change inspection (2026-10-11)
+
+Baseline `1b462e7b9fb561c72d185d184dd4ceba01312f7f`: `src/spec.rs`
+rejects ARM64 but silently accepts unknown YAML/JSON fields. `src/single_vm.rs`
+interpolates spec values into systemd units, Docker arguments and environment
+files; its name check alone does not bound those values. This increment hardens
+the existing specification boundary before adding host privileges. Shared host
+types belong to greentic-types draft PR #214; no duplicate model or unreleased
+path dependency will be introduced here. ARM64 enablement, native preflight,
+operator-owned access policy and rollback remain separate integration work.
+The referenced repo_overview_task.md is absent; this update follows actual
+source inspection and the available global_rules.md routine.
+
+## HOME-03 post-change verification
+
+`DeploymentSpecV1` now rejects unknown fields at all eleven object boundaries
+and validates values before they reach systemd/Docker/environment rendering.
+Four regression tests cover nested JSON/YAML privilege requests, injected
+directives/options, path and timeout bounds, and supported digest references.
+Existing path-separator diagnostics are preserved. The migration notes are in
+`docs/home-03-spec-validation.md`, linked from README.
+
+`TMPDIR=/private/tmp bash ci/local_check.sh` passed (exit 0): formatting, all-target
+all-feature Clippy, thirteen scaffold replays, fixture pack verification,
+3,399 tests with 15 pre-existing ignores, documentation and the no-default-feature
+baseline build. Tool versions: Rust 1.95.0, greentic-pack 1.1.5, greentic-flow 1.1.4.
+Log: `/tmp/iot-home-03-deployer-final-check.log`. Documentation emits 69 existing
+warnings and the baseline build four existing warnings; no warning-free claim
+is made. The initial run's 77 signing-key fixture failures came from macOS's
+symlinked `/var` temp path; the real temp path resolves them without disabling
+security checks. The initial path-error assertion regression is fixed.
+
+ARM64, shared host mappings, native access/ownership preflight, consistent
+preview/plan/apply enforcement and rollback remain unfinished. The current
+change is an input-validation prerequisite, not completion of HOME-03.
+
 ## 1. High-Level Purpose
 - `greentic-deployer` is a Rust CLI/library that builds deployment plans from Greentic packs, chooses a deployment pack mapping, and generates provider-specific IaC/artifacts for apply/destroy workflows.
 - It introspects pack manifests (local dirs, `.gtpack` archives, or distributor fetches), resolves config/secrets/telemetry via `greentic-config` and `greentic-secrets`, and emits Terraform/Bicep/Deployment Manager snippets plus manifests for AWS/Azure/GCP; Local/K8s rely on deployment-pack executors.
