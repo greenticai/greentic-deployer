@@ -90,6 +90,15 @@ pub(crate) fn teardown_sor_units(
     env_id: &EnvId,
     credentials: Option<GcpCredentialMaterial>,
 ) -> Result<Option<Value>, String> {
+    teardown_via(store, env_id, &RealSorTargets { credentials })
+}
+
+/// [`teardown_sor_units`] against any set of regional clients.
+fn teardown_via(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    targets: &dyn SorTargets,
+) -> Result<Option<Value>, String> {
     let places: Vec<CloudRunSorPlacement> = store
         .load_sor_ledger(env_id)
         .map_err(|e| format!("reading the SoR ledger: {e}"))?
@@ -99,14 +108,8 @@ pub(crate) fn teardown_sor_units(
     if places.is_empty() {
         return Ok(None);
     }
-    let targets = RealSorTargets { credentials };
-    let out = run_gcp_async(cloudrun::retire_all(
-        env_id.as_str(),
-        &places,
-        &[],
-        &targets,
-    ))
-    .map_err(|e| e.to_string())?;
+    let out = run_gcp_async(cloudrun::retire_all(env_id.as_str(), &places, &[], targets))
+        .map_err(|e| e.to_string())?;
     Ok(Some(json!({
         "deleted_services": out.deleted_services,
         "deleted_secrets": out.deleted_secrets,
@@ -124,6 +127,90 @@ mod tests {
     /// environment — must report no `sor` result at all, not an empty
     /// object: the caller (`CloudRunProviderTeardown::teardown`) inserts the
     /// `"sor"` key only when this returns `Some`.
+    use crate::environment::sor_units::AppliedSorUnit;
+
+    /// Clients that always refuse, so a test learns whether a code path asked
+    /// for a Google client at all without touching a network or ADC.
+    struct RefusingTargets;
+
+    #[async_trait]
+    impl SorTargets for RefusingTargets {
+        async fn at(&self, project: &str, region: &str) -> Result<SorTargetPair, OpError> {
+            Err(OpError::Conflict(format!(
+                "no client for {project}/{region}"
+            )))
+        }
+    }
+
+    fn ledger_entry() -> AppliedSorUnit {
+        AppliedSorUnit {
+            unit_id: "ledger".into(),
+            sor: "ledger-sor".into(),
+            namespace: String::new(),
+            cloud_run: Some(CloudRunSorPlacement::for_unit(
+                "proj",
+                "europe-west1",
+                "gtc-local",
+                "ledger",
+            )),
+            input_refs: vec![],
+        }
+    }
+
+    fn store_with_ledger() -> (tempfile::TempDir, LocalFsStore, Environment) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        store
+            .transact(&env.environment_id, |l| {
+                l.save_sor_ledger(&[ledger_entry()])
+            })
+            .unwrap();
+        (dir, store, env)
+    }
+
+    #[test]
+    fn nothing_to_do_is_true_only_with_no_units_and_no_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        assert!(nothing_to_do(&store, &env.environment_id).unwrap());
+
+        let (_d, store, env) = store_with_ledger();
+        assert!(!nothing_to_do(&store, &env.environment_id).unwrap());
+    }
+
+    #[test]
+    fn sor_up_builds_no_client_when_there_are_no_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let run = sor_up(&store, &env, &env.environment_id, None).unwrap();
+        assert!(run.is_none());
+    }
+
+    #[test]
+    fn teardown_reports_what_each_place_deleted() {
+        // An empty ledger is covered by the test below; here the ledger names
+        // one place and the clients refuse, so the failure surfaces as text.
+        let (_d, store, env) = store_with_ledger();
+        let err = teardown_via(&store, &env.environment_id, &RefusingTargets).unwrap_err();
+        assert!(err.contains("no client for proj/europe-west1"), "{err}");
+    }
+
+    #[test]
+    fn teardown_with_an_empty_ledger_asks_for_no_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let env = make_env("local");
+        store.save(&env).unwrap();
+        let out = teardown_via(&store, &env.environment_id, &RefusingTargets).unwrap();
+        assert!(out.is_none());
+    }
+
     #[test]
     fn no_sor_units_ever_declared_reports_no_sor_result() {
         let dir = tempfile::tempdir().unwrap();

@@ -163,3 +163,108 @@ impl SorServiceTarget for UnconfiguredSorTarget {
         Err(CloudRunTargetError::Unconfigured)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service() -> SorServiceRef {
+        SorServiceRef {
+            project: "proj".into(),
+            region: "europe-west1".into(),
+            name: "gtc-sor-ledger".into(),
+        }
+    }
+
+    fn status(ready: bool, reconciling: bool) -> SorServiceStatus {
+        SorServiceStatus {
+            etag: "e".into(),
+            owner: None,
+            intent: None,
+            ready,
+            reconciling,
+            url: None,
+            not_ready_reason: None,
+            log_uri: None,
+        }
+    }
+
+    #[test]
+    fn failed_means_settled_and_not_ready() {
+        assert!(status(false, false).failed());
+        assert!(
+            !status(false, true).failed(),
+            "a rollout is worth waiting for"
+        );
+        assert!(!status(true, false).failed());
+        assert!(!status(true, true).failed());
+    }
+
+    #[test]
+    fn the_repository_resource_name_is_the_full_path() {
+        let repo = ArRepository {
+            project: "proj".into(),
+            location: "europe-west1".into(),
+            repository: "bundles".into(),
+        };
+        assert_eq!(
+            repo.resource(),
+            "projects/proj/locations/europe-west1/repositories/bundles"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_unconfigured_target_fails_every_verb_honestly() {
+        let t = UnconfiguredSorTarget;
+        let svc = service();
+        let spec = SorServiceSpec {
+            service: svc.clone(),
+            image: "img".into(),
+            args: vec![],
+            port: 8080,
+            runtime_service_account: "sa@proj.iam.gserviceaccount.com".into(),
+            env: vec![],
+            secret_env: vec![],
+            secret_mounts: vec![],
+            scaling: ScalingSpec {
+                cpu: "1".into(),
+                memory: "512Mi".into(),
+                min_instances: 0,
+                max_instances: 1,
+                concurrency: 80,
+                cpu_always_allocated: false,
+            },
+            health_path: "/healthz".into(),
+            labels: SorServiceLabels {
+                owner: "o".into(),
+                unit_id: "u".into(),
+                intent: "i".into(),
+            },
+        };
+        let repo = ArRepository {
+            project: "proj".into(),
+            location: "europe-west1".into(),
+            repository: "bundles".into(),
+        };
+        assert!(matches!(
+            t.get_sor_service(&svc).await,
+            Err(CloudRunTargetError::Unconfigured)
+        ));
+        assert!(matches!(
+            t.upsert_sor_service(&spec, None).await,
+            Err(CloudRunTargetError::Unconfigured)
+        ));
+        assert!(matches!(
+            t.set_sor_invoker_public(&svc).await,
+            Err(CloudRunTargetError::Unconfigured)
+        ));
+        assert!(matches!(
+            t.delete_sor_service(&svc).await,
+            Err(CloudRunTargetError::Unconfigured)
+        ));
+        assert!(matches!(
+            t.grant_artifact_registry_reader(&repo, "sa@x").await,
+            Err(CloudRunTargetError::Unconfigured)
+        ));
+    }
+}
