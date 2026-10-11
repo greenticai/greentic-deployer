@@ -263,7 +263,15 @@ pub fn write_single_vm_spec(args: &SingleVmRenderSpecRequest) -> Result<()> {
 
 pub fn build_single_vm_plan(spec: &DeploymentSpecV1) -> Result<SingleVmPlan> {
     spec.validate()?;
+    build_single_vm_plan_inner(spec)
+}
 
+pub(crate) fn build_single_vm_host_base(spec: &DeploymentSpecV1) -> Result<SingleVmPlan> {
+    spec.validate_for_host()?;
+    build_single_vm_plan_inner(spec)
+}
+
+fn build_single_vm_plan_inner(spec: &DeploymentSpecV1) -> Result<SingleVmPlan> {
     if spec.spec.target != DeploymentTarget::SingleVm {
         return Err(DeployerError::Config(format!(
             "single-vm planner does not support target {:?}",

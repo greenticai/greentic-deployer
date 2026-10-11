@@ -281,6 +281,10 @@ struct SnapCommand {
 
 #[derive(Subcommand)]
 enum SingleVmSubcommand {
+    /// Validate an explicit host request against root-owned policy and native facts.
+    HostPlan(HostPlanArgs),
+    /// Preview or transactionally apply an explicit host deployment.
+    HostApply(HostApplyArgs),
     RenderSpec(Box<SingleVmRenderSpecArgs>),
     Plan(SingleVmPlanArgs),
     Apply(SingleVmApplyArgs),
@@ -458,6 +462,22 @@ struct SingleVmPlanArgs {
     spec: std::path::PathBuf,
     #[arg(long, value_enum, default_value_t = CliOutputFormat::Text)]
     output: CliOutputFormat,
+}
+
+#[derive(Parser)]
+struct HostPlanArgs {
+    #[arg(long)]
+    spec: std::path::PathBuf,
+    #[arg(long)]
+    policy: std::path::PathBuf,
+}
+
+#[derive(Parser)]
+struct HostApplyArgs {
+    #[command(flatten)]
+    inputs: HostPlanArgs,
+    #[arg(long)]
+    execute: bool,
 }
 
 #[derive(Parser)]
@@ -1517,6 +1537,27 @@ fn run_extension_list(args: ExtensionListArgs) -> Result<()> {
 
 fn run_single_vm(command: SingleVmCommand) -> Result<()> {
     match command.command {
+        SingleVmSubcommand::HostPlan(args) => {
+            let plan = greentic_deployer::single_vm_host::plan(&args.spec, &args.policy)?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+            Ok(())
+        }
+        SingleVmSubcommand::HostApply(args) => {
+            if args.execute {
+                let report = greentic_deployer::single_vm_host::apply(
+                    &args.inputs.spec,
+                    &args.inputs.policy,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let plan = greentic_deployer::single_vm_host::plan(
+                    &args.inputs.spec,
+                    &args.inputs.policy,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            }
+            Ok(())
+        }
         SingleVmSubcommand::RenderSpec(args) => run_single_vm_render_spec(*args),
         SingleVmSubcommand::Plan(args) => {
             let output = plan_single_vm_spec_path(&args.spec)?;

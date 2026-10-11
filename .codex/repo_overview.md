@@ -1,5 +1,30 @@
 # Repository Overview
 
+## HOME-03 host integration
+
+The approved shared-contract PR #214 merged as
+`d6b38898f392ab26f75c706aa962c17cc301cf97`; release `1.2.38173118925` is
+published and pinned. `src/single_vm_host.rs` adds an opt-in versioned host
+specification around the existing single-VM model, preserving legacy
+entrypoints. Operator-owned policy approves the exact deployment and non-root
+workload identity. Plan, preview and apply use native preflight; apply rechecks
+policy, bundle hash, image and mappings immediately before launch. Durable
+service rollback lives in `src/single_vm_host/transaction.rs`. No sibling path
+dependency is used. Documentation: `docs/home-03-host-deployment.md`.
+
+Eleven targeted host tests pass. Native ARM64 Docker/systemd/mTLS apply and
+failed-update rollback passed in an isolated Ubuntu 24.04 Lima VM, Linux
+6.8.0-142-generic; the persistent boot counter survived (7 to 11, including
+host/bridge network updates). Preview/plan agreement and real D-Bus socket
+preflight also pass. Qualification
+qualification scripts and the actual summary are under
+`ci/host-qualification/`. This is service-only simulator evidence, not physical
+Pi/peripheral qualification. `TMPDIR=/private/tmp bash ci/local_check.sh` passed
+(exit 0): 3,410 tests passed, 15 existing ignores; formatting, all-feature
+all-target Clippy, scaffold replay, fixture packs, docs and baseline build
+passed. Existing diagnostics remain: 69 doc warnings and four baseline warnings.
+Log: `/tmp/iot-home-03-deployer-host-final-check.log`.
+
 ## HOME-03 pre-change inspection (2026-10-11)
 
 Baseline `1b462e7b9fb561c72d185d184dd4ceba01312f7f`: `src/spec.rs`

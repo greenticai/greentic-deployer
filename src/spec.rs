@@ -64,6 +64,14 @@ impl DeploymentSpecV1 {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_architecture(false)
+    }
+
+    pub(crate) fn validate_for_host(&self) -> Result<()> {
+        self.validate_architecture(true)
+    }
+
+    fn validate_architecture(&self, host_enabled: bool) -> Result<()> {
         self.validate_rendered_values()?;
         if self.api_version != DEPLOYMENT_SPEC_API_VERSION_V1ALPHA1 {
             return Err(DeployerError::Config(format!(
@@ -85,7 +93,7 @@ impl DeploymentSpecV1 {
             ));
         }
 
-        if self.spec.runtime.arch != LinuxArch::X86_64 {
+        if !host_enabled && self.spec.runtime.arch != LinuxArch::X86_64 {
             return Err(DeployerError::Config(format!(
                 "runtime.arch must be x86_64 for OSS single-vm v1; got {:?}",
                 self.spec.runtime.arch

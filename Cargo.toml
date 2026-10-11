@@ -200,7 +200,8 @@ features = [
 ]
 
 [dependencies.greentic-types]
-version = ">=1.2.0-0, <1.3.0-0"
+# HOME-03 host requirements, released from types PR #214.
+version = "=1.2.38173118925"
 
 [dependencies.greentic-distributor-client]
 version = ">=1.2.0-0, <1.3.0-0"

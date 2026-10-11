@@ -1,0 +1,19 @@
+{
+  "scope": "generic Linux ARM64 service-only simulator",
+  "kernel": "6.8.0-142-generic",
+  "architecture": "aarch64",
+  "binary_sha256": "0eae77b35717f7bacc95e516d6915b6c16d81f672950283e19d1ac8ee92757cf",
+  "bundle_sha256": "2c069c2ca571d2e785ba0770bfe006f2d1c1455dac9a92be69f12d70b793bdaf",
+  "good_image": "sha256:f6e3f82545df2d02d735362ba884f750056ad22955b7f1fcb9511c9dde75aa2a",
+  "bad_image": "sha256:6f144dff58646be708c28956e1b1fa1d6c23cfd7fe954df880bd2a3230de2f99",
+  "before_failed_update": {
+    "healthy": true,
+    "boots": 7
+  },
+  "after_rollback": {
+    "healthy": true,
+    "boots": 11
+  },
+  "result": "passed",
+  "physical_iot_qualification": false
+}
