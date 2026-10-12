@@ -46,6 +46,7 @@ pub mod runtime_secret_sink;
 pub mod runtime_secrets;
 pub mod serverless;
 pub mod single_vm;
+pub mod single_vm_host;
 pub mod snap;
 pub mod sorx_routing;
 pub mod spec;

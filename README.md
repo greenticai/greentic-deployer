@@ -103,6 +103,12 @@ Example spec:
 
 - [examples/single-vm.deployment.yaml](examples/single-vm.deployment.yaml)
 
+Specifications reject unsupported fields and unsafe renderer values; see
+[HOME-03 validation and migration notes](docs/home-03-spec-validation.md).
+The opt-in [HOME-03 native host deployment](docs/home-03-host-deployment.md)
+adds published host requirements, operator policy, native preflight and durable
+service rollback for Linux ARM64 and x86-64.
+
 Plan:
 
 ```bash
