@@ -174,8 +174,70 @@ pub(crate) fn doctor_capabilities(registry: &EnvPackRegistry, env: &Environment)
     }
 }
 
+/// The live-provider half of `drain-revision` / `sweep`: the only part that
+/// reaches a real cluster or cloud project. A seam so the surrounding
+/// store/validation logic can run against a fake.
+pub(crate) trait LiveBackend {
+    fn drain(
+        &self,
+        store: &LocalFsStore,
+        env: &Environment,
+        env_id: &EnvId,
+        descriptor: &PackDescriptor,
+        revision_id: RevisionId,
+        answers: Option<Value>,
+    ) -> Result<crate::env_packs::deployer::DrainOutcome, OpError>;
+
+    fn sweep_k8s(
+        &self,
+        store: &LocalFsStore,
+        env: &Environment,
+        env_id: &EnvId,
+        answers: Option<Value>,
+        apply: bool,
+    ) -> Result<crate::env_packs::k8s::sweep::SweepReport, OpError>;
+}
+
+/// Production backend: delegates to the real providers.
+struct RealBackend;
+
+impl LiveBackend for RealBackend {
+    fn drain(
+        &self,
+        store: &LocalFsStore,
+        env: &Environment,
+        env_id: &EnvId,
+        descriptor: &PackDescriptor,
+        revision_id: RevisionId,
+        answers: Option<Value>,
+    ) -> Result<crate::env_packs::deployer::DrainOutcome, OpError> {
+        live::drain(store, env, env_id, descriptor, revision_id, answers)
+    }
+
+    fn sweep_k8s(
+        &self,
+        store: &LocalFsStore,
+        env: &Environment,
+        env_id: &EnvId,
+        answers: Option<Value>,
+        apply: bool,
+    ) -> Result<crate::env_packs::k8s::sweep::SweepReport, OpError> {
+        live::sweep_k8s(store, env, env_id, answers, apply)
+    }
+}
+
 /// `op env drain-revision <env_id> <revision_id> [--kind]`.
 pub fn drain_revision(
+    store: &LocalFsStore,
+    registry: &EnvPackRegistry,
+    flags: &OpFlags,
+    args: EnvDrainRevisionArgs,
+) -> Result<OpOutcome, OpError> {
+    drain_revision_with(&RealBackend, store, registry, flags, args)
+}
+
+pub(crate) fn drain_revision_with(
+    backend: &dyn LiveBackend,
     store: &LocalFsStore,
     registry: &EnvPackRegistry,
     flags: &OpFlags,
@@ -210,7 +272,7 @@ pub fn drain_revision(
     }
     let env = store.load(&env_id)?;
     let (answers, _) = load_render_answers(store, &env, &descriptor)?;
-    let outcome = live::drain(store, &env, &env_id, &descriptor, revision_id, answers)?;
+    let outcome = backend.drain(store, &env, &env_id, &descriptor, revision_id, answers)?;
     Ok(OpOutcome::new(
         NOUN,
         "drain-revision",
@@ -227,6 +289,16 @@ pub fn drain_revision(
 
 /// `op env sweep <env_id> [--apply] [--kind]`.
 pub fn sweep(
+    store: &LocalFsStore,
+    registry: &EnvPackRegistry,
+    flags: &OpFlags,
+    args: EnvSweepArgs,
+) -> Result<OpOutcome, OpError> {
+    sweep_with(&RealBackend, store, registry, flags, args)
+}
+
+pub(crate) fn sweep_with(
+    backend: &dyn LiveBackend,
     store: &LocalFsStore,
     registry: &EnvPackRegistry,
     flags: &OpFlags,
@@ -258,11 +330,11 @@ pub fn sweep(
         store.transact(&env_id, |_locked| {
             let env = store.load(&env_id)?;
             let (answers, _) = load_render_answers(store, &env, &descriptor)?;
-            live::sweep_k8s(store, &env, &env_id, answers, true)
+            backend.sweep_k8s(store, &env, &env_id, answers, true)
         })?
     } else {
         let (answers, _) = load_render_answers(store, &env, &descriptor)?;
-        live::sweep_k8s(store, &env, &env_id, answers, false)?
+        backend.sweep_k8s(store, &env, &env_id, answers, false)?
     };
     let mut result = serde_json::to_value(report)
         .map_err(|e| OpError::Conflict(format!("sweep report: {e}")))?;
@@ -317,7 +389,7 @@ mod live {
     }
 
     #[cfg(feature = "k8s-client")]
-    fn k8s_inputs(
+    pub(super) fn k8s_inputs(
         store: &LocalFsStore,
         env: &Environment,
         env_id: &EnvId,

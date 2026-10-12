@@ -52,7 +52,11 @@ trait ServiceControl {
     fn pre_launch(&mut self) -> Result<()>;
 }
 
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
+
 struct NativeService {
+    /// The service manager binary; only tests point it elsewhere.
+    systemctl_bin: PathBuf,
     client: reqwest::blocking::Client,
     health_url: String,
     deadline: Duration,
@@ -84,8 +88,8 @@ pub(super) fn command_output(mut command: Command, timeout: Duration) -> Result<
     }
 }
 
-fn systemctl(action: &str, service: Option<&str>) -> Result<Output> {
-    let mut command = Command::new("/usr/bin/systemctl");
+fn systemctl(program: &Path, action: &str, service: Option<&str>) -> Result<Output> {
+    let mut command = Command::new(program);
     command.arg(action);
     if let Some(service) = service {
         command.arg(service);
@@ -108,7 +112,7 @@ impl ServiceControl for NativeService {
         Ok(())
     }
     fn enabled(&mut self, service: &str) -> Result<bool> {
-        let output = systemctl("is-enabled", Some(service))?;
+        let output = systemctl(&self.systemctl_bin, "is-enabled", Some(service))?;
         match String::from_utf8_lossy(&output.stdout).trim() {
             "enabled" => Ok(true),
             "disabled" | "not-found" => Ok(false),
@@ -119,7 +123,7 @@ impl ServiceControl for NativeService {
     }
 
     fn active(&mut self, service: &str) -> Result<bool> {
-        let output = systemctl("is-active", Some(service))?;
+        let output = systemctl(&self.systemctl_bin, "is-active", Some(service))?;
         match String::from_utf8_lossy(&output.stdout).trim() {
             "active" => Ok(true),
             "inactive" | "failed" | "unknown" => Ok(false),
@@ -130,7 +134,10 @@ impl ServiceControl for NativeService {
     }
 
     fn run(&mut self, action: &str, service: Option<&str>) -> Result<()> {
-        if !systemctl(action, service)?.status.success() {
+        if !systemctl(&self.systemctl_bin, action, service)?
+            .status
+            .success()
+        {
             return Err(denied(format!("systemctl {action} failed")));
         }
         Ok(())
@@ -178,6 +185,7 @@ impl NativeService {
             .build()
             .map_err(|_| denied("could not initialize local mTLS health client"))?;
         Ok(Self {
+            systemctl_bin: PathBuf::from(SYSTEMCTL),
             client,
             health_url: format!("https://127.0.0.1:8433{}", spec.host.health.path),
             deadline: Duration::from_secs(u64::from(spec.host.health.startup_timeout_seconds)),
@@ -745,5 +753,288 @@ mod tests {
             fs::read_to_string(dir.path().join("persistent.sqlite")).unwrap(),
             "persistent data must survive"
         );
+    }
+
+    // ---- the real service control, driven through a stand-in service manager ----
+
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A stand-in for `systemctl`: prints `$ENABLED` / `$ACTIVE` for the two
+    /// queries, fails for the `fail` action and succeeds for everything else.
+    fn fake_systemctl(dir: &Path, enabled: &str, active: &str) -> PathBuf {
+        let path = dir.join("systemctl");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  is-enabled) echo '{enabled}' ;;\n  is-active) echo '{active}' ;;\n  fail) exit 3 ;;\n  *) exit 0 ;;\nesac\n"
+        );
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn native(systemctl_bin: PathBuf, health_url: &str, deadline: Duration) -> NativeService {
+        NativeService {
+            systemctl_bin,
+            client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            health_url: health_url.into(),
+            deadline,
+            launch_check: None,
+        }
+    }
+
+    /// Spawning a freshly written script can race another test's fork
+    /// (`ETXTBSY`); retry the call a few times before failing.
+    fn retrying<T>(mut call: impl FnMut() -> Result<T>) -> Result<T> {
+        let mut last = call();
+        for _ in 0..20 {
+            match &last {
+                Err(err) if err.to_string().contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    last = call();
+                }
+                _ => break,
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn command_output_returns_stdout_and_enforces_its_timeout() {
+        let mut ok = Command::new("/bin/sh");
+        ok.args(["-c", "echo hello"]);
+        let out = command_output(ok, Duration::from_secs(10)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "sleep 5"]);
+        let err = command_output(slow, Duration::from_millis(100)).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn enablement_is_read_from_the_service_manager_and_unknown_states_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (state, expected) in [("enabled", true), ("disabled", false), ("not-found", false)] {
+            let bin = fake_systemctl(dir.path(), state, "inactive");
+            let mut svc = native(bin, "http://127.0.0.1:9", Duration::from_millis(10));
+            assert_eq!(retrying(|| svc.enabled("x.service")).unwrap(), expected);
+        }
+        let bin = fake_systemctl(dir.path(), "masked", "inactive");
+        let mut svc = native(bin, "http://127.0.0.1:9", Duration::from_millis(10));
+        let err = retrying(|| svc.enabled("x.service")).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported existing service"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn activity_is_read_from_the_service_manager_and_transitions_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (state, expected) in [
+            ("active", true),
+            ("inactive", false),
+            ("failed", false),
+            ("unknown", false),
+        ] {
+            let bin = fake_systemctl(dir.path(), "enabled", state);
+            let mut svc = native(bin, "http://127.0.0.1:9", Duration::from_millis(10));
+            assert_eq!(retrying(|| svc.active("x.service")).unwrap(), expected);
+        }
+        let bin = fake_systemctl(dir.path(), "enabled", "activating");
+        let mut svc = native(bin, "http://127.0.0.1:9", Duration::from_millis(10));
+        let err = retrying(|| svc.active("x.service")).unwrap_err();
+        assert!(err.to_string().contains("transitioning"), "{err}");
+    }
+
+    #[test]
+    fn run_reports_a_failing_service_manager_action_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_systemctl(dir.path(), "enabled", "active");
+        let mut svc = native(bin, "http://127.0.0.1:9", Duration::from_millis(10));
+        retrying(|| svc.run("daemon-reload", None)).unwrap();
+        retrying(|| svc.run("restart", Some("x.service"))).unwrap();
+        let err = retrying(|| svc.run("fail", Some("x.service"))).unwrap_err();
+        assert!(err.to_string().contains("systemctl fail failed"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_service_manager_is_an_error_not_a_panic() {
+        let mut svc = native(
+            PathBuf::from("/nonexistent/systemctl"),
+            "http://127.0.0.1:9",
+            Duration::from_millis(10),
+        );
+        assert!(svc.run("restart", Some("x.service")).is_err());
+        assert!(svc.enabled("x.service").is_err());
+        assert!(svc.active("x.service").is_err());
+    }
+
+    #[test]
+    fn health_succeeds_against_a_ready_endpoint_and_gives_up_at_its_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let mut ready = native(
+            PathBuf::from(SYSTEMCTL),
+            &format!("http://{addr}/healthz"),
+            Duration::from_secs(10),
+        );
+        ready.healthy().unwrap();
+        server.join().unwrap();
+
+        // Nothing listens here any more: the probe must stop at its deadline.
+        let mut down = native(
+            PathBuf::from(SYSTEMCTL),
+            &format!("http://{addr}/healthz"),
+            Duration::from_millis(300),
+        );
+        let started = Instant::now();
+        let err = down.healthy().unwrap_err();
+        assert!(err.to_string().contains("readiness probe"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(8));
+    }
+
+    #[test]
+    fn pre_launch_without_a_recorded_preflight_is_refused() {
+        let mut svc = native(
+            PathBuf::from(SYSTEMCTL),
+            "http://127.0.0.1:9",
+            Duration::from_millis(10),
+        );
+        let err = svc.pre_launch().unwrap_err();
+        assert!(
+            err.to_string().contains("missing launch preflight"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_health_identity_is_validated_before_any_service_is_touched() {
+        let (spec, policy) = super::super::tests::fixture();
+        // The fixture's CA / client certificate files do not exist on disk.
+        assert!(validate_health_identity(&spec, &policy).is_err());
+    }
+
+    #[test]
+    fn save_file_records_absent_regular_and_refuses_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = save_file(&dir.path().join("none")).unwrap();
+        assert!(absent.bytes.is_none());
+        assert_eq!(absent.mode, 0o600);
+
+        let regular = dir.path().join("unit");
+        fs::write(&regular, "body").unwrap();
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o640)).unwrap();
+        let saved = save_file(&regular).unwrap();
+        assert_eq!(saved.bytes.as_deref(), Some(&b"body"[..]));
+        assert_eq!(saved.mode, 0o640);
+
+        let err = save_file(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("non-regular"), "{err}");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(save_file(&link).is_err());
+    }
+
+    #[test]
+    fn remove_durable_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pending.json");
+        fs::write(&file, "x").unwrap();
+        remove_durable(&file).unwrap();
+        assert!(!file.exists());
+        remove_durable(&file).unwrap();
+    }
+
+    #[test]
+    fn journals_are_bounded_and_must_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = Journal {
+            schema_version: HostRequirementsVersion::V1,
+            service: "svc".into(),
+            files: vec![],
+            enabled: false,
+            active: true,
+        };
+        let path = dir.path().join("ok.json");
+        fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
+        let read = read_journal(&path).unwrap();
+        assert_eq!(read.service, "svc");
+        assert!(read.active);
+
+        let junk = dir.path().join("junk.json");
+        fs::write(&junk, "not json").unwrap();
+        assert!(read_journal(&junk).is_err());
+
+        let huge = dir.path().join("huge.json");
+        fs::write(&huge, vec![b' '; JOURNAL_LIMIT as usize + 8]).unwrap();
+        let err = read_journal(&huge).unwrap_err();
+        assert!(err.to_string().contains("size bound"), "{err}");
+        assert!(read_journal(&dir.path().join("absent.json")).is_err());
+    }
+
+    #[test]
+    fn restore_rewrites_saved_files_and_removes_ones_that_did_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("kept.env");
+        let created = dir.path().join("created.env");
+        fs::write(&kept, "changed").unwrap();
+        fs::write(&created, "new").unwrap();
+        let journal = Journal {
+            schema_version: HostRequirementsVersion::V1,
+            service: "svc".into(),
+            files: vec![
+                SavedFile {
+                    path: kept.clone(),
+                    bytes: Some(b"original".to_vec()),
+                    mode: 0o640,
+                },
+                SavedFile {
+                    path: created.clone(),
+                    bytes: None,
+                    mode: 0o600,
+                },
+            ],
+            enabled: true,
+            active: false,
+        };
+        let mut service = MockService::default();
+        restore(&journal, &mut service).unwrap();
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "original");
+        assert!(!created.exists());
+        assert_eq!(
+            fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(service.calls, ["daemon-reload", "enable"]);
+    }
+
+    #[test]
+    fn native_apply_refuses_without_the_root_supervisor() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let err = apply(
+            &dir.path().join("spec.yaml"),
+            &dir.path().join("policy.json"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("root supervisor"), "{err}");
     }
 }

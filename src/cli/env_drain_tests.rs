@@ -375,3 +375,225 @@ async fn archive_gate_with_force_skips_the_deployer_entirely() {
         .unwrap();
     assert!(matches!(evidence, DrainEvidence::Forced));
 }
+
+mod seam {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::env_packs::deployer::DrainOutcome;
+    use crate::env_packs::deployer::conformance::build_fixture_env;
+    use crate::env_packs::k8s::sweep::SweepReport;
+
+    /// Records what the live half was asked and answers from canned values, so
+    /// the store/validation logic around it runs with no cluster or cloud.
+    #[derive(Default)]
+    struct FakeBackend {
+        drained: RefCell<Vec<RevisionId>>,
+        swept: RefCell<Vec<bool>>,
+        fail_drain: bool,
+    }
+
+    impl LiveBackend for FakeBackend {
+        fn drain(
+            &self,
+            _store: &LocalFsStore,
+            _env: &Environment,
+            _env_id: &EnvId,
+            _descriptor: &PackDescriptor,
+            revision_id: RevisionId,
+            _answers: Option<Value>,
+        ) -> Result<DrainOutcome, OpError> {
+            self.drained.borrow_mut().push(revision_id);
+            if self.fail_drain {
+                return Err(OpError::Conflict("injected live drain failure".into()));
+            }
+            Ok(DrainOutcome {
+                waited_seconds: 7,
+                evidence: DrainEvidence::Forced,
+            })
+        }
+
+        fn sweep_k8s(
+            &self,
+            _store: &LocalFsStore,
+            _env: &Environment,
+            _env_id: &EnvId,
+            _answers: Option<Value>,
+            apply: bool,
+        ) -> Result<SweepReport, OpError> {
+            self.swept.borrow_mut().push(apply);
+            Ok(SweepReport {
+                namespace: "gtc-fixture".into(),
+                label_selector: "sel".into(),
+                store_label: "lbl".into(),
+                dry_run: !apply,
+                orphans: vec![],
+                removed: vec![],
+                kept: vec![],
+                unattributed: vec![],
+                skipped: vec![],
+            })
+        }
+    }
+
+    fn fixture_store(kind: &str) -> (tempfile::TempDir, LocalFsStore, Environment) {
+        let dir = tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = build_fixture_env();
+        env.packs.push(make_binding(CapabilitySlot::Deployer, kind));
+        store.save(&env).unwrap();
+        (dir, store, env)
+    }
+
+    fn drain_args(env: &Environment, revision: RevisionId) -> EnvDrainRevisionArgs {
+        EnvDrainRevisionArgs {
+            env_id: env.environment_id.to_string(),
+            revision_id: revision.to_string(),
+            kind: None,
+        }
+    }
+
+    #[test]
+    fn draining_a_ready_revision_stamps_it_then_asks_the_live_half() {
+        let (_d, store, env) = fixture_store("greentic.deployer.k8s@1.0.0");
+        let ready = env
+            .revisions
+            .iter()
+            .find(|r| r.lifecycle == RevisionLifecycle::Ready)
+            .unwrap()
+            .revision_id;
+        let backend = FakeBackend::default();
+        let out = drain_revision_with(
+            &backend,
+            &store,
+            &EnvPackRegistry::with_builtins(),
+            &OpFlags::default(),
+            drain_args(&env, ready),
+        )
+        .unwrap();
+        assert_eq!(out.result["stamped_draining"], true);
+        assert_eq!(out.result["waited_seconds"], 7);
+        assert_eq!(out.result["revision_id"], ready.to_string());
+        assert_eq!(*backend.drained.borrow(), vec![ready]);
+        let reloaded = store.load(&env.environment_id).unwrap();
+        let stored = reloaded
+            .revisions
+            .iter()
+            .find(|r| r.revision_id == ready)
+            .unwrap();
+        assert_eq!(stored.lifecycle, RevisionLifecycle::Draining);
+    }
+
+    #[test]
+    fn draining_a_revision_that_is_not_ready_does_not_restamp_it() {
+        let (_d, store, env) = fixture_store("greentic.deployer.k8s@1.0.0");
+        let not_ready = env
+            .revisions
+            .iter()
+            .find(|r| r.lifecycle != RevisionLifecycle::Ready)
+            .unwrap()
+            .revision_id;
+        let backend = FakeBackend::default();
+        let out = drain_revision_with(
+            &backend,
+            &store,
+            &EnvPackRegistry::with_builtins(),
+            &OpFlags::default(),
+            drain_args(&env, not_ready),
+        )
+        .unwrap();
+        assert_eq!(out.result["stamped_draining"], false);
+        assert_eq!(backend.drained.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_live_drain_failure_surfaces_unchanged() {
+        let (_d, store, env) = fixture_store("greentic.deployer.k8s@1.0.0");
+        let backend = FakeBackend {
+            fail_drain: true,
+            ..Default::default()
+        };
+        let err = drain_revision_with(
+            &backend,
+            &store,
+            &EnvPackRegistry::with_builtins(),
+            &OpFlags::default(),
+            drain_args(&env, env.revisions[0].revision_id),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("injected live drain failure"));
+    }
+
+    #[test]
+    fn sweep_defaults_to_a_dry_run_and_apply_deletes() {
+        let (_d, store, env) = fixture_store("greentic.deployer.k8s@1.0.0");
+        let backend = FakeBackend::default();
+        for apply in [false, true] {
+            let out = sweep_with(
+                &backend,
+                &store,
+                &EnvPackRegistry::with_builtins(),
+                &OpFlags::default(),
+                EnvSweepArgs {
+                    env_id: env.environment_id.to_string(),
+                    apply,
+                    kind: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(out.result["dry_run"], !apply);
+            assert_eq!(out.result["environment_id"], env.environment_id.as_str());
+        }
+        assert_eq!(*backend.swept.borrow(), vec![false, true]);
+    }
+
+    #[cfg(feature = "creds-gcp")]
+    #[test]
+    fn sweep_is_refused_on_a_remove_capable_deployer_that_is_not_k8s() {
+        let (_d, store, env) = fixture_store("greentic.deployer.gcp-cloudrun@1.0.0");
+        let backend = FakeBackend::default();
+        let err = sweep_with(
+            &backend,
+            &store,
+            &EnvPackRegistry::with_builtins(),
+            &OpFlags::default(),
+            EnvSweepArgs {
+                env_id: env.environment_id.to_string(),
+                apply: false,
+                kind: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("label-scoped"), "{err}");
+        assert!(backend.swept.borrow().is_empty());
+    }
+
+    #[cfg(feature = "k8s-client")]
+    #[test]
+    fn k8s_inputs_read_the_context_from_the_answers_and_need_no_cluster_without_a_bound_identity() {
+        let (_d, store, env) = fixture_store("greentic.deployer.k8s@1.0.0");
+        let answers = json!({"kubeconfig_context": "kind-greentic"});
+        let (context, token) =
+            live::k8s_inputs(&store, &env, &env.environment_id, Some(&answers)).unwrap();
+        assert_eq!(context.as_deref(), Some("kind-greentic"));
+        assert!(token.is_none(), "no credentials_ref is bound");
+        let (context, _) = live::k8s_inputs(&store, &env, &env.environment_id, None).unwrap();
+        assert!(context.is_none());
+    }
+
+    #[test]
+    fn the_live_drain_dispatch_refuses_a_deployer_it_cannot_reach() {
+        let (_d, store, env) = fixture_store(crate::defaults::LOCAL_DEPLOYER_PACK);
+        let descriptor = PackDescriptor::try_new(crate::defaults::LOCAL_DEPLOYER_PACK).unwrap();
+        let err = live::drain(
+            &store,
+            &env,
+            &env.environment_id,
+            &descriptor,
+            env.revisions[0].revision_id,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot drain deployer"), "{err}");
+    }
+}
