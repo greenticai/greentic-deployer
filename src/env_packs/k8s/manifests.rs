@@ -1644,9 +1644,22 @@ pub fn render_router_service(env: &Environment, params: &K8sParams) -> Value {
             "type": params.service_type.as_k8s_str(),
             "selector": labels,
             "ports": [{"name": "http", "port": SERVE_PORT, "targetPort": SERVE_PORT}],
+            // The router keeps each conversation's state (a Direct Line
+            // conversation, a parked card) in its own process memory, and runs
+            // at least two replicas. Without affinity a client's second request
+            // lands on the other replica and is answered `conversation not
+            // found`, with every probe green.
+            "sessionAffinity": "ClientIP",
+            "sessionAffinityConfig": {
+                "clientIP": {"timeoutSeconds": ROUTER_SESSION_AFFINITY_SECONDS}
+            },
         },
     })
 }
+
+/// How long one client address sticks to one router replica: three hours, the
+/// longest a chat conversation is expected to sit idle before it expires.
+const ROUTER_SESSION_AFFINITY_SECONDS: u32 = 10_800;
 
 /// Router PodDisruptionBudget (step 11): voluntary disruptions keep at
 /// least one router serving.
@@ -3275,6 +3288,10 @@ mod tests {
                     "type": "ClusterIP",
                     "selector": labels,
                     "ports": [{"name": "http", "port": SERVE_PORT, "targetPort": SERVE_PORT}],
+                    "sessionAffinity": "ClientIP",
+                    "sessionAffinityConfig": {
+                        "clientIP": {"timeoutSeconds": ROUTER_SESSION_AFFINITY_SECONDS}
+                    },
                 },
             })
         );
