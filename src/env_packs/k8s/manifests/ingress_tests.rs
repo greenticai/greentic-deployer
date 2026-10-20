@@ -32,10 +32,14 @@ fn refusal(answers: Value) -> String {
 /// measured on an unmodified `develop` @ f13cf8d (a scratch test run on that
 /// tree before any Ingress code existed), not on this branch. An env
 /// that answers none of them must render exactly those bytes.
+///
+/// Re-measured once when `gtc-allow-workers` began admitting this env's own
+/// workers (agent-to-agent hops): the set includes every NetworkPolicy, so
+/// that deliberate change moved both digests. The Ingress code did not.
 #[test]
 fn unanswered_ingress_keeps_the_rendered_set_byte_identical() {
-    const DEFAULT_GOLDEN: &str = "95ebefd97fd325c24c15004c1a1e637f5d707c2f9127fa37692b18faf67e05c5";
-    const CUSTOM_GOLDEN: &str = "2e21921500371970ae8c0d0d1bc26f44842ccd4be43f6f70c565f8f12366b726";
+    const DEFAULT_GOLDEN: &str = "5d3b406abf2d506fa41e3b077c67aac7210e01862b3b6417f0128fadcd5ad6a4";
+    const CUSTOM_GOLDEN: &str = "fc02babd3f0c2de36ed794edaa4b99621dd7507327d98376b11c81b60fbadeed";
     let env = build_fixture_env();
     let defaults = render_environment_manifests(&env, &K8sParams::for_env(&env));
     assert_eq!(sha256_hex(&defaults), DEFAULT_GOLDEN);

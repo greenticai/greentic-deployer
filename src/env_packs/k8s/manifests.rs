@@ -2013,10 +2013,22 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
             "spec": {
                 "podSelector": {"matchLabels": worker_component},
                 "policyTypes": ["Ingress"],
+                // The router fronts external traffic, and a worker may also be
+                // called by ANOTHER worker of this env: a generated router unit
+                // forwards a message to its target unit over agent-to-agent
+                // (`http://gtc-worker-<revision>.<ns>.svc:8080/...`), and that
+                // hop is worker to worker. Without the second `from` entry the
+                // default-deny dropped it (measured on kind: the agent card
+                // fetch timed out and the channel answered "that team could not
+                // be reached"), while egress was already open. Scoped to this
+                // env's workers, so a sibling env in the namespace gains nothing.
                 "ingress": [{
-                    "from": [{"podSelector": {"matchLabels": json!({
-                        "app.kubernetes.io/component": "router",
-                    })}}],
+                    "from": [
+                        {"podSelector": {"matchLabels": json!({
+                            "app.kubernetes.io/component": "router",
+                        })}},
+                        {"podSelector": {"matchLabels": common_labels(env, "worker")}},
+                    ],
                     "ports": [{"protocol": "TCP", "port": SERVE_PORT}],
                 }],
             },
@@ -3378,6 +3390,38 @@ mod tests {
     /// the Service resolving while the pod drops the packets — and only under
     /// a NetworkPolicy-enforcing CNI, so it would pass on a cluster without
     /// one.
+    #[test]
+    fn workers_admit_ingress_from_this_envs_workers_for_agent_to_agent_hops() {
+        let (env, params) = fixture();
+        let policies = render_network_policies(&env, &params);
+        let workers = policies
+            .iter()
+            .find(|p| p["metadata"]["name"] == "gtc-allow-workers")
+            .expect("gtc-allow-workers is rendered");
+        let from = workers["spec"]["ingress"][0]["from"]
+            .as_array()
+            .expect("from list");
+        let components: Vec<&str> = from
+            .iter()
+            .map(|f| {
+                f["podSelector"]["matchLabels"]["app.kubernetes.io/component"]
+                    .as_str()
+                    .expect("component label")
+            })
+            .collect();
+        assert_eq!(components, ["router", "worker"]);
+        // The worker peer is scoped to THIS env, so a sibling env sharing the
+        // namespace is not admitted.
+        assert_eq!(
+            from[1]["podSelector"]["matchLabels"][ENV_LABEL],
+            env.environment_id.as_str()
+        );
+        assert_eq!(
+            workers["spec"]["ingress"][0]["ports"],
+            serde_json::json!([{"protocol": "TCP", "port": SERVE_PORT}])
+        );
+    }
+
     #[test]
     fn router_ingress_admits_traffic_from_outside_the_cluster() {
         let (env, mut params) = fixture();
