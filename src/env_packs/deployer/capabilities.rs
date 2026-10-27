@@ -213,7 +213,8 @@ mod tests {
                 "ingress_managed",
                 "private_registry_auth",
                 "multi_instance_safe",
-                "runtime_pin"
+                "runtime_pin",
+                "scale_out_answers"
             ])
         );
         for c in Capability::ALL {
