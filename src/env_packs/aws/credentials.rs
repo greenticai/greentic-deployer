@@ -15,7 +15,7 @@
 //!   DescribeRules / CreateRule / ModifyRule plus AddTags / DescribeTags
 //!   (owner-tagging) for per-deployment listener rules)
 //!   plus this
-//!   handler's STS/IAM self-probes, `iam:PassRole`, and `ecr:PutImage` staging.
+//!   handler's STS/IAM self-probes, and `iam:PassRole`.
 //!   Keeping the list in parity with the real target's runtime calls means a
 //!   role that passes `gtc op credentials requirements` does not then fail on
 //!   the first live warm / traffic-shift / archive.
@@ -96,7 +96,6 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "ecs:DescribeServices",
     "ecs:ListServices",
     "ecs:CreateService",
-    "ecs:UpdateService",
     "ecs:RegisterTaskDefinition",
     "ecs:TagResource",
     "ecs:DescribeTaskDefinition",
@@ -105,8 +104,7 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "ecs:DeleteTaskSet",
     "ecs:DeleteService",
     "ecs:DeregisterTaskDefinition",
-    // Image-push staging + passing the task execution/task roles to ECS.
-    "ecr:PutImage",
+    // Passing the task execution/task roles to ECS.
     "iam:PassRole",
     // ELBv2 weighted traffic shifting across the revisions' target groups.
     // ModifyListener serves the legacy default-action path (one deployment per
@@ -128,11 +126,11 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "secretsmanager:CreateSecret",
     "secretsmanager:DescribeSecret",
     "secretsmanager:PutSecretValue",
+    "secretsmanager:TagResource",
     "secretsmanager:DeleteSecret",
     // CloudWatch Logs group of the deployment's containers (`ensure_log_group`,
     // `delete_log_group`).
     "logs:CreateLogGroup",
-    "logs:DescribeLogGroups",
     "logs:PutRetentionPolicy",
     "logs:DeleteLogGroup",
 ];

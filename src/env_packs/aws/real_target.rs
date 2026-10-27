@@ -191,13 +191,60 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "elasticloadbalancing:DescribeListeners", // discover_endpoint (listener protocol + load balancer ARN)
     "elasticloadbalancing:DescribeLoadBalancers", // discover_endpoint (load balancer DNS name)
     "secretsmanager:CreateSecret",            // ensure_secret
+    "secretsmanager:TagResource",             // ensure_secret (CreateSecret with Tags needs it)
     "secretsmanager:DescribeSecret",          // ensure_secret (read the live owner tag)
     "secretsmanager:PutSecretValue",          // put_secret_value
     "secretsmanager:DeleteSecret",            // delete_secret
     "logs:CreateLogGroup",                    // ensure_log_group
-    "logs:DescribeLogGroups", // granted for operator verification; not called by the target today
-    "logs:PutRetentionPolicy", // ensure_log_group
-    "logs:DeleteLogGroup",    // delete_log_group
+    "logs:PutRetentionPolicy",                // ensure_log_group
+    "logs:DeleteLogGroup",                    // delete_log_group
+];
+
+/// Every AWS SDK operation `RealEcsTarget` sends, with the IAM verb(s) it
+/// needs (an operation may need more than one: a tagged create also needs the
+/// tag verb). The first element is the SDK builder method, so a test can prove
+/// the call still exists in this file; the audit test proves each verb is both
+/// listed in [`REAL_ECS_TARGET_IAM_ACTIONS`] and validated by the preflight.
+#[cfg(test)]
+const REAL_ECS_TARGET_SDK_CALLS: &[(&str, &str)] = &[
+    ("describe_services", "ecs:DescribeServices"),
+    ("list_services", "ecs:ListServices"),
+    ("create_service", "ecs:CreateService"),
+    ("register_task_definition", "ecs:RegisterTaskDefinition"),
+    ("register_task_definition", "ecs:TagResource"), // revision-intent tag
+    ("describe_task_definition", "ecs:DescribeTaskDefinition"),
+    ("create_task_set", "ecs:CreateTaskSet"),
+    ("describe_task_sets", "ecs:DescribeTaskSets"),
+    ("delete_task_set", "ecs:DeleteTaskSet"),
+    ("delete_service", "ecs:DeleteService"),
+    ("deregister_task_definition", "ecs:DeregisterTaskDefinition"),
+    (
+        "describe_target_groups",
+        "elasticloadbalancing:DescribeTargetGroups",
+    ),
+    ("modify_listener", "elasticloadbalancing:ModifyListener"),
+    ("describe_rules", "elasticloadbalancing:DescribeRules"),
+    ("create_rule", "elasticloadbalancing:CreateRule"),
+    ("create_rule", "elasticloadbalancing:AddTags"), // owner tag on the rule
+    ("modify_rule", "elasticloadbalancing:ModifyRule"),
+    ("delete_rule", "elasticloadbalancing:DeleteRule"),
+    ("describe_tags", "elasticloadbalancing:DescribeTags"),
+    (
+        "describe_listeners",
+        "elasticloadbalancing:DescribeListeners",
+    ),
+    (
+        "describe_load_balancers",
+        "elasticloadbalancing:DescribeLoadBalancers",
+    ),
+    ("create_secret", "secretsmanager:CreateSecret"),
+    ("create_secret", "secretsmanager:TagResource"), // owner tag at creation
+    ("describe_secret", "secretsmanager:DescribeSecret"),
+    ("put_secret_value", "secretsmanager:PutSecretValue"),
+    ("delete_secret", "secretsmanager:DeleteSecret"),
+    ("create_log_group", "logs:CreateLogGroup"),
+    ("put_retention_policy", "logs:PutRetentionPolicy"),
+    ("delete_log_group", "logs:DeleteLogGroup"),
 ];
 
 impl RealEcsTarget {
@@ -850,6 +897,13 @@ impl EcsDeployTarget for RealEcsTarget {
         }
     }
 
+    /// Idempotent per content: the client request token is derived from the
+    /// bytes, so re-putting identical bytes returns the version that already
+    /// holds them. Caveat (A, B, A): re-putting bytes equal to an OLDER version
+    /// returns that older version but does NOT move `AWSCURRENT` back to it. The
+    /// seed is delivered through a pinned `valueFrom` version reference, so
+    /// the pinned task definition is unaffected; only a consumer reading
+    /// `AWSCURRENT` would observe the difference.
     async fn put_secret_value(
         &self,
         name: &str,
@@ -1287,13 +1341,15 @@ fn seed_volume() -> Volume {
 /// The non-essential init container: seed secrets arrive as env vars, are
 /// written under `/seed`, and verified against their SHA-256.
 fn seed_init_container(seed: &SeedInit) -> Result<ContainerDefinition, EcsTargetError> {
+    let script = seed_init::script(&seed.files)
+        .map_err(|e| EcsTargetError::Api(format!("seed-init: {e}")))?;
     let mut b = ContainerDefinition::builder()
         .name(SEED_INIT_CONTAINER)
         .image(&seed.image)
         .essential(false)
         .command("sh")
         .command("-c")
-        .command(seed_init::script(&seed.files))
+        .command(script)
         .mount_points(seed_mount(false));
     for f in &seed.files {
         b = b
@@ -1619,8 +1675,13 @@ fn forward_action(tuples: &[(u32, String)]) -> Result<Action, EcsTargetError> {
 /// to the API's 999 ceiling (only a lone 100% revision hits it, and a single
 /// non-zero tuple takes all traffic regardless).
 fn elb_weight(weight_bps: u32) -> i32 {
-    (weight_bps / 10).min(999) as i32
+    (weight_bps / ELB_WEIGHT_GRANULARITY_BPS).min(999) as i32
 }
+
+/// Finest split weight (in bps) an ALB forward action can express: one ELB
+/// weight unit. The CLI preflights recorded splits against this same constant,
+/// so a weight `elb_weight` would truncate is refused before it is applied.
+pub(crate) const ELB_WEIGHT_GRANULARITY_BPS: u32 = 10;
 
 /// Build the ELBv2 rule conditions for a deployment's routing: a host-header
 /// condition and/or a path-pattern condition (ELBv2 AND-combines them when both
@@ -2442,6 +2503,48 @@ mod tests {
                  role does not fail on the first live deploy"
             );
         }
+    }
+
+    /// The SDK-call table, the declared action list and the validated verbs are
+    /// one set: every operation's verb is declared and validated, and nothing is
+    /// declared that no operation needs. The table's operations are also proven
+    /// to still be called in this file.
+    #[test]
+    fn every_verb_the_real_target_needs_is_validated() {
+        use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;
+        let source = include_str!("real_target.rs");
+        for (op, verb) in REAL_ECS_TARGET_SDK_CALLS {
+            assert!(
+                source.contains(&format!(".{op}()")),
+                "table names SDK operation `{op}` but real_target.rs never calls it"
+            );
+            assert!(
+                REAL_ECS_TARGET_IAM_ACTIONS.contains(verb),
+                "`{op}` needs `{verb}` but REAL_ECS_TARGET_IAM_ACTIONS omits it"
+            );
+            assert!(
+                VALIDATED_IAM_VERBS.contains(verb),
+                "`{op}` needs `{verb}` but the preflight does not validate it"
+            );
+        }
+        for action in REAL_ECS_TARGET_IAM_ACTIONS {
+            assert!(
+                REAL_ECS_TARGET_SDK_CALLS.iter().any(|(_, v)| v == action),
+                "`{action}` is declared but no SDK operation in the table needs it"
+            );
+        }
+    }
+
+    /// The deployer-side preflight granularity is the unit `elb_weight` divides
+    /// by: a weight of exactly one granule is ELB weight 1, and anything finer
+    /// is not a whole multiple (so the preflight refuses it).
+    #[test]
+    fn preflight_granularity_matches_elb_weight() {
+        assert_eq!(elb_weight(ELB_WEIGHT_GRANULARITY_BPS), 1);
+        assert_ne!(
+            (ELB_WEIGHT_GRANULARITY_BPS + 1) % ELB_WEIGHT_GRANULARITY_BPS,
+            0
+        );
     }
 
     /// The bound-session injection maps all three STS parts onto the static

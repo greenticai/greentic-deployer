@@ -50,8 +50,57 @@ fn var_stem(name: &str) -> String {
 }
 
 #[cfg(any(test, feature = "deploy-aws-ecs"))]
+/// A seed file name the init script cannot safely embed.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SeedNameError {
+    /// Empty, absolute, containing a `.`/`..`/empty path component, or a
+    /// character outside `[A-Za-z0-9._/-]` (names go into a shell script).
+    #[error(
+        "seed file name {0:?} is not allowed (use [A-Za-z0-9._/-], no leading `/`, no `.`/`..`/empty components)"
+    )]
+    Invalid(String),
+    /// Two files would share one environment variable.
+    #[error("seed files {first:?} and {second:?} map to the same env var `{var}`")]
+    Collision {
+        first: String,
+        second: String,
+        var: String,
+    },
+}
+
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
+fn validate_name(name: &str) -> Result<(), SeedNameError> {
+    let bad = name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        || name
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..");
+    if bad {
+        Err(SeedNameError::Invalid(name.to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 /// The `sh -c` script: write each file byte for byte, then verify its digest.
-pub(crate) fn script(files: &[SeedFile]) -> String {
+/// Fails closed on a name that is unsafe to embed or collides on its env var.
+pub(crate) fn script(files: &[SeedFile]) -> Result<String, SeedNameError> {
+    let mut seen: Vec<(String, &str)> = Vec::with_capacity(files.len());
+    for f in files {
+        validate_name(&f.name)?;
+        let stem = var_stem(&f.name);
+        if let Some((_, first)) = seen.iter().find(|(s, _)| *s == stem) {
+            return Err(SeedNameError::Collision {
+                first: (*first).to_string(),
+                second: f.name.clone(),
+                var: content_var(f),
+            });
+        }
+        seen.push((stem, &f.name));
+    }
     let mut out = String::from("set -eu\numask 022\n");
     for f in files {
         let path = format!("/seed/{}", f.name);
@@ -64,7 +113,7 @@ pub(crate) fn script(files: &[SeedFile]) -> String {
             sha_var(f)
         ));
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -96,12 +145,47 @@ mod tests {
         let s = script(&[
             file("environment.json"),
             file(".greentic/dev/.dev.secrets.env"),
-        ]);
+        ])
+        .unwrap();
         assert!(s.starts_with("set -eu\numask 022\n"));
         assert!(s.contains(
             "printf '%s' \"$GREENTIC_SEED_ENVIRONMENT_JSON\" > /seed/environment.json\n"
         ));
         assert!(s.contains("mkdir -p /seed/.greentic/dev\n"));
         assert!(s.contains("sha256sum -c -s"));
+    }
+
+    #[test]
+    fn seed_file_names_are_validated() {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a b",
+            "a;rm -rf x",
+            "a$(id)",
+            "a'b",
+            "a\nb",
+            "a/",
+        ] {
+            assert!(
+                script(&[file(bad)]).is_err(),
+                "name {bad:?} must be refused"
+            );
+        }
+        assert!(script(&[file("environment.json")]).is_ok());
+        assert!(script(&[file(".greentic/dev/.dev.secrets.env")]).is_ok());
+    }
+
+    #[test]
+    fn colliding_seed_var_stems_are_refused() {
+        // `a.b` and `a_b` both map to GREENTIC_SEED_A_B.
+        match script(&[file("a.b"), file("a_b")]) {
+            Err(SeedNameError::Collision { .. }) => {}
+            other => panic!("expected a collision, got {other:?}"),
+        }
     }
 }

@@ -88,8 +88,6 @@ enum ActionBucket {
     /// `ecs:Register/DeregisterTaskDefinition` — no resource-level scoping;
     /// Resource = "*".
     EcsTaskDefinition,
-    /// `ecr:*` — image push, scoped to repo ARN.
-    Ecr,
     /// `elasticloadbalancing:Describe*` — no resource-level scoping;
     /// Resource = "*".
     AlbReadOnly,
@@ -127,9 +125,6 @@ fn classify_action(action: &str) -> ActionBucket {
     }
     if action.starts_with("ecs:") {
         return ActionBucket::Ecs;
-    }
-    if action.starts_with("ecr:") {
-        return ActionBucket::Ecr;
     }
     if action.starts_with("elasticloadbalancing:Describe") {
         return ActionBucket::AlbReadOnly;
@@ -188,12 +183,6 @@ const BUCKET_SPECS: &[BucketSpec] = &[
         bucket: ActionBucket::EcsTaskDefinition,
         comment: "ECS task-definition lifecycle — no resource-level scoping; Resource must be \"*\".",
         resource: "*",
-        extra: None,
-    },
-    BucketSpec {
-        bucket: ActionBucket::Ecr,
-        comment: "ECR image push — admin scopes to repo ARN.",
-        resource: "<REPLACE_WITH_ECR_REPO_ARNS>",
         extra: None,
     },
     BucketSpec {
@@ -320,7 +309,7 @@ fn render_terraform(input: &IamRulesPackInput<'_>) -> String {
 # with the actual ARNs from your AWS account before applying:
 #
 #   <REPLACE_WITH_ECS_RESOURCE_ARNS>  — e.g. arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*
-#   <REPLACE_WITH_ECR_REPO_ARNS>      — e.g. arn:aws:ecr:<region>:<account>:repository/greentic-*
+#   <REPLACE_WITH_SECRET_ARNS>        — e.g. arn:aws:secretsmanager:<region>:<account>:secret:greentic/*
 #   <REPLACE_WITH_ALB_LISTENER_ARNS>  — e.g. arn:aws:elasticloadbalancing:<region>:<account>:listener/app/<lb>/<id>/<id>
 #   <REPLACE_WITH_LOG_GROUP_ARN_PREFIX> — e.g. arn:aws:logs:<region>:<account>:log-group:/greentic/*
 #   <REPLACE_WITH_ECS_TASK_ROLE_ARN>  — e.g. arn:aws:iam::<account>:role/greentic-{env_id}-task-execution
@@ -409,9 +398,6 @@ The policy is split into multiple statements by sensitivity:
 - **ECS task-definition lifecycle** (`ecs:RegisterTaskDefinition`,
   `ecs:DeregisterTaskDefinition`) — granted at `Resource = "*"` because
   AWS provides no resource-level scoping for these actions.
-- **ECR** (`ecr:PutImage`) — replace `<REPLACE_WITH_ECR_REPO_ARNS>` with
-  your repository ARN, e.g.
-  `arn:aws:ecr:<region>:<account>:repository/greentic-*`.
 - **ELB describe** (`elasticloadbalancing:DescribeTargetGroups`) —
   granted at `Resource = "*"` because AWS provides no resource-level
   scoping for describe actions.
@@ -421,12 +407,15 @@ The policy is split into multiple statements by sensitivity:
   per-deployment listener rules, and the tag verbs stamp + verify each rule's
   owning deployment so the deployer only rewrites rules it created. Replace
   `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your listener ARN.
-- **CloudWatch Logs** (`logs:CreateLogGroup`, `DescribeLogGroups`,
-  `PutRetentionPolicy`, `DeleteLogGroup`) — replace
-  `<REPLACE_WITH_LOG_GROUP_ARN_PREFIX>` with the log-group ARN prefix, e.g.
-  `arn:aws:logs:<region>:<account>:log-group:/greentic/*`. Note
-  `DescribeLogGroups` does not support resource-level scoping in IAM; if the
-  scoped statement refuses it, grant that one verb at `Resource = "*"`.
+- **CloudWatch Logs** (`logs:CreateLogGroup`, `PutRetentionPolicy`,
+  `DeleteLogGroup`) — replace `<REPLACE_WITH_LOG_GROUP_ARN_PREFIX>` with the
+  log-group ARN prefix, e.g.
+  `arn:aws:logs:<region>:<account>:log-group:/greentic/*`.
+- **Secrets Manager** (`secretsmanager:CreateSecret`, `DescribeSecret`,
+  `PutSecretValue`, `TagResource`, `DeleteSecret`) — the seed and telemetry
+  secrets the deployer owns. Replace `<REPLACE_WITH_SECRET_ARNS>` with the
+  secret ARN prefix, e.g.
+  `arn:aws:secretsmanager:<region>:<account>:secret:greentic/*`.
 - **iam:PassRole** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
   ARN of the ECS task-execution role, e.g.
   `arn:aws:iam::<account>:role/greentic-{env_id}-task-execution`.
@@ -482,10 +471,27 @@ The policy is split into multiple statements by sensitivity:
    All capabilities (`{sts_cap}` + the IAM verbs above) must pass
    before `gtc op deploy {env_id}` is honored.
 
+## Roles you provide (this policy does NOT grant these)
+
+The deployer only passes two existing roles to ECS (`iam:PassRole` above); it
+never creates them and never attaches permissions to them. Give them:
+
+- **Task execution role** (`execution_role_arn`):
+  `secretsmanager:GetSecretValue` on the seed secrets the deployer creates
+  (the `secrets` entries of the task definition are resolved with this role),
+  `logs:CreateLogStream` and `logs:PutLogEvents` on the deployment's log
+  group, and pull access for the runtime image (the public GHCR runtime image
+  needs none; a private registry needs its pull permissions here).
+- **Task role** (the role the worker assumes): read access to the bundle
+  registry — for ECR, `ecr:GetAuthorizationToken` on `*` plus
+  `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on the bundle
+  repositories. The designer pushes the bundle with its own credentials; the
+  deployer pushes no images.
+
 ## What this does NOT do
 
 C3 is the credentials stub. Phase D D-AWS-1 adds the rest of the ECS
-provisioning Terraform (VPC, ECR repository, ALB, ECS cluster, task
+provisioning Terraform (VPC, ALB, ECS cluster, task
 definitions). For now this pack only creates the IAM role Greentic
 assumes at deploy time.
 "#,
@@ -589,7 +595,7 @@ mod tests {
                 "ecs:CreateService",
                 "ecs:UpdateService",
                 "ecs:CreateTaskSet",
-                "ecr:PutImage",
+                "secretsmanager:CreateSecret",
                 "elasticloadbalancing:ModifyListener",
                 "iam:PassRole",
             ],
@@ -637,7 +643,7 @@ mod tests {
         let input = IamRulesPackInput {
             env_id: "prod-eu",
             admin_identity_hint: "arn:aws:iam::111122223333:role/x",
-            allowed_actions: &["ecs:CreateService", "ecr:PutImage"],
+            allowed_actions: &["ecs:CreateService", "secretsmanager:CreateSecret"],
         };
         let pack = render_min_iam_rules_pack(&input);
         let readme = pack
@@ -661,7 +667,7 @@ mod tests {
     }
 
     /// The full verb list produces at least 5 statements: read-only, ECS,
-    /// ECR, ALB, and PassRole.
+    /// Secrets Manager, ALB, and PassRole.
     #[test]
     fn tf_emits_one_statement_per_bucket() {
         let input = IamRulesPackInput {
@@ -673,7 +679,7 @@ mod tests {
                 "ecs:CreateService",
                 "ecs:UpdateService",
                 "ecs:CreateTaskSet",
-                "ecr:PutImage",
+                "secretsmanager:CreateSecret",
                 "elasticloadbalancing:ModifyListener",
                 "iam:PassRole",
             ],
@@ -692,7 +698,7 @@ mod tests {
                 let trimmed = l.trim();
                 trimmed.starts_with("# Read-only")
                     || trimmed.starts_with("# ECS rollout")
-                    || trimmed.starts_with("# ECR image")
+                    || trimmed.starts_with("# Secrets Manager")
                     || trimmed.starts_with("# ALB listener")
                     || trimmed.starts_with("# iam:PassRole")
             })
@@ -715,7 +721,7 @@ mod tests {
                 "sts:GetCallerIdentity",
                 "iam:SimulatePrincipalPolicy",
                 "ecs:CreateService",
-                "ecr:PutImage",
+                "secretsmanager:CreateSecret",
                 "elasticloadbalancing:ModifyListener",
                 "iam:PassRole",
             ],
