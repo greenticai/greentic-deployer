@@ -30,11 +30,17 @@ pub enum Capability {
     /// Each revision runs the runtime image its own manifest pinned
     /// (unified update L2), not just the environment-wide answer.
     RuntimePin,
+    /// The deployer reads the scale-out answers (k8s `replicas` + `redis_url`;
+    /// Cloud Run `max_instances` > 1 gated on `redis_url` + a VPC route) and
+    /// refuses an unbacked multi-instance shape. A client must not send those
+    /// keys to a deployer that does not report this: older ones refuse them
+    /// as unknown answer keys (k8s) or accept `max_instances` with no gate.
+    ScaleOutAnswers,
 }
 
 impl Capability {
     /// Every capability, in report order.
-    pub const ALL: [Capability; 7] = [
+    pub const ALL: [Capability; 8] = [
         Capability::Drain,
         Capability::TrafficSplit,
         Capability::IngressManaged,
@@ -42,6 +48,7 @@ impl Capability {
         Capability::MultiInstanceSafe,
         Capability::Remove,
         Capability::RuntimePin,
+        Capability::ScaleOutAnswers,
     ];
 
     /// Wire name (matches the serde spelling).
@@ -54,6 +61,7 @@ impl Capability {
             Capability::MultiInstanceSafe => "multi_instance_safe",
             Capability::Remove => "remove",
             Capability::RuntimePin => "runtime_pin",
+            Capability::ScaleOutAnswers => "scale_out_answers",
         }
     }
 }
@@ -82,6 +90,7 @@ pub struct AdapterCapabilities {
     pub multi_instance_safe: bool,
     pub remove: bool,
     pub runtime_pin: bool,
+    pub scale_out_answers: bool,
 }
 
 impl AdapterCapabilities {
@@ -94,6 +103,7 @@ impl AdapterCapabilities {
         multi_instance_safe: false,
         remove: false,
         runtime_pin: false,
+        scale_out_answers: false,
     };
 
     /// Whether `capability` is present.
@@ -106,6 +116,7 @@ impl AdapterCapabilities {
             Capability::MultiInstanceSafe => self.multi_instance_safe,
             Capability::Remove => self.remove,
             Capability::RuntimePin => self.runtime_pin,
+            Capability::ScaleOutAnswers => self.scale_out_answers,
         }
     }
 

@@ -104,6 +104,30 @@ questions:
     constraint:
       pattern: '^[0-9]+$'
 
+  - id: replicas
+    type: string
+    title: Worker replicas (optional)
+    description: >-
+      Replica count for each worker Deployment. Leave blank for 1. More
+      than 1 is accepted only when `redis_url` is also answered, because
+      sessions, flow state and revision pins would otherwise live in each
+      pod's memory.
+    required: false
+    default_value: "1"
+    constraint:
+      pattern: '^[0-9]+$'
+
+  - id: redis_url
+    type: string
+    title: Shared Redis URL (optional)
+    description: >-
+      redis:// URL of the shared session/state store the workers use.
+      Carries the AUTH string, so it is rendered into a Secret and read
+      by the pod through secretKeyRef. TLS (rediss://) is not supported.
+    required: false
+    constraint:
+      pattern: '^redis://.+$'
+
   - id: oci_insecure_registries
     type: string
     title: Insecure OCI registries (optional)
