@@ -1169,6 +1169,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_unicode_routing_host_falls_back_to_the_load_balancer_dns() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "b\u{fc}cher-shop.de",
+        });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("https://{}.alb.invalid", rev.deployment_id.0))
+        );
+    }
+
+    #[tokio::test]
     async fn a_scheme_prefixed_routing_host_is_not_doubled() {
         let (handler, _target) = handler_with_fake();
         let env = build_fixture_env();

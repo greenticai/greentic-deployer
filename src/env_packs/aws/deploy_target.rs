@@ -275,13 +275,16 @@ pub fn compose_endpoint(protocol_is_https: bool, dns_or_host: &str, path: Option
 pub fn endpoint_host(raw: &str) -> Option<String> {
     let mut rest = raw.trim();
     for scheme in ["https://", "http://"] {
-        if rest.len() >= scheme.len() && rest[..scheme.len()].eq_ignore_ascii_case(scheme) {
-            rest = &rest[scheme.len()..];
+        if rest
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        {
+            rest = rest.get(scheme.len()..).unwrap_or("");
             break;
         }
     }
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = rest[..end].trim();
+    let authority = rest.get(..end).unwrap_or("").trim();
     let (host, port) = match authority.split_once(':') {
         Some((host, port)) => (host, Some(port)),
         None => (authority, None),
@@ -1185,6 +1188,20 @@ mod endpoint_tests {
             endpoint_host("app.example.com:"),
             Some("app.example.com".into())
         );
+    }
+
+    #[test]
+    fn endpoint_host_does_not_panic_on_multibyte_boundary() {
+        for raw in [
+            "a\u{e9}\u{e9}\u{e9}\u{e9}",
+            "b\u{fc}cher-shop.de",
+            "abcdefg\u{20ac}",
+            "abcdef\u{1f600}",
+            "\u{1f600}\u{1f600}\u{1f600}",
+            "https://b\u{fc}cher.de",
+        ] {
+            assert_eq!(endpoint_host(raw), None, "{raw}");
+        }
     }
 
     #[test]
