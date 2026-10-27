@@ -173,7 +173,8 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "ecs:RegisterTaskDefinition", // create_task_set
     "ecs:TagResource",            // create_task_set (revision-intent tag on the task definition)
     "ecs:DescribeTaskDefinition", // live_revision_intent (read the revision-intent tag)
-    "ecs:CreateTaskSet",          // create_task_set
+    "ecs:ListTagsForResource", // live_revision_intent (include=TAGS; may be required, verify live)
+    "ecs:CreateTaskSet",       // create_task_set
     // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
     // (apply_listener_weights reads each revision's target-group binding here)
     "ecs:DescribeTaskSets",
@@ -213,6 +214,7 @@ const REAL_ECS_TARGET_SDK_CALLS: &[(&str, &str)] = &[
     ("register_task_definition", "ecs:RegisterTaskDefinition"),
     ("register_task_definition", "ecs:TagResource"), // revision-intent tag
     ("describe_task_definition", "ecs:DescribeTaskDefinition"),
+    ("describe_task_definition", "ecs:ListTagsForResource"), // include=TAGS; verify live (Task 12)
     ("create_task_set", "ecs:CreateTaskSet"),
     ("describe_task_sets", "ecs:DescribeTaskSets"),
     ("delete_task_set", "ecs:DeleteTaskSet"),
@@ -2535,15 +2537,68 @@ mod tests {
         }
     }
 
-    /// The deployer-side preflight granularity is the unit `elb_weight` divides
-    /// by: a weight of exactly one granule is ELB weight 1, and anything finer
-    /// is not a whole multiple (so the preflight refuses it).
+    /// An env whose only split weights its revisions 1 bps off a whole granule.
+    fn finer_than_one_granule_env() -> greentic_deploy_spec::Environment {
+        use crate::cli::tests_common::{
+            make_bundle_deployment, make_env, make_revision, make_traffic_split,
+        };
+        use greentic_deploy_spec::{RevisionLifecycle, TrafficSplitEntry};
+        let mut env = make_env("local");
+        let d = make_bundle_deployment("local", "bundle-a");
+        let r1 = make_revision(
+            "local",
+            "bundle-a",
+            &d.deployment_id,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        let r2 = make_revision(
+            "local",
+            "bundle-a",
+            &d.deployment_id,
+            2,
+            RevisionLifecycle::Ready,
+        );
+        let mut split = make_traffic_split(
+            "local",
+            "bundle-a",
+            &d.deployment_id,
+            &r1.revision_id,
+            "01J000000000000000000000AC",
+        );
+        split.entries = vec![
+            TrafficSplitEntry {
+                revision_id: r1.revision_id,
+                weight_bps: ELB_WEIGHT_GRANULARITY_BPS + 1,
+            },
+            TrafficSplitEntry {
+                revision_id: r2.revision_id,
+                weight_bps: 10_000 - ELB_WEIGHT_GRANULARITY_BPS - 1,
+            },
+        ];
+        env.bundles.push(d);
+        env.revisions.extend([r1, r2]);
+        env.traffic_splits.push(split);
+        env
+    }
+
+    /// The preflight granularity is the unit `elb_weight` divides by: one
+    /// granule is ELB weight 1, and a split one bps finer is refused by the
+    /// real preflight (not merely by arithmetic on the constant).
     #[test]
     fn preflight_granularity_matches_elb_weight() {
+        use crate::cli::env::preflight_split_granularity;
         assert_eq!(elb_weight(ELB_WEIGHT_GRANULARITY_BPS), 1);
-        assert_ne!(
-            (ELB_WEIGHT_GRANULARITY_BPS + 1) % ELB_WEIGHT_GRANULARITY_BPS,
-            0
+        let err = preflight_split_granularity(
+            &finer_than_one_granule_env(),
+            ELB_WEIGHT_GRANULARITY_BPS,
+            "ALB",
+            "0.1%",
+            None,
+        );
+        assert!(
+            err.is_err(),
+            "a weight finer than one ELB unit must be refused"
         );
     }
 

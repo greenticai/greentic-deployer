@@ -2480,13 +2480,22 @@ pub(crate) fn cloudrun_revisions_to_warm(
 /// whole multiple of `granularity_bps`, the finest weight the platform's router
 /// can represent, so a split it cannot express fails BEFORE warming creates live
 /// revisions that could then not be routed to as recorded.
-pub(super) fn preflight_split_granularity(
+///
+/// `only` narrows the check to one deployment's split (a call that applies just
+/// that split must not be refused over another deployment's); `None` checks
+/// every recorded split.
+pub(crate) fn preflight_split_granularity(
     env: &Environment,
     granularity_bps: u32,
     platform: &str,
     granularity_label: &str,
+    only: Option<greentic_deploy_spec::DeploymentId>,
 ) -> Result<(), OpError> {
-    for split in &env.traffic_splits {
+    for split in env
+        .traffic_splits
+        .iter()
+        .filter(|s| only.is_none_or(|d| s.deployment_id == d))
+    {
         for entry in &split.entries {
             if entry.weight_bps % granularity_bps != 0 {
                 return Err(OpError::Conflict(format!(
@@ -2550,7 +2559,7 @@ pub(crate) fn cloudrun_env_up(
     // of 100 bps (plan D1 — the same invariant `split_to_traffic_targets` enforces
     // at apply time). Reject a non-representable split up front so it fails BEFORE
     // warming creates live revisions we would then be unable to route to.
-    preflight_split_granularity(&env, 100, "Cloud Run", "1%")?;
+    preflight_split_granularity(&env, 100, "Cloud Run", "1%", None)?;
 
     // 0. SoR units (SoRLa phase 3E): every sorx service up and ready, and its
     //    route document in the dev store, BEFORE any worker is warmed — each
@@ -2691,7 +2700,13 @@ pub(super) fn apply_traffic_aws_ecs(
 
     // A weight finer than one ELB unit would be silently truncated; refuse it
     // before any AWS call (same preflight `op env up` runs).
-    preflight_split_granularity(env, ELB_WEIGHT_GRANULARITY_BPS, "ALB", "0.1%")?;
+    preflight_split_granularity(
+        env,
+        ELB_WEIGHT_GRANULARITY_BPS,
+        "ALB",
+        "0.1%",
+        Some(deployment_id),
+    )?;
     let inputs = aws_ecs_target_inputs(store, env, env_id, answers)?;
     let identity = inputs.identity;
 

@@ -120,6 +120,7 @@ fn classify_action(action: &str) -> ActionBucket {
             | "ecs:DeregisterTaskDefinition"
             | "ecs:DescribeTaskDefinition"
             | "ecs:TagResource"
+            | "ecs:ListTagsForResource"
     ) {
         return ActionBucket::EcsTaskDefinition;
     }
@@ -396,7 +397,7 @@ The policy is split into multiple statements by sensitivity:
   ARNs, e.g.
   `arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*`.
 - **ECS task-definition lifecycle** (`ecs:RegisterTaskDefinition`,
-  `ecs:DeregisterTaskDefinition`) — granted at `Resource = "*"` because
+  `ecs:DeregisterTaskDefinition`, `ecs:DescribeTaskDefinition`, `ecs:TagResource`, `ecs:ListTagsForResource`) — granted at `Resource = "*"` because
   AWS provides no resource-level scoping for these actions.
 - **ELB describe** (`elasticloadbalancing:DescribeTargetGroups`) —
   granted at `Resource = "*"` because AWS provides no resource-level

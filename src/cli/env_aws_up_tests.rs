@@ -484,3 +484,84 @@ fn apply_traffic_refuses_a_split_finer_than_the_alb_granularity() {
         other => panic!("expected a split refusal, got {other:?}"),
     }
 }
+
+/// Two deployments in one env: `target` carries a healthy 50/50 split and
+/// `other` a hand-edited 3333/6667 one. Returns (store, env, env_id, target id).
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn env_with_a_fine_split_on_another_deployment(
+    region: &str,
+    fine_on_target: bool,
+) -> (
+    tempfile::TempDir,
+    Environment,
+    EnvId,
+    greentic_deploy_spec::DeploymentId,
+) {
+    let dir = tempdir().unwrap();
+    let store = LocalFsStore::new(dir.path());
+    let mut env = make_env("local");
+    bind_aws(&mut env);
+    let mut ids = Vec::new();
+    for (name, fine, ulid) in [
+        ("bundle-a", fine_on_target, "01J000000000000000000000AC"),
+        ("bundle-b", !fine_on_target, "01J000000000000000000000AD"),
+    ] {
+        let d = make_bundle_deployment("local", name);
+        let r1 = make_revision("local", name, &d.deployment_id, 1, RevisionLifecycle::Ready);
+        let r2 = make_revision("local", name, &d.deployment_id, 2, RevisionLifecycle::Ready);
+        let mut split = make_traffic_split("local", name, &d.deployment_id, &r1.revision_id, ulid);
+        let (w1, w2) = if fine { (3_333, 6_667) } else { (5_000, 5_000) };
+        split.entries = vec![
+            TrafficSplitEntry {
+                revision_id: r1.revision_id,
+                weight_bps: w1,
+            },
+            TrafficSplitEntry {
+                revision_id: r2.revision_id,
+                weight_bps: w2,
+            },
+        ];
+        ids.push(d.deployment_id);
+        env.bundles.push(d);
+        env.revisions.extend([r1, r2]);
+        env.traffic_splits.push(split);
+    }
+    store.save(&env).unwrap();
+    let env_id = EnvId::try_from("local").unwrap();
+    write_aws_answers(&store, &env_id, region);
+    (dir, env, env_id, ids[0])
+}
+
+/// Another deployment's stale fine-grained split is not this call's business.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[test]
+fn apply_traffic_ignores_another_deployments_fine_grained_split() {
+    use crate::env_packs::aws::deploy_target::InMemoryEcs;
+    let region = "fake-region-apply-traffic-other-split";
+    let fake = Arc::new(InMemoryEcs::default());
+    let _seam = crate::cli::env::ecs_target_seam::install(region, fake.clone());
+    let (dir, env, env_id, target) = env_with_a_fine_split_on_another_deployment(region, false);
+    let store = LocalFsStore::new(dir.path());
+    // Whatever the live apply answers, it must not be the granularity refusal.
+    if let Err(OpError::Conflict(msg)) =
+        crate::cli::env::apply_traffic_aws_ecs(&store, &env, &env_id, target, None)
+    {
+        assert!(!msg.contains("whole multiples"), "{msg}");
+    }
+}
+
+/// The target deployment's own fine split is still refused.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[test]
+fn apply_traffic_still_refuses_the_target_deployments_own_fine_split() {
+    use crate::env_packs::aws::deploy_target::InMemoryEcs;
+    let region = "fake-region-apply-traffic-own-split";
+    let fake = Arc::new(InMemoryEcs::default());
+    let _seam = crate::cli::env::ecs_target_seam::install(region, fake.clone());
+    let (dir, env, env_id, target) = env_with_a_fine_split_on_another_deployment(region, true);
+    let store = LocalFsStore::new(dir.path());
+    match crate::cli::env::apply_traffic_aws_ecs(&store, &env, &env_id, target, None) {
+        Err(OpError::Conflict(msg)) => assert!(msg.contains("10 bps"), "{msg}"),
+        other => panic!("expected a split refusal, got {other:?}"),
+    }
+}

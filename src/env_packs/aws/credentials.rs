@@ -99,6 +99,9 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "ecs:RegisterTaskDefinition",
     "ecs:TagResource",
     "ecs:DescribeTaskDefinition",
+    // DescribeTaskDefinition with include=TAGS (unverified: AWS may or may not
+    // require this separately; granted as a read-only precaution, see Task 12).
+    "ecs:ListTagsForResource",
     "ecs:CreateTaskSet",
     "ecs:DescribeTaskSets",
     "ecs:DeleteTaskSet",
@@ -539,7 +542,12 @@ impl AwsDeployerCredentials {
     /// only the first validate pays the chain-resolve cost.
     fn resolve_client(&self) -> Result<Arc<dyn AwsValidatorClient>, AwsClientError> {
         // Fast path: client already built.
-        if let Some(c) = self.client.lock().expect("mutex not poisoned").as_ref() {
+        if let Some(c) = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
             return Ok(Arc::clone(c));
         }
         // Slow path: build the real client on a dedicated thread + runtime.
@@ -547,7 +555,10 @@ impl AwsDeployerCredentials {
         // parent runtime, so we always isolate via std::thread::scope.
         let built = run_aws_async(RealAwsClient::resolve())?;
         let arc: Arc<dyn AwsValidatorClient> = Arc::new(built);
-        let mut slot = self.client.lock().expect("mutex not poisoned");
+        let mut slot = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Another thread may have raced us — keep their client to avoid
         // tearing down a perfectly good SDK client.
         if let Some(c) = slot.as_ref() {
@@ -825,7 +836,8 @@ where
                 rt.block_on(fut)
             })
             .join()
-            .expect("AWS validate thread did not panic")
+            // Re-raise the worker thread's own panic instead of masking it.
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     })
 }
 
