@@ -667,7 +667,6 @@ impl Deployer for AwsEcsDeployerHandler {
             boot_env: &boot_env,
             secret_env_names: &secret_env_names,
             seed_init_image: SEED_INIT_IMAGE,
-            log_retention_days: params.log_retention_days,
         });
 
         self.target

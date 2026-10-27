@@ -40,8 +40,6 @@ pub(crate) struct IntentInputs<'a> {
     pub secret_env_names: &'a [&'a str],
     /// The pinned seed-init (busybox) image.
     pub seed_init_image: &'a str,
-    /// The log group retention the warm converges, in days.
-    pub log_retention_days: i32,
 }
 
 /// SHA-256 over length-prefixed fields, truncated to 128 bits of lowercase hex
@@ -56,7 +54,8 @@ pub(crate) struct IntentInputs<'a> {
 /// `public-ip`, `cpu` and `memory` (each only when non-empty),
 /// `container-name`, `container-port`; then the desired count, the seed
 /// secret name, the boot env pairs in order, `secret-env` per name (only when
-/// present), `seed-init-image` and `log-retention`.
+/// present) and `seed-init-image`. Log retention is NOT hashed: it belongs
+/// to the log group, which every warm converges, not to the task definition.
 pub(crate) fn revision_intent(inputs: &IntentInputs<'_>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -98,7 +97,6 @@ pub(crate) fn revision_intent(inputs: &IntentInputs<'_>) -> String {
         tagged(b"secret-env", name.as_bytes());
     }
     tagged(b"seed-init-image", inputs.seed_init_image.as_bytes());
-    tagged(b"log-retention", &inputs.log_retention_days.to_le_bytes());
     hex::encode(&hasher.finalize()[..16])
 }
 
@@ -190,7 +188,6 @@ mod tests {
             boot_env: &boot_env,
             secret_env_names: &[],
             seed_init_image: "busybox@sha256:abc",
-            log_retention_days: 30,
         };
         edit(&mut inputs);
         revision_intent(&inputs)
@@ -212,7 +209,7 @@ mod tests {
     /// this value, and every live revision would then read as a conflict.
     #[test]
     fn revision_intent_golden_vector() {
-        assert_eq!(base(), "50bb3e07b2714d343a9543a27f70cf47");
+        assert_eq!(base(), "c9e89e285a823063e4ed3e1063a68b39");
     }
 
     #[test]
@@ -289,11 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn log_retention_moves_the_intent() {
-        assert_ne!(base(), intent_with(|_| {}, |i| i.log_retention_days = 14));
-    }
-
-    #[test]
     fn length_prefixes_stop_boundary_forgery() {
         let with_env = |boot_env: &[(String, String)]| {
             revision_intent(&IntentInputs {
@@ -304,7 +296,6 @@ mod tests {
                 boot_env,
                 secret_env_names: &[],
                 seed_init_image: "b",
-                log_retention_days: 30,
             })
         };
         assert_ne!(

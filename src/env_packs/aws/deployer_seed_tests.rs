@@ -186,6 +186,37 @@ async fn rewarm_with_a_changed_task_role_conflicts() {
     assert_eq!(target.create_task_set_calls(), 1, "no second task set");
 }
 
+/// Retention is a property of the log group, which every warm converges; it
+/// is not baked into the task definition, so a re-warm with a new retention
+/// converges and applies it.
+#[tokio::test]
+async fn a_changed_log_retention_still_converges() {
+    let (handler, target) = handler_with_fake();
+    let env = build_fixture_env();
+    let rev = &env.revisions[0];
+    handler
+        .warm_revision(
+            &env,
+            rev.revision_id,
+            Some(&json!({ "log_retention_days": "30" })),
+        )
+        .await
+        .unwrap();
+    handler
+        .warm_revision(
+            &env,
+            rev.revision_id,
+            Some(&json!({ "log_retention_days": "14" })),
+        )
+        .await
+        .expect("a changed retention converges");
+
+    assert_eq!(target.create_task_set_calls(), 1, "no second task set");
+    let params = AwsEcsParams::for_env(&env);
+    let group = log_group_name(&params.secret_prefix, &rev.deployment_id);
+    assert_eq!(target.log_groups().get(&group), Some(&14));
+}
+
 #[tokio::test]
 async fn oversized_seed_is_refused_not_truncated() {
     let (handler, target) = handler_with_fake();
