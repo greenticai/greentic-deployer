@@ -17,7 +17,13 @@ pub(crate) struct RulesInput<'a> {
 fn slug(env_id: &str) -> String {
     env_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -114,12 +120,16 @@ pub(crate) fn render_rules_pack(input: &RulesInput<'_>) -> RulesPack {
             RulesPackEntry {
                 filename: "azure-aca-setup.sh".into(),
                 content: setup_script(input.env_id),
-                description: Some("az CLI: role, service principal, role assignments, ACR pull token.".into()),
+                description: Some(
+                    "az CLI: role, service principal, role assignments, ACR pull token.".into(),
+                ),
             },
             RulesPackEntry {
                 filename: "README.md".into(),
                 content: readme(input.env_id),
-                description: Some("Apply instructions for the Azure Container Apps bootstrap.".into()),
+                description: Some(
+                    "Apply instructions for the Azure Container Apps bootstrap.".into(),
+                ),
             },
         ],
     }
@@ -132,11 +142,20 @@ mod tests {
     #[test]
     fn role_json_lists_exactly_the_required_actions_and_no_wildcards() {
         let v: serde_json::Value = serde_json::from_str(&role_definition("prod")).unwrap();
-        let actions: Vec<&str> =
-            v["Actions"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+        let actions: Vec<&str> = v["Actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
         assert_eq!(actions, REQUIRED_ACTIONS);
         assert!(!actions.iter().any(|a| a.contains('*')));
-        assert!(v["AssignableScopes"][0].as_str().unwrap().contains("resourceGroups"));
+        assert!(
+            v["AssignableScopes"][0]
+                .as_str()
+                .unwrap()
+                .contains("resourceGroups")
+        );
     }
 
     #[test]
@@ -160,6 +179,9 @@ mod tests {
     fn the_pack_has_three_safe_entries() {
         let p = render_rules_pack(&RulesInput { env_id: "prod" });
         let names: Vec<&str> = p.entries.iter().map(|e| e.filename.as_str()).collect();
-        assert_eq!(names, ["azure-aca-role.json", "azure-aca-setup.sh", "README.md"]);
+        assert_eq!(
+            names,
+            ["azure-aca-role.json", "azure-aca-setup.sh", "README.md"]
+        );
     }
 }

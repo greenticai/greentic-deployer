@@ -26,10 +26,17 @@ fn version_req_accepts_ga_and_dev_and_rejects_the_next_major() {
 
 #[test]
 fn wizard_yaml_pins_its_id_and_requires_the_scope_answers() {
-    let yaml = AzureAcaDeployerHandler::default().wizard_qaspec_yaml().unwrap();
+    let yaml = AzureAcaDeployerHandler::default()
+        .wizard_qaspec_yaml()
+        .unwrap();
     let spec: qa_spec::FormSpec = serde_yaml_bw::from_str(yaml).unwrap();
     assert_eq!(spec.id, "greentic.deployer.azure-aca.wizard");
-    for key in ["subscription_id", "tenant_id", "resource_group", "environment_name"] {
+    for key in [
+        "subscription_id",
+        "tenant_id",
+        "resource_group",
+        "environment_name",
+    ] {
         let q = spec.questions.iter().find(|q| q.id == key).unwrap();
         assert!(q.required, "{key}");
     }
@@ -37,7 +44,9 @@ fn wizard_yaml_pins_its_id_and_requires_the_scope_answers() {
 
 #[test]
 fn every_wizard_question_is_an_accepted_answer_key() {
-    let yaml = AzureAcaDeployerHandler::default().wizard_qaspec_yaml().unwrap();
+    let yaml = AzureAcaDeployerHandler::default()
+        .wizard_qaspec_yaml()
+        .unwrap();
     let spec: qa_spec::FormSpec = serde_yaml_bw::from_str(yaml).unwrap();
     let mut answers = serde_json::Map::new();
     for q in &spec.questions {
@@ -62,7 +71,10 @@ fn debug_of_the_handler_never_prints_dev_secret_bytes() {
         Some(b"SUPERSECRET".to_vec()),
     );
     let shown = format!("{h:?}");
-    assert!(!shown.contains("SUPERSECRET") && shown.contains("<redacted 11 bytes>"), "{shown}");
+    assert!(
+        !shown.contains("SUPERSECRET") && shown.contains("<redacted 11 bytes>"),
+        "{shown}"
+    );
 }
 
 #[test]
@@ -77,9 +89,17 @@ fn descriptor_path_is_registered_for_provider_teardown() {
 fn the_registry_resolves_the_azure_pack_and_refuses_other_versions() {
     let registry = crate::env_packs::EnvPackRegistry::with_builtins();
     let ok = PackDescriptor::try_new("greentic.deployer.azure-aca@1.0.0").unwrap();
-    assert!(registry.resolve_for_slot(CapabilitySlot::Deployer, &ok).is_ok());
+    assert!(
+        registry
+            .resolve_for_slot(CapabilitySlot::Deployer, &ok)
+            .is_ok()
+    );
     let bad = PackDescriptor::try_new("greentic.deployer.azure-aca@2.0.0").unwrap();
-    assert!(registry.resolve_for_slot(CapabilitySlot::Deployer, &bad).is_err());
+    assert!(
+        registry
+            .resolve_for_slot(CapabilitySlot::Deployer, &bad)
+            .is_err()
+    );
 }
 
 #[test]

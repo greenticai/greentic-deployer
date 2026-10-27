@@ -8,11 +8,11 @@ use tokio::time::{Instant, sleep};
 
 use super::AzureAcaDeployerHandler;
 use super::arm_body::{OWNER_TAG, secrets_with_values};
-use super::arm_types::{
-    AppSecret, AppSpec, EnvEntry, InitSpec, RevisionSpec, TrafficEntry,
-};
+use super::arm_types::{AppSecret, AppSpec, EnvEntry, InitSpec, RevisionSpec, TrafficEntry};
 use super::boot_env::aca_boot_env;
-use super::deploy_target::{AcaDeployTarget, AcaTargetError, AppRef, AppState, RevisionRef, RevisionStatus};
+use super::deploy_target::{
+    AcaDeployTarget, AcaTargetError, AppRef, AppState, RevisionRef, RevisionStatus,
+};
 use super::naming::{app_name, revision_name, revision_suffix};
 use super::params::AcaParams;
 use super::registry_credential::OCI_PASSWORD_ENV;
@@ -21,7 +21,7 @@ use super::revision_intent::{
 };
 use super::seed::{
     DEV_STORE_FILE, ENVIRONMENT_SEED_FILE, SEED_INIT_IMAGE, SeedFile, check_value, content_var,
-    file_secret_name, init_script, seed_secret_name, sha256_hex, sha_var, validate_seed,
+    file_secret_name, init_script, seed_secret_name, sha_var, sha256_hex, validate_seed,
 };
 use super::sizing;
 use crate::env_packs::deployer::{DeployerError, WarmOutcome};
@@ -67,9 +67,15 @@ pub(crate) fn traffic_for_new(previous: &[TrafficEntry], new_name: &str) -> Vec<
         for t in &mut out {
             t.weight = 0;
         }
-        out.push(TrafficEntry { revision_name: new_name.to_string(), weight: 100 });
+        out.push(TrafficEntry {
+            revision_name: new_name.to_string(),
+            weight: 100,
+        });
     } else {
-        out.push(TrafficEntry { revision_name: new_name.to_string(), weight: 0 });
+        out.push(TrafficEntry {
+            revision_name: new_name.to_string(),
+            weight: 0,
+        });
     }
     out
 }
@@ -115,11 +121,19 @@ fn seed_files(
     dev_secrets: Option<&[u8]>,
 ) -> Result<Vec<SeedFile>, DeployerError> {
     let environment_json = seed_environment_bytes(env, &[revision_id]).map_err(|e| {
-        DeployerError::Provider(format!("serializing environment.json for seed staging: {e}"))
+        DeployerError::Provider(format!(
+            "serializing environment.json for seed staging: {e}"
+        ))
     })?;
-    let mut files = vec![SeedFile { name: ENVIRONMENT_SEED_FILE.to_string(), bytes: environment_json }];
+    let mut files = vec![SeedFile {
+        name: ENVIRONMENT_SEED_FILE.to_string(),
+        bytes: environment_json,
+    }];
     if let Some(dev) = dev_secrets {
-        files.push(SeedFile { name: DEV_STORE_FILE.to_string(), bytes: dev.to_vec() });
+        files.push(SeedFile {
+            name: DEV_STORE_FILE.to_string(),
+            bytes: dev.to_vec(),
+        });
     }
     for f in &files {
         validate_seed(f).map_err(|e| DeployerError::Provider(e.to_string()))?;
@@ -185,14 +199,20 @@ fn plan(
         secret_env_names: &secret_env_names,
         seed_init_image: SEED_INIT_IMAGE,
     });
-    let mut env_entries: Vec<EnvEntry> =
-        boot_env.iter().map(|(k, v)| EnvEntry::plain(k, v)).collect();
+    let mut env_entries: Vec<EnvEntry> = boot_env
+        .iter()
+        .map(|(k, v)| EnvEntry::plain(k, v))
+        .collect();
     env_entries.extend(secret_env);
     env_entries.push(EnvEntry::plain(INTENT_ENV, &intent));
     Ok(Plan {
         spec_secrets: secrets,
         env: env_entries,
-        init: InitSpec { image: SEED_INIT_IMAGE.to_string(), script, env: init_env },
+        init: InitSpec {
+            image: SEED_INIT_IMAGE.to_string(),
+            script,
+            env: init_env,
+        },
         intent,
     })
 }
@@ -214,7 +234,11 @@ impl AzureAcaDeployerHandler {
                 env_id: env.environment_id.clone(),
                 revision_id,
             })?;
-        let files = seed_files(env, revision_id, self.dev_secrets.as_ref().map(super::DevSecrets::as_bytes))?;
+        let files = seed_files(
+            env,
+            revision_id,
+            self.dev_secrets.as_ref().map(super::DevSecrets::as_bytes),
+        )?;
         let image = params.runtime_image_for(revision.runtime_image_digest.as_deref());
         let res = sizing::snap(params.cpu.as_deref(), params.memory.as_deref())
             .map_err(|e| DeployerError::Provider(format!("invalid answers: {e}")))?;
@@ -223,21 +247,33 @@ impl AzureAcaDeployerHandler {
         let name = app_name(&revision.deployment_id);
         let suffix = revision_suffix(&revision_id);
         let rev_name = revision_name(&name, &suffix);
-        let app = AppRef { name: name.as_str().to_string() };
-        let rev_ref = RevisionRef { app: app.clone(), name: rev_name.clone() };
+        let app = AppRef {
+            name: name.as_str().to_string(),
+        };
+        let rev_ref = RevisionRef {
+            app: app.clone(),
+            name: rev_name.clone(),
+        };
         let ours = env_owner_stamp(env.environment_id.as_str());
 
         let previous = match self.target.inspect_app(&app).await.map_err(provider)? {
             AppState::Absent => Vec::new(),
             AppState::Present { owner, traffic } => {
                 if owner.as_deref() != Some(ours.as_str()) {
-                    return Err(DeployerError::Provider(foreign_owner(&app.name, owner.as_deref())));
+                    return Err(DeployerError::Provider(foreign_owner(
+                        &app.name,
+                        owner.as_deref(),
+                    )));
                 }
                 traffic
             }
         };
 
-        let live = self.target.live_revision_intent(&rev_ref).await.map_err(provider)?;
+        let live = self
+            .target
+            .live_revision_intent(&rev_ref)
+            .await
+            .map_err(provider)?;
         match classify(live, &plan.intent) {
             IntentVerdict::Converge => {}
             IntentVerdict::Conflict { live } => {
@@ -268,14 +304,22 @@ impl AzureAcaDeployerHandler {
                 self.target.put_revision(&spec).await.map_err(provider)?;
                 // A rival warm that created this revision between the probe and
                 // the PUT would otherwise be adopted silently.
-                let after = self.target.live_revision_intent(&rev_ref).await.map_err(provider)?;
+                let after = self
+                    .target
+                    .live_revision_intent(&rev_ref)
+                    .await
+                    .map_err(provider)?;
                 if let IntentVerdict::Conflict { live } = classify(after, &plan.intent) {
                     return Err(revision_conflict(revision_id, &plan.intent, live));
                 }
             }
         }
         wait_running(self.target.as_ref(), &rev_ref, timeout, poll).await?;
-        let endpoint_url = self.target.discover_endpoint(&app).await.map_err(provider)?;
+        let endpoint_url = self
+            .target
+            .discover_endpoint(&app)
+            .await
+            .map_err(provider)?;
         Ok(WarmOutcome { endpoint_url })
     }
 }

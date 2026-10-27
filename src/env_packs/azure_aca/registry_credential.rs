@@ -109,7 +109,9 @@ mod tests {
     #[test]
     fn blank_is_none_and_both_set_parses() {
         assert_eq!(parse(None, Some(&json!(" "))).unwrap(), None);
-        let c = parse(Some(&json!("tok")), Some(&json!("pw"))).unwrap().unwrap();
+        let c = parse(Some(&json!("tok")), Some(&json!("pw")))
+            .unwrap()
+            .unwrap();
         assert_eq!(c.username(), "tok");
         assert_eq!(c.password().expose(), "pw");
     }
@@ -123,7 +125,9 @@ mod tests {
 
     #[test]
     fn debug_hides_the_password() {
-        let c = parse(Some(&json!("tok")), Some(&json!("hunter2"))).unwrap().unwrap();
+        let c = parse(Some(&json!("tok")), Some(&json!("hunter2")))
+            .unwrap()
+            .unwrap();
         assert!(!format!("{c:?}").contains("hunter2"));
     }
 }

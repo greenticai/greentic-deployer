@@ -43,7 +43,10 @@ fn accepts_the_documented_keys() {
     assert_eq!(p.acr_login_server.as_deref(), Some("myacr.azurecr.io"));
     assert_eq!(p.min_instances, 1);
     assert!(p.registry.is_some());
-    assert!(p.managed_environment_id().ends_with("/managedEnvironments/gtc-env"));
+    assert!(
+        p.managed_environment_id()
+            .ends_with("/managedEnvironments/gtc-env")
+    );
 }
 
 #[test]
@@ -51,7 +54,10 @@ fn defaults_are_scale_to_zero_single_instance_southeastasia() {
     let p = AcaParams::from_answers(Some(&base())).unwrap();
     assert_eq!((p.min_instances, p.max_instances), (0, 1));
     assert_eq!(p.location, "southeastasia");
-    assert_eq!(p.runtime_image_for(None), format!("{RUNTIME_IMAGE_REPO}:develop"));
+    assert_eq!(
+        p.runtime_image_for(None),
+        format!("{RUNTIME_IMAGE_REPO}:develop")
+    );
 }
 
 #[test]
@@ -62,19 +68,43 @@ fn max_and_min_instances_are_bounded() {
 
 #[test]
 fn unknown_and_cross_cloud_keys_are_unknown_key() {
-    for k in ["access_mode", "secret_prefix", "cluster", "alb_listener_arn", "region", "project"] {
+    for k in [
+        "access_mode",
+        "secret_prefix",
+        "cluster",
+        "alb_listener_arn",
+        "region",
+        "project",
+    ] {
         let e = AcaParams::from_answers(Some(&with(k, json!("x")))).unwrap_err();
-        assert!(matches!(e, AcaParamsError::UnknownKey(ref n) if n == k), "{k}: {e}");
+        assert!(
+            matches!(e, AcaParamsError::UnknownKey(ref n) if n == k),
+            "{k}: {e}"
+        );
     }
 }
 
 #[test]
 fn scope_answers_are_required_and_validated() {
-    assert!(matches!(AcaParams::from_answers(None), Err(AcaParamsError::Missing(_))));
-    for k in ["subscription_id", "tenant_id", "resource_group", "environment_name"] {
+    assert!(matches!(
+        AcaParams::from_answers(None),
+        Err(AcaParamsError::Missing(_))
+    ));
+    for k in [
+        "subscription_id",
+        "tenant_id",
+        "resource_group",
+        "environment_name",
+    ] {
         let mut a = base();
         a.as_object_mut().unwrap().remove(k);
-        assert!(matches!(AcaParams::from_answers(Some(&a)), Err(AcaParamsError::Missing(_))), "{k}");
+        assert!(
+            matches!(
+                AcaParams::from_answers(Some(&a)),
+                Err(AcaParamsError::Missing(_))
+            ),
+            "{k}"
+        );
     }
     assert!(AcaParams::from_answers(Some(&with("subscription_id", json!("not-a-guid")))).is_err());
     assert!(AcaParams::from_answers(Some(&with("resource_group", json!("a b")))).is_err());
@@ -82,13 +112,21 @@ fn scope_answers_are_required_and_validated() {
 
 #[test]
 fn bad_digest_telemetry_and_lone_registry_half_are_errors() {
-    assert!(AcaParams::from_answers(Some(&with("runtime_image_digest", json!("sha256:abc")))).is_err());
+    assert!(
+        AcaParams::from_answers(Some(&with("runtime_image_digest", json!("sha256:abc")))).is_err()
+    );
     let d = format!("sha256:{}", "a".repeat(64));
     let p = AcaParams::from_answers(Some(&with("runtime_image_digest", json!(d)))).unwrap();
     assert!(p.runtime_image_for(None).contains('@'));
-    assert!(p.runtime_image_for(Some("sha256:pin")).ends_with("@sha256:pin"));
+    assert!(
+        p.runtime_image_for(Some("sha256:pin"))
+            .ends_with("@sha256:pin")
+    );
     let bad_tel = with("telemetry_env", json!({"NOT_ALLOWED": "x"}));
-    assert!(matches!(AcaParams::from_answers(Some(&bad_tel)), Err(AcaParamsError::Telemetry(_))));
+    assert!(matches!(
+        AcaParams::from_answers(Some(&bad_tel)),
+        Err(AcaParamsError::Telemetry(_))
+    ));
     assert!(AcaParams::from_answers(Some(&with("oci_username", json!("u")))).is_err());
 }
 
@@ -99,5 +137,8 @@ fn debug_never_prints_secrets() {
     a["telemetry_headers"] = json!("Authorization=Bearer topsecret");
     let p = AcaParams::from_answers(Some(&a)).unwrap();
     let shown = format!("{p:?}");
-    assert!(!shown.contains("hunter2-secret") && !shown.contains("topsecret"), "{shown}");
+    assert!(
+        !shown.contains("hunter2-secret") && !shown.contains("topsecret"),
+        "{shown}"
+    );
 }

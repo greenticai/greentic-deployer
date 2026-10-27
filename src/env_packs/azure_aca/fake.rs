@@ -58,7 +58,10 @@ impl InMemoryAca {
     }
 
     pub(crate) fn app_names(&self) -> Vec<String> {
-        self.apps.lock().map(|g| g.keys().cloned().collect()).unwrap_or_default()
+        self.apps
+            .lock()
+            .map(|g| g.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn revisions_of(&self, app: &str) -> Vec<String> {
@@ -81,7 +84,10 @@ impl InMemoryAca {
         self.apps
             .lock()
             .ok()
-            .and_then(|g| g.get(app).map(|a| a.secrets.iter().map(|s| s.name.clone()).collect()))
+            .and_then(|g| {
+                g.get(app)
+                    .map(|a| a.secrets.iter().map(|s| s.name.clone()).collect())
+            })
             .unwrap_or_default()
     }
 
@@ -90,7 +96,10 @@ impl InMemoryAca {
         if let Ok(mut g) = self.apps.lock() {
             g.insert(
                 name.to_string(),
-                FakeApp { owner: owner.map(str::to_string), ..FakeApp::default() },
+                FakeApp {
+                    owner: owner.map(str::to_string),
+                    ..FakeApp::default()
+                },
             );
         }
     }
@@ -127,29 +136,45 @@ impl AcaDeployTarget for InMemoryAca {
         let g = self.apps.lock().map_err(|_| poisoned())?;
         Ok(match g.get(&app.name) {
             None => AppState::Absent,
-            Some(a) => AppState::Present { owner: a.owner.clone(), traffic: a.traffic.clone() },
+            Some(a) => AppState::Present {
+                owner: a.owner.clone(),
+                traffic: a.traffic.clone(),
+            },
         })
     }
 
     async fn list_secrets(&self, app: &AppRef) -> Result<Vec<AppSecret>, AcaTargetError> {
         self.record(format!("list_secrets:{}", app.name));
         let g = self.apps.lock().map_err(|_| poisoned())?;
-        Ok(g.get(&app.name).map(|a| a.secrets.clone()).unwrap_or_default())
+        Ok(g.get(&app.name)
+            .map(|a| a.secrets.clone())
+            .unwrap_or_default())
     }
 
     async fn put_revision(&self, spec: &AppSpec) -> Result<RevisionRef, AcaTargetError> {
-        let app = AppRef { name: spec.name.as_str().to_string() };
+        let app = AppRef {
+            name: spec.name.as_str().to_string(),
+        };
         let name = revision_name(&spec.name, &spec.revision.suffix);
         self.record(format!("put_revision:{name}"));
         let total: u32 = spec.traffic.iter().map(|t| t.weight).sum();
         if !spec.traffic.is_empty() && total != 100 {
-            return Err(AcaTargetError::Api(format!("traffic sums to {total}, not 100")));
+            return Err(AcaTargetError::Api(format!(
+                "traffic sums to {total}, not 100"
+            )));
         }
         let mut g = self.apps.lock().map_err(|_| poisoned())?;
         let entry = g.entry(app.name.clone()).or_default();
-        let incoming_owner = spec.tags.iter().find(|(k, _)| k == OWNER_TAG).map(|(_, v)| v.clone());
+        let incoming_owner = spec
+            .tags
+            .iter()
+            .find(|(k, _)| k == OWNER_TAG)
+            .map(|(_, v)| v.clone());
         if entry.owner.is_some() && entry.owner != incoming_owner {
-            return Err(AcaTargetError::Conflict(format!("app `{}` has another owner", app.name)));
+            return Err(AcaTargetError::Conflict(format!(
+                "app `{}` has another owner",
+                app.name
+            )));
         }
         entry.owner = incoming_owner;
         let new_intent = intent_of(spec);
@@ -175,15 +200,26 @@ impl AcaDeployTarget for InMemoryAca {
                 }
             }
         }
-        let status = match self.fail_next_revision.lock().map_err(|_| poisoned())?.take() {
+        let status = match self
+            .fail_next_revision
+            .lock()
+            .map_err(|_| poisoned())?
+            .take()
+        {
             Some(reason) => RevisionStatus::Failed { reason },
-            None => RevisionStatus::Running { replicas: spec.revision.min_replicas },
+            None => RevisionStatus::Running {
+                replicas: spec.revision.min_replicas,
+            },
         };
         entry.secrets = spec.secrets.clone();
         entry.traffic = spec.traffic.clone();
         entry.revisions.insert(
             name.clone(),
-            FakeRevision { intent: new_intent, status, secret_refs: secret_refs(spec) },
+            FakeRevision {
+                intent: new_intent,
+                status,
+                secret_refs: secret_refs(spec),
+            },
         );
         Ok(RevisionRef { app, name })
     }
@@ -191,10 +227,17 @@ impl AcaDeployTarget for InMemoryAca {
     async fn live_revision_intent(&self, rev: &RevisionRef) -> Result<LiveIntent, AcaTargetError> {
         self.record(format!("live_revision_intent:{}", rev.name));
         let g = self.apps.lock().map_err(|_| poisoned())?;
-        Ok(match g.get(&rev.app.name).and_then(|a| a.revisions.get(&rev.name)) {
-            None => LiveIntent::Absent,
-            Some(r) => LiveIntent::Present { intent: r.intent.clone() },
-        })
+        Ok(
+            match g
+                .get(&rev.app.name)
+                .and_then(|a| a.revisions.get(&rev.name))
+            {
+                None => LiveIntent::Absent,
+                Some(r) => LiveIntent::Present {
+                    intent: r.intent.clone(),
+                },
+            },
+        )
     }
 
     async fn revision_status(&self, rev: &RevisionRef) -> Result<RevisionStatus, AcaTargetError> {
@@ -213,7 +256,9 @@ impl AcaDeployTarget for InMemoryAca {
         self.record(format!("set_traffic:{}", app.name));
         let total: u32 = weights.iter().map(|t| t.weight).sum();
         if total != 100 {
-            return Err(AcaTargetError::Api(format!("traffic sums to {total}, not 100")));
+            return Err(AcaTargetError::Api(format!(
+                "traffic sums to {total}, not 100"
+            )));
         }
         let mut g = self.apps.lock().map_err(|_| poisoned())?;
         let a = g
@@ -234,7 +279,10 @@ impl AcaDeployTarget for InMemoryAca {
     async fn deactivate_revision(&self, rev: &RevisionRef) -> Result<(), AcaTargetError> {
         self.record(format!("deactivate_revision:{}", rev.name));
         let mut g = self.apps.lock().map_err(|_| poisoned())?;
-        if let Some(r) = g.get_mut(&rev.app.name).and_then(|a| a.revisions.get_mut(&rev.name)) {
+        if let Some(r) = g
+            .get_mut(&rev.app.name)
+            .and_then(|a| a.revisions.get_mut(&rev.name))
+        {
             r.status = RevisionStatus::Inactive;
         }
         Ok(())
@@ -248,8 +296,12 @@ impl AcaDeployTarget for InMemoryAca {
 
     async fn discover_endpoint(&self, app: &AppRef) -> Result<Option<String>, AcaTargetError> {
         let g = self.apps.lock().map_err(|_| poisoned())?;
-        Ok(g.contains_key(&app.name)
-            .then(|| format!("https://{}.example.southeastasia.azurecontainerapps.io", app.name)))
+        Ok(g.contains_key(&app.name).then(|| {
+            format!(
+                "https://{}.example.southeastasia.azurecontainerapps.io",
+                app.name
+            )
+        }))
     }
 }
 

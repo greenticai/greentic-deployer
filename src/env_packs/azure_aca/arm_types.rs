@@ -35,7 +35,10 @@ pub(crate) struct AppSecret {
 
 impl AppSecret {
     pub(crate) fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { name: name.into(), value: SecretValue::new(value) }
+        Self {
+            name: name.into(),
+            value: SecretValue::new(value),
+        }
     }
 }
 
@@ -48,11 +51,17 @@ pub(crate) enum EnvEntry {
 impl EnvEntry {
     /// A non-secret value (boot env, a digest).
     pub(crate) fn plain(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self::Plain { name: name.into(), value: value.into() }
+        Self::Plain {
+            name: name.into(),
+            value: value.into(),
+        }
     }
     /// A value sourced from an app secret.
     pub(crate) fn secret_ref(name: impl Into<String>, secret: impl Into<String>) -> Self {
-        Self::SecretRef { name: name.into(), secret: secret.into() }
+        Self::SecretRef {
+            name: name.into(),
+            secret: secret.into(),
+        }
     }
     pub(crate) fn name(&self) -> &str {
         match self {
@@ -103,5 +112,7 @@ pub(crate) struct AppSpec {
 
 /// Refusal to change a secret a live revision may reference.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("secret `{0}` already exists with different content; ACA secrets are content-addressed here and never rewritten")]
+#[error(
+    "secret `{0}` already exists with different content; ACA secrets are content-addressed here and never rewritten"
+)]
 pub(crate) struct SecretConflict(pub String);

@@ -120,15 +120,23 @@ pub(crate) fn up(
     // `env_up_deployer_gate`). A build without `creds-gcp` cannot recognize the
     // Cloud Run kind, so it treats a Cloud Run manifest as k8s; such a build
     // cannot deploy Cloud Run regardless, and apply is idempotent.
+    let targets_azure = manifest_targets_azure(store, &env_id, &manifest)?;
     let targets_cloudrun = manifest_targets_cloudrun(store, &env_id, &manifest)?;
     let targets_aws_ecs = manifest_targets_aws_ecs(store, &env_id, &manifest)?;
-    if let Err(missing) = env_up_deployer_gate(
-        targets_cloudrun,
-        targets_aws_ecs,
-        cfg!(feature = "deploy-gcp-cloudrun"),
-        cfg!(all(feature = "creds-aws", feature = "deploy-aws-ecs")),
-        cfg!(feature = "k8s-client"),
-    ) {
+    if targets_azure && !cfg!(all(feature = "creds-azure", feature = "deploy-azure-aca")) {
+        return Err(OpError::Conflict(
+            super::env_azure::NO_DEPLOY_FEATURE.to_string(),
+        ));
+    }
+    if !targets_azure
+        && let Err(missing) = env_up_deployer_gate(
+            targets_cloudrun,
+            targets_aws_ecs,
+            cfg!(feature = "deploy-gcp-cloudrun"),
+            cfg!(all(feature = "creds-aws", feature = "deploy-aws-ecs")),
+            cfg!(feature = "k8s-client"),
+        )
+    {
         return Err(OpError::Conflict(match missing {
             "deploy-gcp-cloudrun" => "this build was compiled without the \
                  `deploy-gcp-cloudrun` feature; `op env up` needs it to deploy a \
@@ -379,7 +387,10 @@ fn imperative_bring_up(
     if let Some(result) = super::env::cloudrun_env_up(store, registry, env_id)? {
         return Ok(Some(result));
     }
-    super::env_aws_up::aws_env_up(store, registry, env_id)
+    if let Some(result) = super::env_aws_up::aws_env_up(store, registry, env_id)? {
+        return Ok(Some(result));
+    }
+    super::env_azure_up::azure_env_up(store, registry, env_id)
 }
 
 /// Whether THIS build can converge the effective `op env up` deployer, or must
@@ -469,6 +480,18 @@ fn manifest_targets_aws_ecs(
 ) -> Result<bool, OpError> {
     Ok(manifest_deployer_kind(store, env_id, manifest)?
         .is_some_and(|d| super::env_aws_up::names_aws_ecs_deployer(&d)))
+}
+
+/// Whether `op env up`'s effective desired deployer is Azure Container Apps.
+/// Recognized by descriptor path in every build, so a build without the live
+/// client refuses by name instead of gating the env as k8s.
+fn manifest_targets_azure(
+    store: &LocalFsStore,
+    env_id: &greentic_deploy_spec::EnvId,
+    manifest: &EnvManifest,
+) -> Result<bool, OpError> {
+    Ok(manifest_deployer_kind(store, env_id, manifest)?
+        .is_some_and(|d| super::env_azure_up::names_azure_aca_deployer(&d)))
 }
 
 /// Phase 5 — reconcile + rollout, gated on `k8s-client`.

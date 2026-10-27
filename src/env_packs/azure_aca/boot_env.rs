@@ -23,11 +23,26 @@ pub(crate) fn aca_boot_env(
         ("GREENTIC_ENV_ID".to_string(), env_id.to_string()),
         ("GREENTIC_SEED_DIR".to_string(), SEED_MOUNT_DIR.to_string()),
         ("HOME".to_string(), RUNTIME_HOME.to_string()),
-        ("GREENTIC_GATEWAY_LISTEN_ADDR".to_string(), "0.0.0.0".to_string()),
-        ("GREENTIC_REVISION_ID".to_string(), revision.revision_id.0.to_string()),
-        ("GREENTIC_DEPLOYMENT_ID".to_string(), revision.deployment_id.0.to_string()),
-        ("GREENTIC_BUNDLE_ID".to_string(), revision.bundle_id.as_str().to_string()),
-        ("GREENTIC_BUNDLE_DIGEST".to_string(), revision.bundle_digest.clone()),
+        (
+            "GREENTIC_GATEWAY_LISTEN_ADDR".to_string(),
+            "0.0.0.0".to_string(),
+        ),
+        (
+            "GREENTIC_REVISION_ID".to_string(),
+            revision.revision_id.0.to_string(),
+        ),
+        (
+            "GREENTIC_DEPLOYMENT_ID".to_string(),
+            revision.deployment_id.0.to_string(),
+        ),
+        (
+            "GREENTIC_BUNDLE_ID".to_string(),
+            revision.bundle_id.as_str().to_string(),
+        ),
+        (
+            "GREENTIC_BUNDLE_DIGEST".to_string(),
+            revision.bundle_digest.clone(),
+        ),
     ];
     if let Some(t) = &params.runtime_tenant {
         vars.push(("GREENTIC_TENANT".to_string(), t.clone()));
@@ -68,14 +83,24 @@ mod tests {
             "runtime_tenant": "acme", "runtime_team": "ops",
             "telemetry_env": {"OTEL_SERVICE_NAME": "svc"}
         }));
-        let names: Vec<String> =
-            aca_boot_env(&env, &env.revisions[0], &p).into_iter().map(|(k, _)| k).collect();
+        let names: Vec<String> = aca_boot_env(&env, &env.revisions[0], &p)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(
             names[..11],
             [
-                "GREENTIC_ENV", "GREENTIC_ENV_ID", "GREENTIC_SEED_DIR", "HOME",
-                "GREENTIC_GATEWAY_LISTEN_ADDR", "GREENTIC_REVISION_ID", "GREENTIC_DEPLOYMENT_ID",
-                "GREENTIC_BUNDLE_ID", "GREENTIC_BUNDLE_DIGEST", "GREENTIC_TENANT", "GREENTIC_TEAM",
+                "GREENTIC_ENV",
+                "GREENTIC_ENV_ID",
+                "GREENTIC_SEED_DIR",
+                "HOME",
+                "GREENTIC_GATEWAY_LISTEN_ADDR",
+                "GREENTIC_REVISION_ID",
+                "GREENTIC_DEPLOYMENT_ID",
+                "GREENTIC_BUNDLE_ID",
+                "GREENTIC_BUNDLE_DIGEST",
+                "GREENTIC_TENANT",
+                "GREENTIC_TEAM",
             ]
         );
         assert!(names.contains(&"OTEL_SERVICE_NAME".to_string()));
@@ -92,6 +117,10 @@ mod tests {
         let joined = format!("{vars:?}");
         assert!(!joined.contains("topsecret") && !joined.contains("hunter2"));
         assert!(vars.iter().any(|(k, v)| k == "OCI_USERNAME" && v == "tok"));
-        assert!(!vars.iter().any(|(k, _)| k == "OCI_PASSWORD" || k == "OTLP_HEADERS"));
+        assert!(
+            !vars
+                .iter()
+                .any(|(k, _)| k == "OCI_PASSWORD" || k == "OTLP_HEADERS")
+        );
     }
 }

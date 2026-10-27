@@ -40,11 +40,16 @@ pub struct AzureAcaDeployerCredentials {
 
 impl AzureAcaDeployerCredentials {
     pub fn with_client(client: Arc<dyn AzureValidatorClient>) -> Self {
-        Self { client: Some(client) }
+        Self {
+            client: Some(client),
+        }
     }
 
     fn action_cap(action: &str) -> Capability {
-        Capability::new(format!("azure-aca.rbac.{action}"), format!("ARM action `{action}` is permitted"))
+        Capability::new(
+            format!("azure-aca.rbac.{action}"),
+            format!("ARM action `{action}` is permitted"),
+        )
     }
 
     fn caps() -> Vec<Capability> {
@@ -62,7 +67,9 @@ impl AzureAcaDeployerCredentials {
                 .into_iter()
                 .map(|capability| CapabilityCheck {
                     capability,
-                    status: CapabilityStatus::Fail { reason: reason.to_string() },
+                    status: CapabilityStatus::Fail {
+                        reason: reason.to_string(),
+                    },
                 })
                 .collect(),
         )
@@ -83,7 +90,10 @@ fn default_client() -> Result<Arc<dyn AzureValidatorClient>, String> {
 
 #[cfg(not(feature = "deploy-azure-aca"))]
 fn default_client() -> Result<Arc<dyn AzureValidatorClient>, String> {
-    Err("this build was compiled without the `deploy-azure-aca` feature; it cannot probe Azure".to_string())
+    Err(
+        "this build was compiled without the `deploy-azure-aca` feature; it cannot probe Azure"
+            .to_string(),
+    )
 }
 
 /// Sync -> async bridge on a scoped thread; a failed runtime build is an error,
@@ -119,16 +129,31 @@ pub(crate) fn report_for(
             CapabilityStatus::Fail { reason: e.clone() },
         ),
     };
-    checks.push(CapabilityCheck { capability: Capability::new(TOKEN_CAP, "Entra client-credentials token acquired for ARM"), status: token_env.0 });
-    checks.push(CapabilityCheck { capability: Capability::new(ENVIRONMENT_CAP, "managed environment is readable"), status: token_env.1 });
+    checks.push(CapabilityCheck {
+        capability: Capability::new(TOKEN_CAP, "Entra client-credentials token acquired for ARM"),
+        status: token_env.0,
+    });
+    checks.push(CapabilityCheck {
+        capability: Capability::new(ENVIRONMENT_CAP, "managed environment is readable"),
+        status: token_env.1,
+    });
     for action in REQUIRED_ACTIONS {
         let status = match &perms {
             Ok(p) if action_allowed(p, action) => CapabilityStatus::Pass,
-            Ok(p) if p.is_empty() => CapabilityStatus::Fail { reason: format!("no permissions returned; `{action}` is not granted") },
-            Ok(_) => CapabilityStatus::Fail { reason: format!("`{action}` is not granted at the resource group") },
-            Err(e) => CapabilityStatus::Fail { reason: format!("could not read permissions: {e}") },
+            Ok(p) if p.is_empty() => CapabilityStatus::Fail {
+                reason: format!("no permissions returned; `{action}` is not granted"),
+            },
+            Ok(_) => CapabilityStatus::Fail {
+                reason: format!("`{action}` is not granted at the resource group"),
+            },
+            Err(e) => CapabilityStatus::Fail {
+                reason: format!("could not read permissions: {e}"),
+            },
         };
-        checks.push(CapabilityCheck { capability: AzureAcaDeployerCredentials::action_cap(action), status });
+        checks.push(CapabilityCheck {
+            capability: AzureAcaDeployerCredentials::action_cap(action),
+            status,
+        });
     }
     if let Ok(p) = &perms
         && is_broad(p)
@@ -153,7 +178,11 @@ impl DeployerCredentials for AzureAcaDeployerCredentials {
         };
         let probed = run_async(async move {
             let env = client.check_environment().await;
-            let perms = if env.is_ok() { client.effective_permissions().await } else { Err("skipped: environment unreachable".to_string()) };
+            let perms = if env.is_ok() {
+                client.effective_permissions().await
+            } else {
+                Err("skipped: environment unreachable".to_string())
+            };
             (env, perms)
         });
         match probed {
@@ -166,7 +195,9 @@ impl DeployerCredentials for AzureAcaDeployerCredentials {
         // Render-only: the Azure admin reviews and runs the script, then binds the
         // service principal with `op credentials rotate`.
         Ok(BootstrapOutcome {
-            rules_pack: render_rules_pack(&RulesInput { env_id: input.env_id.as_str() }),
+            rules_pack: render_rules_pack(&RulesInput {
+                env_id: input.env_id.as_str(),
+            }),
             bound_credentials_ref: None,
             bound_expiry: None,
             bound_secret_material: None,

@@ -45,10 +45,19 @@ fn seeds() -> Vec<AppSecret> {
 #[tokio::test]
 async fn put_revision_is_idempotent_for_the_same_intent_and_conflicts_otherwise() {
     let t = InMemoryAca::new();
-    let a = t.put_revision(&spec(0x10, "i1", seeds(), &[(0x10, 100)])).await.unwrap();
-    let b = t.put_revision(&spec(0x10, "i1", seeds(), &[(0x10, 100)])).await.unwrap();
+    let a = t
+        .put_revision(&spec(0x10, "i1", seeds(), &[(0x10, 100)]))
+        .await
+        .unwrap();
+    let b = t
+        .put_revision(&spec(0x10, "i1", seeds(), &[(0x10, 100)]))
+        .await
+        .unwrap();
     assert_eq!(a, b);
-    let e = t.put_revision(&spec(0x10, "i2", seeds(), &[(0x10, 100)])).await.unwrap_err();
+    let e = t
+        .put_revision(&spec(0x10, "i2", seeds(), &[(0x10, 100)]))
+        .await
+        .unwrap_err();
     assert!(matches!(e, AcaTargetError::Conflict(_)));
     assert_eq!(t.revisions_of(&a.app.name).len(), 1);
 }
@@ -56,8 +65,14 @@ async fn put_revision_is_idempotent_for_the_same_intent_and_conflicts_otherwise(
 #[tokio::test]
 async fn traffic_must_sum_to_100_and_name_known_revisions() {
     let t = InMemoryAca::new();
-    let r = t.put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)])).await.unwrap();
-    let w = |n: &str, w| TrafficEntry { revision_name: n.into(), weight: w };
+    let r = t
+        .put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)]))
+        .await
+        .unwrap();
+    let w = |n: &str, w| TrafficEntry {
+        revision_name: n.into(),
+        weight: w,
+    };
     assert!(t.set_traffic(&r.app, &[w(&r.name, 60)]).await.is_err());
     assert!(t.set_traffic(&r.app, &[w("nope", 100)]).await.is_err());
     t.set_traffic(&r.app, &[w(&r.name, 100)]).await.unwrap();
@@ -66,9 +81,16 @@ async fn traffic_must_sum_to_100_and_name_known_revisions() {
 #[tokio::test]
 async fn a_referenced_secret_cannot_be_dropped() {
     let t = InMemoryAca::new();
-    t.put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)])).await.unwrap();
+    t.put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)]))
+        .await
+        .unwrap();
     let e = t
-        .put_revision(&spec(0x20, "j", vec![AppSecret::new("other", "x")], &[(0x10, 100), (0x20, 0)]))
+        .put_revision(&spec(
+            0x20,
+            "j",
+            vec![AppSecret::new("other", "x")],
+            &[(0x10, 100), (0x20, 0)],
+        ))
         .await
         .unwrap_err();
     assert!(e.to_string().contains("still referenced"), "{e}");
@@ -77,9 +99,15 @@ async fn a_referenced_secret_cannot_be_dropped() {
 #[tokio::test]
 async fn delete_is_idempotent_and_deactivate_tolerates_absence() {
     let t = InMemoryAca::new();
-    let r = t.put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)])).await.unwrap();
+    let r = t
+        .put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)]))
+        .await
+        .unwrap();
     t.deactivate_revision(&r).await.unwrap();
-    assert_eq!(t.revision_status(&r).await.unwrap(), RevisionStatus::Inactive);
+    assert_eq!(
+        t.revision_status(&r).await.unwrap(),
+        RevisionStatus::Inactive
+    );
     assert!(t.delete_app(&r.app).await.unwrap());
     assert!(!t.delete_app(&r.app).await.unwrap());
     t.deactivate_revision(&r).await.unwrap();
@@ -90,10 +118,16 @@ async fn a_foreign_owner_is_reported_and_refused() {
     let t = InMemoryAca::new();
     let name = app_name(&DeploymentId(Ulid::from(1_u128)));
     t.seed_app(name.as_str(), Some("someone-else"));
-    let app = AppRef { name: name.as_str().into() };
+    let app = AppRef {
+        name: name.as_str().into(),
+    };
     assert!(matches!(
         t.inspect_app(&app).await.unwrap(),
         AppState::Present { owner: Some(o), .. } if o == "someone-else"
     ));
-    assert!(t.put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)])).await.is_err());
+    assert!(
+        t.put_revision(&spec(0x10, "i", seeds(), &[(0x10, 100)]))
+            .await
+            .is_err()
+    );
 }

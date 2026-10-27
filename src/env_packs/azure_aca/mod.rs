@@ -8,22 +8,36 @@
 //! `docs/azure-aca-seed-and-bundle-delivery.md`.
 
 pub(crate) mod arm_body;
+pub(crate) mod arm_http;
+pub(crate) mod arm_paths;
 pub(crate) mod arm_types;
-pub(crate) mod bootstrap;
-pub mod credentials;
 pub(crate) mod boot_env;
+pub(crate) mod bootstrap;
+#[cfg(feature = "deploy-azure-aca")]
+pub(crate) mod bound_session;
+pub mod credentials;
 pub(crate) mod deploy_target;
 pub mod deployer;
 pub(crate) mod deployer_warm;
 #[cfg(test)]
 pub(crate) mod fake;
+pub(crate) mod lro;
 pub(crate) mod naming;
 pub mod params;
-pub(crate) mod registry_credential;
-pub(crate) mod revision_intent;
 pub mod rbac;
+#[cfg(feature = "deploy-azure-aca")]
+pub(crate) mod real_target;
+#[cfg(feature = "deploy-azure-aca")]
+pub(crate) mod real_validator;
+pub(crate) mod registry_credential;
+#[cfg(feature = "deploy-azure-aca")]
+pub(crate) mod reqwest_http;
+pub(crate) mod revision_intent;
 pub(crate) mod seed;
 pub(crate) mod sizing;
+pub(crate) mod status;
+pub(crate) mod teardown;
+pub(crate) mod token;
 
 pub use credentials::{AzureAcaDeployerCredentials, AzureValidatorClient};
 pub use params::{AcaParams, AcaParamsError};
@@ -62,7 +76,11 @@ pub struct AzureAcaDeployerHandler {
 
 impl Default for AzureAcaDeployerHandler {
     fn default() -> Self {
-        Self { creds: AzureAcaDeployerCredentials::default(), target: Arc::new(UnconfiguredAcaTarget), dev_secrets: None }
+        Self {
+            creds: AzureAcaDeployerCredentials::default(),
+            target: Arc::new(UnconfiguredAcaTarget),
+            dev_secrets: None,
+        }
     }
 }
 
@@ -76,12 +94,22 @@ impl AzureAcaDeployerHandler {
         target: Arc<dyn AcaDeployTarget>,
         dev_secrets: Option<Vec<u8>>,
     ) -> Self {
-        Self { creds: AzureAcaDeployerCredentials::default(), target, dev_secrets: dev_secrets.map(DevSecrets) }
+        Self {
+            creds: AzureAcaDeployerCredentials::default(),
+            target,
+            dev_secrets: dev_secrets.map(DevSecrets),
+        }
     }
 }
 
 fn comparator(op: Op, major: u64, pre: Prerelease) -> Comparator {
-    Comparator { op, major, minor: Some(0), patch: Some(0), pre }
+    Comparator {
+        op,
+        major,
+        minor: Some(0),
+        patch: Some(0),
+        pre,
+    }
 }
 
 impl EnvPackHandler for AzureAcaDeployerHandler {

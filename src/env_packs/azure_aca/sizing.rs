@@ -36,7 +36,9 @@ pub(crate) enum SizingError {
     BadCpu(String),
     #[error("`{0}` is not a valid memory size (use e.g. `1Gi` or `512Mi`)")]
     BadMemory(String),
-    #[error("no Container Apps consumption size fits cpu {cpu:?} / memory {memory:?} (max 4 cpu, 8Gi)")]
+    #[error(
+        "no Container Apps consumption size fits cpu {cpu:?} / memory {memory:?} (max 4 cpu, 8Gi)"
+    )]
     TooLarge {
         cpu: Option<String>,
         memory: Option<String>,
@@ -120,8 +122,17 @@ mod tests {
     #[test]
     fn bad_and_oversized_requests_are_refused() {
         assert!(matches!(snap(Some("0"), None), Err(SizingError::BadCpu(_))));
-        assert!(matches!(snap(None, Some("1G")), Err(SizingError::BadMemory(_))));
-        assert!(matches!(snap(None, Some("9Gi")), Err(SizingError::TooLarge { .. })));
-        assert!(matches!(snap(Some("5"), None), Err(SizingError::TooLarge { .. })));
+        assert!(matches!(
+            snap(None, Some("1G")),
+            Err(SizingError::BadMemory(_))
+        ));
+        assert!(matches!(
+            snap(None, Some("9Gi")),
+            Err(SizingError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            snap(Some("5"), None),
+            Err(SizingError::TooLarge { .. })
+        ));
     }
 }

@@ -9,7 +9,9 @@
 //! | `apply_traffic_split` | Rewrite `ingress.traffic` only; weights are whole percents; every named revision must be `Running`. |
 
 use async_trait::async_trait;
-use greentic_deploy_spec::{BundleDeploymentStatus, DeploymentId, Environment, Revision, RevisionId};
+use greentic_deploy_spec::{
+    BundleDeploymentStatus, DeploymentId, Environment, Revision, RevisionId,
+};
 use serde_json::Value;
 
 use super::AzureAcaDeployerHandler;
@@ -106,7 +108,8 @@ impl Deployer for AzureAcaDeployerHandler {
     ) -> Result<WarmOutcome, DeployerError> {
         require_revision(env, revision_id)?;
         let params = params_from(answers)?;
-        self.warm(env, revision_id, &params, warm_timeout(), WARM_POLL).await
+        self.warm(env, revision_id, &params, warm_timeout(), WARM_POLL)
+            .await
     }
 
     async fn drain_revision(
@@ -129,7 +132,9 @@ impl Deployer for AzureAcaDeployerHandler {
         let revision = revision_of(env, revision_id)?;
         let _ = params_from(answers)?;
         let name = app_name(&revision.deployment_id);
-        let app = AppRef { name: name.as_str().to_string() };
+        let app = AppRef {
+            name: name.as_str().to_string(),
+        };
         if whole_bundle_retiring(env, revision) {
             // Deleting the app removes every revision and secret in one call, so
             // no per-revision deactivation runs (it would fail after the first).
@@ -139,7 +144,10 @@ impl Deployer for AzureAcaDeployerHandler {
                 app,
                 name: revision_name(&name, &revision_suffix(&revision_id)),
             };
-            self.target.deactivate_revision(&rev).await.map_err(provider)?;
+            self.target
+                .deactivate_revision(&rev)
+                .await
+                .map_err(provider)?;
         }
         Ok(ArchiveOutcome::default())
     }
@@ -153,12 +161,17 @@ impl Deployer for AzureAcaDeployerHandler {
         let outcome = enforce_split_invariants(env, deployment_id)?;
         let _ = params_from(answers)?;
         let name = app_name(&deployment_id);
-        let app = AppRef { name: name.as_str().to_string() };
+        let app = AppRef {
+            name: name.as_str().to_string(),
+        };
         let mut weights = Vec::with_capacity(outcome.applied_entries.len());
         for entry in &outcome.applied_entries {
             let weight = percent(entry.weight_bps)?;
             let rev_name = revision_name(&name, &revision_suffix(&entry.revision_id));
-            let rev = RevisionRef { app: app.clone(), name: rev_name.clone() };
+            let rev = RevisionRef {
+                app: app.clone(),
+                name: rev_name.clone(),
+            };
             match self.target.revision_status(&rev).await.map_err(provider)? {
                 RevisionStatus::Running { .. } => {}
                 other => {
@@ -167,9 +180,15 @@ impl Deployer for AzureAcaDeployerHandler {
                     )));
                 }
             }
-            weights.push(TrafficEntry { revision_name: rev_name, weight });
+            weights.push(TrafficEntry {
+                revision_name: rev_name,
+                weight,
+            });
         }
-        self.target.set_traffic(&app, &weights).await.map_err(provider)?;
+        self.target
+            .set_traffic(&app, &weights)
+            .await
+            .map_err(provider)?;
         Ok(outcome)
     }
 }

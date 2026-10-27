@@ -149,10 +149,17 @@ mod tests {
     #[test]
     fn classify_covers_the_three_cases() {
         assert_eq!(classify(LiveIntent::Absent, "x"), IntentVerdict::Create);
-        let same = LiveIntent::Present { intent: Some("x".into()) };
+        let same = LiveIntent::Present {
+            intent: Some("x".into()),
+        };
         assert_eq!(classify(same, "x"), IntentVerdict::Converge);
-        let diff = LiveIntent::Present { intent: Some("y".into()) };
-        assert!(matches!(classify(diff, "x"), IntentVerdict::Conflict { .. }));
+        let diff = LiveIntent::Present {
+            intent: Some("y".into()),
+        };
+        assert!(matches!(
+            classify(diff, "x"),
+            IntentVerdict::Conflict { .. }
+        ));
         let none = LiveIntent::Present { intent: None };
         assert_eq!(classify(none, "x"), IntentVerdict::Conflict { live: None });
     }

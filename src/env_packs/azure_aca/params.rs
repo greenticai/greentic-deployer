@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use super::registry_credential::{self, RegistryCredential};
 use crate::env_packs::RUNTIME_IMAGE_REPO;
-use crate::env_packs::telemetry::{self as telemetry_answers, TelemetryAnswerError, TelemetryAnswers};
+use crate::env_packs::telemetry::{
+    self as telemetry_answers, TelemetryAnswerError, TelemetryAnswers,
+};
 
 pub(crate) const DEFAULT_LOCATION: &str = "southeastasia";
 const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
@@ -59,11 +61,18 @@ fn string(key: &str, v: &Value) -> Result<String, AcaParamsError> {
 
 fn optional(key: &str, v: &Value) -> Result<Option<String>, AcaParamsError> {
     let s = string(key, v)?;
-    Ok(if s.trim().is_empty() { None } else { Some(s.trim().to_string()) })
+    Ok(if s.trim().is_empty() {
+        None
+    } else {
+        Some(s.trim().to_string())
+    })
 }
 
 fn invalid(key: &str, detail: impl Into<String>) -> AcaParamsError {
-    AcaParamsError::Invalid { key: key.to_string(), detail: detail.into() }
+    AcaParamsError::Invalid {
+        key: key.to_string(),
+        detail: detail.into(),
+    }
 }
 
 fn parse_u32(key: &str, v: &Value) -> Result<u32, AcaParamsError> {
@@ -71,7 +80,9 @@ fn parse_u32(key: &str, v: &Value) -> Result<u32, AcaParamsError> {
         return u32::try_from(n).map_err(|_| invalid(key, "out of range"));
     }
     let s = string(key, v)?;
-    s.trim().parse().map_err(|_| invalid(key, format!("`{s}` is not a non-negative integer")))
+    s.trim()
+        .parse()
+        .map_err(|_| invalid(key, format!("`{s}` is not a non-negative integer")))
 }
 
 fn is_guid(s: &str) -> bool {
@@ -98,24 +109,45 @@ fn resource_name(key: &str, v: &Value) -> Result<String, AcaParamsError> {
     let s = string(key, v)?.trim().to_string();
     let ok = !s.is_empty()
         && s.len() <= 90
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if ok { Ok(s) } else { Err(invalid(key, "must be 1-90 characters of [A-Za-z0-9_-]")) }
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(s)
+    } else {
+        Err(invalid(key, "must be 1-90 characters of [A-Za-z0-9_-]"))
+    }
 }
 
 fn digest(key: &str, v: &Value) -> Result<Option<String>, AcaParamsError> {
-    let Some(d) = optional(key, v)? else { return Ok(None) };
+    let Some(d) = optional(key, v)? else {
+        return Ok(None);
+    };
     let ok = d.strip_prefix("sha256:").is_some_and(|h| {
         h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     });
-    if ok { Ok(Some(d)) } else { Err(invalid(key, "is not a `sha256:<64 hex>` digest")) }
+    if ok {
+        Ok(Some(d))
+    } else {
+        Err(invalid(key, "is not a `sha256:<64 hex>` digest"))
+    }
 }
 
 fn host(key: &str, v: &Value) -> Result<Option<String>, AcaParamsError> {
-    let Some(h) = optional(key, v)? else { return Ok(None) };
+    let Some(h) = optional(key, v)? else {
+        return Ok(None);
+    };
     let ok = h.len() <= 253
-        && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
         && h.contains('.');
-    if ok { Ok(Some(h.to_ascii_lowercase())) } else { Err(invalid(key, "must be a registry host name, e.g. `myacr.azurecr.io`")) }
+    if ok {
+        Ok(Some(h.to_ascii_lowercase()))
+    } else {
+        Err(invalid(
+            key,
+            "must be a registry host name, e.g. `myacr.azurecr.io`",
+        ))
+    }
 }
 
 impl AcaParams {
@@ -155,15 +187,22 @@ impl AcaParams {
                 "environment_name" => envn = Some(resource_name(key, value)?),
                 "location" => {
                     if let Some(l) = optional(key, value)? {
-                        let ok = l.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+                        let ok = l
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
                         if !ok {
-                            return Err(invalid(key, "must be an Azure location name like `southeastasia`"));
+                            return Err(invalid(
+                                key,
+                                "must be an Azure location name like `southeastasia`",
+                            ));
                         }
                         p.location = l;
                     }
                 }
                 "acr_login_server" => p.acr_login_server = host(key, value)?,
-                "log_analytics_workspace_id" => p.log_analytics_workspace_id = optional(key, value)?,
+                "log_analytics_workspace_id" => {
+                    p.log_analytics_workspace_id = optional(key, value)?
+                }
                 "min_instances" => {
                     p.min_instances = parse_u32(key, value)?;
                     if p.min_instances > 1 {
@@ -173,7 +212,10 @@ impl AcaParams {
                 "max_instances" => {
                     p.max_instances = parse_u32(key, value)?;
                     if p.max_instances != 1 {
-                        return Err(invalid(key, "must be 1 (the per-replica seed has a single writer)"));
+                        return Err(invalid(
+                            key,
+                            "must be 1 (the per-replica seed has a single writer)",
+                        ));
                     }
                 }
                 "cpu" => p.cpu = optional(key, value)?,

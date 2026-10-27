@@ -115,15 +115,30 @@ mod tests {
     #[test]
     fn wildcard_matching_and_notactions() {
         assert!(pattern_matches("*", "Microsoft.App/containerApps/read"));
-        assert!(pattern_matches("Microsoft.App/*/read", "microsoft.app/containerApps/read"));
-        assert!(pattern_matches("Microsoft.App/containerApps/*", "Microsoft.App/containerApps/listSecrets/action"));
-        assert!(!pattern_matches("Microsoft.App/containerApps/read", "Microsoft.App/containerApps/write"));
-        assert!(!pattern_matches("Microsoft.Web/*", "Microsoft.App/containerApps/read"));
+        assert!(pattern_matches(
+            "Microsoft.App/*/read",
+            "microsoft.app/containerApps/read"
+        ));
+        assert!(pattern_matches(
+            "Microsoft.App/containerApps/*",
+            "Microsoft.App/containerApps/listSecrets/action"
+        ));
+        assert!(!pattern_matches(
+            "Microsoft.App/containerApps/read",
+            "Microsoft.App/containerApps/write"
+        ));
+        assert!(!pattern_matches(
+            "Microsoft.Web/*",
+            "Microsoft.App/containerApps/read"
+        ));
         let p = [perm(&["*"], &["Microsoft.App/containerApps/delete"])];
         assert!(action_allowed(&p, "Microsoft.App/containerApps/read"));
         assert!(!action_allowed(&p, "Microsoft.App/containerApps/delete"));
         // A notAction in one entry does not strip another entry's grant.
-        let two = [p[0].clone(), perm(&["Microsoft.App/containerApps/delete"], &[])];
+        let two = [
+            p[0].clone(),
+            perm(&["Microsoft.App/containerApps/delete"], &[]),
+        ];
         assert!(action_allowed(&two, "Microsoft.App/containerApps/delete"));
     }
 
@@ -147,13 +162,19 @@ mod tests {
         let p = [perm(&["*"], &["Microsoft.Authorization/*/Delete"])];
         assert!(missing_actions(&p).is_empty());
         assert!(is_broad(&p));
-        assert!(!is_broad(&[perm(&["Microsoft.App/containerApps/read"], &[])]));
+        assert!(!is_broad(&[perm(
+            &["Microsoft.App/containerApps/read"],
+            &[]
+        )]));
     }
 
     #[test]
     fn the_target_actions_are_a_subset_of_the_validator_set() {
         for a in REAL_ACA_TARGET_RBAC_ACTIONS {
-            assert!(REQUIRED_ACTIONS.contains(a), "{a} missing from REQUIRED_ACTIONS");
+            assert!(
+                REQUIRED_ACTIONS.contains(a),
+                "{a} missing from REQUIRED_ACTIONS"
+            );
         }
     }
 }

@@ -24,16 +24,26 @@ impl AzureValidatorClient for Scripted {
 fn run(c: &AzureAcaDeployerCredentials) -> RequirementsReport {
     let id = EnvId::try_from("local").unwrap();
     let cfg = EnvironmentHostConfig::new(id.clone());
-    c.validate(&ValidationContext { env_id: &id, env_root: Path::new("."), host_config: &cfg })
+    c.validate(&ValidationContext {
+        env_id: &id,
+        env_root: Path::new("."),
+        host_config: &cfg,
+    })
 }
 
 fn all_granted() -> Vec<Permission> {
-    vec![Permission { actions: REQUIRED_ACTIONS.iter().map(|s| s.to_string()).collect(), not_actions: vec![] }]
+    vec![Permission {
+        actions: REQUIRED_ACTIONS.iter().map(|s| s.to_string()).collect(),
+        not_actions: vec![],
+    }]
 }
 
 #[test]
 fn a_fully_granted_identity_passes_via_the_fake_client_only() {
-    let c = AzureAcaDeployerCredentials::with_client(Arc::new(Scripted { env: Ok(()), perms: Ok(all_granted()) }));
+    let c = AzureAcaDeployerCredentials::with_client(Arc::new(Scripted {
+        env: Ok(()),
+        perms: Ok(all_granted()),
+    }));
     let r = run(&c);
     assert!(r.passed(), "{:?}", r.missing());
     assert_eq!(r.checks.len(), c.required_capabilities().len());
@@ -41,8 +51,14 @@ fn a_fully_granted_identity_passes_via_the_fake_client_only() {
 
 #[test]
 fn missing_actions_are_reported_exactly() {
-    let perms = vec![Permission { actions: vec!["Microsoft.App/containerApps/read".into()], not_actions: vec![] }];
-    let c = AzureAcaDeployerCredentials::with_client(Arc::new(Scripted { env: Ok(()), perms: Ok(perms) }));
+    let perms = vec![Permission {
+        actions: vec!["Microsoft.App/containerApps/read".into()],
+        not_actions: vec![],
+    }];
+    let c = AzureAcaDeployerCredentials::with_client(Arc::new(Scripted {
+        env: Ok(()),
+        perms: Ok(perms),
+    }));
     let r = run(&c);
     assert!(!r.passed());
     let missing = r.missing();
@@ -52,10 +68,17 @@ fn missing_actions_are_reported_exactly() {
 
 #[test]
 fn an_unreachable_environment_fails_token_and_environment_and_skips_rbac() {
-    let c = AzureAcaDeployerCredentials::with_client(Arc::new(Scripted { env: Err("401 unauthorized".into()), perms: Ok(all_granted()) }));
+    let c = AzureAcaDeployerCredentials::with_client(Arc::new(Scripted {
+        env: Err("401 unauthorized".into()),
+        perms: Ok(all_granted()),
+    }));
     let r = run(&c);
     assert!(!r.passed());
-    assert!(r.checks.iter().all(|c| matches!(c.status, CapabilityStatus::Fail { .. })));
+    assert!(
+        r.checks
+            .iter()
+            .all(|c| matches!(c.status, CapabilityStatus::Fail { .. }))
+    );
 }
 
 #[test]
@@ -69,7 +92,11 @@ fn bootstrap_is_render_only_and_binds_nothing() {
     let id = EnvId::try_from("local").unwrap();
     let admin = ZeroizedAdmin::new("", String::new());
     let out = AzureAcaDeployerCredentials::default()
-        .bootstrap(&BootstrapInput { env_id: &id, env_root: Path::new("."), admin: &admin })
+        .bootstrap(&BootstrapInput {
+            env_id: &id,
+            env_root: Path::new("."),
+            admin: &admin,
+        })
         .unwrap();
     assert!(out.bound_credentials_ref.is_none() && out.bound_secret_material.is_none());
     assert_eq!(out.rules_pack.entries.len(), 3);

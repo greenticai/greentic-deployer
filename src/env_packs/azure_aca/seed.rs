@@ -35,7 +35,12 @@ pub(crate) struct SeedFile {
 
 impl std::fmt::Debug for SeedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SeedFile({}, <redacted {} bytes>)", self.name, self.bytes.len())
+        write!(
+            f,
+            "SeedFile({}, <redacted {} bytes>)",
+            self.name,
+            self.bytes.len()
+        )
     }
 }
 
@@ -45,7 +50,11 @@ pub(crate) enum SeedError {
         "seed file `{name}` is {size} bytes, over the {limit}-byte limit of one Container Apps \
          secret; refusing rather than truncating. Archive revisions nothing routes to to shrink it"
     )]
-    TooLarge { name: String, size: usize, limit: usize },
+    TooLarge {
+        name: String,
+        size: usize,
+        limit: usize,
+    },
     #[error("seed file `{name}` is not valid UTF-8")]
     NotUtf8 { name: String },
     #[error("seed file `{name}` contains a NUL byte, which an environment variable cannot carry")]
@@ -74,10 +83,14 @@ pub(crate) fn check_value(name: &str, bytes: &[u8]) -> Result<(), SeedError> {
         });
     }
     if std::str::from_utf8(bytes).is_err() {
-        return Err(SeedError::NotUtf8 { name: name.to_string() });
+        return Err(SeedError::NotUtf8 {
+            name: name.to_string(),
+        });
     }
     if bytes.contains(&0) {
-        return Err(SeedError::ContainsNul { name: name.to_string() });
+        return Err(SeedError::ContainsNul {
+            name: name.to_string(),
+        });
     }
     Ok(())
 }
@@ -87,7 +100,9 @@ fn validate_name(name: &str) -> Result<(), SeedError> {
         || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
-        || name.split('/').any(|c| c.is_empty() || c == "." || c == "..");
+        || name
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..");
     if bad {
         Err(SeedError::BadName(name.to_string()))
     } else {
@@ -121,7 +136,13 @@ fn var_stem(name: &str) -> String {
         DEV_STORE_FILE => "DEV_STORE".to_string(),
         other => other
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
             .collect(),
     }
 }
@@ -155,7 +176,10 @@ pub(crate) fn init_script(files: &[SeedFile]) -> Result<String, SeedError> {
             out.push_str(&format!("mkdir -p {SEED_MOUNT_DIR}/{dir}\n"));
         }
         out.push_str(&format!("printf '%s' \"${}\" > {path}\n", content_var(f)));
-        out.push_str(&format!("echo \"${}  {path}\" | sha256sum -c -s\n", sha_var(f)));
+        out.push_str(&format!(
+            "echo \"${}  {path}\" | sha256sum -c -s\n",
+            sha_var(f)
+        ));
     }
     Ok(out)
 }
@@ -165,18 +189,33 @@ mod tests {
     use super::*;
 
     fn f(name: &str, body: &str) -> SeedFile {
-        SeedFile { name: name.into(), bytes: body.as_bytes().to_vec() }
+        SeedFile {
+            name: name.into(),
+            bytes: body.as_bytes().to_vec(),
+        }
     }
 
     #[test]
     fn oversize_nul_or_non_utf8_is_refused_with_a_named_error() {
-        let big = SeedFile { name: "environment.json".into(), bytes: vec![b'a'; SEED_MAX_BYTES + 1] };
+        let big = SeedFile {
+            name: "environment.json".into(),
+            bytes: vec![b'a'; SEED_MAX_BYTES + 1],
+        };
         let e = validate_seed(&big).unwrap_err();
         assert!(matches!(e, SeedError::TooLarge { .. }));
         assert!(e.to_string().contains("environment.json"));
-        assert!(matches!(validate_seed(&f("environment.json", "a\0b")), Err(SeedError::ContainsNul { .. })));
-        let bad = SeedFile { name: "environment.json".into(), bytes: vec![0xff] };
-        assert!(matches!(validate_seed(&bad), Err(SeedError::NotUtf8 { .. })));
+        assert!(matches!(
+            validate_seed(&f("environment.json", "a\0b")),
+            Err(SeedError::ContainsNul { .. })
+        ));
+        let bad = SeedFile {
+            name: "environment.json".into(),
+            bytes: vec![0xff],
+        };
+        assert!(matches!(
+            validate_seed(&bad),
+            Err(SeedError::NotUtf8 { .. })
+        ));
         assert!(validate_seed(&f("environment.json", "{}")).is_ok());
     }
 
@@ -193,14 +232,25 @@ mod tests {
     fn script_creates_nested_dirs_and_checks_digests() {
         let s = init_script(&[f("environment.json", "{}"), f(DEV_STORE_FILE, "k=v")]).unwrap();
         assert!(s.starts_with("set -eu\numask 022\n"));
-        assert!(s.contains("printf '%s' \"$GREENTIC_SEED_ENVIRONMENT_JSON\" > /seed/environment.json"));
+        assert!(
+            s.contains("printf '%s' \"$GREENTIC_SEED_ENVIRONMENT_JSON\" > /seed/environment.json")
+        );
         assert!(s.contains("mkdir -p /seed/.greentic/dev\n"));
         assert!(s.contains("GREENTIC_SEED_DEV_STORE_SHA256") && s.contains("sha256sum -c -s"));
     }
 
     #[test]
     fn unsafe_names_and_collisions_are_refused() {
-        for bad in ["", "/etc/passwd", "../x", "a//b", "a b", "a;rm", "a$(id)", "a/"] {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a//b",
+            "a b",
+            "a;rm",
+            "a$(id)",
+            "a/",
+        ] {
             assert!(init_script(&[f(bad, "x")]).is_err(), "{bad:?}");
         }
         assert!(matches!(

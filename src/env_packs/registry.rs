@@ -237,10 +237,10 @@ mod tests {
         // of the `local` env's default bindings, but the registry resolves them
         // so `gtc op env-packs add … --kind greentic.deployer.<cloud>` resolves.
         let registry = EnvPackRegistry::with_builtins();
-        let expected =
-            6 + cfg!(feature = "creds-aws") as usize
-                + cfg!(feature = "creds-gcp") as usize
-                + cfg!(feature = "creds-azure") as usize;
+        let expected = 6
+            + cfg!(feature = "creds-aws") as usize
+            + cfg!(feature = "creds-gcp") as usize
+            + cfg!(feature = "creds-azure") as usize;
         assert_eq!(registry.len(), expected);
     }
 
