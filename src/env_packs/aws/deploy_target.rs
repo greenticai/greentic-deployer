@@ -92,6 +92,45 @@ pub fn log_group_name(secret_prefix: &str, deployment_id: &DeploymentId) -> Stri
     format!("/greentic/{secret_prefix}/{}", deployment_id.0)
 }
 
+/// Retention values CloudWatch Logs accepts for `PutRetentionPolicy`
+/// (`retentionInDays`); anything else is an `InvalidParameterException`.
+pub const LOG_RETENTION_DAYS: &[i32] = &[
+    1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922,
+    3288, 3653,
+];
+
+/// True when `days` is a retention CloudWatch Logs accepts.
+pub fn valid_log_retention_days(days: i32) -> bool {
+    LOG_RETENTION_DAYS.contains(&days)
+}
+
+/// Refusal for a retention CloudWatch Logs would reject.
+pub(crate) fn invalid_retention(days: i32) -> EcsTargetError {
+    EcsTargetError::Api(format!(
+        "log retention of {days} day(s) is not one CloudWatch Logs accepts \
+         (allowed: {LOG_RETENTION_DAYS:?})"
+    ))
+}
+
+/// Tag key stamped on a revision's task definition carrying its revision
+/// intent (see `revision_intent`). Read back on a re-warm to tell a retry of
+/// the same warm from a changed configuration under an immutable revision.
+pub const REVISION_INTENT_TAG_KEY: &str = "greentic:revision-intent";
+
+/// What the provider holds for a revision's task set.
+///
+/// Three states, not `Option<String>`: a task set with no intent stamp is not
+/// the same fact as no task set, and folding it into either would make an
+/// unverifiable task set read as "create it" or as "converged".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveTaskSet {
+    /// No task set for this revision.
+    Absent,
+    /// A task set exists; `intent` is its task definition's stamp (`None` when
+    /// unstamped).
+    Present { intent: Option<String> },
+}
+
 /// Desired state of one revision's task set.
 ///
 /// The ALB target group this revision binds to is **not** on the spec: the
@@ -284,6 +323,13 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     /// second definition.
     async fn create_task_set(&self, spec: &TaskSetSpec) -> Result<TaskSetHandle, EcsTargetError>;
 
+    /// Read whether the revision's task set exists and, if so, the revision
+    /// intent stamped on its task definition ([`REVISION_INTENT_TAG_KEY`]).
+    async fn live_revision_intent(
+        &self,
+        task_set: &TaskSetRef,
+    ) -> Result<LiveTaskSet, EcsTargetError>;
+
     /// Poll a task set's rollout status (steady state + target-group health).
     async fn task_set_stability(
         &self,
@@ -323,7 +369,8 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     async fn delete_secret(&self, name: &str) -> Result<(), EcsTargetError>;
 
     /// Create the CloudWatch log group `name` if absent and set its retention
-    /// to `retention_days`. Idempotent.
+    /// to `retention_days`. Idempotent. A retention outside
+    /// [`LOG_RETENTION_DAYS`] is refused before any call.
     async fn ensure_log_group(&self, name: &str, retention_days: i32)
     -> Result<(), EcsTargetError>;
 
@@ -342,6 +389,12 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
         Err(EcsTargetError::Unconfigured)
     }
     async fn create_task_set(&self, _spec: &TaskSetSpec) -> Result<TaskSetHandle, EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
+    async fn live_revision_intent(
+        &self,
+        _task_set: &TaskSetRef,
+    ) -> Result<LiveTaskSet, EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
     async fn task_set_stability(
@@ -414,6 +467,11 @@ pub struct InMemoryEcs {
     secrets: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     /// Version ids per secret, in creation order.
     secret_versions: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
+    /// The spec each live task set was created from (its intent included).
+    task_set_specs:
+        std::sync::Mutex<std::collections::BTreeMap<(DeploymentId, RevisionId), TaskSetSpec>>,
+    /// `create_task_set` calls received, including idempotent re-creates.
+    create_task_set_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryEcs {
@@ -456,6 +514,25 @@ impl InMemoryEcs {
         self.log_groups.lock().expect("mutex not poisoned").clone()
     }
 
+    /// The spec the revision's live task set was created from.
+    pub fn task_set_spec_of(
+        &self,
+        deployment_id: DeploymentId,
+        revision_id: RevisionId,
+    ) -> Option<TaskSetSpec> {
+        self.task_set_specs
+            .lock()
+            .expect("mutex not poisoned")
+            .get(&(deployment_id, revision_id))
+            .cloned()
+    }
+
+    /// How many times `create_task_set` was called.
+    pub fn create_task_set_calls(&self) -> usize {
+        self.create_task_set_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Snapshot of the live task sets.
     pub fn task_sets(
         &self,
@@ -496,6 +573,8 @@ impl EcsDeployTarget for InMemoryEcs {
     }
 
     async fn create_task_set(&self, spec: &TaskSetSpec) -> Result<TaskSetHandle, EcsTargetError> {
+        self.create_task_set_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let key = (spec.deployment_id, spec.revision_id);
         let mut sets = self.task_sets.lock().expect("mutex not poisoned");
         // Idempotent: re-creating an existing task set returns the existing
@@ -508,7 +587,34 @@ impl EcsDeployTarget for InMemoryEcs {
             task_def_arn: format!("td-{}-{}", spec.deployment_id.0, spec.revision_id.0),
         };
         sets.insert(key, handle.clone());
+        self.task_set_specs
+            .lock()
+            .expect("mutex not poisoned")
+            .insert(key, spec.clone());
         Ok(handle)
+    }
+
+    async fn live_revision_intent(
+        &self,
+        task_set: &TaskSetRef,
+    ) -> Result<LiveTaskSet, EcsTargetError> {
+        let key = (task_set.deployment_id, task_set.revision_id);
+        if !self
+            .task_sets
+            .lock()
+            .expect("mutex not poisoned")
+            .contains_key(&key)
+        {
+            return Ok(LiveTaskSet::Absent);
+        }
+        let intent = self
+            .task_set_specs
+            .lock()
+            .expect("mutex not poisoned")
+            .get(&key)
+            .map(|spec| spec.revision_intent.clone())
+            .filter(|intent| !intent.is_empty());
+        Ok(LiveTaskSet::Present { intent })
     }
 
     async fn task_set_stability(
@@ -525,10 +631,15 @@ impl EcsDeployTarget for InMemoryEcs {
 
     async fn delete_task_set(&self, task_set: &TaskSetRef) -> Result<(), EcsTargetError> {
         // Idempotent: removing an absent set is Ok.
+        let key = (task_set.deployment_id, task_set.revision_id);
         self.task_sets
             .lock()
             .expect("mutex not poisoned")
-            .remove(&(task_set.deployment_id, task_set.revision_id));
+            .remove(&key);
+        self.task_set_specs
+            .lock()
+            .expect("mutex not poisoned")
+            .remove(&key);
         Ok(())
     }
 
@@ -609,6 +720,9 @@ impl EcsDeployTarget for InMemoryEcs {
         name: &str,
         retention_days: i32,
     ) -> Result<(), EcsTargetError> {
+        if !valid_log_retention_days(retention_days) {
+            return Err(invalid_retention(retention_days));
+        }
         self.log_groups
             .lock()
             .expect("mutex not poisoned")
@@ -638,6 +752,57 @@ mod log_tests {
         let groups = ecs.log_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups.get("/g/a"), Some(&30));
+    }
+
+    #[tokio::test]
+    async fn ensure_log_group_refuses_a_retention_aws_does_not_accept() {
+        let ecs = InMemoryEcs::default();
+        let err = ecs.ensure_log_group("/g/a", 2).await.unwrap_err();
+        assert!(err.to_string().contains("2 day(s)"), "{err}");
+        assert!(ecs.log_groups().is_empty());
+        assert!(valid_log_retention_days(3653) && !valid_log_retention_days(0));
+    }
+
+    #[tokio::test]
+    async fn live_revision_intent_reads_absent_then_the_stamp() {
+        let ecs = InMemoryEcs::default();
+        let d = DeploymentId(Ulid::from(0x01_u128));
+        let r = RevisionId(Ulid::from(0x02_u128));
+        let at = TaskSetRef {
+            deployment_id: d,
+            revision_id: r,
+            cluster: "c".into(),
+            region: "us-east-1".into(),
+        };
+        assert_eq!(
+            ecs.live_revision_intent(&at).await.unwrap(),
+            LiveTaskSet::Absent
+        );
+        let spec = |intent: &str| TaskSetSpec {
+            deployment_id: d,
+            revision_id: r,
+            cluster: "c".into(),
+            region: "us-east-1".into(),
+            image: "img".into(),
+            env: Vec::new(),
+            secret_env: Vec::new(),
+            seed: None,
+            log_group: None,
+            revision_intent: intent.into(),
+        };
+        ecs.create_task_set(&spec("abc")).await.unwrap();
+        assert_eq!(
+            ecs.live_revision_intent(&at).await.unwrap(),
+            LiveTaskSet::Present {
+                intent: Some("abc".into())
+            }
+        );
+        ecs.delete_task_set(&at).await.unwrap();
+        ecs.create_task_set(&spec("")).await.unwrap();
+        assert_eq!(
+            ecs.live_revision_intent(&at).await.unwrap(),
+            LiveTaskSet::Present { intent: None }
+        );
     }
 
     #[tokio::test]

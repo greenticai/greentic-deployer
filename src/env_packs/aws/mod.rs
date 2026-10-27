@@ -37,7 +37,9 @@ pub mod deploy_target;
 pub mod deployer;
 #[cfg(feature = "deploy-aws-ecs")]
 pub mod real_target;
+pub(crate) mod revision_intent;
 pub(crate) mod seed_init;
+pub(crate) mod seed_stage;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
@@ -57,6 +59,9 @@ pub struct AwsEcsDeployerHandler {
     /// verbs honestly); the real aws-sdk-backed target is wired in a follow-up
     /// PR behind the `deploy-aws-ecs` feature.
     pub(crate) target: std::sync::Arc<dyn deploy_target::EcsDeployTarget>,
+    /// Raw `.dev.secrets.env` bytes the CLI read from the env's store, staged
+    /// as the second seed file. `None` for an env with no dev store.
+    pub(crate) dev_secrets: Option<Vec<u8>>,
 }
 
 impl Default for AwsEcsDeployerHandler {
@@ -64,6 +69,7 @@ impl Default for AwsEcsDeployerHandler {
         Self {
             creds: AwsDeployerCredentials::default(),
             target: std::sync::Arc::new(deploy_target::UnconfiguredEcsTarget),
+            dev_secrets: None,
         }
     }
 }
@@ -85,15 +91,26 @@ impl AwsEcsDeployerHandler {
         Self {
             creds: AwsDeployerCredentials::with_client(client),
             target: std::sync::Arc::new(deploy_target::UnconfiguredEcsTarget),
+            dev_secrets: None,
         }
     }
 
     /// Construct with a pluggable deploy-target seam. Tests pass the in-memory
     /// fake; the orchestration wiring passes a connected aws-sdk-backed target.
     pub fn with_target(target: std::sync::Arc<dyn deploy_target::EcsDeployTarget>) -> Self {
+        Self::with_target_and_dev_secrets(target, None)
+    }
+
+    /// [`Self::with_target`] plus the env's dev-store bytes, staged by
+    /// `warm_revision` as `/seed/.greentic/dev/.dev.secrets.env`.
+    pub fn with_target_and_dev_secrets(
+        target: std::sync::Arc<dyn deploy_target::EcsDeployTarget>,
+        dev_secrets: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             creds: AwsDeployerCredentials::default(),
             target,
+            dev_secrets,
         }
     }
 }

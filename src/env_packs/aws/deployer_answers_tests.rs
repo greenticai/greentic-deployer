@@ -97,3 +97,37 @@ fn runtime_image_is_digest_pinned_or_tag_based() {
         format!("ghcr.io/greenticai/greentic-start-distroless@{DIGEST}")
     );
 }
+
+#[test]
+fn blank_secret_prefix_defaults() {
+    let env = build_fixture_env();
+    for blank in ["", "   "] {
+        let p = parse(json!({ "secret_prefix": blank })).unwrap();
+        assert_eq!(
+            p.secret_prefix,
+            format!("gtc-{}", env.environment_id.as_str()),
+            "blank `{blank}` falls back to the env default"
+        );
+    }
+}
+
+#[test]
+fn log_retention_days_defaults_to_30_and_must_be_a_cloudwatch_value() {
+    assert_eq!(
+        AwsEcsParams::for_env(&build_fixture_env()).log_retention_days,
+        30
+    );
+    assert_eq!(
+        parse(json!({ "log_retention_days": "14" }))
+            .unwrap()
+            .log_retention_days,
+        14
+    );
+    for bad in ["2", "0", "10000"] {
+        let err = parse(json!({ "log_retention_days": bad })).unwrap_err();
+        assert!(
+            matches!(&err, AwsEcsParamsError::Invalid { key, .. } if key == "log_retention_days"),
+            "`{bad}`: {err}"
+        );
+    }
+}

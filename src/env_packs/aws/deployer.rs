@@ -14,7 +14,7 @@
 //! | Verb | Provider side-effect |
 //! |---|---|
 //! | `stage_revision` | None. Image/bundle delivery is a separate cross-provider slice (K8s defers it too). |
-//! | `warm_revision` | Ensure the deployment's `EXTERNAL`-controller service + create the revision's task set; wait until it stabilizes. |
+//! | `warm_revision` | Ensure the deployment's `EXTERNAL`-controller service and log group; unless the revision's task set already carries this warm's intent, stage the seed into Secrets Manager and create the task set (runtime image, boot env, `seed-init`); wait until it stabilizes. A task set stamped with a different intent is refused (task definitions are immutable). |
 //! | `drain_revision` | None — routing-side. Traffic shifts via `apply_traffic_split`; target-group deregistration-delay drains in-flight. |
 //! | `archive_revision` | Delete the revision's task set + deregister its task definition (idempotent against absent). |
 //! | `apply_traffic_split` | Write the listener rule's weighted forward action across the deployment's task-set target groups. Never re-creates task sets. |
@@ -32,27 +32,33 @@ use serde_json::Value;
 use tokio::time::{Instant, sleep};
 
 use super::AwsEcsDeployerHandler;
+use super::boot_env::ecs_boot_env;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, ServiceSpec, TargetGroupWeight,
-    TaskSetRef, TaskSetSpec,
+    EcsDeployTarget, EcsTargetError, LOG_RETENTION_DAYS, ListenerRef, ListenerRouting, ServiceSpec,
+    TargetGroupWeight, TaskSetRef, TaskSetSpec, log_group_name, valid_log_retention_days,
 };
+use super::revision_intent::{IntentVerdict, classify, revision_conflict, revision_intent};
+use super::seed_stage::environment_secret_name;
 use crate::env_packs::RUNTIME_IMAGE_REPO;
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
     WarmOutcome, enforce_split_invariants, require_revision,
 };
 use crate::env_packs::telemetry::{
-    self as telemetry_answers, TelemetryAnswerError, TelemetryAnswers,
+    self as telemetry_answers, HEADER_ENV_NAMES, TelemetryAnswerError, TelemetryAnswers,
 };
 
-/// Default container image base when the binding supplies no
-/// `ecr_repository_prefix`. The in-memory path never pulls it; the real target
-/// requires the operator to scope `ecr_repository_prefix` to their account.
+/// Default repository base when the binding supplies no
+/// `ecr_repository_prefix`. Recorded for the bundle-delivery path; the worker
+/// container always runs the public runtime image (`runtime_image`).
 const DEFAULT_IMAGE_BASE: &str = "greentic/operator";
 
 /// Default image-tag prefix when the binding supplies no
 /// `container_image_tag_prefix`. Matches the wizard's `default_value`.
 const DEFAULT_IMAGE_TAG_PREFIX: &str = "rev-";
+
+/// Default retention of the deployment's log group (a CloudWatch-allowed value).
+const DEFAULT_LOG_RETENTION_DAYS: i32 = 30;
 
 /// Default tag of the public runtime image.
 const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
@@ -105,7 +111,9 @@ pub struct AwsEcsParams {
     pub region: String,
     /// ECS cluster name the deployer manages services in.
     pub cluster: String,
-    /// Container image base every revision's image is built from.
+    /// Repository base answered as `ecr_repository_prefix`. Not the worker
+    /// image: the worker runs [`Self::runtime_image`] and reads its bundle
+    /// from `bundle_source_uri` in the seeded `environment.json`.
     pub image_base: String,
     /// Prefix the revision's image tag is built from (wizard default `rev-`).
     /// Blank tags with the raw revision ULID.
@@ -153,6 +161,9 @@ pub struct AwsEcsParams {
     pub runtime_team: Option<String>,
     /// Telemetry profile (`telemetry_env` / `telemetry_headers`).
     pub telemetry: TelemetryAnswers,
+    /// Retention of the deployment's CloudWatch log group, in days. Always one
+    /// of the values CloudWatch Logs accepts (default 30).
+    pub log_retention_days: i32,
 }
 
 /// Why a wizard answers blob could not be read into [`AwsEcsParams`].
@@ -396,6 +407,7 @@ impl AwsEcsParams {
             runtime_tenant: None,
             runtime_team: None,
             telemetry: TelemetryAnswers::default(),
+            log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
         }
     }
 
@@ -480,7 +492,26 @@ impl AwsEcsParams {
                 }
                 "runtime_image_tag" => params.runtime_image_tag = answer_string(key, value)?,
                 "runtime_image_digest" => params.runtime_image_digest = parse_digest(key, value)?,
-                "secret_prefix" => params.secret_prefix = answer_string(key, value)?,
+                // Blank keeps the `gtc-{env}` default: the prefix names every
+                // staged secret, and `-environment` alone is not a usable name.
+                "secret_prefix" => {
+                    if let Some(prefix) = optional_string(key, value)? {
+                        params.secret_prefix = prefix;
+                    }
+                }
+                "log_retention_days" => {
+                    let days = parse_u32(key, value)?;
+                    params.log_retention_days = i32::try_from(days)
+                        .ok()
+                        .filter(|d| valid_log_retention_days(*d))
+                        .ok_or_else(|| AwsEcsParamsError::Invalid {
+                            key: key.to_string(),
+                            detail: format!(
+                                "{days} is not a CloudWatch Logs retention; allowed: \
+                                 {LOG_RETENTION_DAYS:?}"
+                            ),
+                        })?;
+                }
                 "runtime_tenant" => params.runtime_tenant = optional_string(key, value)?,
                 "runtime_team" => params.runtime_team = optional_string(key, value)?,
                 telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
@@ -504,15 +535,6 @@ impl AwsEcsParams {
             Some(digest) => format!("{RUNTIME_IMAGE_REPO}@{digest}"),
             None => format!("{RUNTIME_IMAGE_REPO}:{}", self.runtime_image_tag),
         }
-    }
-
-    /// Image the revision's Fargate task runs (image base + the configured
-    /// tag prefix + the revision ULID).
-    fn image_for(&self, revision_id: RevisionId) -> String {
-        format!(
-            "{}:{}{}",
-            self.image_base, self.image_tag_prefix, revision_id.0
-        )
     }
 }
 
@@ -609,9 +631,44 @@ impl Deployer for AwsEcsDeployerHandler {
         answers: Option<&Value>,
     ) -> Result<WarmOutcome, DeployerError> {
         require_revision(env, revision_id)?;
-        let revision = Self::revision(env, revision_id).expect("require_revision passed");
+        let revision = Self::revision(env, revision_id).ok_or(DeployerError::RevisionNotFound {
+            env_id: env.environment_id.clone(),
+            revision_id,
+        })?;
         let params = params_from_answers(env, answers)?;
         let deployment_id = revision.deployment_id;
+        let task_set_ref = TaskSetRef {
+            deployment_id,
+            revision_id,
+            cluster: params.cluster.clone(),
+            region: params.region.clone(),
+        };
+
+        // What this warm intends, computed BEFORE staging so a retry stages
+        // nothing to learn it. The worker runs the public runtime image; the
+        // bundle it serves is named by `bundle_source_uri` inside the seeded
+        // `environment.json` (decision record section 4), not by the image.
+        let image = params.runtime_image();
+        let boot_env = ecs_boot_env(env, revision, &params);
+        let secret_env_names: Vec<&str> = if params.telemetry.headers().is_some() {
+            HEADER_ENV_NAMES.to_vec()
+        } else {
+            Vec::new()
+        };
+        let (cpu, memory) = params
+            .launch
+            .as_ref()
+            .map(|l| (l.cpu.as_str(), l.memory.as_str()))
+            .unwrap_or(("", ""));
+        let intent = revision_intent(
+            &image,
+            cpu,
+            memory,
+            params.min_instances,
+            &environment_secret_name(&params.secret_prefix),
+            &boot_env,
+            &secret_env_names,
+        );
 
         self.target
             .ensure_service(&ServiceSpec {
@@ -622,21 +679,65 @@ impl Deployer for AwsEcsDeployerHandler {
             })
             .await
             .map_err(provider)?;
+        // The log group is not part of the immutable revision: converge it on
+        // every warm so a changed retention answer lands.
+        let log_group = log_group_name(&params.secret_prefix, &deployment_id);
         self.target
-            .create_task_set(&TaskSetSpec {
-                deployment_id,
-                revision_id,
-                cluster: params.cluster.clone(),
-                region: params.region.clone(),
-                image: params.image_for(revision_id),
-                env: Vec::new(),
-                secret_env: Vec::new(),
-                seed: None,
-                log_group: None,
-                revision_intent: String::new(),
-            })
+            .ensure_log_group(&log_group, params.log_retention_days)
             .await
             .map_err(provider)?;
+
+        let live = self
+            .target
+            .live_revision_intent(&task_set_ref)
+            .await
+            .map_err(provider)?;
+        match classify(live, &intent) {
+            // The same warm, retried: the revision keeps the seed versions it
+            // was created with (a task definition cannot pick up new ones).
+            IntentVerdict::Converge => {}
+            IntentVerdict::Conflict { live } => {
+                return Err(revision_conflict(revision_id, &intent, live));
+            }
+            IntentVerdict::Create => {
+                let staged = super::seed_stage::stage(
+                    self.target.as_ref(),
+                    env,
+                    revision_id,
+                    &params,
+                    self.dev_secrets.as_deref(),
+                )
+                .await?;
+                self.target
+                    .create_task_set(&TaskSetSpec {
+                        deployment_id,
+                        revision_id,
+                        cluster: params.cluster.clone(),
+                        region: params.region.clone(),
+                        image,
+                        env: boot_env,
+                        secret_env: staged.secret_env,
+                        seed: Some(staged.seed),
+                        log_group: Some(log_group),
+                        revision_intent: intent.clone(),
+                    })
+                    .await
+                    .map_err(provider)?;
+                // `create_task_set` returns an existing task set unchanged, so
+                // a rival warm that created this revision between the probe
+                // and the create would otherwise be adopted silently. Re-read
+                // the stamp; a task set not yet visible is left to the
+                // stability wait.
+                let after = self
+                    .target
+                    .live_revision_intent(&task_set_ref)
+                    .await
+                    .map_err(provider)?;
+                if let IntentVerdict::Conflict { live } = classify(after, &intent) {
+                    return Err(revision_conflict(revision_id, &intent, live));
+                }
+            }
+        }
 
         // The task set is created; the revision is only Ready once it reaches
         // steady state (running == desired AND its target group is healthy). A
@@ -645,12 +746,7 @@ impl Deployer for AwsEcsDeployerHandler {
         // tasks.
         wait_for_task_set_stability(
             self.target.as_ref(),
-            &TaskSetRef {
-                deployment_id,
-                revision_id,
-                cluster: params.cluster.clone(),
-                region: params.region.clone(),
-            },
+            &task_set_ref,
             warm_stabilize_timeout(),
             WARM_STABILIZE_POLL_INTERVAL,
         )
@@ -678,7 +774,10 @@ impl Deployer for AwsEcsDeployerHandler {
         answers: Option<&Value>,
     ) -> Result<ArchiveOutcome, DeployerError> {
         require_revision(env, revision_id)?;
-        let revision = Self::revision(env, revision_id).expect("require_revision passed");
+        let revision = Self::revision(env, revision_id).ok_or(DeployerError::RevisionNotFound {
+            env_id: env.environment_id.clone(),
+            revision_id,
+        })?;
         let params = params_from_answers(env, answers)?;
         self.target
             .delete_task_set(&TaskSetRef {
@@ -733,6 +832,10 @@ impl Deployer for AwsEcsDeployerHandler {
 #[cfg(test)]
 #[path = "deployer_answers_tests.rs"]
 mod answers_tests;
+
+#[cfg(test)]
+#[path = "deployer_seed_tests.rs"]
+mod seed_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1090,6 +1193,12 @@ mod tests {
                 task_def_arn: "td".into(),
             })
         }
+        async fn live_revision_intent(
+            &self,
+            _task_set: &TaskSetRef,
+        ) -> Result<super::super::deploy_target::LiveTaskSet, EcsTargetError> {
+            Ok(super::super::deploy_target::LiveTaskSet::Absent)
+        }
         async fn task_set_stability(
             &self,
             _task_set: &TaskSetRef,
@@ -1222,31 +1331,6 @@ mod tests {
         assert_eq!(
             params.assume_role_arn.as_deref(),
             Some("arn:aws:iam::111122223333:role/greentic-deployer")
-        );
-    }
-
-    #[test]
-    fn image_for_honors_the_configured_tag_prefix() {
-        let env = build_fixture_env();
-        let rev = env.revisions[0].revision_id;
-
-        // Default prefix → `<base>:rev-<ulid>`.
-        let default = AwsEcsParams::for_env(&env);
-        assert_eq!(
-            default.image_for(rev),
-            format!("{}:rev-{}", default.image_base, rev.0)
-        );
-
-        // Blank prefix → raw revision ULID tag (`<base>:<ulid>`), matching the
-        // wizard's "leave blank to tag with the raw revision ULID".
-        let blank = AwsEcsParams::from_answers(
-            &env,
-            Some(&serde_json::json!({ "container_image_tag_prefix": "" })),
-        )
-        .unwrap();
-        assert_eq!(
-            blank.image_for(rev),
-            format!("{}:{}", blank.image_base, rev.0)
         );
     }
 

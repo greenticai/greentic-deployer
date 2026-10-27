@@ -98,6 +98,8 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "ecs:CreateService",
     "ecs:UpdateService",
     "ecs:RegisterTaskDefinition",
+    "ecs:TagResource",
+    "ecs:DescribeTaskDefinition",
     "ecs:CreateTaskSet",
     "ecs:DescribeTaskSets",
     "ecs:DeleteTaskSet",

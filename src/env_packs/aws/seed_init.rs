@@ -1,30 +1,37 @@
 //! Pure description of the `seed-init` container (ungated, no AWS types).
 //!
 //! Decision record: `docs/aws-ecs-seed-and-bundle-delivery.md` section 3.
+//!
+//! The warm path (always compiled) needs only [`SEED_INIT_IMAGE`]; the
+//! container-rendering items are read by the `deploy-aws-ecs` real target, so
+//! they are compiled with it (and for tests) rather than carried dead in a
+//! `creds-aws`-only build.
 
-// Consumed by the warm path in a later phase-1 task; until then only tests and
-// the gated real target reference these items.
-#![allow(dead_code)]
-
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 use super::deploy_target::SeedFile;
 
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 /// Container name of the init container; the worker `dependsOn` it.
 pub(crate) const SEED_INIT_CONTAINER: &str = "seed-init";
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 /// Name of the task-level bind-mount volume shared by both containers.
 pub(crate) const SEED_VOLUME: &str = "seed";
 /// Busybox init image, pinned by index digest (decision record 3.3).
 pub(crate) const SEED_INIT_IMAGE: &str = "public.ecr.aws/docker/library/busybox:1.37.0-musl@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092";
 
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 /// Env var carrying the file's content (injected from Secrets Manager).
 pub(crate) fn content_var(file: &SeedFile) -> String {
     format!("GREENTIC_SEED_{}", var_stem(&file.name))
 }
 
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 /// Env var carrying the file's expected SHA-256 (plain, a digest is public).
 pub(crate) fn sha_var(file: &SeedFile) -> String {
     format!("{}_SHA256", content_var(file))
 }
 
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 fn var_stem(name: &str) -> String {
     match name {
         "environment.json" => "ENVIRONMENT_JSON".to_string(),
@@ -42,6 +49,7 @@ fn var_stem(name: &str) -> String {
     }
 }
 
+#[cfg(any(test, feature = "deploy-aws-ecs"))]
 /// The `sh -c` script: write each file byte for byte, then verify its digest.
 pub(crate) fn script(files: &[SeedFile]) -> String {
     let mut out = String::from("set -eu\numask 022\n");

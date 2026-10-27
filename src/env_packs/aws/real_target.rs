@@ -110,6 +110,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use aws_sdk_ecs::error::BuildError;
 use aws_sdk_ecs::operation::create_task_set::CreateTaskSetOutput;
 use aws_sdk_ecs::operation::describe_services::DescribeServicesOutput;
 use aws_sdk_ecs::operation::describe_task_sets::DescribeTaskSetsOutput;
@@ -118,7 +119,8 @@ use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerCondition, ContainerDefinition,
     ContainerDependency, DeploymentController, DeploymentControllerType, KeyValuePair,
     LoadBalancer, LogConfiguration, LogDriver, MountPoint, NetworkConfiguration, NetworkMode,
-    PortMapping, Scale, ScaleUnit, Secret, StabilityStatus, TaskSet, Volume,
+    PortMapping, Scale, ScaleUnit, Secret, StabilityStatus, Tag as EcsTag, TaskDefinitionField,
+    TaskSet, Volume,
 };
 use aws_sdk_elasticloadbalancingv2::operation::describe_target_groups::DescribeTargetGroupsOutput;
 use aws_sdk_elasticloadbalancingv2::types::{
@@ -129,9 +131,10 @@ use greentic_deploy_spec::{DeploymentId, RevisionId};
 
 use super::boot_env::SEED_MOUNT_DIR;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, EnsuredSecret, ListenerRef, ListenerRouting,
-    SECRET_OWNER_TAG_KEY, SecretEnvRef, SecretVersionRef, SeedInit, ServiceSpec, TargetGroupWeight,
-    TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability, secret_version_token,
+    EcsDeployTarget, EcsTargetError, EnsuredSecret, ListenerRef, ListenerRouting, LiveTaskSet,
+    REVISION_INTENT_TAG_KEY, SECRET_OWNER_TAG_KEY, SecretEnvRef, SecretVersionRef, SeedInit,
+    ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
+    invalid_retention, secret_version_token, valid_log_retention_days,
 };
 use super::seed_init::{self, SEED_INIT_CONTAINER, SEED_VOLUME};
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
@@ -166,6 +169,8 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "ecs:ListServices",           // create_task_set (single-owner pool guard)
     "ecs:CreateService",          // ensure_service
     "ecs:RegisterTaskDefinition", // create_task_set
+    "ecs:TagResource",            // create_task_set (revision-intent tag on the task definition)
+    "ecs:DescribeTaskDefinition", // live_revision_intent (read the revision-intent tag)
     "ecs:CreateTaskSet",          // create_task_set
     // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
     // (apply_listener_weights reads each revision's target-group binding here)
@@ -373,12 +378,12 @@ impl EcsDeployTarget for RealEcsTarget {
             .service_name(&service)
             .desired_count(service_desired_count(spec))
             .client_token(service_client_token(&spec.deployment_id))
-            .deployment_controller(
+            .deployment_controller(built(
+                "deployment controller",
                 DeploymentController::builder()
                     .r#type(DeploymentControllerType::External)
-                    .build()
-                    .expect("deployment controller type is set"),
-            )
+                    .build(),
+            )?)
             .send()
             .await
             .map_err(|e| api("create_service", e))?;
@@ -470,11 +475,17 @@ impl EcsDeployTarget for RealEcsTarget {
                     .as_deref()
                     .map(|group| (group, spec.region.as_str())),
                 spec.seed.is_some(),
-            ));
+            )?);
         if let Some(seed) = &spec.seed {
             register = register
-                .container_definitions(seed_init_container(seed))
+                .container_definitions(seed_init_container(seed)?)
                 .volumes(seed_volume());
+        }
+        // The intent stamp a re-warm compares (see `revision_intent`). Task
+        // definitions are immutable, so the stamp written here is the one that
+        // revision carries for life.
+        if !spec.revision_intent.is_empty() {
+            register = register.tags(intent_tag(&spec.revision_intent));
         }
         let registered = register
             .send()
@@ -490,7 +501,7 @@ impl EcsDeployTarget for RealEcsTarget {
             .task_definition(&task_def_arn)
             .external_id(&external_id)
             .client_token(task_set_client_token(&spec.revision_id))
-            .network_configuration(network_config(&self.launch))
+            .network_configuration(network_config(&self.launch)?)
             .load_balancers(load_balancer(&self.launch, &target_group_arn))
             .scale(
                 Scale::builder()
@@ -503,6 +514,42 @@ impl EcsDeployTarget for RealEcsTarget {
             .map_err(|e| api("create_task_set", e))?;
 
         task_set_handle_from(&created, task_def_arn)
+    }
+
+    async fn live_revision_intent(
+        &self,
+        task_set: &TaskSetRef,
+    ) -> Result<LiveTaskSet, EcsTargetError> {
+        let service = service_name(&task_set.deployment_id);
+        let external_id = task_set_external_id(&task_set.revision_id);
+        let sets = self
+            .ecs
+            .describe_task_sets()
+            .cluster(&task_set.cluster)
+            .service(&service)
+            .send()
+            .await
+            .map_err(|e| api("describe_task_sets", e))?;
+        let Some(task_def_arn) =
+            find_task_set(&sets, &external_id).map(|ts| ts.task_definition().map(str::to_string))
+        else {
+            return Ok(LiveTaskSet::Absent);
+        };
+        // A task set with no task definition cannot be verified.
+        let Some(task_def_arn) = task_def_arn else {
+            return Ok(LiveTaskSet::Present { intent: None });
+        };
+        let described = self
+            .ecs
+            .describe_task_definition()
+            .task_definition(&task_def_arn)
+            .include(TaskDefinitionField::Tags)
+            .send()
+            .await
+            .map_err(|e| api("describe_task_definition", e))?;
+        Ok(LiveTaskSet::Present {
+            intent: intent_from_tags(described.tags()),
+        })
     }
 
     async fn task_set_stability(
@@ -688,6 +735,9 @@ impl EcsDeployTarget for RealEcsTarget {
         name: &str,
         retention_days: i32,
     ) -> Result<(), EcsTargetError> {
+        if !valid_log_retention_days(retention_days) {
+            return Err(invalid_retention(retention_days));
+        }
         match self
             .logs
             .create_log_group()
@@ -989,7 +1039,7 @@ fn container_def(
     secret_env: &[SecretEnvRef],
     log: Option<(&str, &str)>,
     seed: bool,
-) -> ContainerDefinition {
+) -> Result<ContainerDefinition, EcsTargetError> {
     let mut b = ContainerDefinition::builder()
         .name(&launch.container_name)
         .image(image)
@@ -1003,39 +1053,69 @@ fn container_def(
         b = b.environment(KeyValuePair::builder().name(name).value(value).build());
     }
     for s in secret_env {
-        b = b.secrets(secret_entry(&s.name, &s.value_from_arn));
+        b = b.secrets(secret_entry(&s.name, &s.value_from_arn)?);
     }
     if let Some((group, region)) = log {
-        b = b.log_configuration(awslogs_config(group, region, &launch.container_name));
+        b = b.log_configuration(awslogs_config(group, region, &launch.container_name)?);
     }
     if seed {
-        b = b.mount_points(seed_mount(true)).depends_on(
+        b = b.mount_points(seed_mount(true)).depends_on(built(
+            "container dependency",
             ContainerDependency::builder()
                 .container_name(SEED_INIT_CONTAINER)
                 .condition(ContainerCondition::Success)
-                .build()
-                .expect("dependency container name and condition are set"),
-        );
+                .build(),
+        )?);
     }
-    b.build()
+    Ok(b.build())
 }
 
-fn secret_entry(name: &str, value_from: &str) -> Secret {
-    Secret::builder()
-        .name(name)
-        .value_from(value_from)
-        .build()
-        .expect("secret name and valueFrom are set")
+/// Map an SDK builder's missing-required-field error to a seam error rather
+/// than panicking: the inputs come from operator answers, so a gap is an
+/// operator-visible failure, not a bug to crash on.
+fn built<T>(what: &str, result: Result<T, BuildError>) -> Result<T, EcsTargetError> {
+    result.map_err(|e| EcsTargetError::Api(format!("building the {what}: {e}")))
 }
 
-fn awslogs_config(group: &str, region: &str, stream_prefix: &str) -> LogConfiguration {
-    LogConfiguration::builder()
-        .log_driver(LogDriver::Awslogs)
-        .options("awslogs-group", group)
-        .options("awslogs-region", region)
-        .options("awslogs-stream-prefix", stream_prefix)
+fn secret_entry(name: &str, value_from: &str) -> Result<Secret, EcsTargetError> {
+    built(
+        "secret reference",
+        Secret::builder().name(name).value_from(value_from).build(),
+    )
+}
+
+fn awslogs_config(
+    group: &str,
+    region: &str,
+    stream_prefix: &str,
+) -> Result<LogConfiguration, EcsTargetError> {
+    built(
+        "awslogs configuration",
+        LogConfiguration::builder()
+            .log_driver(LogDriver::Awslogs)
+            .options("awslogs-group", group)
+            .options("awslogs-region", region)
+            .options("awslogs-stream-prefix", stream_prefix)
+            .build(),
+    )
+}
+
+/// The ECS tag carrying a task definition's revision intent.
+fn intent_tag(intent: &str) -> EcsTag {
+    EcsTag::builder()
+        .key(REVISION_INTENT_TAG_KEY)
+        .value(intent)
         .build()
-        .expect("log driver is set")
+}
+
+/// The revision intent stamped on a task definition; `None` when unstamped or
+/// blank.
+fn intent_from_tags(tags: &[EcsTag]) -> Option<String> {
+    tags.iter()
+        .find(|t| t.key() == Some(REVISION_INTENT_TAG_KEY))
+        .and_then(|t| t.value())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 fn seed_mount(read_only: bool) -> MountPoint {
@@ -1054,7 +1134,7 @@ fn seed_volume() -> Volume {
 
 /// The non-essential init container: seed secrets arrive as env vars, are
 /// written under `/seed`, and verified against their SHA-256.
-fn seed_init_container(seed: &SeedInit) -> ContainerDefinition {
+fn seed_init_container(seed: &SeedInit) -> Result<ContainerDefinition, EcsTargetError> {
     let mut b = ContainerDefinition::builder()
         .name(SEED_INIT_CONTAINER)
         .image(&seed.image)
@@ -1068,7 +1148,7 @@ fn seed_init_container(seed: &SeedInit) -> ContainerDefinition {
             .secrets(secret_entry(
                 &seed_init::content_var(f),
                 &f.secret_value_from,
-            ))
+            )?)
             .environment(
                 KeyValuePair::builder()
                     .name(seed_init::sha_var(f))
@@ -1076,26 +1156,27 @@ fn seed_init_container(seed: &SeedInit) -> ContainerDefinition {
                     .build(),
             );
     }
-    b.build()
+    Ok(b.build())
 }
 
 /// The awsvpc network configuration for the task set's Fargate ENIs.
-fn network_config(launch: &FargateLaunchConfig) -> NetworkConfiguration {
+fn network_config(launch: &FargateLaunchConfig) -> Result<NetworkConfiguration, EcsTargetError> {
     let assign = if launch.assign_public_ip {
         AssignPublicIp::Enabled
     } else {
         AssignPublicIp::Disabled
     };
-    NetworkConfiguration::builder()
-        .awsvpc_configuration(
-            AwsVpcConfiguration::builder()
-                .set_subnets(Some(launch.subnets.clone()))
-                .set_security_groups(Some(launch.security_groups.clone()))
-                .assign_public_ip(assign)
-                .build()
-                .expect("awsvpc subnets are set"),
-        )
-        .build()
+    let vpc = built(
+        "awsvpc configuration",
+        AwsVpcConfiguration::builder()
+            .set_subnets(Some(launch.subnets.clone()))
+            .set_security_groups(Some(launch.security_groups.clone()))
+            .assign_public_ip(assign)
+            .build(),
+    )?;
+    Ok(NetworkConfiguration::builder()
+        .awsvpc_configuration(vpc)
+        .build())
 }
 
 /// The load-balancer binding for the task set: register the launch config's
@@ -1500,6 +1581,18 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
+    fn intent_tag_round_trips_and_missing_or_blank_reads_none() {
+        assert_eq!(
+            intent_from_tags(&[intent_tag("abc")]),
+            Some("abc".to_string())
+        );
+        assert_eq!(intent_from_tags(&[]), None);
+        assert_eq!(intent_from_tags(&[intent_tag("")]), None);
+        let other = EcsTag::builder().key("k").value("v").build();
+        assert_eq!(intent_from_tags(&[other]), None);
+    }
+
+    #[test]
     fn owner_tag_round_trips_and_missing_tag_reads_empty() {
         let tags = owner_tags("env-abc").unwrap();
         assert_eq!(tags[0].key(), Some("greentic:owner"));
@@ -1595,7 +1688,7 @@ mod tests {
 
     #[test]
     fn container_def_carries_image_name_and_port() {
-        let cd = container_def(&launch(), "registry/img:rev-rev1", &[], &[], None, false);
+        let cd = container_def(&launch(), "registry/img:rev-rev1", &[], &[], None, false).unwrap();
         assert_eq!(cd.name(), Some("worker"));
         assert_eq!(cd.image(), Some("registry/img:rev-rev1"));
         assert_eq!(cd.essential(), Some(true));
@@ -1605,7 +1698,7 @@ mod tests {
 
     #[test]
     fn container_def_without_extras_is_unchanged() {
-        let cd = container_def(&launch(), "img", &[], &[], None, false);
+        let cd = container_def(&launch(), "img", &[], &[], None, false).unwrap();
         assert!(cd.environment().is_empty());
         assert!(cd.secrets().is_empty());
         assert!(cd.log_configuration().is_none());
@@ -1639,7 +1732,8 @@ mod tests {
             &secrets,
             Some(("/ecs/gtc", "us-east-1")),
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(cd.environment()[0].name(), Some("GREENTIC_ENV"));
         assert_eq!(cd.environment()[0].value(), Some("dev"));
         assert_eq!(cd.secrets()[0].name(), "OTLP_HEADERS");
@@ -1674,7 +1768,7 @@ mod tests {
                 sha256_hex: "cd".repeat(32),
             }],
         };
-        let init = seed_init_container(&seed);
+        let init = seed_init_container(&seed).unwrap();
         assert_eq!(init.name(), Some("seed-init"));
         assert_eq!(init.essential(), Some(false));
         assert_eq!(init.image(), Some("busybox@sha256:abc"));
@@ -1697,7 +1791,7 @@ mod tests {
 
         assert_eq!(seed_volume().name(), Some("seed"));
 
-        let worker = container_def(&launch(), "img", &[], &[], None, true);
+        let worker = container_def(&launch(), "img", &[], &[], None, true).unwrap();
         assert_eq!(worker.mount_points()[0].source_volume(), Some("seed"));
         assert_eq!(worker.mount_points()[0].container_path(), Some("/seed"));
         assert_eq!(worker.mount_points()[0].read_only(), Some(true));
@@ -1710,7 +1804,7 @@ mod tests {
 
     #[test]
     fn network_config_maps_subnets_security_groups_and_public_ip() {
-        let nc = network_config(&launch());
+        let nc = network_config(&launch()).unwrap();
         let vpc = nc.awsvpc_configuration().expect("awsvpc config present");
         assert_eq!(vpc.subnets(), ["subnet-a", "subnet-b"]);
         assert_eq!(vpc.security_groups(), ["sg-1"]);
@@ -1718,7 +1812,7 @@ mod tests {
 
         let mut public = launch();
         public.assign_public_ip = true;
-        let nc = network_config(&public);
+        let nc = network_config(&public).unwrap();
         assert_eq!(
             nc.awsvpc_configuration().unwrap().assign_public_ip(),
             Some(&AssignPublicIp::Enabled)

@@ -114,7 +114,15 @@ fn classify_action(action: &str) -> ActionBucket {
     if action.starts_with("sts:") || action.starts_with("iam:Simulate") {
         return ActionBucket::ReadOnly;
     }
-    if action == "ecs:RegisterTaskDefinition" || action == "ecs:DeregisterTaskDefinition" {
+    // Task-definition verbs take no resource-level scoping (`DescribeTaskDefinition`
+    // and the `TagResource` the register's revision-intent tag needs included).
+    if matches!(
+        action,
+        "ecs:RegisterTaskDefinition"
+            | "ecs:DeregisterTaskDefinition"
+            | "ecs:DescribeTaskDefinition"
+            | "ecs:TagResource"
+    ) {
         return ActionBucket::EcsTaskDefinition;
     }
     if action.starts_with("ecs:") {

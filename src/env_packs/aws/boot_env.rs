@@ -5,10 +5,6 @@
 //! credential is NOT part of this list; it is a Secrets Manager reference
 //! injected through the container's `secrets` (see `SecretEnvRef`).
 
-// Consumed by the warm path in a later phase-1 task; until then only tests and
-// the gated real target reference these items.
-#![allow(dead_code)]
-
 use greentic_deploy_spec::{Environment, Revision};
 
 use super::deployer::AwsEcsParams;
