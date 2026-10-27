@@ -1672,32 +1672,33 @@ fn pinned_role_without_session(assume_role_arn: Option<&str>, session_present: b
     assume_role_arn.is_some() && !session_present
 }
 
+/// Everything the AWS-ECS verbs need to build a real target, resolved once.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+pub(super) struct AwsEcsTargetInputs {
+    /// `bound` when a deployer session is bound, else `ambient`.
+    pub(super) identity: &'static str,
+    /// The bound STS session (`None` → the ambient credential chain).
+    pub(super) session: Option<crate::env_packs::aws::credentials::AssumedSession>,
+    /// The Fargate launch config, checked present.
+    pub(super) launch: crate::env_packs::aws::real_target::FargateLaunchConfig,
+    /// The full parsed binding answers (`launch` duplicated above, unwrapped).
+    pub(super) params: crate::env_packs::aws::deployer::AwsEcsParams,
+}
+
 /// Resolve the bound deployer session, parse the AWS-ECS construction inputs,
-/// and enforce the fail-closed preconditions. Returns
-/// `(identity_label, session, launch, region, target_group_pool)` — everything
-/// `RealEcsTarget::resolve` needs plus the outcome's identity label. Shared by
-/// `apply-revision` and `apply-traffic` so both honor the same guards.
+/// and enforce the fail-closed preconditions. Shared by `apply-revision`,
+/// `apply-traffic` and the provider teardown so all honor the same guards.
 ///
 /// Fails closed (before any AWS call) when the binding pins `assume_role_arn`
 /// but no session is bound (`pinned_role_without_session`), and when the Fargate
 /// launch config is absent.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
-#[allow(clippy::type_complexity)]
 pub(super) fn aws_ecs_target_inputs(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
     answers: Option<&Value>,
-) -> Result<
-    (
-        &'static str,
-        Option<crate::env_packs::aws::credentials::AssumedSession>,
-        crate::env_packs::aws::real_target::FargateLaunchConfig,
-        String,
-        Vec<String>,
-    ),
-    OpError,
-> {
+) -> Result<AwsEcsTargetInputs, OpError> {
     use crate::env_packs::aws::deployer::AwsEcsParams;
 
     // Bound STS session when the env declares one, else the ambient chain
@@ -1719,44 +1720,94 @@ pub(super) fn aws_ecs_target_inputs(
                 .to_string(),
         ));
     }
-    let launch = params.launch.ok_or_else(|| {
+    let launch = params.launch.clone().ok_or_else(|| {
         OpError::Conflict(
             "the aws-ecs deployer binding has no Fargate launch config (needs execution_role_arn \
              + subnets + security_groups); re-run the binding wizard before applying"
                 .to_string(),
         )
     })?;
-    Ok((
+    Ok(AwsEcsTargetInputs {
         identity,
         session,
         launch,
-        params.region,
-        params.target_group_pool,
-    ))
+        params,
+    })
+}
+
+/// Test-only replacement of the real ECS target, keyed by region so tests that
+/// run in parallel never see each other's fake. `run_aws_async` drives the
+/// handler on a scoped thread, so a thread-local could not carry it.
+#[cfg(all(test, feature = "creds-aws", feature = "deploy-aws-ecs"))]
+pub(crate) mod ecs_target_seam {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use crate::env_packs::aws::deploy_target::EcsDeployTarget;
+
+    type Targets = Mutex<BTreeMap<String, Arc<dyn EcsDeployTarget>>>;
+    static TARGETS: Targets = Mutex::new(BTreeMap::new());
+
+    /// Removes the installed fake when dropped.
+    pub(crate) struct Installed(String);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            if let Ok(mut map) = TARGETS.lock() {
+                map.remove(&self.0);
+            }
+        }
+    }
+
+    pub(crate) fn install(region: &str, target: Arc<dyn EcsDeployTarget>) -> Installed {
+        TARGETS
+            .lock()
+            .expect("seam mutex not poisoned")
+            .insert(region.to_string(), target);
+        Installed(region.to_string())
+    }
+
+    pub(super) fn lookup(region: &str) -> Option<Arc<dyn EcsDeployTarget>> {
+        TARGETS.lock().ok()?.get(region).cloned()
+    }
 }
 
 /// Resolve the region-pinned AWS clients (with the bound session injected) and
-/// wrap them in a handler. Shared by the AWS verb dispatchers so the
-/// resolve + `with_target` boilerplate (and its error message) lives once.
+/// wrap them in a handler carrying `dev_secrets` (the dev-store bytes a warm
+/// stages; `None` for every other verb). Shared by the AWS verb dispatchers so
+/// the resolve boilerplate (and its error message) lives once.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
 async fn resolve_ecs_handler(
-    region: &str,
-    launch: crate::env_packs::aws::real_target::FargateLaunchConfig,
-    pool: Vec<String>,
-    session: Option<crate::env_packs::aws::credentials::AssumedSession>,
+    inputs: AwsEcsTargetInputs,
+    dev_secrets: Option<Vec<u8>>,
 ) -> Result<crate::env_packs::aws::AwsEcsDeployerHandler, OpError> {
     use crate::env_packs::aws::AwsEcsDeployerHandler;
     use crate::env_packs::aws::real_target::RealEcsTarget;
     use std::sync::Arc;
 
-    let target = RealEcsTarget::resolve(region, launch, pool, session)
-        .await
-        .map_err(|e| {
-            OpError::Conflict(format!(
-                "cannot initialize the AWS ECS deployer client: {e}"
-            ))
-        })?;
-    Ok(AwsEcsDeployerHandler::with_target(Arc::new(target)))
+    #[cfg(test)]
+    if let Some(fake) = ecs_target_seam::lookup(&inputs.params.region) {
+        return Ok(AwsEcsDeployerHandler::with_target_and_dev_secrets(
+            fake,
+            dev_secrets,
+        ));
+    }
+    let target = RealEcsTarget::resolve(
+        &inputs.params.region,
+        inputs.launch,
+        inputs.params.target_group_pool,
+        inputs.session,
+    )
+    .await
+    .map_err(|e| {
+        OpError::Conflict(format!(
+            "cannot initialize the AWS ECS deployer client: {e}"
+        ))
+    })?;
+    Ok(AwsEcsDeployerHandler::with_target_and_dev_secrets(
+        Arc::new(target),
+        dev_secrets,
+    ))
 }
 
 /// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
@@ -1766,7 +1817,7 @@ async fn resolve_ecs_handler(
 /// ALB listener (`None` for drain/archive or with no listener). Requires the
 /// `deploy-aws-ecs` feature.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
-fn apply_revision_aws_ecs(
+pub(super) fn apply_revision_aws_ecs(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
@@ -1784,11 +1835,20 @@ fn apply_revision_aws_ecs(
         .find(|r| r.revision_id == revision_id)
         .expect("revision presence checked by the caller");
     let worker_name = service_name(&revision.deployment_id);
-    let (identity, session, launch, region, pool) =
-        aws_ecs_target_inputs(store, env, env_id, answers)?;
+    let inputs = aws_ecs_target_inputs(store, env, env_id, answers)?;
+    let identity = inputs.identity;
+    // Stage the env's dev store as seed material only on a warm, and only when
+    // the env resolves `secret://` against the dev store — never Vault — so
+    // operator-local material never ships into the runtime (same guard as
+    // Cloud Run).
+    let dev_secrets = if verb == RevisionVerb::Warm && env_stages_dev_secrets(env) {
+        read_dev_secrets_bytes(store, env_id)?
+    } else {
+        None
+    };
 
     let endpoint = run_aws_async(async move {
-        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
+        let handler = resolve_ecs_handler(inputs, dev_secrets).await?;
         match verb {
             RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
@@ -1809,7 +1869,7 @@ fn apply_revision_aws_ecs(
 }
 
 #[cfg(all(feature = "creds-aws", not(feature = "deploy-aws-ecs")))]
-fn apply_revision_aws_ecs(
+pub(super) fn apply_revision_aws_ecs(
     _store: &LocalFsStore,
     _env: &Environment,
     _env_id: &EnvId,
@@ -1914,7 +1974,7 @@ impl crate::environment::ProviderTeardown for ProviderTeardownRouter {
             return CloudRunProviderTeardown.teardown(ctx);
         }
         #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
-        if ctx.descriptor_path == "greentic.deployer.aws-ecs" {
+        if ctx.descriptor_path == super::env_aws_up::AWS_ECS_DEPLOYER_PATH {
             return super::env_aws_teardown::EcsProviderTeardown.teardown(ctx);
         }
         Err(
@@ -2068,14 +2128,17 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
     }
 }
 
-/// Whether `warm_revision` should stage the local dev-store as Cloud Run seed
-/// material: the env has a `Secrets`-slot pack AND resolves `secret://` against
+/// Whether `warm_revision` should stage the local dev-store as seed material
+/// (Cloud Run and AWS ECS alike): the env has a `Secrets`-slot pack AND resolves `secret://` against
 /// the dev-store backend, never Vault. Mirrors the k8s render gate
 /// (`SecretsBackend::DevStore` + `env_uses_dev_secrets`). Staging a Vault-backed
 /// env's dev-store would ship operator-local material — including any bound
 /// deployer credentials persisted there — into the runtime seed.
-#[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
-fn cloudrun_stages_dev_secrets(env: &Environment) -> bool {
+#[cfg(any(
+    all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
+    all(feature = "creds-aws", feature = "deploy-aws-ecs")
+))]
+fn env_stages_dev_secrets(env: &Environment) -> bool {
     env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets) && secrets_backend_is_dev_store(env)
 }
 
@@ -2201,7 +2264,7 @@ fn cloudrun_seed_material(
     if !warm {
         return Ok((None, GeneratedSecretSeed::Unverified));
     }
-    let stages = cloudrun_stages_dev_secrets(env);
+    let stages = env_stages_dev_secrets(env);
     if !(runs_multiple_instances(params) && multi_instance_safe(params)) {
         let bytes = if stages {
             read_dev_secrets_bytes(store, env_id)?
@@ -2409,6 +2472,31 @@ pub(crate) fn cloudrun_revisions_to_warm(
         .collect()
 }
 
+/// Side-effect-free bring-up preflight: every recorded split weight must be a
+/// whole multiple of `granularity_bps`, the finest weight the platform's router
+/// can represent, so a split it cannot express fails BEFORE warming creates live
+/// revisions that could then not be routed to as recorded.
+pub(super) fn preflight_split_granularity(
+    env: &Environment,
+    granularity_bps: u32,
+    platform: &str,
+    granularity_label: &str,
+) -> Result<(), OpError> {
+    for split in &env.traffic_splits {
+        for entry in &split.entries {
+            if entry.weight_bps % granularity_bps != 0 {
+                return Err(OpError::Conflict(format!(
+                    "traffic split for deployment `{}` weights revision `{}` at {} bps; \
+                     {platform} weights must be whole multiples of {granularity_bps} bps \
+                     ({granularity_label})",
+                    split.deployment_id, entry.revision_id, entry.weight_bps,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One-command Cloud Run bring-up for `op env up`.
 ///
 /// After the deployer-agnostic `env_apply::apply`, `op env up` calls this to
@@ -2458,17 +2546,7 @@ pub(crate) fn cloudrun_env_up(
     // of 100 bps (plan D1 — the same invariant `split_to_traffic_targets` enforces
     // at apply time). Reject a non-representable split up front so it fails BEFORE
     // warming creates live revisions we would then be unable to route to.
-    for split in &env.traffic_splits {
-        for entry in &split.entries {
-            if entry.weight_bps % 100 != 0 {
-                return Err(OpError::Conflict(format!(
-                    "traffic split for deployment `{}` weights revision `{}` at {} bps; \
-                     Cloud Run weights must be whole multiples of 100 bps (1%)",
-                    split.deployment_id, entry.revision_id, entry.weight_bps,
-                )));
-            }
-        }
-    }
+    preflight_split_granularity(&env, 100, "Cloud Run", "1%")?;
 
     // 0. SoR units (SoRLa phase 3E): every sorx service up and ready, and its
     //    route document in the dev store, BEFORE any worker is warmed — each
@@ -2558,7 +2636,7 @@ pub(crate) fn cloudrun_env_up(
 /// body is the "compiled without the cloud feature" stub), so AWS-ECS is the
 /// fallthrough and only the `creds-gcp`-gated Cloud Run arm needs special-casing
 /// — no build-matrix split is required here.
-fn apply_traffic_non_k8s(
+pub(super) fn apply_traffic_non_k8s(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
@@ -2606,11 +2684,12 @@ fn apply_traffic_aws_ecs(
     use crate::env_packs::aws::credentials::run_aws_async;
     use crate::env_packs::deployer::Deployer;
 
-    let (identity, session, launch, region, pool) =
-        aws_ecs_target_inputs(store, env, env_id, answers)?;
+    let inputs = aws_ecs_target_inputs(store, env, env_id, answers)?;
+    let identity = inputs.identity;
 
     let outcome = run_aws_async(async move {
-        let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
+        // Traffic reweight never warms a revision, so it stages no seed.
+        let handler = resolve_ecs_handler(inputs, None).await?;
         handler
             .apply_traffic_split(env, deployment_id, answers)
             .await
@@ -6608,9 +6687,9 @@ mod tests {
 
     #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
     #[test]
-    fn cloudrun_stages_dev_secrets_only_for_the_dev_store_backend() {
+    fn env_stages_dev_secrets_only_for_the_dev_store_backend() {
         // No Secrets pack → nothing resolves `secret://`, so no seed material.
-        assert!(!cloudrun_stages_dev_secrets(&make_env("local")));
+        assert!(!env_stages_dev_secrets(&make_env("local")));
 
         // Dev-store Secrets binding → stage the local dev-store.
         let mut env = make_env("local");
@@ -6618,7 +6697,7 @@ mod tests {
             CapabilitySlot::Secrets,
             crate::defaults::LOCAL_SECRETS_PACK,
         ));
-        assert!(cloudrun_stages_dev_secrets(&env));
+        assert!(env_stages_dev_secrets(&env));
 
         // Vault Secrets binding → NEVER upload the local dev-store: the values
         // (and any bound deployer credentials in it) stay operator-local.
@@ -6627,7 +6706,7 @@ mod tests {
             CapabilitySlot::Secrets,
             crate::defaults::VAULT_SECRETS_PACK,
         ));
-        assert!(!cloudrun_stages_dev_secrets(&env));
+        assert!(!env_stages_dev_secrets(&env));
     }
 
     #[test]

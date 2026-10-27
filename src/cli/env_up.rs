@@ -121,9 +121,12 @@ pub(crate) fn up(
     // Cloud Run kind, so it treats a Cloud Run manifest as k8s; such a build
     // cannot deploy Cloud Run regardless, and apply is idempotent.
     let targets_cloudrun = manifest_targets_cloudrun(store, &env_id, &manifest)?;
+    let targets_aws_ecs = manifest_targets_aws_ecs(store, &env_id, &manifest)?;
     if let Err(missing) = env_up_deployer_gate(
         targets_cloudrun,
+        targets_aws_ecs,
         cfg!(feature = "deploy-gcp-cloudrun"),
+        cfg!(all(feature = "creds-aws", feature = "deploy-aws-ecs")),
         cfg!(feature = "k8s-client"),
     ) {
         return Err(OpError::Conflict(match missing {
@@ -131,6 +134,7 @@ pub(crate) fn up(
                  `deploy-gcp-cloudrun` feature; `op env up` needs it to deploy a \
                  Cloud Run environment"
                 .to_string(),
+            "deploy-aws-ecs" => super::env_aws_up::NO_DEPLOY_FEATURE.to_string(),
             _ => "this build was compiled without the `k8s-client` feature; \
                  `op env up` needs it for the k8s deployer"
                 .to_string(),
@@ -258,13 +262,13 @@ pub(crate) fn up(
         return Ok((apply_outcome, None));
     }
 
-    // ── Deployer dispatch: Cloud Run bring-up ────────────────────────
-    // Cloud Run is imperative — no cluster to reconcile. When the applied env's
-    // live deployer is Cloud Run, warm its revisions + push traffic and return
-    // the discovered `*.run.app` URL (no port-forward). Any other deployer kind
-    // returns `None` and falls through to the k8s convergence phases below,
-    // unchanged.
-    if let Some(result) = super::env::cloudrun_env_up(store, registry, &env_id)? {
+    // ── Deployer dispatch: imperative bring-up ───────────────────────
+    // Cloud Run and AWS ECS are imperative — no cluster to reconcile. When the
+    // applied env's live deployer is one of them, warm its revisions + push
+    // traffic and return the discovered endpoint URL(s) (no port-forward). Any
+    // other deployer kind returns `None` and falls through to the k8s
+    // convergence phases below, unchanged.
+    if let Some(result) = imperative_bring_up(store, registry, &env_id)? {
         return Ok((OpOutcome::new(NOUN, "up", result), None));
     }
 
@@ -363,20 +367,42 @@ fn up_result_json(
     result
 }
 
+/// The imperative deployers' bring-up: Cloud Run, then AWS ECS. `None` only
+/// when the env's live deployer is neither, so the caller's k8s phases run for
+/// k8s envs alone — an AWS env is always answered here (brought up, or refused
+/// by a build that cannot deploy it), never handed to the k8s reconcile.
+fn imperative_bring_up(
+    store: &LocalFsStore,
+    registry: &EnvPackRegistry,
+    env_id: &greentic_deploy_spec::EnvId,
+) -> Result<Option<serde_json::Value>, OpError> {
+    if let Some(result) = super::env::cloudrun_env_up(store, registry, env_id)? {
+        return Ok(Some(result));
+    }
+    super::env_aws_up::aws_env_up(store, registry, env_id)
+}
+
 /// Whether THIS build can converge the effective `op env up` deployer, or must
 /// fail before apply. Each deployer is gated INDEPENDENTLY: a Cloud Run env needs
 /// the real `deploy-gcp-cloudrun` target (the `creds-gcp` scaffold only stubs the
-/// deploy path), and a k8s env needs `k8s-client` for reconcile. The presence of
-/// the OTHER deployer's feature never satisfies the requirement — a k8s-client
-/// build cannot deploy Cloud Run, and a Cloud Run build cannot reconcile k8s.
+/// deploy path), an AWS ECS env needs the real `deploy-aws-ecs` target, and a
+/// k8s env needs `k8s-client` for reconcile. The presence of ANOTHER deployer's
+/// feature never satisfies the requirement — a k8s-client build cannot deploy
+/// Cloud Run or ECS, and a cloud build cannot reconcile k8s.
 /// Pure (feature flags passed in) so the full truth table is unit-testable
 /// regardless of the build's compiled features; `Err` names the missing feature.
 fn env_up_deployer_gate(
     targets_cloudrun: bool,
+    targets_aws_ecs: bool,
     has_deploy_gcp_cloudrun: bool,
+    has_deploy_aws_ecs: bool,
     has_k8s_client: bool,
 ) -> Result<(), &'static str> {
-    if targets_cloudrun {
+    if targets_aws_ecs {
+        if !has_deploy_aws_ecs {
+            return Err("deploy-aws-ecs");
+        }
+    } else if targets_cloudrun {
         if !has_deploy_gcp_cloudrun {
             return Err("deploy-gcp-cloudrun");
         }
@@ -386,19 +412,15 @@ fn env_up_deployer_gate(
     Ok(())
 }
 
-/// Whether `op env up`'s effective desired deployer is Cloud Run, resolved
-/// BEFORE any mutation: the manifest's Deployer-slot pack when it (re)binds one,
-/// else the existing env's Deployer binding. Cloud Run is the only `env up`
-/// deployer that reconciles without `k8s-client` (it is imperative); every k8s
-/// path needs it. The pre-apply feature gate keys off this rather than the
-/// optional `cluster` block, which a clusterless k8s manifest (targeting an
-/// ambient kubeconfig) legitimately omits. Total function: `false` on builds
-/// without `creds-gcp`, where `is_cloudrun_kind` is `false`.
-fn manifest_targets_cloudrun(
+/// The effective desired deployer kind of `op env up`, resolved BEFORE any
+/// mutation: the manifest's Deployer-slot pack when it (re)binds one, else the
+/// existing env's Deployer binding. `None` when neither names one (or the
+/// manifest's kind does not parse — the apply rejects it later).
+fn manifest_deployer_kind(
     store: &LocalFsStore,
     env_id: &greentic_deploy_spec::EnvId,
     manifest: &EnvManifest,
-) -> Result<bool, OpError> {
+) -> Result<Option<greentic_deploy_spec::PackDescriptor>, OpError> {
     use crate::environment::EnvironmentStore as _;
     use greentic_deploy_spec::{CapabilitySlot, PackDescriptor};
 
@@ -408,20 +430,45 @@ fn manifest_targets_cloudrun(
         .iter()
         .find(|p| p.slot == CapabilitySlot::Deployer)
     {
-        return Ok(PackDescriptor::try_new(pack.kind.as_str())
-            .map(|d| super::env::is_cloudrun_kind(&d))
-            .unwrap_or(false));
+        return Ok(PackDescriptor::try_new(pack.kind.as_str()).ok());
     }
 
     // No deployer in the manifest → inherit the existing env's binding, when the
-    // env already exists (a fresh env with no bound deployer is not Cloud Run).
+    // env already exists (a fresh env with no bound deployer is neither).
     if store.exists(env_id)? {
         let env = store.load(env_id)?;
         if let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) {
-            return Ok(super::env::is_cloudrun_kind(&binding.kind));
+            return Ok(Some(binding.kind.clone()));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Whether `op env up`'s effective desired deployer is Cloud Run
+/// ([`manifest_deployer_kind`]). The pre-apply feature gate keys off this rather
+/// than the optional `cluster` block, which a clusterless k8s manifest
+/// (targeting an ambient kubeconfig) legitimately omits. Total function: `false`
+/// on builds without `creds-gcp`, where `is_cloudrun_kind` is `false`.
+fn manifest_targets_cloudrun(
+    store: &LocalFsStore,
+    env_id: &greentic_deploy_spec::EnvId,
+    manifest: &EnvManifest,
+) -> Result<bool, OpError> {
+    Ok(manifest_deployer_kind(store, env_id, manifest)?
+        .is_some_and(|d| super::env::is_cloudrun_kind(&d)))
+}
+
+/// Whether `op env up`'s effective desired deployer is AWS ECS
+/// ([`manifest_deployer_kind`]). Recognized by descriptor path in EVERY build —
+/// unlike Cloud Run's `creds-gcp`-gated check — so a build without the AWS
+/// deploy path refuses an AWS manifest by name instead of gating it as k8s.
+fn manifest_targets_aws_ecs(
+    store: &LocalFsStore,
+    env_id: &greentic_deploy_spec::EnvId,
+    manifest: &EnvManifest,
+) -> Result<bool, OpError> {
+    Ok(manifest_deployer_kind(store, env_id, manifest)?
+        .is_some_and(|d| super::env_aws_up::names_aws_ecs_deployer(&d)))
 }
 
 /// Phase 5 — reconcile + rollout, gated on `k8s-client`.
@@ -1418,7 +1465,7 @@ fn kind_context_name(name: &str) -> String {
 fn merge_kubeconfig_context(
     answers: Option<Value>,
     ctx: Option<&str>,
-) -> Result<Option<Value>, OpError> {
+) -> Result<Option<serde_json::Value>, OpError> {
     let Some(ctx) = ctx else {
         return Ok(answers);
     };
@@ -1830,28 +1877,161 @@ mod tests {
     /// `deploy-gcp-cloudrun` was letting k8s-client cover a Cloud Run deployer).
     #[test]
     fn env_up_deployer_gate_truth_table() {
-        // (targets_cloudrun, has_deploy_gcp_cloudrun, has_k8s_client)
+        // (targets_cloudrun, targets_aws_ecs, has_deploy_gcp_cloudrun,
+        //  has_deploy_aws_ecs, has_k8s_client)
         // Cloud Run deployer → needs deploy-gcp-cloudrun; k8s-client never covers.
-        assert_eq!(env_up_deployer_gate(true, true, true), Ok(()));
-        assert_eq!(env_up_deployer_gate(true, true, false), Ok(()));
+        assert_eq!(env_up_deployer_gate(true, false, true, false, true), Ok(()));
         assert_eq!(
-            env_up_deployer_gate(true, false, true),
+            env_up_deployer_gate(true, false, true, false, false),
+            Ok(())
+        );
+        assert_eq!(
+            env_up_deployer_gate(true, false, false, false, true),
             Err("deploy-gcp-cloudrun"),
             "k8s-client must NOT satisfy a Cloud Run deployer"
         );
         assert_eq!(
-            env_up_deployer_gate(true, false, false),
+            env_up_deployer_gate(true, false, false, true, false),
+            Err("deploy-gcp-cloudrun"),
+            "deploy-aws-ecs must NOT satisfy a Cloud Run deployer"
+        );
+        assert_eq!(
+            env_up_deployer_gate(true, false, false, false, false),
             Err("deploy-gcp-cloudrun")
         );
-        // k8s deployer → needs k8s-client; deploy-gcp-cloudrun never covers.
-        assert_eq!(env_up_deployer_gate(false, true, true), Ok(()));
-        assert_eq!(env_up_deployer_gate(false, false, true), Ok(()));
+        // k8s deployer → needs k8s-client; no cloud deploy feature ever covers.
+        assert_eq!(env_up_deployer_gate(false, false, true, true, true), Ok(()));
         assert_eq!(
-            env_up_deployer_gate(false, true, false),
+            env_up_deployer_gate(false, false, false, false, true),
+            Ok(())
+        );
+        assert_eq!(
+            env_up_deployer_gate(false, false, true, false, false),
             Err("k8s-client"),
             "deploy-gcp-cloudrun must NOT satisfy a k8s deployer"
         );
-        assert_eq!(env_up_deployer_gate(false, false, false), Err("k8s-client"));
+        assert_eq!(
+            env_up_deployer_gate(false, false, false, true, false),
+            Err("k8s-client"),
+            "deploy-aws-ecs must NOT satisfy a k8s deployer"
+        );
+        assert_eq!(
+            env_up_deployer_gate(false, false, false, false, false),
+            Err("k8s-client")
+        );
+    }
+
+    /// The AWS dimension of the gate: an AWS ECS deployer needs the real
+    /// `deploy-aws-ecs` target, and neither `k8s-client` nor
+    /// `deploy-gcp-cloudrun` substitutes for it — before this, an AWS manifest
+    /// was gated as k8s and fell into the k8s reconcile.
+    #[test]
+    fn env_up_deployer_gate_truth_table_covers_aws() {
+        assert_eq!(
+            env_up_deployer_gate(false, true, false, true, false),
+            Ok(())
+        );
+        assert_eq!(env_up_deployer_gate(false, true, true, true, true), Ok(()));
+        assert_eq!(
+            env_up_deployer_gate(false, true, false, false, true),
+            Err("deploy-aws-ecs"),
+            "k8s-client must NOT satisfy an AWS ECS deployer"
+        );
+        assert_eq!(
+            env_up_deployer_gate(false, true, true, false, false),
+            Err("deploy-aws-ecs"),
+            "deploy-gcp-cloudrun must NOT satisfy an AWS ECS deployer"
+        );
+        assert_eq!(
+            env_up_deployer_gate(false, true, true, false, true),
+            Err("deploy-aws-ecs")
+        );
+        assert_eq!(
+            env_up_deployer_gate(false, true, false, false, false),
+            Err("deploy-aws-ecs")
+        );
+    }
+
+    /// The AWS deployer is recognized by its descriptor path in EVERY build —
+    /// a build without the AWS env-pack must still refuse it by name rather
+    /// than treating it as k8s.
+    #[test]
+    fn manifest_targets_aws_ecs_true_for_aws_deployer_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let m = deployer_manifest(Some("greentic.deployer.aws-ecs@1.0.0"));
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        assert!(manifest_targets_aws_ecs(&store, &env_id, &m).unwrap());
+        assert!(!manifest_targets_cloudrun(&store, &env_id, &m).unwrap());
+    }
+
+    #[test]
+    fn manifest_targets_aws_ecs_false_for_k8s_deployer_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let m = deployer_manifest(Some("greentic.deployer.k8s@1.0.0"));
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        assert!(!manifest_targets_aws_ecs(&store, &env_id, &m).unwrap());
+    }
+
+    /// Existing env bound to AWS ECS, manifest omits the deployer → inherits
+    /// the binding → AWS (exempt from the k8s-client gate).
+    #[test]
+    fn manifest_targets_aws_ecs_true_for_existing_aws_env_without_manifest_deployer() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use crate::environment::EnvironmentStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let m = deployer_manifest(None);
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+        assert!(manifest_targets_aws_ecs(&store, &env_id, &m).unwrap());
+    }
+
+    /// `op env up`'s deployer dispatch for an AWS ECS env answers itself — it
+    /// never returns `None`, which is what lets the k8s phases (vault,
+    /// reconcile, port-forward) run. With the live target compiled in an env
+    /// with no revisions brings up with no AWS call; without it the dispatch
+    /// refuses by name.
+    #[test]
+    fn an_aws_manifest_never_reaches_the_k8s_phases() {
+        use crate::cli::tests_common::{make_binding, make_env};
+        use crate::environment::EnvironmentStore as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let registry = crate::env_packs::EnvPackRegistry::with_builtins();
+        let mut env = make_env("local");
+        env.packs.push(make_binding(
+            greentic_deploy_spec::CapabilitySlot::Deployer,
+            "greentic.deployer.aws-ecs@1.0.0",
+        ));
+        store.save(&env).unwrap();
+        let env_id = greentic_deploy_spec::EnvId::try_from("local").unwrap();
+
+        let outcome = imperative_bring_up(&store, &registry, &env_id);
+
+        if cfg!(all(feature = "creds-aws", feature = "deploy-aws-ecs")) {
+            let result = outcome
+                .expect("an empty AWS env brings up without an AWS call")
+                .expect("an AWS env must be answered by the AWS bring-up, not fall through");
+            assert_eq!(
+                result["kind"]
+                    .as_str()
+                    .map(|k| k.starts_with("greentic.deployer.aws-ecs")),
+                Some(true),
+                "{result}"
+            );
+        } else {
+            match outcome {
+                Err(OpError::Conflict(msg)) => assert!(msg.contains("deploy-aws-ecs"), "{msg}"),
+                other => panic!("expected a deploy-aws-ecs refusal, got {other:?}"),
+            }
+        }
     }
 
     /// A k8s deployer named in the manifest is NOT Cloud Run, so the pre-apply
