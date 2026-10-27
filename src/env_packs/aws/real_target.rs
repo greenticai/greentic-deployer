@@ -147,6 +147,7 @@ pub struct RealEcsTarget {
     ecs: aws_sdk_ecs::Client,
     elb: aws_sdk_elasticloadbalancingv2::Client,
     secrets: aws_sdk_secretsmanager::Client,
+    logs: aws_sdk_cloudwatchlogs::Client,
     launch: FargateLaunchConfig,
     /// Operator-supplied ALB target groups (ARNs or names) the target assigns
     /// revisions to, one per live revision. Blue/green needs ≥2; assignment is
@@ -182,6 +183,10 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "secretsmanager:DescribeSecret",     // ensure_secret (read the live owner tag)
     "secretsmanager:PutSecretValue",     // put_secret_value
     "secretsmanager:DeleteSecret",       // delete_secret
+    "logs:CreateLogGroup",               // ensure_log_group
+    "logs:DescribeLogGroups", // granted for operator verification; not called by the target today
+    "logs:PutRetentionPolicy", // ensure_log_group
+    "logs:DeleteLogGroup",    // delete_log_group
 ];
 
 impl RealEcsTarget {
@@ -222,6 +227,7 @@ impl RealEcsTarget {
             ecs: aws_sdk_ecs::Client::new(&config),
             elb: aws_sdk_elasticloadbalancingv2::Client::new(&config),
             secrets: aws_sdk_secretsmanager::Client::new(&config),
+            logs: aws_sdk_cloudwatchlogs::Client::new(&config),
             launch,
             target_group_pool,
         })
@@ -352,10 +358,20 @@ impl EcsDeployTarget for RealEcsTarget {
         // has no dedicated already-exists error; a naked duplicate surfaces as
         // `InvalidParameterException`). The describe stays as a fast path that
         // skips the create entirely once the service is ACTIVE.
+        // `desiredCount` is the service-level task count; the EXTERNAL
+        // controller has no scheduler of its own, but ECS still takes the
+        // service's desired count, and each task set's `scale` (100% in
+        // `create_task_set`) is a percentage OF that count. Setting it here is
+        // therefore what makes `min_instances` real. AWS documents
+        // `create-service --deployment-controller type=EXTERNAL
+        // --desired-count N` for this controller; not verified against a live
+        // account in this task. An already-ACTIVE service keeps its count
+        // (the early return above): this method never resizes.
         self.ecs
             .create_service()
             .cluster(&spec.cluster)
             .service_name(&service)
+            .desired_count(service_desired_count(spec))
             .client_token(service_client_token(&spec.deployment_id))
             .deployment_controller(
                 DeploymentController::builder()
@@ -666,6 +682,70 @@ impl EcsDeployTarget for RealEcsTarget {
             Err(e) => Err(secrets_api("DeleteSecret", &e)),
         }
     }
+
+    async fn ensure_log_group(
+        &self,
+        name: &str,
+        retention_days: i32,
+    ) -> Result<(), EcsTargetError> {
+        match self
+            .logs
+            .create_log_group()
+            .log_group_name(name)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_already_exists_exception()) => {}
+            Err(e) => return Err(logs_api("CreateLogGroup", &e)),
+        }
+        // Retention is (re)applied on every call so a changed answer converges.
+        self.logs
+            .put_retention_policy()
+            .log_group_name(name)
+            .retention_in_days(retention_days)
+            .send()
+            .await
+            .map_err(|e| logs_api("PutRetentionPolicy", &e))?;
+        Ok(())
+    }
+
+    async fn delete_log_group(&self, name: &str) -> Result<(), EcsTargetError> {
+        match self
+            .logs
+            .delete_log_group()
+            .log_group_name(name)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(logs_api("DeleteLogGroup", &e)),
+        }
+    }
+}
+
+/// Error mapper for CloudWatch Logs calls, rendering the full SDK error chain.
+fn logs_api<E>(op: &str, err: &E) -> EcsTargetError
+where
+    E: std::error::Error + 'static,
+{
+    EcsTargetError::Api(format!(
+        "cloudwatchlogs {op}: {}",
+        aws_sdk_cloudwatchlogs::error::DisplayErrorContext(err)
+    ))
+}
+
+/// The service's desired task count as the SDK's `i32`, saturating.
+fn service_desired_count(spec: &ServiceSpec) -> i32 {
+    i32::try_from(spec.desired_count).unwrap_or(i32::MAX)
 }
 
 /// Error mapper for Secrets Manager calls, rendering the full SDK error chain.
@@ -1531,6 +1611,18 @@ mod tests {
         assert!(cd.log_configuration().is_none());
         assert!(cd.mount_points().is_empty());
         assert!(cd.depends_on().is_empty());
+    }
+
+    #[test]
+    fn ensure_service_records_desired_count() {
+        let spec = |n| ServiceSpec {
+            deployment_id: dep(),
+            cluster: "c".to_string(),
+            region: "r".to_string(),
+            desired_count: n,
+        };
+        assert_eq!(service_desired_count(&spec(3)), 3);
+        assert_eq!(service_desired_count(&spec(u32::MAX)), i32::MAX);
     }
 
     #[test]

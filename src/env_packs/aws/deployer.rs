@@ -618,6 +618,7 @@ impl Deployer for AwsEcsDeployerHandler {
                 deployment_id,
                 cluster: params.cluster.clone(),
                 region: params.region.clone(),
+                desired_count: params.min_instances,
             })
             .await
             .map_err(provider)?;
@@ -782,6 +783,19 @@ mod tests {
             sets.contains_key(&(rev.deployment_id, rev.revision_id)),
             "task set keyed by (deployment, revision)"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_passes_min_instances_as_desired_count() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({ "min_instances": "3" });
+        handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(target.desired_count_of(rev.deployment_id), Some(3));
     }
 
     #[tokio::test]
@@ -1113,6 +1127,12 @@ mod tests {
         }
         async fn delete_secret(&self, _name: &str) -> Result<(), EcsTargetError> {
             Err(EcsTargetError::Unconfigured)
+        }
+        async fn ensure_log_group(&self, _n: &str, _r: i32) -> Result<(), EcsTargetError> {
+            Ok(())
+        }
+        async fn delete_log_group(&self, _n: &str) -> Result<(), EcsTargetError> {
+            Ok(())
         }
     }
 

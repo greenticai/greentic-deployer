@@ -98,6 +98,9 @@ enum ActionBucket {
     /// `secretsmanager:*` — seed / telemetry secret staging, scoped to the
     /// secret ARN prefix the deployer owns.
     SecretsManager,
+    /// `logs:*` — CloudWatch log group of the deployment, scoped to the log
+    /// group ARN prefix the deployer owns.
+    Logs,
     /// `iam:PassRole` — privilege-sensitive, scoped + conditioned.
     PassRole,
     /// Unrecognized action — falls to a review bucket.
@@ -128,6 +131,9 @@ fn classify_action(action: &str) -> ActionBucket {
     }
     if action.starts_with("secretsmanager:") {
         return ActionBucket::SecretsManager;
+    }
+    if action.starts_with("logs:") {
+        return ActionBucket::Logs;
     }
     ActionBucket::Unrecognized
 }
@@ -198,6 +204,12 @@ const BUCKET_SPECS: &[BucketSpec] = &[
         bucket: ActionBucket::SecretsManager,
         comment: "Secrets Manager seed staging — admin scopes to the deployer's secret ARN prefix.",
         resource: "<REPLACE_WITH_SECRET_ARNS>",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::Logs,
+        comment: "CloudWatch Logs group management — admin scopes to the deployer's log group ARN prefix.",
+        resource: "<REPLACE_WITH_LOG_GROUP_ARN_PREFIX>",
         extra: None,
     },
     BucketSpec {
@@ -302,6 +314,7 @@ fn render_terraform(input: &IamRulesPackInput<'_>) -> String {
 #   <REPLACE_WITH_ECS_RESOURCE_ARNS>  — e.g. arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*
 #   <REPLACE_WITH_ECR_REPO_ARNS>      — e.g. arn:aws:ecr:<region>:<account>:repository/greentic-*
 #   <REPLACE_WITH_ALB_LISTENER_ARNS>  — e.g. arn:aws:elasticloadbalancing:<region>:<account>:listener/app/<lb>/<id>/<id>
+#   <REPLACE_WITH_LOG_GROUP_ARN_PREFIX> — e.g. arn:aws:logs:<region>:<account>:log-group:/greentic/*
 #   <REPLACE_WITH_ECS_TASK_ROLE_ARN>  — e.g. arn:aws:iam::<account>:role/greentic-{env_id}-task-execution
 #
 # Trust principal is rendered from the operator-supplied admin hint:
@@ -400,6 +413,12 @@ The policy is split into multiple statements by sensitivity:
   per-deployment listener rules, and the tag verbs stamp + verify each rule's
   owning deployment so the deployer only rewrites rules it created. Replace
   `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your listener ARN.
+- **CloudWatch Logs** (`logs:CreateLogGroup`, `DescribeLogGroups`,
+  `PutRetentionPolicy`, `DeleteLogGroup`) — replace
+  `<REPLACE_WITH_LOG_GROUP_ARN_PREFIX>` with the log-group ARN prefix, e.g.
+  `arn:aws:logs:<region>:<account>:log-group:/greentic/*`. Note
+  `DescribeLogGroups` does not support resource-level scoping in IAM; if the
+  scoped statement refuses it, grant that one verb at `Resource = "*"`.
 - **iam:PassRole** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
   ARN of the ECS task-execution role, e.g.
   `arn:aws:iam::<account>:role/greentic-{env_id}-task-execution`.

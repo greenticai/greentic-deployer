@@ -81,6 +81,15 @@ pub struct ServiceSpec {
     pub deployment_id: DeploymentId,
     pub cluster: String,
     pub region: String,
+    /// Tasks the service keeps running (the wizard's `min_instances`, never
+    /// 0). Task sets scale to 100% of this count.
+    pub desired_count: u32,
+}
+
+/// CloudWatch log group the deployment's containers write to:
+/// `/greentic/<secret_prefix>/<deployment_id>`.
+pub fn log_group_name(secret_prefix: &str, deployment_id: &DeploymentId) -> String {
+    format!("/greentic/{secret_prefix}/{}", deployment_id.0)
 }
 
 /// Desired state of one revision's task set.
@@ -312,6 +321,14 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     /// Delete the secret immediately, without a recovery window. Idempotent
     /// against an absent secret.
     async fn delete_secret(&self, name: &str) -> Result<(), EcsTargetError>;
+
+    /// Create the CloudWatch log group `name` if absent and set its retention
+    /// to `retention_days`. Idempotent.
+    async fn ensure_log_group(&self, name: &str, retention_days: i32)
+    -> Result<(), EcsTargetError>;
+
+    /// Delete the log group. Idempotent against an absent group.
+    async fn delete_log_group(&self, name: &str) -> Result<(), EcsTargetError>;
 }
 
 /// The default target for a handler with no real client wired. Every provider
@@ -360,6 +377,16 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
     async fn delete_secret(&self, _name: &str) -> Result<(), EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
+    async fn ensure_log_group(
+        &self,
+        _name: &str,
+        _retention_days: i32,
+    ) -> Result<(), EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
+    async fn delete_log_group(&self, _name: &str) -> Result<(), EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
 }
 
 /// In-memory fake target for unit tests + the conformance bench.
@@ -370,7 +397,9 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
 #[derive(Debug, Default)]
 pub struct InMemoryEcs {
     /// Deployments whose service has been ensured.
-    services: std::sync::Mutex<std::collections::BTreeSet<DeploymentId>>,
+    services: std::sync::Mutex<std::collections::BTreeMap<DeploymentId, u32>>,
+    /// Log groups by name -> retention days.
+    log_groups: std::sync::Mutex<std::collections::BTreeMap<String, i32>>,
     /// Task sets keyed by `(deployment, revision)`.
     task_sets:
         std::sync::Mutex<std::collections::BTreeMap<(DeploymentId, RevisionId), TaskSetHandle>>,
@@ -405,7 +434,26 @@ impl InMemoryEcs {
 
     /// Snapshot of the ensured services.
     pub fn services(&self) -> std::collections::BTreeSet<DeploymentId> {
-        self.services.lock().expect("mutex not poisoned").clone()
+        self.services
+            .lock()
+            .expect("mutex not poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Desired count the deployment's service was first ensured with.
+    pub fn desired_count_of(&self, deployment_id: DeploymentId) -> Option<u32> {
+        self.services
+            .lock()
+            .expect("mutex not poisoned")
+            .get(&deployment_id)
+            .copied()
+    }
+
+    /// Snapshot of the ensured log groups (name -> retention days).
+    pub fn log_groups(&self) -> std::collections::BTreeMap<String, i32> {
+        self.log_groups.lock().expect("mutex not poisoned").clone()
     }
 
     /// Snapshot of the live task sets.
@@ -442,7 +490,8 @@ impl EcsDeployTarget for InMemoryEcs {
         self.services
             .lock()
             .expect("mutex not poisoned")
-            .insert(spec.deployment_id);
+            .entry(spec.deployment_id)
+            .or_insert(spec.desired_count);
         Ok(())
     }
 
@@ -553,6 +602,73 @@ impl EcsDeployTarget for InMemoryEcs {
             .expect("mutex not poisoned")
             .remove(name);
         Ok(())
+    }
+
+    async fn ensure_log_group(
+        &self,
+        name: &str,
+        retention_days: i32,
+    ) -> Result<(), EcsTargetError> {
+        self.log_groups
+            .lock()
+            .expect("mutex not poisoned")
+            .insert(name.to_string(), retention_days);
+        Ok(())
+    }
+
+    async fn delete_log_group(&self, name: &str) -> Result<(), EcsTargetError> {
+        self.log_groups
+            .lock()
+            .expect("mutex not poisoned")
+            .remove(name);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn ensure_log_group_is_idempotent() {
+        let ecs = InMemoryEcs::default();
+        ecs.ensure_log_group("/g/a", 14).await.unwrap();
+        ecs.ensure_log_group("/g/a", 30).await.unwrap();
+        let groups = ecs.log_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.get("/g/a"), Some(&30));
+    }
+
+    #[tokio::test]
+    async fn delete_log_group_is_idempotent() {
+        let ecs = InMemoryEcs::default();
+        ecs.ensure_log_group("/g/a", 14).await.unwrap();
+        ecs.delete_log_group("/g/a").await.unwrap();
+        ecs.delete_log_group("/g/a").await.unwrap();
+        assert!(ecs.log_groups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_target_refuses_log_calls() {
+        let t = UnconfiguredEcsTarget;
+        assert!(matches!(
+            t.ensure_log_group("g", 7).await,
+            Err(EcsTargetError::Unconfigured)
+        ));
+        assert!(matches!(
+            t.delete_log_group("g").await,
+            Err(EcsTargetError::Unconfigured)
+        ));
+    }
+
+    #[test]
+    fn log_group_name_is_prefix_and_deployment() {
+        let d = DeploymentId(Ulid::from(0x01_u128));
+        assert_eq!(
+            log_group_name("gtc-dev", &d),
+            format!("/greentic/gtc-dev/{}", d.0)
+        );
     }
 }
 

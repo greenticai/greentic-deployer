@@ -121,6 +121,12 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "secretsmanager:DescribeSecret",
     "secretsmanager:PutSecretValue",
     "secretsmanager:DeleteSecret",
+    // CloudWatch Logs group of the deployment's containers (`ensure_log_group`,
+    // `delete_log_group`).
+    "logs:CreateLogGroup",
+    "logs:DescribeLogGroups",
+    "logs:PutRetentionPolicy",
+    "logs:DeleteLogGroup",
 ];
 
 /// Returns the canonical capability ID for an IAM verb.
