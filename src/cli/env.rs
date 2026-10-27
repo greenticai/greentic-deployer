@@ -1833,7 +1833,11 @@ pub(super) fn apply_revision_aws_ecs(
         .revisions
         .iter()
         .find(|r| r.revision_id == revision_id)
-        .expect("revision presence checked by the caller");
+        .ok_or_else(|| {
+            OpError::NotFound(format!(
+                "revision `{revision_id}` is not part of environment `{env_id}`"
+            ))
+        })?;
     let worker_name = service_name(&revision.deployment_id);
     let inputs = aws_ecs_target_inputs(store, env, env_id, answers)?;
     let identity = inputs.identity;
@@ -2668,7 +2672,7 @@ pub(super) fn apply_traffic_non_k8s(
 /// the identity used + the enforced split. Requires the `deploy-aws-ecs`
 /// feature.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
-fn apply_traffic_aws_ecs(
+pub(super) fn apply_traffic_aws_ecs(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
@@ -2682,8 +2686,12 @@ fn apply_traffic_aws_ecs(
     OpError,
 > {
     use crate::env_packs::aws::credentials::run_aws_async;
+    use crate::env_packs::aws::real_target::ELB_WEIGHT_GRANULARITY_BPS;
     use crate::env_packs::deployer::Deployer;
 
+    // A weight finer than one ELB unit would be silently truncated; refuse it
+    // before any AWS call (same preflight `op env up` runs).
+    preflight_split_granularity(env, ELB_WEIGHT_GRANULARITY_BPS, "ALB", "0.1%")?;
     let inputs = aws_ecs_target_inputs(store, env, env_id, answers)?;
     let identity = inputs.identity;
 

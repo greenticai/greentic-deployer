@@ -68,7 +68,12 @@ pub fn aws_env_up(
 
     // ALB forward weights are `weight_bps / 10` (0..=999), so a split finer than
     // 10 bps cannot be expressed. Refuse it before warming anything.
-    preflight_split_granularity(&env, 10, "ALB", "0.1%")?;
+    preflight_split_granularity(
+        &env,
+        crate::env_packs::aws::real_target::ELB_WEIGHT_GRANULARITY_BPS,
+        "ALB",
+        "0.1%",
+    )?;
 
     // 1. Warm every revision that carries traffic. A deployment's revisions sit
     //    behind one listener route, so endpoints are keyed by deployment.

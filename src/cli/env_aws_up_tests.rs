@@ -392,3 +392,95 @@ fn the_aws_descriptor_path_is_the_handlers() {
         crate::env_packs::aws::AwsEcsDeployerHandler::DESCRIPTOR_PATH
     );
 }
+
+/// A revision id the env does not carry is a typed refusal, not a panic.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[test]
+fn apply_revision_aws_ecs_refuses_an_unknown_revision_instead_of_panicking() {
+    let dir = tempdir().unwrap();
+    let store = LocalFsStore::new(dir.path());
+    let mut env = make_env("local");
+    bind_aws(&mut env);
+    let d = make_bundle_deployment("local", "bundle-a");
+    let stranger = make_revision(
+        "local",
+        "bundle-a",
+        &d.deployment_id,
+        1,
+        RevisionLifecycle::Ready,
+    );
+    // `stranger` is deliberately NOT pushed onto the env.
+    store.save(&env).unwrap();
+    let env_id = EnvId::try_from("local").unwrap();
+    match crate::cli::env::apply_revision_aws_ecs(
+        &store,
+        &env,
+        &env_id,
+        stranger.revision_id,
+        crate::cli::env::RevisionVerb::Warm,
+        None,
+    ) {
+        Err(OpError::NotFound(msg)) => assert!(msg.contains("revision"), "{msg}"),
+        other => panic!("expected a NotFound refusal, got {other:?}"),
+    }
+}
+
+/// `op env apply-traffic` on its own applies the same granularity preflight
+/// `op env up` does: 3333/6667 would otherwise be silently truncated.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[test]
+fn apply_traffic_refuses_a_split_finer_than_the_alb_granularity() {
+    use crate::env_packs::aws::deploy_target::InMemoryEcs;
+    let region = "fake-region-apply-traffic-fine-split";
+    let fake = Arc::new(InMemoryEcs::default());
+    let _seam = crate::cli::env::ecs_target_seam::install(region, fake.clone());
+
+    let dir = tempdir().unwrap();
+    let store = LocalFsStore::new(dir.path());
+    let mut env = make_env("local");
+    bind_aws(&mut env);
+    let d = make_bundle_deployment("local", "bundle-a");
+    let r1 = make_revision(
+        "local",
+        "bundle-a",
+        &d.deployment_id,
+        1,
+        RevisionLifecycle::Ready,
+    );
+    let r2 = make_revision(
+        "local",
+        "bundle-a",
+        &d.deployment_id,
+        2,
+        RevisionLifecycle::Ready,
+    );
+    let mut split = make_traffic_split(
+        "local",
+        "bundle-a",
+        &d.deployment_id,
+        &r1.revision_id,
+        "01J000000000000000000000AC",
+    );
+    split.entries = vec![
+        TrafficSplitEntry {
+            revision_id: r1.revision_id,
+            weight_bps: 3_333,
+        },
+        TrafficSplitEntry {
+            revision_id: r2.revision_id,
+            weight_bps: 6_667,
+        },
+    ];
+    let deployment_id = d.deployment_id;
+    env.bundles.push(d);
+    env.revisions.extend([r1, r2]);
+    env.traffic_splits.push(split);
+    store.save(&env).unwrap();
+    let env_id = EnvId::try_from("local").unwrap();
+    write_aws_answers(&store, &env_id, region);
+
+    match crate::cli::env::apply_traffic_aws_ecs(&store, &env, &env_id, deployment_id, None) {
+        Err(OpError::Conflict(msg)) => assert!(msg.contains("10 bps"), "{msg}"),
+        other => panic!("expected a split refusal, got {other:?}"),
+    }
+}

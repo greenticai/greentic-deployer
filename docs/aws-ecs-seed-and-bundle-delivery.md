@@ -125,14 +125,14 @@ Task definition shape (per revision):
   - `GREENTIC_SEED_DEV_STORE` = `<dev-store secret arn>:::<version-id>` (only
     when the environment has a dev store)
   and plain `environment` carrying the expected SHA-256 of each file
-  (`GREENTIC_SEED_ENVIRONMENT_SHA256`, `GREENTIC_SEED_DEV_STORE_SHA256`; a
+  (`GREENTIC_SEED_ENVIRONMENT_JSON_SHA256`, `GREENTIC_SEED_DEV_STORE_SHA256`; a
   digest is not secret). Command, run by `sh`:
 
   ```sh
   set -eu
   umask 022
   printf '%s' "$GREENTIC_SEED_ENVIRONMENT_JSON" > /seed/environment.json
-  echo "$GREENTIC_SEED_ENVIRONMENT_SHA256  /seed/environment.json" | sha256sum -c -s
+  echo "$GREENTIC_SEED_ENVIRONMENT_JSON_SHA256  /seed/environment.json" | sha256sum -c -s
   if [ -n "${GREENTIC_SEED_DEV_STORE_SHA256:-}" ]; then
     mkdir -p /seed/.greentic/dev
     printf '%s' "$GREENTIC_SEED_DEV_STORE" > /seed/.greentic/dev/.dev.secrets.env
@@ -270,3 +270,23 @@ Read from documentation and source only; none of it has run on Fargate:
 - the worker (uid 65532) reading the `0644` files under the root-owned `0755`
   mount;
 - the ECR ambient credential path itself (it does not exist yet).
+
+## 6. Roles the operator provides (the deployer grants nothing to them)
+
+The deployer passes two pre-existing roles to ECS (`iam:PassRole`, conditioned
+on `ecs-tasks.amazonaws.com`). It never creates them and never attaches
+permissions to them; the bootstrap Terraform and README say the same.
+
+- **Execution role** (`execution_role_arn`): `secretsmanager:GetSecretValue`
+  on the seed secrets (ECS resolves the task definition's `secrets` entries
+  with this role before any container starts), `logs:CreateLogStream` and
+  `logs:PutLogEvents` on the deployment's log group, and pull access for the
+  runtime image. The public GHCR runtime image and the busybox init image need
+  no registry permission; a private registry does.
+- **Task role** (the identity greentic-start runs as): read access to the
+  bundle registry per section 4 -- for ECR, `ecr:GetAuthorizationToken` on `*`
+  plus `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on the bundle
+  repositories.
+
+The deployer's own role needs no ECR permission at all: nothing in the deployer
+pushes an image (`ecr:PutImage` was removed from the validated verbs).
