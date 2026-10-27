@@ -2,12 +2,10 @@
 //! and params, build the live target, drive the verbs. Only the live path needs
 //! `deploy-azure-aca`; a build without it refuses by name.
 
-use greentic_deploy_spec::{EnvId, Environment, RevisionId};
-use serde_json::Value;
-
 use super::OpError;
 use super::env::RevisionVerb;
 use crate::environment::LocalFsStore;
+use greentic_deploy_spec::{EnvId, Environment, RevisionId};
 
 /// Descriptor path, known in every build.
 pub(crate) const AZURE_ACA_DEPLOYER_PATH: &str = "greentic.deployer.azure-aca";
@@ -17,6 +15,9 @@ pub(crate) const NO_DEPLOY_FEATURE: &str = "this build was compiled without the 
 
 #[cfg(all(feature = "creds-azure", feature = "deploy-azure-aca"))]
 pub(super) use live::{AcaProviderTeardown, apply_revision_azure, apply_traffic_azure};
+
+#[cfg(not(all(feature = "creds-azure", feature = "deploy-azure-aca")))]
+use serde_json::Value;
 
 #[cfg(not(all(feature = "creds-azure", feature = "deploy-azure-aca")))]
 pub(super) fn apply_revision_azure(
@@ -63,39 +64,6 @@ mod live {
     use crate::env_packs::azure_aca::{AcaParams, AzureAcaDeployerHandler, bound_session, naming};
     use crate::env_packs::deployer::Deployer;
     use crate::environment::{ProviderTeardown, ProviderTeardownCtx, StoreError};
-
-    #[cfg(test)]
-    pub(crate) mod aca_target_seam {
-        //! Test-only replacement of the live target, keyed by subscription id.
-        use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex};
-
-        use crate::env_packs::azure_aca::deploy_target::AcaDeployTarget;
-
-        static TARGETS: Mutex<BTreeMap<String, Arc<dyn AcaDeployTarget>>> =
-            Mutex::new(BTreeMap::new());
-
-        pub(crate) struct Installed(String);
-
-        impl Drop for Installed {
-            fn drop(&mut self) {
-                if let Ok(mut m) = TARGETS.lock() {
-                    m.remove(&self.0);
-                }
-            }
-        }
-
-        pub(crate) fn install(subscription: &str, t: Arc<dyn AcaDeployTarget>) -> Installed {
-            if let Ok(mut m) = TARGETS.lock() {
-                m.insert(subscription.to_string(), t);
-            }
-            Installed(subscription.to_string())
-        }
-
-        pub(super) fn lookup(subscription: &str) -> Option<Arc<dyn AcaDeployTarget>> {
-            TARGETS.lock().ok()?.get(subscription).cloned()
-        }
-    }
 
     pub(in crate::cli) struct AzureTargetInputs {
         pub identity: &'static str,
@@ -270,6 +238,39 @@ mod live {
 
     #[cfg(test)]
     pub(crate) use aca_target_seam::install as install_target;
+
+    #[cfg(test)]
+    pub(crate) mod aca_target_seam {
+        //! Test-only replacement of the live target, keyed by subscription id.
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        use crate::env_packs::azure_aca::deploy_target::AcaDeployTarget;
+
+        static TARGETS: Mutex<BTreeMap<String, Arc<dyn AcaDeployTarget>>> =
+            Mutex::new(BTreeMap::new());
+
+        pub(crate) struct Installed(String);
+
+        impl Drop for Installed {
+            fn drop(&mut self) {
+                if let Ok(mut m) = TARGETS.lock() {
+                    m.remove(&self.0);
+                }
+            }
+        }
+
+        pub(crate) fn install(subscription: &str, t: Arc<dyn AcaDeployTarget>) -> Installed {
+            if let Ok(mut m) = TARGETS.lock() {
+                m.insert(subscription.to_string(), t);
+            }
+            Installed(subscription.to_string())
+        }
+
+        pub(super) fn lookup(subscription: &str) -> Option<Arc<dyn AcaDeployTarget>> {
+            TARGETS.lock().ok()?.get(subscription).cloned()
+        }
+    }
 }
 
 #[cfg(all(test, feature = "creds-azure", feature = "deploy-azure-aca"))]

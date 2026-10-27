@@ -71,7 +71,7 @@ pub(crate) fn parse_memory_mib(raw: &str) -> Result<u32, SizingError> {
 }
 
 fn memory_string(mib: u32) -> String {
-    if mib % 1024 == 0 {
+    if mib.is_multiple_of(1024) {
         format!("{}Gi", mib / 1024)
     } else {
         format!("{:.1}Gi", f64::from(mib) / 1024.0)

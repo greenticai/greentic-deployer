@@ -5,7 +5,9 @@
 //! in the validator's [`REQUIRED_ACTIONS`] and in the rendered custom role; tests
 //! tie the three together.
 
-/// Actions the ARM REST client issues (control plane only).
+/// Actions the ARM REST client issues (control plane only). Tied to the validator
+/// set by a test; the rendered role is built from [`REQUIRED_ACTIONS`].
+#[cfg(test)]
 pub(crate) const REAL_ACA_TARGET_RBAC_ACTIONS: &[&str] = &[
     "Microsoft.App/containerApps/read",
     "Microsoft.App/containerApps/write",
@@ -84,6 +86,7 @@ pub(crate) fn action_allowed(perms: &[Permission], action: &str) -> bool {
 }
 
 /// Required actions the identity lacks, in `REQUIRED_ACTIONS` order.
+#[cfg(test)]
 pub(crate) fn missing_actions(perms: &[Permission]) -> Vec<&'static str> {
     REQUIRED_ACTIONS
         .iter()

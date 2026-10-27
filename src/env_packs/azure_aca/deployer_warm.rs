@@ -32,7 +32,6 @@ use crate::environment::seed::seed_environment_bytes;
 pub(crate) const TARGET_PORT: u16 = 8080;
 const WARM_TIMEOUT: Duration = Duration::from_secs(300);
 const WARM_TIMEOUT_ENV: &str = "GREENTIC_AZURE_ACA_WARM_READY_TIMEOUT_SECS";
-const WARM_POLL: Duration = Duration::from_secs(5);
 
 pub(crate) fn provider(e: AcaTargetError) -> DeployerError {
     DeployerError::Provider(e.to_string())

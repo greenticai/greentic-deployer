@@ -28,7 +28,7 @@ runtime contract this reuses: `docs/aws-ecs-seed-and-bundle-delivery.md`
 | App name limit | 32 characters | `naming::APP_NAME_MAX` | `NEEDS_LIVE` |
 | Revision suffix | `r` + lowercased revision id, `[a-z0-9-]`, no `--`, at most 64 | `naming::revision_suffix` | documented by Microsoft Learn |
 | Seed size cap | `SEED_MAX_BYTES = 24_576` | `seed::SEED_MAX_BYTES` | `NEEDS_LIVE` (per-secret cap not found in docs; 24 KiB is the Key Vault limit, conservative) |
-| Seed mechanism | `SecretRef` env into the init container | `seed::SEED_DELIVERY` | `NEEDS_LIVE` (secret volume into an init container, and `/` in a volume `path`, unverified) |
+| Seed mechanism | `SecretRef` env into the init container | `seed` module (init script + `deployer_warm::plan`) | `NEEDS_LIVE` (secret volume into an init container, and `/` in a volume `path`, unverified) |
 | Secrets update | full `PUT` re-sending every secret from `listSecrets` | `deployer_warm::merge_secrets` | `NEEDS_LIVE` (whether a `PATCH` merges secrets by name is unverified) |
 | cpu / memory pairs | consumption pairs `0.25/0.5Gi` .. `4/8Gi`, memory = 2 x cpu | `sizing::snap` | `NEEDS_LIVE` |
 | Intent read-back | container env `GREENTIC_REVISION_INTENT` on `GET revision` | `status::intent_from_revision` | `NEEDS_LIVE` (whether the revision GET exposes `template.containers[].env` is unverified; if absent the revision reads as unstamped, which is a CONFLICT, never an adoption) |
@@ -53,8 +53,8 @@ greentic-start reads `GREENTIC_SEED_DIR` (here `/seed`) holding
    refused with a named error BEFORE any ARM write. Never truncated.
 
 Fallback when `NEEDS_LIVE` shows secret volumes reach init containers and accept
-a nested `path`: flip `SEED_DELIVERY` to `SecretVolume` (raises the cap; the
-init container then only copies). The body builder already models both.
+a nested `path`: switch the init container to a secret volume in `arm_body` + `deployer_warm::plan` (raises the cap; the
+init container then only copies). Only the secretRef-env mechanism is implemented.
 
 ## Secrets are read-modify-write
 

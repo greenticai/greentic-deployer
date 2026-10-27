@@ -33,7 +33,7 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "creds-gcp", "deploy-gcp-cloudrun", "k8s-client"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "creds-gcp", "deploy-gcp-cloudrun", "creds-azure", "deploy-azure-aca", "k8s-client"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]

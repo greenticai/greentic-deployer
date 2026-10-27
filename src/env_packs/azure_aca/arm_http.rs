@@ -73,6 +73,7 @@ pub(crate) struct ArmResponse {
 }
 
 impl ArmResponse {
+    #[cfg(test)]
     pub(crate) fn new(status: u16, body: &str) -> Self {
         Self {
             status,
@@ -81,6 +82,7 @@ impl ArmResponse {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers
             .push((name.to_ascii_lowercase(), value.to_string()));
@@ -143,12 +145,6 @@ pub(crate) mod fake {
             Self {
                 requests: Mutex::default(),
                 script: Mutex::new(responses.into_iter().map(Ok).collect()),
-            }
-        }
-
-        pub(crate) fn push(&self, r: ArmResponse) {
-            if let Ok(mut s) = self.script.lock() {
-                s.push_back(Ok(r));
             }
         }
 

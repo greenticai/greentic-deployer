@@ -52,7 +52,7 @@ fn whole_bundle_retiring(env: &Environment, revision: &Revision) -> bool {
 
 /// Percent weight for a bps weight; refuses a split Container Apps cannot express.
 pub(crate) fn percent(weight_bps: u32) -> Result<u32, DeployerError> {
-    if weight_bps % WEIGHT_GRANULARITY_BPS != 0 {
+    if !weight_bps.is_multiple_of(WEIGHT_GRANULARITY_BPS) {
         return Err(DeployerError::Provider(format!(
             "traffic weight {weight_bps} bps is not expressible: Container Apps weights are whole \
              percents (multiples of {WEIGHT_GRANULARITY_BPS} bps)"

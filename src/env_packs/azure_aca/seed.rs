@@ -16,15 +16,9 @@ pub(crate) const SEED_INIT_CONTAINER: &str = "seed-init";
 pub(crate) const SEED_VOLUME: &str = "seed";
 pub(crate) const SEED_MOUNT_DIR: &str = "/seed";
 
-/// How seed files reach the init container (the one `NEEDS_LIVE` switch).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SeedDelivery {
-    /// Each file is a `secretRef` env var of the init container.
-    SecretRefEnv,
-}
-
-/// The delivery the code uses today.
-pub(crate) const SEED_DELIVERY: SeedDelivery = SeedDelivery::SecretRefEnv;
+// Delivery: each seed file is a `secretRef` env var of the init container (the one
+// `NEEDS_LIVE` choice; a secret volume would raise the size cap). Only this
+// mechanism is implemented, see the decision record.
 
 /// One seed file.
 #[derive(Clone, PartialEq, Eq)]
