@@ -53,8 +53,9 @@ use crate::env_packs::telemetry::{
 };
 
 /// Default repository base when the binding supplies no
-/// `ecr_repository_prefix`. Recorded for the bundle-delivery path; the worker
-/// container always runs the public runtime image (`runtime_image`).
+/// `ecr_repository_prefix`. RESERVED: parsed (the wizard still collects it) but
+/// read by nothing; the worker container always runs the public runtime image
+/// (`runtime_image`) and the deployer pushes no images.
 const DEFAULT_IMAGE_BASE: &str = "greentic/operator";
 
 /// Default image-tag prefix when the binding supplies no
@@ -69,6 +70,12 @@ const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
 
 /// Seam failures surface as provider failures — the verb's preconditions have
 /// already passed by the time the target is touched.
+/// All traffic on one revision: expressible without any listener.
+fn is_trivial_split(entries: &[greentic_deploy_spec::TrafficSplitEntry]) -> bool {
+    let live: Vec<_> = entries.iter().filter(|e| e.weight_bps > 0).collect();
+    matches!(live.as_slice(), [only] if only.weight_bps == 10_000)
+}
+
 fn provider(err: EcsTargetError) -> DeployerError {
     DeployerError::Provider(err.to_string())
 }
@@ -115,16 +122,17 @@ pub struct AwsEcsParams {
     pub region: String,
     /// ECS cluster name the deployer manages services in.
     pub cluster: String,
-    /// Repository base answered as `ecr_repository_prefix`. Not the worker
+    /// RESERVED: repository base answered as `ecr_repository_prefix`, kept for
+    /// answer compatibility and read by nothing. Not the worker
     /// image: the worker runs [`Self::runtime_image`] and reads its bundle
     /// from `bundle_source_uri` in the seeded `environment.json`.
     pub image_base: String,
-    /// Prefix the revision's image tag is built from (wizard default `rev-`).
-    /// Blank tags with the raw revision ULID.
+    /// RESERVED (wizard answer `container_image_tag_prefix`, default `rev-`):
+    /// parsed for answer compatibility, read by nothing.
     pub image_tag_prefix: String,
     /// ALB listener ARN the weighted forward action is written to. `None`
-    /// means no ALB mirror is configured: `apply_traffic_split` skips the
-    /// listener update and the runtime dispatcher stays authoritative.
+    /// means no listener is configured: `apply_traffic_split` then accepts only
+    /// a split sending all traffic to one revision and refuses any other.
     pub listener_arn: Option<String>,
     /// Scoped deployer role ARN to assume for a bound STS session (the role
     /// the rules-pack Terraform creates). `None` means no role hop: render-only
@@ -647,6 +655,8 @@ impl Deployer for AwsEcsDeployerHandler {
              (min_instances >= 1, max_instances == 1)",
             "ingress_managed: the load balancer, listener, certificate and target groups are \
              operator-provided; the pack only discovers the URL",
+            "traffic_split: requires an operator-provided listener (`alb_listener_arn`); a \
+             split across several revisions is refused without one",
             "drain: not implemented — a retire that needs a drain window is refused",
             "runtime_pin: no per-revision pin; the runtime image comes from the \
              environment-wide answer",
@@ -740,7 +750,7 @@ impl Deployer for AwsEcsDeployerHandler {
                     env,
                     revision_id,
                     &params,
-                    self.dev_secrets.as_deref(),
+                    self.dev_secrets.as_ref().map(super::DevSecrets::as_bytes),
                 )
                 .await?;
                 self.target
@@ -880,9 +890,19 @@ impl Deployer for AwsEcsDeployerHandler {
         // Preconditions + outcome construction BEFORE any AWS call.
         let outcome = enforce_split_invariants(env, deployment_id)?;
         let params = params_from_answers(env, answers)?;
-        // Only touch the ALB when a listener is configured; with no
-        // `alb_listener_arn` the runtime dispatcher stays authoritative for
-        // traffic splitting, so there is no listener to write.
+        // Weights can only be applied on an operator-provided ALB listener:
+        // every ECS task set runs at 100% scale and the seed carries a single
+        // revision, so no runtime dispatcher splits traffic. Without
+        // `alb_listener_arn`, only a split that sends everything to one
+        // revision is expressible; anything else fails closed.
+        if params.listener_arn.is_none() && !is_trivial_split(&outcome.applied_entries) {
+            return Err(DeployerError::Provider(
+                "traffic split across several revisions (or below 100%) needs the \
+                 `alb_listener_arn` answer: ECS applies weights only through an \
+                 operator-provided ALB listener"
+                    .to_string(),
+            ));
+        }
         if let Some(listener_arn) = &params.listener_arn {
             let weights: Vec<TargetGroupWeight> = outcome
                 .applied_entries
@@ -935,9 +955,79 @@ mod tests {
 
     // ---- conformance: the Phase D entry gate ----------------------------
 
+    /// The shared bench passes `None` answers everywhere, but its fixture split
+    /// spans several revisions, which AWS applies only through a listener. This
+    /// wrapper supplies the operator's listener to `apply_traffic_split` alone.
+    #[derive(Debug)]
+    struct WithListener(AwsEcsDeployerHandler);
+
+    #[async_trait::async_trait]
+    impl Deployer for WithListener {
+        async fn stage_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+        ) -> Result<StageOutcome, DeployerError> {
+            self.0.stage_revision(env, revision_id).await
+        }
+        async fn warm_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<WarmOutcome, DeployerError> {
+            self.0.warm_revision(env, revision_id, answers).await
+        }
+        async fn drain_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<DrainOutcome, DeployerError> {
+            self.0.drain_revision(env, revision_id, answers).await
+        }
+        async fn confirm_drained(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<crate::env_packs::deployer::DrainEvidence, DeployerError> {
+            self.0.confirm_drained(env, revision_id, answers).await
+        }
+        fn capabilities(&self) -> AdapterCapabilities {
+            self.0.capabilities()
+        }
+        fn capability_notes(&self) -> &'static [&'static str] {
+            self.0.capability_notes()
+        }
+        async fn archive_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<ArchiveOutcome, DeployerError> {
+            self.0.archive_revision(env, revision_id, answers).await
+        }
+        async fn apply_traffic_split(
+            &self,
+            env: &Environment,
+            deployment_id: DeploymentId,
+            _answers: Option<&Value>,
+        ) -> Result<TrafficSplitOutcome, DeployerError> {
+            let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+            self.0
+                .apply_traffic_split(env, deployment_id, Some(&answers))
+                .await
+        }
+        fn report_runtime_config(&self, env: &Environment) -> greentic_deploy_spec::RuntimeConfig {
+            self.0.report_runtime_config(env)
+        }
+    }
+
     #[tokio::test]
     async fn aws_ecs_deployer_passes_conformance() {
         let (handler, _target) = handler_with_fake();
+        let handler = WithListener(handler);
         run_conformance(&handler)
             .await
             .expect("AWS-ECS deployer satisfies the Phase D conformance contract");
@@ -1421,21 +1511,51 @@ mod tests {
         assert!(target.endpoint_queries().is_empty());
     }
 
-    /// With no `alb_listener_arn` configured, the split still produces the
-    /// right outcome but the deployer leaves the ALB untouched — the runtime
-    /// dispatcher stays authoritative for traffic splitting.
+    /// A split that actually divides traffic needs the operator's listener:
+    /// every ECS task set scales to 100%, so nothing else can apply weights.
+    /// Without `alb_listener_arn` it is refused, naming the answer, and the
+    /// target stays untouched.
     #[tokio::test]
-    async fn traffic_split_without_a_listener_skips_the_alb() {
+    async fn a_non_trivial_split_without_a_listener_is_refused() {
         let (handler, target) = handler_with_fake();
         let env = build_fixture_env();
         let dep = env.bundles[0].deployment_id;
+        assert!(
+            env.traffic_splits
+                .iter()
+                .find(|s| s.deployment_id == dep)
+                .is_some_and(|s| s.entries.iter().filter(|e| e.weight_bps > 0).count() > 1),
+            "fixture precondition: a split across several revisions"
+        );
+
+        let err = handler
+            .apply_traffic_split(&env, dep, None)
+            .await
+            .unwrap_err();
+        match err {
+            DeployerError::Provider(msg) => assert!(msg.contains("alb_listener_arn"), "{msg}"),
+            other => panic!("expected a Provider refusal, got {other:?}"),
+        }
+        assert!(target.weights_for(dep).is_none());
+    }
+
+    /// A trivial split (all traffic to one revision) needs no listener.
+    #[tokio::test]
+    async fn a_single_revision_split_without_a_listener_is_ok() {
+        let (handler, target) = handler_with_fake();
+        let mut env = build_fixture_env();
+        let dep = env.bundles[0].deployment_id;
+        let split = env
+            .traffic_splits
+            .iter_mut()
+            .find(|s| s.deployment_id == dep)
+            .unwrap();
+        split.entries.truncate(1);
+        split.entries[0].weight_bps = 10_000;
 
         let outcome = handler.apply_traffic_split(&env, dep, None).await.unwrap();
         assert_eq!(outcome.applied_deployment_id, dep);
-        assert!(
-            target.weights_for(dep).is_none(),
-            "no listener configured: the ALB must be left untouched"
-        );
+        assert!(target.weights_for(dep).is_none());
     }
 
     /// Preconditions run BEFORE any target call: unknown revision / invalid

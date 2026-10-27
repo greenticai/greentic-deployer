@@ -51,6 +51,24 @@ use crate::tool_check::ToolCheck;
 
 pub use credentials::{AwsDeployerCredentials, AwsValidatorClient};
 
+/// Raw dev-store bytes. `Debug` redacts the content: the handler derives
+/// `Debug` and these bytes are credentials. (The GCP Cloud Run handler holds
+/// its dev secrets the same way and is not changed here.)
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DevSecrets(Vec<u8>);
+
+impl DevSecrets {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DevSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted {} bytes>", self.0.len())
+    }
+}
+
 /// Native handler for the AWS-ECS deployer env-pack.
 #[derive(Debug)]
 pub struct AwsEcsDeployerHandler {
@@ -63,7 +81,7 @@ pub struct AwsEcsDeployerHandler {
     pub(crate) target: std::sync::Arc<dyn deploy_target::EcsDeployTarget>,
     /// Raw `.dev.secrets.env` bytes the CLI read from the env's store, staged
     /// as the second seed file. `None` for an env with no dev store.
-    pub(crate) dev_secrets: Option<Vec<u8>>,
+    pub(crate) dev_secrets: Option<DevSecrets>,
 }
 
 impl Default for AwsEcsDeployerHandler {
@@ -112,7 +130,7 @@ impl AwsEcsDeployerHandler {
         Self {
             creds: AwsDeployerCredentials::default(),
             target,
-            dev_secrets,
+            dev_secrets: dev_secrets.map(DevSecrets),
         }
     }
 }
@@ -253,5 +271,20 @@ mod tests {
             spec.questions.iter().any(|q| q.id == "target_group_arns"),
             "aws-ecs wizard must collect the target-group pool",
         );
+    }
+
+    #[test]
+    fn debug_of_the_handler_never_prints_dev_secret_bytes() {
+        let handler = AwsEcsDeployerHandler::with_target_and_dev_secrets(
+            std::sync::Arc::new(deploy_target::UnconfiguredEcsTarget),
+            Some(b"SUPERSECRET".to_vec()),
+        );
+        let shown = format!("{handler:?}");
+        assert!(!shown.contains("SUPERSECRET"), "{shown}");
+        assert!(
+            !shown.contains("83, 85, 80"),
+            "bytes leaked as a list: {shown}"
+        );
+        assert!(shown.contains("<redacted 11 bytes>"), "{shown}");
     }
 }

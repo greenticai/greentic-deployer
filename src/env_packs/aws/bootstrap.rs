@@ -309,10 +309,10 @@ fn render_terraform(input: &IamRulesPackInput<'_>) -> String {
 # IMPORTANT: Resource placeholders (`<REPLACE_WITH_*>`) must be replaced
 # with the actual ARNs from your AWS account before applying:
 #
-#   <REPLACE_WITH_ECS_RESOURCE_ARNS>  — e.g. arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*
-#   <REPLACE_WITH_SECRET_ARNS>        — e.g. arn:aws:secretsmanager:<region>:<account>:secret:greentic/*
+#   <REPLACE_WITH_ECS_RESOURCE_ARNS>  — e.g. arn:aws:ecs:<region>:<account>:service/<cluster>/gtc-svc-*
+#   <REPLACE_WITH_SECRET_ARNS>        — e.g. arn:aws:secretsmanager:<region>:<account>:secret:gtc-{env_id}-*
 #   <REPLACE_WITH_ALB_LISTENER_ARNS>  — e.g. arn:aws:elasticloadbalancing:<region>:<account>:listener/app/<lb>/<id>/<id>
-#   <REPLACE_WITH_LOG_GROUP_ARN_PREFIX> — e.g. arn:aws:logs:<region>:<account>:log-group:/greentic/*
+#   <REPLACE_WITH_LOG_GROUP_ARN_PREFIX> — e.g. arn:aws:logs:<region>:<account>:log-group:/greentic/gtc-{env_id}/*
 #   <REPLACE_WITH_ECS_TASK_ROLE_ARN>  — e.g. arn:aws:iam::<account>:role/greentic-{env_id}-task-execution
 #
 # Trust principal is rendered from the operator-supplied admin hint:
@@ -392,32 +392,36 @@ The policy is split into multiple statements by sensitivity:
 
 - **Read-only** (`sts:GetCallerIdentity`, `iam:SimulatePrincipalPolicy`)
   — `Resource = "*"` is safe; these are validation-only.
-- **ECS rollout** (scopable `ecs:*` verbs) — replace
-  `<REPLACE_WITH_ECS_RESOURCE_ARNS>` with your cluster/service/task-set
-  ARNs, e.g.
-  `arn:aws:ecs:<region>:<account>:service/<cluster>/greentic-*`.
+- **ECS rollout** (`ecs:DescribeServices`, `ListServices`, `CreateService`,
+  `DeleteService`, `CreateTaskSet`, `DescribeTaskSets`, `DeleteTaskSet`) —
+  replace `<REPLACE_WITH_ECS_RESOURCE_ARNS>` with your cluster/service/task-set
+  ARNs. The deployer names its services `gtc-svc-*`, e.g.
+  `arn:aws:ecs:<region>:<account>:service/<cluster>/gtc-svc-*`.
 - **ECS task-definition lifecycle** (`ecs:RegisterTaskDefinition`,
-  `ecs:DeregisterTaskDefinition`, `ecs:DescribeTaskDefinition`, `ecs:TagResource`, `ecs:ListTagsForResource`) — granted at `Resource = "*"` because
-  AWS provides no resource-level scoping for these actions.
-- **ELB describe** (`elasticloadbalancing:DescribeTargetGroups`) —
-  granted at `Resource = "*"` because AWS provides no resource-level
-  scoping for describe actions.
+  `DeregisterTaskDefinition`, `DescribeTaskDefinition`, `TagResource`,
+  `ListTagsForResource`) — granted at `Resource = "*"` because AWS provides no
+  resource-level scoping for these actions.
+- **ELB describe** (`elasticloadbalancing:DescribeTargetGroups`,
+  `DescribeListeners`, `DescribeLoadBalancers`) — granted at `Resource = "*"`
+  because AWS provides no resource-level scoping for describe actions.
 - **ALB listener mutation** (`elasticloadbalancing:ModifyListener`,
-  `DescribeRules`, `CreateRule`, `ModifyRule`, `AddTags`, `DescribeTags`) —
-  `ModifyListener` writes the listener's default action; the rule verbs write
-  per-deployment listener rules, and the tag verbs stamp + verify each rule's
-  owning deployment so the deployer only rewrites rules it created. Replace
-  `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your listener ARN.
+  `DescribeRules`, `CreateRule`, `ModifyRule`, `DeleteRule`, `AddTags`,
+  `DescribeTags`) — `ModifyListener` writes the listener's default action; the
+  rule verbs write and remove per-deployment listener rules, and the tag verbs
+  stamp + verify each rule's owning deployment so the deployer only rewrites
+  rules it created. Replace `<REPLACE_WITH_ALB_LISTENER_ARNS>` with your
+  listener ARN.
 - **CloudWatch Logs** (`logs:CreateLogGroup`, `PutRetentionPolicy`,
   `DeleteLogGroup`) — replace `<REPLACE_WITH_LOG_GROUP_ARN_PREFIX>` with the
-  log-group ARN prefix, e.g.
-  `arn:aws:logs:<region>:<account>:log-group:/greentic/*`.
+  log-group ARN prefix. The deployer creates `/greentic/<secret_prefix>/<deployment id>`
+  (default `secret_prefix` is `gtc-{env_id}`), e.g.
+  `arn:aws:logs:<region>:<account>:log-group:/greentic/gtc-{env_id}/*`.
 - **Secrets Manager** (`secretsmanager:CreateSecret`, `DescribeSecret`,
-  `PutSecretValue`, `TagResource`, `DeleteSecret`) — the seed and telemetry
-  secrets the deployer owns. Replace `<REPLACE_WITH_SECRET_ARNS>` with the
-  secret ARN prefix, e.g.
-  `arn:aws:secretsmanager:<region>:<account>:secret:greentic/*`.
-- **iam:PassRole** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
+  `PutSecretValue`, `TagResource`, `DeleteSecret`) — the three secrets the
+  deployer owns: `<secret_prefix>-environment`, `<secret_prefix>-dev-store` and
+  `<secret_prefix>-telemetry-headers`. Replace `<REPLACE_WITH_SECRET_ARNS>` with
+  e.g. `arn:aws:secretsmanager:<region>:<account>:secret:gtc-{env_id}-*`.
+- **`iam:PassRole`** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
   ARN of the ECS task-execution role, e.g.
   `arn:aws:iam::<account>:role/greentic-{env_id}-task-execution`.
   Conditioned on `iam:PassedToService = ecs-tasks.amazonaws.com`.
@@ -788,6 +792,32 @@ mod tests {
             tf.contains("\"s3:GetObject\""),
             "unrecognized action must appear in the HCL; content:\n{tf}"
         );
+    }
+
+    /// The README prose names every validated verb (by its full id or by its
+    /// suffix in backticks), so the operator-facing list cannot drift behind
+    /// `VALIDATED_IAM_VERBS`.
+    #[test]
+    fn readme_prose_names_every_validated_verb() {
+        use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;
+        let pack = render_min_iam_rules_pack(&IamRulesPackInput {
+            env_id: "prod-eu",
+            admin_identity_hint: "arn:aws:iam::111122223333:role/x",
+            allowed_actions: &[],
+        });
+        let readme = &pack
+            .entries
+            .iter()
+            .find(|e| e.filename == "README.md")
+            .unwrap()
+            .content;
+        for verb in VALIDATED_IAM_VERBS {
+            let suffix = verb.split_once(':').map_or(*verb, |(_, s)| s);
+            assert!(
+                readme.contains(&format!("`{verb}`")) || readme.contains(&format!("`{suffix}`")),
+                "README prose does not mention `{verb}`"
+            );
+        }
     }
 
     #[test]

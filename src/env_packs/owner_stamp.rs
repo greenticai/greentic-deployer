@@ -2,7 +2,7 @@
 //!
 //! Shared by the Cloud Run lane (a `greentic-owner` label) and the AWS-ECS lane
 //! (a `greentic:owner` tag), so one environment reads as one owner on both and
-//! the conflict check means the same thing everywhere. Ungated: neither cloud
+//! the conflict check means the same thing everywhere. Not feature-gated: neither cloud
 //! feature owns it.
 
 /// The value stamped as a staged secret's owner: a GCP-label-safe rendering of

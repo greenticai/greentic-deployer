@@ -81,8 +81,8 @@ pub const AWS_STS_CALLER_IDENTITY_CAP: &str = "aws.sts.caller-identity";
 /// this slice, so the grouping is free to change).
 ///
 /// Covers the full ECS task-set rollout surface `RealEcsTarget` exercises at
-/// deploy time, this handler's own STS/IAM self-probes, image-push staging, and
-/// `iam:PassRole`. The runtime subset the real target actually calls is listed
+/// deploy time, this handler's own STS/IAM self-probes, Secrets Manager / CloudWatch Logs
+/// staging, and `iam:PassRole`. The runtime subset the real target actually calls is listed
 /// in `real_target::REAL_ECS_TARGET_IAM_ACTIONS`; a test pins it ⊆ this list, so
 /// adding an SDK call to the real target without a matching verb here fails CI
 /// rather than the customer's first live deploy. Each verb maps to a capability

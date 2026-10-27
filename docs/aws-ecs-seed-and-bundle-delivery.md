@@ -1,8 +1,10 @@
 # AWS ECS Fargate: seed and bundle delivery (decision record)
 
 Status: decided 2026-10-27. Spike for the ECS Fargate parity effort
-(`src/env_packs/aws` reaching parity with `src/env_packs/gcp_cloudrun`). No
-production code ships with this document.
+(`src/env_packs/aws` reaching parity with `src/env_packs/gcp_cloudrun`). The
+seed-delivery half is implemented in `src/env_packs/aws` (`seed_init`,
+`seed_stage`); the registry credential for the bundle pull is NOT (see the
+"Interim" note in section 4).
 
 ## External prerequisite (read first)
 
@@ -251,12 +253,21 @@ Rejected:
   ties the lane to one network layout. Not chosen; recorded as the only
   no-upstream-change option that is not time-bombed.
 
-### Interim (no greentic-start change)
+### Interim: no path exists yet
 
-A registry with **long-lived** credentials (for example a GHCR token or a
-Harbor robot account) works today: put `OCI_USERNAME`/`OCI_PASSWORD` in a
-Secrets Manager secret and reference it from the worker's `secrets`. This is
-acceptable for a gated live test. It is not the ECR answer.
+An earlier version of this section said a long-lived registry credential
+(`OCI_USERNAME`/`OCI_PASSWORD`) could be put in a Secrets Manager secret and
+referenced from the worker's `secrets`. **That path does not exist in the
+deployer.** The deployer has no answer that injects registry credentials; the
+only `secrets` it attaches to the worker are the seed files and the telemetry
+headers (`secret_env` carries telemetry headers only).
+
+The Task 12 live test therefore needs ONE of these, neither of which is written:
+
+- (a) ambient ECR credentials usable by greentic-start (the external
+  prerequisite above), or
+- (b) new deployer code that injects a registry secret (username/password or a
+  token) into the worker's container `secrets`.
 
 ## 5. Not verified (must be checked in the live E2E)
 

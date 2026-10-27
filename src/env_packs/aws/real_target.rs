@@ -1177,7 +1177,7 @@ fn api<E: std::fmt::Display>(op: &str, err: E) -> EcsTargetError {
     EcsTargetError::Api(format!("ecs {op}: {err}"))
 }
 
-// `service_name` / `SERVICE_NAME_PREFIX` live in `deploy_target` (ungated) so the
+// `service_name` / `SERVICE_NAME_PREFIX` live in `deploy_target` (compiled in every build) so the
 // teardown report can name services without this feature; re-exported here.
 pub(crate) use super::deploy_target::{SERVICE_NAME_PREFIX, service_name};
 

@@ -1,4 +1,4 @@
-//! Pure description of the `seed-init` container (ungated, no AWS types).
+//! Pure description of the `seed-init` container (compiled in every build; no AWS types).
 //!
 //! Decision record: `docs/aws-ecs-seed-and-bundle-delivery.md` section 3.
 //!
