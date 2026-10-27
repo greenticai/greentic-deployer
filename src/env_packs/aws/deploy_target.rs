@@ -423,9 +423,10 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     /// Delete the deployment's whole service: every remaining task set first
     /// (an `EXTERNAL`-controller service cannot be deleted while it has any),
     /// then the service itself. Idempotent: an absent (or already `INACTIVE`)
-    /// service is `Ok`. Leaves the cluster and the operator's target groups
+    /// service is `Ok(false)`; `Ok(true)` means a service existed and was removed.
+    /// Leaves the cluster and the operator's target groups
     /// alone.
-    async fn delete_service(&self, service: &ServiceRef) -> Result<(), EcsTargetError>;
+    async fn delete_service(&self, service: &ServiceRef) -> Result<bool, EcsTargetError>;
 
     /// Remove the deployment's own host/path listener rule, if this deployment
     /// created one. Idempotent: an absent rule is `Ok`. Never touches the
@@ -485,8 +486,9 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     async fn ensure_log_group(&self, name: &str, retention_days: i32)
     -> Result<(), EcsTargetError>;
 
-    /// Delete the log group. Idempotent against an absent group.
-    async fn delete_log_group(&self, name: &str) -> Result<(), EcsTargetError>;
+    /// Delete the log group. Idempotent against an absent group: `Ok(true)` only
+    /// when a group existed and was removed.
+    async fn delete_log_group(&self, name: &str) -> Result<bool, EcsTargetError>;
 }
 
 /// The default target for a handler with no real client wired. Every provider
@@ -517,7 +519,7 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
     async fn delete_task_set(&self, _task_set: &TaskSetRef) -> Result<(), EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
-    async fn delete_service(&self, _service: &ServiceRef) -> Result<(), EcsTargetError> {
+    async fn delete_service(&self, _service: &ServiceRef) -> Result<bool, EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
     async fn delete_listener_rule(&self, _listener: &ListenerRef) -> Result<(), EcsTargetError> {
@@ -563,7 +565,7 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
     ) -> Result<(), EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
-    async fn delete_log_group(&self, _name: &str) -> Result<(), EcsTargetError> {
+    async fn delete_log_group(&self, _name: &str) -> Result<bool, EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
 }
@@ -605,6 +607,9 @@ pub struct InMemoryEcs {
     /// Deployments whose per-deployment listener rule `delete_listener_rule`
     /// removed, in call order (only calls that carried routing are recorded).
     rule_deletions: std::sync::Mutex<Vec<DeploymentId>>,
+    /// When set, task-set operations on a deployment whose service is absent
+    /// fail like AWS (`ServiceNotFoundException`) instead of being no-ops.
+    strict_services: std::sync::atomic::AtomicBool,
     /// Set when the fake listener is plain HTTP (default: HTTPS).
     listener_is_http: std::sync::atomic::AtomicBool,
 }
@@ -625,6 +630,31 @@ impl InMemoryEcs {
             .lock()
             .expect("mutex not poisoned")
             .insert(deployment_id, desired_count);
+    }
+
+    /// Make task-set operations error when the deployment's service is absent,
+    /// as AWS does once the service is deleted.
+    pub fn require_service_for_task_set_ops(&self, on: bool) {
+        self.strict_services
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check_service_present(&self, deployment_id: DeploymentId) -> Result<(), EcsTargetError> {
+        if self
+            .strict_services
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !self
+                .services
+                .lock()
+                .expect("mutex not poisoned")
+                .contains_key(&deployment_id)
+        {
+            return Err(EcsTargetError::Api(format!(
+                "ecs describe_task_sets: ServiceNotFoundException: service for deployment {} not found",
+                deployment_id.0
+            )));
+        }
+        Ok(())
     }
 
     /// Deployments whose listener rule was deleted, in call order.
@@ -809,6 +839,7 @@ impl EcsDeployTarget for InMemoryEcs {
     }
 
     async fn delete_task_set(&self, task_set: &TaskSetRef) -> Result<(), EcsTargetError> {
+        self.check_service_present(task_set.deployment_id)?;
         // Idempotent: removing an absent set is Ok.
         let key = (task_set.deployment_id, task_set.revision_id);
         self.task_sets
@@ -822,7 +853,7 @@ impl EcsDeployTarget for InMemoryEcs {
         Ok(())
     }
 
-    async fn delete_service(&self, service: &ServiceRef) -> Result<(), EcsTargetError> {
+    async fn delete_service(&self, service: &ServiceRef) -> Result<bool, EcsTargetError> {
         // Idempotent: like the real target, every task set goes first, then the
         // service; absent is Ok.
         let dep = service.deployment_id;
@@ -834,11 +865,12 @@ impl EcsDeployTarget for InMemoryEcs {
             .lock()
             .expect("mutex not poisoned")
             .retain(|(d, _), _| *d != dep);
-        self.services
+        Ok(self
+            .services
             .lock()
             .expect("mutex not poisoned")
-            .remove(&dep);
-        Ok(())
+            .remove(&dep)
+            .is_some())
     }
 
     async fn delete_listener_rule(&self, listener: &ListenerRef) -> Result<(), EcsTargetError> {
@@ -991,12 +1023,13 @@ impl EcsDeployTarget for InMemoryEcs {
         Ok(())
     }
 
-    async fn delete_log_group(&self, name: &str) -> Result<(), EcsTargetError> {
-        self.log_groups
+    async fn delete_log_group(&self, name: &str) -> Result<bool, EcsTargetError> {
+        Ok(self
+            .log_groups
             .lock()
             .expect("mutex not poisoned")
-            .remove(name);
-        Ok(())
+            .remove(name)
+            .is_some())
     }
 }
 

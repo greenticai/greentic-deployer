@@ -49,17 +49,22 @@ pub(crate) async fn teardown_environment(
                 })
                 .await?;
         }
-        target
+        // Only a resource that existed and was removed is reported: an
+        // idempotent no-op on an absent one deleted nothing.
+        if target
             .delete_service(&ServiceRef {
                 deployment_id,
                 cluster: params.cluster.clone(),
                 region: params.region.clone(),
             })
-            .await?;
-        deleted_services.push(service_name(&deployment_id));
+            .await?
+        {
+            deleted_services.push(service_name(&deployment_id));
+        }
         let log_group = log_group_name(&params.secret_prefix, &deployment_id);
-        target.delete_log_group(&log_group).await?;
-        deleted_log_groups.push(log_group);
+        if target.delete_log_group(&log_group).await? {
+            deleted_log_groups.push(log_group);
+        }
     }
 
     let ours = env_owner_stamp(env_id);
@@ -146,6 +151,8 @@ mod tests {
     async fn destroy_deletes_task_sets_service_secrets_and_log_group() {
         let (env, target) = warmed().await;
         let secrets_before = target.secrets().len();
+        let services_before = target.services().len();
+        let groups_before = target.log_groups().len();
         let report = teardown_environment(
             target.as_ref(),
             &params(&env),
@@ -161,15 +168,17 @@ mod tests {
         assert!(target.log_groups().is_empty(), "log group must go");
         assert_eq!(report["provider"], "greentic.deployer.aws-ecs");
         assert_eq!(report["region"], params(&env).region);
-        let n = ids(&env).len();
-        assert_eq!(report["deleted_services"].as_array().map(Vec::len), Some(n));
+        assert_eq!(
+            report["deleted_services"].as_array().map(Vec::len),
+            Some(services_before)
+        );
         assert_eq!(
             report["deleted_secrets"].as_array().map(Vec::len),
             Some(secrets_before)
         );
         assert_eq!(
             report["deleted_log_groups"].as_array().map(Vec::len),
-            Some(n)
+            Some(groups_before)
         );
         assert_eq!(report["skipped_secrets"], serde_json::json!([]));
     }
@@ -185,9 +194,52 @@ mod tests {
         let report = teardown_environment(target.as_ref(), &p, id, &ids(&env))
             .await
             .expect("second teardown is idempotent");
-        assert_eq!(report["deleted_secrets"], serde_json::json!([]));
-        assert_eq!(report["skipped_secrets"], serde_json::json!([]));
+        for key in [
+            "deleted_services",
+            "deleted_log_groups",
+            "deleted_secrets",
+            "skipped_secrets",
+        ] {
+            assert_eq!(
+                report[key],
+                serde_json::json!([]),
+                "a second run deletes nothing, so `{key}` is empty"
+            );
+        }
         assert!(target.services().is_empty());
+    }
+
+    #[tokio::test]
+    async fn destroy_reports_only_what_it_deleted() {
+        let (env, target) = warmed().await;
+        let all = ids(&env);
+        assert!(all.len() >= 2);
+        let gone = all[0];
+        // One deployment's service and log group are already gone.
+        let p = params(&env);
+        target
+            .delete_service(&ServiceRef {
+                deployment_id: gone,
+                cluster: p.cluster.clone(),
+                region: p.region.clone(),
+            })
+            .await
+            .unwrap();
+        target
+            .delete_log_group(&log_group_name(&p.secret_prefix, &gone))
+            .await
+            .unwrap();
+        let report = teardown_environment(target.as_ref(), &p, env.environment_id.as_str(), &all)
+            .await
+            .unwrap();
+        let services = report["deleted_services"].as_array().unwrap();
+        assert!(!services.iter().any(|s| *s == service_name(&gone)));
+        let groups = report["deleted_log_groups"].as_array().unwrap();
+        assert!(
+            !groups
+                .iter()
+                .any(|g| *g == log_group_name(&p.secret_prefix, &gone))
+        );
     }
 
     #[tokio::test]

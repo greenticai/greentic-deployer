@@ -110,7 +110,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aws_sdk_ecs::error::BuildError;
+use aws_sdk_ecs::error::{BuildError, ProvideErrorMetadata};
 use aws_sdk_ecs::operation::create_task_set::CreateTaskSetOutput;
 use aws_sdk_ecs::operation::describe_services::DescribeServicesOutput;
 use aws_sdk_ecs::operation::describe_task_sets::DescribeTaskSetsOutput;
@@ -584,8 +584,15 @@ impl EcsDeployTarget for RealEcsTarget {
             .cluster(&task_set.cluster)
             .service(&service)
             .send()
-            .await
-            .map_err(|e| api("describe_task_sets", e))?;
+            .await;
+        let out = match out {
+            Ok(out) => out,
+            // The whole service is gone (deleted by a retire/destroy that
+            // already removed every task set): nothing left to delete. A
+            // missing CLUSTER is deliberately NOT in this class.
+            Err(e) if is_service_gone_code(e.code()) => return Ok(()),
+            Err(e) => return Err(api("describe_task_sets", e)),
+        };
         // Idempotent: an absent task set is a no-op success.
         let Some(found) = task_set_for_delete(&out, &external_id) else {
             return Ok(());
@@ -614,7 +621,7 @@ impl EcsDeployTarget for RealEcsTarget {
         Ok(())
     }
 
-    async fn delete_service(&self, service: &ServiceRef) -> Result<(), EcsTargetError> {
+    async fn delete_service(&self, service: &ServiceRef) -> Result<bool, EcsTargetError> {
         let name = service_name(&service.deployment_id);
         let described = self
             .ecs
@@ -626,7 +633,7 @@ impl EcsDeployTarget for RealEcsTarget {
             .map_err(|e| api("describe_services", e))?;
         // Idempotent: an absent (or INACTIVE, already deleted) service is done.
         if !active_service_exists(&described, &name) {
-            return Ok(());
+            return Ok(false);
         }
         // An EXTERNAL-controller service holds its task sets itself: remove
         // every one still there (and its task definition) before the service.
@@ -666,7 +673,7 @@ impl EcsDeployTarget for RealEcsTarget {
             .send()
             .await
             .map_err(|e| api("delete_service", e))?;
-        Ok(())
+        Ok(true)
     }
 
     async fn delete_listener_rule(&self, listener: &ListenerRef) -> Result<(), EcsTargetError> {
@@ -917,7 +924,7 @@ impl EcsDeployTarget for RealEcsTarget {
         Ok(())
     }
 
-    async fn delete_log_group(&self, name: &str) -> Result<(), EcsTargetError> {
+    async fn delete_log_group(&self, name: &str) -> Result<bool, EcsTargetError> {
         match self
             .logs
             .delete_log_group()
@@ -925,12 +932,12 @@ impl EcsDeployTarget for RealEcsTarget {
             .send()
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(true),
             Err(e)
                 if e.as_service_error()
                     .is_some_and(|s| s.is_resource_not_found_exception()) =>
             {
-                Ok(())
+                Ok(false)
             }
             Err(e) => Err(logs_api("DeleteLogGroup", &e)),
         }
@@ -1411,6 +1418,16 @@ fn task_set_for_delete(out: &DescribeTaskSetsOutput, external_id: &str) -> Optio
         id: ts.id()?.to_string(),
         task_definition: ts.task_definition().map(str::to_string),
     })
+}
+
+/// True for the ECS error codes that mean the deployment's service no longer
+/// exists (or is draining), so its task sets are already gone. A missing
+/// cluster (`ClusterNotFoundException`) is a different fact and stays an error.
+fn is_service_gone_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("ServiceNotFoundException" | "ServiceNotActiveException")
+    )
 }
 
 /// Every task set in a DescribeTaskSets response, for deleting a whole service.
@@ -2405,6 +2422,15 @@ mod tests {
     /// Parity guard: every IAM action the real target calls must be in the
     /// credentials preflight's validated verb list, so a role that passes
     /// `gtc op credentials requirements` can actually warm / shift / archive.
+    #[test]
+    fn service_gone_codes_are_recognised_and_a_missing_cluster_is_not() {
+        assert!(is_service_gone_code(Some("ServiceNotFoundException")));
+        assert!(is_service_gone_code(Some("ServiceNotActiveException")));
+        assert!(!is_service_gone_code(Some("ClusterNotFoundException")));
+        assert!(!is_service_gone_code(Some("AccessDeniedException")));
+        assert!(!is_service_gone_code(None));
+    }
+
     #[test]
     fn real_target_iam_actions_are_a_subset_of_validated_verbs() {
         use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;

@@ -806,19 +806,13 @@ impl Deployer for AwsEcsDeployerHandler {
             revision_id,
         })?;
         let params = params_from_answers(env, answers)?;
-        self.target
-            .delete_task_set(&TaskSetRef {
-                deployment_id: revision.deployment_id,
-                revision_id,
-                cluster: params.cluster.clone(),
-                region: params.region.clone(),
-            })
-            .await
-            .map_err(provider)?;
         // The deployment's last revision going away takes the whole bundle with
         // it (`op bundles retire` marked it archived): nothing is left to serve,
-        // so its listener rule and service must not leak. A single revision of a
-        // live bundle keeps both.
+        // so its listener rule and service must not leak. Deleting the service
+        // removes every task set, so no per-set delete runs here: after the
+        // first revision's archive the service is gone and any task-set call
+        // would fail, wedging the retire of a multi-revision bundle and every
+        // retry. A single revision of a live bundle only loses its task set.
         if whole_bundle_retiring(env, revision) {
             if let Some(listener_arn) = &params.listener_arn {
                 self.target
@@ -834,6 +828,16 @@ impl Deployer for AwsEcsDeployerHandler {
             self.target
                 .delete_service(&ServiceRef {
                     deployment_id: revision.deployment_id,
+                    cluster: params.cluster,
+                    region: params.region,
+                })
+                .await
+                .map_err(provider)?;
+        } else {
+            self.target
+                .delete_task_set(&TaskSetRef {
+                    deployment_id: revision.deployment_id,
+                    revision_id,
                     cluster: params.cluster,
                     region: params.region,
                 })
@@ -1034,6 +1038,62 @@ mod tests {
             .archive_revision(&env, rev.revision_id, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retiring_a_two_revision_bundle_archives_every_revision() {
+        let (handler, target) = handler_with_fake();
+        target.require_service_for_task_set_ops(true);
+        let mut env = build_fixture_env();
+        let dep = env.revisions[0].deployment_id;
+        let revs: Vec<_> = env
+            .revisions
+            .iter()
+            .filter(|r| r.deployment_id == dep)
+            .map(|r| r.revision_id)
+            .collect();
+        assert!(revs.len() >= 2, "fixture must hold a 2-revision bundle");
+        for r in &revs {
+            handler.warm_revision(&env, *r, None).await.unwrap();
+        }
+        for b in &mut env.bundles {
+            if b.deployment_id == dep {
+                b.status = greentic_deploy_spec::BundleDeploymentStatus::Archived;
+            }
+        }
+        for r in &revs {
+            handler
+                .archive_revision(&env, *r, None)
+                .await
+                .expect("every revision of a retiring bundle archives");
+        }
+        assert!(!target.services().contains(&dep));
+        assert!(target.task_sets().keys().all(|(d, _)| *d != dep));
+    }
+
+    #[tokio::test]
+    async fn archive_retry_after_service_deleted_is_ok() {
+        let (handler, target) = handler_with_fake();
+        target.require_service_for_task_set_ops(true);
+        let mut env = build_fixture_env();
+        let rev = env.revisions[0].clone();
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        for b in &mut env.bundles {
+            if b.deployment_id == rev.deployment_id {
+                b.status = greentic_deploy_spec::BundleDeploymentStatus::Archived;
+            }
+        }
+        handler
+            .archive_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        handler
+            .archive_revision(&env, rev.revision_id, None)
+            .await
+            .expect("a retry after the service is gone converges");
     }
 
     #[tokio::test]
@@ -1459,8 +1519,8 @@ mod tests {
         async fn delete_service(
             &self,
             _service: &super::super::deploy_target::ServiceRef,
-        ) -> Result<(), EcsTargetError> {
-            Ok(())
+        ) -> Result<bool, EcsTargetError> {
+            Ok(false)
         }
         async fn delete_listener_rule(
             &self,
@@ -1504,8 +1564,8 @@ mod tests {
         async fn ensure_log_group(&self, _n: &str, _r: i32) -> Result<(), EcsTargetError> {
             Ok(())
         }
-        async fn delete_log_group(&self, _n: &str) -> Result<(), EcsTargetError> {
-            Ok(())
+        async fn delete_log_group(&self, _n: &str) -> Result<bool, EcsTargetError> {
+            Ok(false)
         }
     }
 
