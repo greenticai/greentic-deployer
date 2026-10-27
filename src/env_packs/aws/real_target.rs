@@ -135,7 +135,8 @@ use super::deploy_target::{
     EcsDeployTarget, EcsTargetError, EnsuredSecret, ListenerRef, ListenerRouting, LiveTaskSet,
     REVISION_INTENT_TAG_KEY, SECRET_OWNER_TAG_KEY, SecretEnvRef, SecretVersionRef, SeedInit,
     ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
-    compose_endpoint, invalid_retention, secret_version_token, valid_log_retention_days,
+    compose_endpoint, endpoint_host, invalid_retention, secret_version_token,
+    valid_log_retention_days,
 };
 use super::seed_init::{self, SEED_INIT_CONTAINER, SEED_VOLUME};
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
@@ -680,9 +681,13 @@ impl EcsDeployTarget for RealEcsTarget {
             ))
         })?;
         let https = matches!(found.protocol(), Some(ProtocolEnum::Https));
-        let routing_host = listener.routing.as_ref().and_then(|r| r.host.as_deref());
+        let routing_host = listener
+            .routing
+            .as_ref()
+            .and_then(|r| r.host.as_deref())
+            .and_then(endpoint_host);
         if let Some(host) = routing_host {
-            return Ok(Some(compose_endpoint(https, host, None)));
+            return Ok(Some(compose_endpoint(https, &host, None)));
         }
         let Some(lb_arn) = found.load_balancer_arn() else {
             return Ok(None);

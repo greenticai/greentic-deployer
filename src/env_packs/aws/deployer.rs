@@ -1149,6 +1149,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_wildcard_routing_host_falls_back_to_the_load_balancer_dns() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "*.example.com",
+        });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("https://{}.alb.invalid", rev.deployment_id.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheme_prefixed_routing_host_is_not_doubled() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "https://app.example.com",
+        });
+        let out = handler
+            .warm_revision(&env, env.revisions[0].revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some("https://app.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_error_fails_the_warm() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        target.fail_endpoint_discovery("elb unreachable");
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        let err = handler
+            .warm_revision(&env, env.revisions[0].revision_id, Some(&answers))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("elb unreachable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn warm_over_http_listener_returns_an_http_endpoint() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        target.set_listener_https(false);
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("http://{}.alb.invalid", rev.deployment_id.0))
+        );
+    }
+
     /// No `alb_listener_arn`: there is nothing to discover, and that is not an error.
     #[tokio::test]
     async fn no_listener_means_no_endpoint() {

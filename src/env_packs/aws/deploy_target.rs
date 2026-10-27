@@ -266,6 +266,42 @@ pub fn compose_endpoint(protocol_is_https: bool, dns_or_host: &str, path: Option
     }
 }
 
+/// Reduce an operator-supplied `alb_routing_host` to something safe to put in
+/// a URL authority: `host` or `host:port`. Strips a leading `http(s)://`, cuts
+/// at the first `/`, `?` or `#`, keeps a `:port` only when it is 1..=65535.
+/// `None` for an empty host, a wildcard (`*.example.com` is a valid ALB rule
+/// value but not an address) or any character outside `[A-Za-z0-9.-]`; the
+/// caller then falls back to the load balancer's DNS name.
+pub fn endpoint_host(raw: &str) -> Option<String> {
+    let mut rest = raw.trim();
+    for scheme in ["https://", "http://"] {
+        if rest.len() >= scheme.len() && rest[..scheme.len()].eq_ignore_ascii_case(scheme) {
+            rest = &rest[scheme.len()..];
+            break;
+        }
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest[..end].trim();
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return None;
+    }
+    let port = port
+        .and_then(|p| p.parse::<u16>().ok().filter(|n| *n != 0))
+        .filter(|_| port.is_some_and(|p| p.chars().all(|c| c.is_ascii_digit())));
+    Some(match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
 /// One weighted revision in a listener rule's forward action. The revision's
 /// target group is **not** carried here: the real target maps each revision to
 /// the TG its task set is bound to (read from the live task sets), so the
@@ -505,6 +541,10 @@ pub struct InMemoryEcs {
     create_task_set_calls: std::sync::atomic::AtomicUsize,
     /// Every listener `discover_endpoint` was asked about, in call order.
     endpoint_queries: std::sync::Mutex<Vec<ListenerRef>>,
+    /// When set, `discover_endpoint` fails with this message.
+    endpoint_failure: std::sync::Mutex<Option<String>>,
+    /// Set when the fake listener is plain HTTP (default: HTTPS).
+    listener_is_http: std::sync::atomic::AtomicBool,
 }
 
 impl InMemoryEcs {
@@ -571,6 +611,17 @@ impl InMemoryEcs {
         &self,
     ) -> std::collections::BTreeMap<(DeploymentId, RevisionId), TaskSetHandle> {
         self.task_sets.lock().expect("mutex not poisoned").clone()
+    }
+
+    /// Make every later `discover_endpoint` fail with `message`.
+    pub fn fail_endpoint_discovery(&self, message: &str) {
+        *self.endpoint_failure.lock().expect("mutex not poisoned") = Some(message.to_string());
+    }
+
+    /// Choose the fake listener's protocol (default HTTPS).
+    pub fn set_listener_https(&self, https: bool) {
+        self.listener_is_http
+            .store(!https, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Listeners `discover_endpoint` was asked about, in call order.
@@ -708,11 +759,24 @@ impl EcsDeployTarget for InMemoryEcs {
             .lock()
             .expect("mutex not poisoned")
             .push(listener.clone());
-        let host = match listener.routing.as_ref().and_then(|r| r.host.as_deref()) {
-            Some(host) => host.to_string(),
-            None => format!("{}.alb.invalid", listener.deployment_id.0),
-        };
-        Ok(Some(compose_endpoint(true, &host, None)))
+        if let Some(message) = self
+            .endpoint_failure
+            .lock()
+            .expect("mutex not poisoned")
+            .clone()
+        {
+            return Err(EcsTargetError::Api(message));
+        }
+        let https = !self
+            .listener_is_http
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let host = listener
+            .routing
+            .as_ref()
+            .and_then(|r| r.host.as_deref())
+            .and_then(endpoint_host)
+            .unwrap_or_else(|| format!("{}.alb.invalid", listener.deployment_id.0));
+        Ok(Some(compose_endpoint(https, &host, None)))
     }
 
     async fn ensure_secret(
@@ -1036,6 +1100,137 @@ mod endpoint_tests {
         assert_eq!(
             compose_endpoint(true, "a.example", Some("/")),
             "https://a.example"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_keeps_a_plain_host() {
+        assert_eq!(
+            endpoint_host("app.example.com"),
+            Some("app.example.com".into())
+        );
+    }
+
+    #[test]
+    fn endpoint_host_keeps_a_valid_port() {
+        assert_eq!(
+            endpoint_host("app.example.com:8443"),
+            Some("app.example.com:8443".into())
+        );
+    }
+
+    #[test]
+    fn endpoint_host_strips_a_scheme_in_any_case() {
+        assert_eq!(
+            endpoint_host("https://app.example.com"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("HTTP://app.example.com"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("HtTpS://app.example.com"),
+            Some("app.example.com".into())
+        );
+    }
+
+    #[test]
+    fn endpoint_host_cuts_a_path_query_or_fragment() {
+        assert_eq!(
+            endpoint_host("app.example.com/x"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("app.example.com?q=1"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("app.example.com#f"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("https://app.example.com:8443/x"),
+            Some("app.example.com:8443".into())
+        );
+    }
+
+    #[test]
+    fn endpoint_host_rejects_a_wildcard() {
+        assert_eq!(endpoint_host("*.example.com"), None);
+    }
+
+    #[test]
+    fn endpoint_host_rejects_empty_and_whitespace() {
+        assert_eq!(endpoint_host(""), None);
+        assert_eq!(endpoint_host("   "), None);
+        assert_eq!(endpoint_host("https://"), None);
+    }
+
+    #[test]
+    fn endpoint_host_drops_an_invalid_port() {
+        assert_eq!(
+            endpoint_host("app.example.com:0"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("app.example.com:99999"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("app.example.com:abc"),
+            Some("app.example.com".into())
+        );
+        assert_eq!(
+            endpoint_host("app.example.com:"),
+            Some("app.example.com".into())
+        );
+    }
+
+    #[test]
+    fn endpoint_host_rejects_illegal_characters() {
+        assert_eq!(endpoint_host("app_example.com"), None);
+        assert_eq!(endpoint_host("user@app.example.com"), None);
+    }
+
+    #[tokio::test]
+    async fn in_memory_target_can_fail_discovery_on_demand() {
+        let ecs = InMemoryEcs::default();
+        ecs.fail_endpoint_discovery("boom");
+        let err = ecs.discover_endpoint(&listener(None)).await.unwrap_err();
+        assert!(matches!(err, EcsTargetError::Api(m) if m.contains("boom")));
+    }
+
+    #[tokio::test]
+    async fn in_memory_target_sanitizes_the_routing_host_and_falls_back() {
+        let ecs = InMemoryEcs::default();
+        let routed = |h: &str| {
+            listener(Some(ListenerRouting {
+                host: Some(h.into()),
+                path: None,
+            }))
+        };
+        assert_eq!(
+            ecs.discover_endpoint(&routed("https://app.example.com/x"))
+                .await
+                .unwrap(),
+            Some("https://app.example.com".into())
+        );
+        let l = routed("*.example.com");
+        assert_eq!(
+            ecs.discover_endpoint(&l).await.unwrap(),
+            Some(format!("https://{}.alb.invalid", l.deployment_id.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_target_uses_http_for_an_http_listener() {
+        let ecs = InMemoryEcs::default();
+        ecs.set_listener_https(false);
+        let l = listener(None);
+        assert_eq!(
+            ecs.discover_endpoint(&l).await.unwrap(),
+            Some(format!("http://{}.alb.invalid", l.deployment_id.0))
         );
     }
 
