@@ -38,6 +38,7 @@ use super::deploy_target::{
     ServiceSpec, TargetGroupWeight, TaskSetRef, TaskSetSpec, log_group_name,
     valid_log_retention_days,
 };
+use super::registry_credential::{self, OCI_PASSWORD_ENV, RegistryCredential};
 use super::revision_intent::{
     IntentInputs, IntentVerdict, classify, revision_conflict, revision_intent,
 };
@@ -179,6 +180,10 @@ pub struct AwsEcsParams {
     pub runtime_team: Option<String>,
     /// Telemetry profile (`telemetry_env` / `telemetry_headers`).
     pub telemetry: TelemetryAnswers,
+    /// Registry credential for the worker's bundle pull (`oci_username` /
+    /// `oci_password`); `None` pulls anonymously (or with an ambient
+    /// credential the runtime finds itself).
+    pub(crate) registry: Option<RegistryCredential>,
     /// Retention of the deployment's CloudWatch log group, in days. Always one
     /// of the values CloudWatch Logs accepts (default 30).
     pub log_retention_days: i32,
@@ -425,6 +430,7 @@ impl AwsEcsParams {
             runtime_tenant: None,
             runtime_team: None,
             telemetry: TelemetryAnswers::default(),
+            registry: None,
             log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
         }
     }
@@ -462,6 +468,8 @@ impl AwsEcsParams {
         let mut routing_path = None;
         let mut telemetry_env = None;
         let mut telemetry_headers = None;
+        let mut oci_username = None;
+        let mut oci_password = None;
         for (key, value) in obj {
             match key.as_str() {
                 "region" => params.region = answer_string(key, value)?,
@@ -532,12 +540,15 @@ impl AwsEcsParams {
                 }
                 "runtime_tenant" => params.runtime_tenant = optional_string(key, value)?,
                 "runtime_team" => params.runtime_team = optional_string(key, value)?,
+                registry_credential::USERNAME_KEY => oci_username = Some(value),
+                registry_credential::PASSWORD_KEY => oci_password = Some(value),
                 telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
                 telemetry_answers::TELEMETRY_HEADERS_KEY => telemetry_headers = Some(value),
                 other => return Err(AwsEcsParamsError::UnknownKey(other.to_string())),
             }
         }
         params.telemetry = telemetry_answers::parse(telemetry_env, telemetry_headers)?;
+        params.registry = registry_credential::parse(oci_username, oci_password)?;
         params.launch = launch.build()?;
         params.routing = match (routing_host, routing_path) {
             (None, None) => None,
@@ -648,7 +659,7 @@ impl Deployer for AwsEcsDeployerHandler {
             drain: false,
             traffic_split: true,
             ingress_managed: false,
-            private_registry_auth: false,
+            private_registry_auth: true,
             multi_instance_safe: false,
             remove: true,
             runtime_pin: false,
@@ -663,6 +674,9 @@ impl Deployer for AwsEcsDeployerHandler {
              operator-provided; the pack only discovers the URL",
             "traffic_split: requires an operator-provided listener (`alb_listener_arn`); a \
              split across several revisions is refused without one",
+            "private_registry_auth: `oci_username` / `oci_password` answers; the password is a \
+             Secrets Manager secret injected as `OCI_PASSWORD`. Amazon ECR is not covered (it \
+             has no long-lived password)",
             "drain: not implemented — a retire that needs a drain window is refused",
             "runtime_pin: no per-revision pin; the runtime image comes from the \
              environment-wide answer",
@@ -705,11 +719,14 @@ impl Deployer for AwsEcsDeployerHandler {
         // `environment.json` (decision record section 4), not by the image.
         let image = params.runtime_image();
         let boot_env = ecs_boot_env(env, revision, &params);
-        let secret_env_names: Vec<&str> = if params.telemetry.headers().is_some() {
+        let mut secret_env_names: Vec<&str> = if params.telemetry.headers().is_some() {
             HEADER_ENV_NAMES.to_vec()
         } else {
             Vec::new()
         };
+        if params.registry.is_some() {
+            secret_env_names.push(OCI_PASSWORD_ENV);
+        }
         let seed_secret = environment_secret_name(&params.secret_prefix);
         let intent = revision_intent(&IntentInputs {
             image: &image,

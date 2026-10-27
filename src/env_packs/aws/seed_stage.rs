@@ -10,6 +10,7 @@
 //! | `environment.json` (pruned to this revision) | `<prefix>-environment` | `seed-init` |
 //! | `.greentic/dev/.dev.secrets.env` (only when the env has one) | `<prefix>-dev-store` | `seed-init` |
 //! | telemetry headers (only when answered) | `<prefix>-telemetry-headers` | the worker's `secrets`, never `environment` |
+//! | registry password (only when answered) | `<prefix>-oci-password` | the worker's `secrets` as `OCI_PASSWORD`, never `environment` |
 //!
 //! Every value is checked BEFORE any secret is created or written, so an
 //! oversized seed leaves nothing half-staged.
@@ -20,6 +21,7 @@ use super::deploy_target::{
     EcsDeployTarget, EnsuredSecret, SecretEnvRef, SecretVersionRef, SeedFile, SeedInit,
 };
 use super::deployer::AwsEcsParams;
+use super::registry_credential::OCI_PASSWORD_ENV;
 use super::seed_init::SEED_INIT_IMAGE;
 use crate::cli::secrets::DEV_STORE_RELATIVE;
 use crate::env_packs::deployer::DeployerError;
@@ -46,6 +48,11 @@ pub(crate) fn dev_store_secret_name(secret_prefix: &str) -> String {
 /// Secret carrying the telemetry headers: `<secret_prefix>-telemetry-headers`.
 pub(crate) fn telemetry_headers_secret_name(secret_prefix: &str) -> String {
     format!("{secret_prefix}-telemetry-headers")
+}
+
+/// Secret carrying the registry password: `<secret_prefix>-oci-password`.
+pub(crate) fn oci_password_secret_name(secret_prefix: &str) -> String {
+    format!("{secret_prefix}-oci-password")
 }
 
 /// Why a seed value was refused before staging. Never truncated, never split.
@@ -167,6 +174,14 @@ pub(crate) async fn stage(
         check_seed_value("telemetry headers", h).map_err(refuse)?;
     }
 
+    let registry_password = params
+        .registry
+        .as_ref()
+        .map(|r| r.password().expose().as_bytes());
+    if let Some(p) = registry_password {
+        check_seed_value("registry password", p).map_err(refuse)?;
+    }
+
     let env_id = env.environment_id.as_str();
     let prefix = &params.secret_prefix;
     let env_version = claim_and_put(
@@ -200,6 +215,13 @@ pub(crate) async fn stage(
                 value_from_arn: version.value_from(),
             });
         }
+    }
+    if let Some(p) = registry_password {
+        let version = claim_and_put(target, &oci_password_secret_name(prefix), env_id, p).await?;
+        secret_env.push(SecretEnvRef {
+            name: OCI_PASSWORD_ENV.to_string(),
+            value_from_arn: version.value_from(),
+        });
     }
     Ok(StagedSeed {
         seed: SeedInit {

@@ -19,7 +19,8 @@ use super::deploy_target::{
 };
 use super::deployer::AwsEcsParams;
 use super::seed_stage::{
-    dev_store_secret_name, environment_secret_name, telemetry_headers_secret_name,
+    dev_store_secret_name, environment_secret_name, oci_password_secret_name,
+    telemetry_headers_secret_name,
 };
 use crate::env_packs::owner_stamp::env_owner_stamp;
 
@@ -74,6 +75,7 @@ pub(crate) async fn teardown_environment(
         environment_secret_name(&params.secret_prefix),
         dev_store_secret_name(&params.secret_prefix),
         telemetry_headers_secret_name(&params.secret_prefix),
+        oci_password_secret_name(&params.secret_prefix),
     ] {
         match target.get_secret_owner(&name).await? {
             None => {}
@@ -181,6 +183,37 @@ mod tests {
             Some(groups_before)
         );
         assert_eq!(report["skipped_secrets"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn destroy_deletes_the_registry_password_secret() {
+        let target = Arc::new(InMemoryEcs::default());
+        let handler = AwsEcsDeployerHandler::with_target(target.clone());
+        let env = build_fixture_env();
+        handler
+            .warm_revision(
+                &env,
+                env.revisions[0].revision_id,
+                Some(&json!({ "oci_username": "robot", "oci_password": "pw" })),
+            )
+            .await
+            .expect("warm");
+        let name = oci_password_secret_name(&params(&env).secret_prefix);
+        assert!(target.secrets().contains_key(&name));
+        let report = teardown_environment(
+            target.as_ref(),
+            &params(&env),
+            env.environment_id.as_str(),
+            &ids(&env),
+        )
+        .await
+        .expect("teardown");
+        assert!(target.secrets().is_empty(), "the password secret must go");
+        assert!(
+            report["deleted_secrets"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|s| s == &json!(name)))
+        );
     }
 
     #[tokio::test]

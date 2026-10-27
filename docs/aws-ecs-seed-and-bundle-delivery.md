@@ -3,8 +3,9 @@
 Status: decided 2026-10-27. Spike for the ECS Fargate parity effort
 (`src/env_packs/aws` reaching parity with `src/env_packs/gcp_cloudrun`). The
 seed-delivery half is implemented in `src/env_packs/aws` (`seed_init`,
-`seed_stage`); the registry credential for the bundle pull is NOT (see the
-"Interim" note in section 4).
+`seed_stage`); the explicit registry credential (`oci_username`/`oci_password`,
+static-credential registries only) is implemented in `registry_credential`
+(section 4); ECR is not covered by it.
 
 ## External prerequisite (read first)
 
@@ -228,8 +229,10 @@ Deployer obligations once the prerequisite lands:
   repositories. The **execution role** gets `secretsmanager:GetSecretValue` on
   the seed and telemetry secrets (and `kms:Decrypt` if a customer key is used)
   and the log permissions.
-- The deployer must **not** set `OCI_USERNAME`/`OCI_PASSWORD` on the worker:
-  an explicit pair wins over the ambient token.
+- For an ECR bundle the deployer must **not** set `OCI_USERNAME`/`OCI_PASSWORD`
+  on the worker: an explicit pair wins over the ambient token. The
+  `oci_username`/`oci_password` answers are opt-in and unset by default, so an
+  ECR environment simply leaves them blank.
 - The worker needs network reach to the ECR API and ECR's S3 layer storage
   (public IP, NAT, or the `ecr.api`, `ecr.dkr` and S3 gateway endpoints).
 
@@ -253,21 +256,49 @@ Rejected:
   ties the lane to one network layout. Not chosen; recorded as the only
   no-upstream-change option that is not time-bombed.
 
-### Interim: no path exists yet
+### Explicit registry credential (implemented): `oci_username` / `oci_password`
 
-An earlier version of this section said a long-lived registry credential
-(`OCI_USERNAME`/`OCI_PASSWORD`) could be put in a Secrets Manager secret and
-referenced from the worker's `secrets`. **That path does not exist in the
-deployer.** The deployer has no answer that injects registry credentials; the
-only `secrets` it attaches to the worker are the seed files and the telemetry
-headers (`secret_env` carries telemetry headers only).
+For a private registry that issues a **static** credential (GHCR, Docker Hub,
+Harbor, a self-hosted registry, Artifact Registry with a service-account key)
+the worker gets an explicit pair. greentic-start reads exactly `OCI_USERNAME`
+and `OCI_PASSWORD` from its environment (`bundle_ref::generic_registry_credentials`
+in greentic-start; both must be non-empty, and an explicit pair wins over any
+ambient credential). The AWS lane mirrors the K8s lane's answers:
 
-The Task 12 live test therefore needs ONE of these, neither of which is written:
+| Answer | Where it goes | Revision intent |
+|---|---|---|
+| `oci_username` | plain `environment` entry `OCI_USERNAME` (a username is not secret) | hashed with the rest of the boot env |
+| `oci_password` | Secrets Manager secret `<secret_prefix>-oci-password`, a content-addressed version, injected into the **worker's** `secrets` as `OCI_PASSWORD` by `<arn>:::<version-id>` | only the env var **name** `OCI_PASSWORD` (presence), never the value or the version |
 
-- (a) ambient ECR credentials usable by greentic-start (the external
-  prerequisite above), or
-- (b) new deployer code that injects a registry secret (username/password or a
-  token) into the worker's container `secrets`.
+Rules:
+
+- Both or neither. A lone half is refused at parse time (greentic-start would
+  silently ignore it); blank values mean unset. Values are never echoed into an
+  error and `Debug` of the parameters redacts the password.
+- Like the telemetry headers, the secret is claimed with the environment owner
+  stamp (a foreign or unstamped secret of that name is a conflict), checked
+  (UTF-8, no NUL, size) **before** any AWS write, and deleted by
+  `op env destroy`.
+- The **execution role** needs `secretsmanager:GetSecretValue` on this secret
+  too; the usual `arn:aws:secretsmanager:<region>:<account>:secret:gtc-{env_id}-*`
+  grant already covers it. No new deployer IAM verb is needed (it reuses
+  `CreateSecret`, `DescribeSecret`, `PutSecretValue`, `TagResource`,
+  `DeleteSecret`).
+- Rotating the password does not change the intent, so re-warming the **same**
+  revision converges and keeps the version it was created with (a task
+  definition cannot pick up a new version). The next **new** revision stages the
+  new password. Changing the username, or adding/removing the pair, changes the
+  intent and is refused for a live revision like any other configuration change.
+- `capabilities.private_registry_auth` is `true`.
+- Do not set this pair for an ECR bundle expecting it to work for long: see
+  below.
+
+**Amazon ECR is not covered by this pair.** ECR has no long-lived password; its
+only credential is a 12-hour token. greentic-start has no ECR logic (no
+`ecr`/`amazonaws` match in its source), so ECR works only through the ambient
+credential prerequisite in section 4 (greentic-start change). Storing an ECR
+token in `oci_password` works for tasks started within 12 hours of the deploy and
+crash-loops afterwards, which is the rejected option above.
 
 ## 5. Not verified (must be checked in the live E2E)
 
@@ -280,7 +311,11 @@ Read from documentation and source only; none of it has run on Fargate:
   rather than leaving it pending;
 - the worker (uid 65532) reading the `0644` files under the root-owned `0755`
   mount;
-- the ECR ambient credential path itself (it does not exist yet).
+- the ECR ambient credential path itself (it does not exist yet);
+- the explicit `OCI_USERNAME`/`OCI_PASSWORD` injection against a real private
+  registry on Fargate (task start resolving the `secrets` entry, greentic-start
+  authenticating with it) and the execution role's `GetSecretValue` on the new
+  secret; covered only by the in-memory fake and unit tests.
 
 ## 6. Roles the operator provides (the deployer grants nothing to them)
 

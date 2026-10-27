@@ -37,6 +37,7 @@ pub mod deploy_target;
 pub mod deployer;
 #[cfg(feature = "deploy-aws-ecs")]
 pub mod real_target;
+pub(crate) mod registry_credential;
 pub(crate) mod revision_intent;
 pub(crate) mod seed_init;
 pub(crate) mod seed_stage;

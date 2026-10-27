@@ -162,3 +162,28 @@ fn the_wizard_does_not_require_the_ecr_repository_prefix() {
         );
     }
 }
+
+#[test]
+fn from_answers_accepts_the_registry_pair_and_treats_blank_as_unset() {
+    let p = parse(json!({ "oci_username": "robot", "oci_password": "pw" })).unwrap();
+    let c = p.registry.as_ref().expect("a credential");
+    assert_eq!(c.username(), "robot");
+    assert_eq!(c.password().expose(), "pw");
+    let blank = parse(json!({ "oci_username": "", "oci_password": " " })).unwrap();
+    assert_eq!(blank.registry, None);
+    assert_eq!(AwsEcsParams::for_env(&build_fixture_env()).registry, None);
+}
+
+#[test]
+fn from_answers_refuses_a_lone_registry_half() {
+    for answers in [
+        json!({ "oci_username": "robot" }),
+        json!({ "oci_password": "pw" }),
+        json!({ "oci_username": "robot", "oci_password": "" }),
+    ] {
+        assert!(matches!(
+            parse(answers).unwrap_err(),
+            AwsEcsParamsError::Invalid { .. }
+        ));
+    }
+}

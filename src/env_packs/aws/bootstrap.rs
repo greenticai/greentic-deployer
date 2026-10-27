@@ -417,9 +417,9 @@ The policy is split into multiple statements by sensitivity:
   (default `secret_prefix` is `gtc-{env_id}`), e.g.
   `arn:aws:logs:<region>:<account>:log-group:/greentic/gtc-{env_id}/*`.
 - **Secrets Manager** (`secretsmanager:CreateSecret`, `DescribeSecret`,
-  `PutSecretValue`, `TagResource`, `DeleteSecret`) — the three secrets the
-  deployer owns: `<secret_prefix>-environment`, `<secret_prefix>-dev-store` and
-  `<secret_prefix>-telemetry-headers`. Replace `<REPLACE_WITH_SECRET_ARNS>` with
+  `PutSecretValue`, `TagResource`, `DeleteSecret`) — the secrets the
+  deployer owns: `<secret_prefix>-environment`, `<secret_prefix>-dev-store`,
+  `<secret_prefix>-telemetry-headers` and `<secret_prefix>-oci-password`. Replace `<REPLACE_WITH_SECRET_ARNS>` with
   e.g. `arn:aws:secretsmanager:<region>:<account>:secret:gtc-{env_id}-*`.
 - **`iam:PassRole`** — replace `<REPLACE_WITH_ECS_TASK_ROLE_ARN>` with the
   ARN of the ECS task-execution role, e.g.

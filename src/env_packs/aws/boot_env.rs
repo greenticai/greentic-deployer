@@ -8,6 +8,7 @@
 use greentic_deploy_spec::{Environment, Revision};
 
 use super::deployer::AwsEcsParams;
+use super::registry_credential::OCI_USERNAME_ENV;
 
 /// Mount point of the seed volume (`GREENTIC_SEED_DIR`).
 pub(crate) const SEED_MOUNT_DIR: &str = "/seed";
@@ -55,6 +56,14 @@ pub(crate) fn ecs_boot_env(
         vars.push(("GREENTIC_TEAM".to_string(), team.clone()));
     }
     vars.extend(params.telemetry.env_for_role("worker"));
+    // The registry username is not secret; the password is injected through the
+    // container's `secrets` and is never part of this list.
+    if let Some(registry) = &params.registry {
+        vars.push((
+            OCI_USERNAME_ENV.to_string(),
+            registry.username().to_string(),
+        ));
+    }
     vars
 }
 
@@ -134,6 +143,27 @@ mod tests {
         for (name, value) in &vars {
             assert!(!HEADER_ENV_NAMES.contains(&name.as_str()), "{name}");
             assert!(!value.contains("topsecret"), "{name} leaks the header");
+        }
+    }
+
+    #[test]
+    fn boot_env_carries_the_registry_username_last_and_never_the_password() {
+        let env = build_fixture_env();
+        let mut params = AwsEcsParams::for_env(&env);
+        params.runtime_tenant = Some("acme".to_string());
+        params.registry = super::super::registry_credential::parse(
+            Some(&json!("robot")),
+            Some(&json!("topsecret")),
+        )
+        .unwrap();
+        let vars = ecs_boot_env(&env, &env.revisions[0], &params);
+        assert_eq!(
+            vars.last(),
+            Some(&("OCI_USERNAME".to_string(), "robot".to_string()))
+        );
+        for (name, value) in &vars {
+            assert_ne!(name, "OCI_PASSWORD");
+            assert!(!value.contains("topsecret"), "{name} leaks the password");
         }
     }
 }

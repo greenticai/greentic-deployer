@@ -70,7 +70,7 @@ fn capabilities_reports_the_aws_ecs_flags() {
     assert_eq!(caps["drain"], false);
     assert_eq!(caps["traffic_split"], true);
     assert_eq!(caps["ingress_managed"], false);
-    assert_eq!(caps["private_registry_auth"], false);
+    assert_eq!(caps["private_registry_auth"], true);
     assert_eq!(caps["multi_instance_safe"], false);
     assert_eq!(caps["remove"], true);
     assert_eq!(caps["runtime_pin"], false);

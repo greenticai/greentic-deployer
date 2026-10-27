@@ -293,6 +293,9 @@ questions:
   # Scaling, runtime pin and tenant scope (ECS Fargate parity).
   # `telemetry_env` / `telemetry_headers` are structured answers parsed by
   # `env_packs::telemetry`; like on GCP they are not wizard questions.
+  # `oci_username` / `oci_password` (the registry credential for the worker's
+  # bundle pull) are likewise answers the designer supplies, not questions:
+  # this wizard never collects credential material.
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   - id: min_instances

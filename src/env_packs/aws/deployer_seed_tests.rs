@@ -9,7 +9,8 @@ use crate::cli::secrets::DEV_STORE_RELATIVE;
 use crate::env_packs::aws::boot_env::ecs_boot_env;
 use crate::env_packs::aws::deploy_target::{InMemoryEcs, log_group_name};
 use crate::env_packs::aws::seed_stage::{
-    SEED_MAX_BYTES, dev_store_secret_name, environment_secret_name, telemetry_headers_secret_name,
+    SEED_MAX_BYTES, dev_store_secret_name, environment_secret_name, oci_password_secret_name,
+    telemetry_headers_secret_name,
 };
 use crate::env_packs::deployer::conformance::build_fixture_env;
 use crate::env_packs::telemetry::HEADER_ENV_NAMES;
@@ -310,4 +311,190 @@ async fn warm_sets_log_group_and_boot_env() {
     assert_eq!(spec.env, ecs_boot_env(&env, rev, &params));
     assert_eq!(spec.image, params.runtime_image());
     assert_eq!(spec.revision_intent.len(), 32, "the intent is stamped");
+}
+
+// ---- registry credential (oci_username / oci_password) ---------------------
+
+const OCI_PW: &str = "reg-pw-s3cret";
+
+fn registry_answers() -> serde_json::Value {
+    json!({ "oci_username": "robot", "oci_password": OCI_PW })
+}
+
+#[tokio::test]
+async fn registry_password_reaches_secret_env_only() {
+    let (handler, target) = handler_with_fake();
+    let env = build_fixture_env();
+    handler
+        .warm_revision(
+            &env,
+            env.revisions[0].revision_id,
+            Some(&registry_answers()),
+        )
+        .await
+        .unwrap();
+
+    let spec = spec_of(&target, &env);
+    assert!(
+        spec.env
+            .iter()
+            .all(|(k, v)| k != "OCI_PASSWORD" && !v.contains(OCI_PW)),
+        "the password never reaches plain env: {:?}",
+        spec.env
+    );
+    assert!(
+        spec.env
+            .iter()
+            .any(|(k, v)| k == "OCI_USERNAME" && v == "robot"),
+        "the username is plain env: {:?}",
+        spec.env
+    );
+    let secret = oci_password_secret_name(&prefix(&env));
+    let refs: Vec<_> = spec
+        .secret_env
+        .iter()
+        .filter(|s| s.name == "OCI_PASSWORD")
+        .collect();
+    assert_eq!(refs.len(), 1);
+    assert!(
+        refs[0].value_from_arn.contains(&secret),
+        "{}",
+        refs[0].value_from_arn
+    );
+    assert!(refs[0].value_from_arn.contains(":::"), "version-pinned");
+    assert_eq!(target.secret_versions_of(&secret).len(), 1);
+    assert!(!spec.revision_intent.contains(OCI_PW));
+}
+
+#[tokio::test]
+async fn no_registry_answers_stage_no_registry_secret() {
+    let (handler, target) = handler_with_fake();
+    let env = build_fixture_env();
+    handler
+        .warm_revision(&env, env.revisions[0].revision_id, None)
+        .await
+        .unwrap();
+    let spec = spec_of(&target, &env);
+    assert!(spec.secret_env.is_empty());
+    assert!(spec.env.iter().all(|(k, _)| k != "OCI_USERNAME"));
+    assert!(
+        !target
+            .secrets()
+            .contains_key(&oci_password_secret_name(&prefix(&env)))
+    );
+}
+
+#[tokio::test]
+async fn a_lone_registry_half_is_refused_before_the_target_is_touched() {
+    let (handler, target) = handler_with_fake();
+    let env = build_fixture_env();
+    let err = handler
+        .warm_revision(
+            &env,
+            env.revisions[0].revision_id,
+            Some(&json!({ "oci_password": OCI_PW })),
+        )
+        .await
+        .unwrap_err();
+    assert!(!err.to_string().contains(OCI_PW), "{err}");
+    assert!(target.secrets().is_empty());
+    assert!(target.task_sets().is_empty());
+}
+
+#[tokio::test]
+async fn registry_presence_and_username_change_the_intent_but_not_the_password() {
+    let env = build_fixture_env();
+    let rev = env.revisions[0].revision_id;
+    let intent = |answers: Option<serde_json::Value>| {
+        let env = env.clone();
+        async move {
+            let (handler, target) = handler_with_fake();
+            handler
+                .warm_revision(&env, rev, answers.as_ref())
+                .await
+                .unwrap();
+            spec_of(&target, &env).revision_intent
+        }
+    };
+    let none = intent(None).await;
+    let with = intent(Some(registry_answers())).await;
+    let other_user = intent(Some(
+        json!({ "oci_username": "other", "oci_password": OCI_PW }),
+    ))
+    .await;
+    let other_pw = intent(Some(
+        json!({ "oci_username": "robot", "oci_password": "rotated" }),
+    ))
+    .await;
+    assert_ne!(none, with, "presence is part of the intent");
+    assert_ne!(with, other_user, "the username is part of the intent");
+    assert_eq!(
+        with, other_pw,
+        "the password value is never part of the intent"
+    );
+}
+
+#[tokio::test]
+async fn rewarm_with_the_same_registry_answers_converges_and_a_new_username_conflicts() {
+    let (handler, target) = handler_with_fake();
+    let env = build_fixture_env();
+    let rev = env.revisions[0].revision_id;
+    handler
+        .warm_revision(&env, rev, Some(&registry_answers()))
+        .await
+        .unwrap();
+    handler
+        .warm_revision(&env, rev, Some(&registry_answers()))
+        .await
+        .unwrap();
+    assert_eq!(target.create_task_set_calls(), 1);
+    let secret = oci_password_secret_name(&prefix(&env));
+    assert_eq!(
+        target.secret_versions_of(&secret).len(),
+        1,
+        "no new version"
+    );
+
+    let err = handler
+        .warm_revision(
+            &env,
+            rev,
+            Some(&json!({ "oci_username": "other", "oci_password": OCI_PW })),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("immutable"), "{err}");
+}
+
+#[tokio::test]
+async fn a_foreign_registry_secret_is_a_conflict() {
+    let (handler, target) = handler_with_fake();
+    let env = build_fixture_env();
+    let name = oci_password_secret_name(&prefix(&env));
+    target
+        .ensure_secret(&name, "another-env-stamp")
+        .await
+        .unwrap();
+    let err = handler
+        .warm_revision(
+            &env,
+            env.revisions[0].revision_id,
+            Some(&registry_answers()),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(&name), "{err}");
+    assert!(target.secret_versions_of(&name).is_empty());
+    assert!(target.task_sets().is_empty());
+}
+
+#[test]
+fn the_params_debug_never_shows_the_registry_password() {
+    let params = parse_registry();
+    let dbg = format!("{params:?}");
+    assert!(!dbg.contains(OCI_PW), "{dbg}");
+}
+
+fn parse_registry() -> AwsEcsParams {
+    AwsEcsParams::from_answers(&build_fixture_env(), Some(&registry_answers())).unwrap()
 }
