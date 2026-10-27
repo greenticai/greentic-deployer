@@ -594,6 +594,7 @@ impl Deployer for K8sDeployerHandler {
             multi_instance_safe: false,
             remove: true,
             runtime_pin: true,
+            scale_out_answers: true,
         }
     }
 
@@ -611,6 +612,7 @@ impl Deployer for K8sDeployerHandler {
              worker image and keeps the runtime_image answer's repository; the shared router \
              always runs the runtime_image answer and moves only when that answer is edited \
              (after every unit is on the new worker)",
+            "scale_out_answers: `replicas` > 1 is accepted only with `redis_url`; default 1",
         ]
     }
 

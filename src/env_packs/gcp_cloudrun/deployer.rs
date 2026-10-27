@@ -1019,6 +1019,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
             multi_instance_safe: false,
             remove: true,
             runtime_pin: true,
+            scale_out_answers: true,
         }
     }
 
@@ -1034,6 +1035,8 @@ impl Deployer for GcpCloudRunDeployerHandler {
             "remove: archive deletes the revision; env destroy deletes the Service",
             "runtime_pin: each revision runs the runtime image its manifest pinned (unified \
              update L2); unpinned revisions run the binding answer",
+            "scale_out_answers: `max_instances` > 1 is accepted only with `redis_url` + a VPC \
+             route (and pre-minted generated secrets); otherwise refused",
         ]
     }
 

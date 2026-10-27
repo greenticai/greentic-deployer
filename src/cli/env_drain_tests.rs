@@ -224,3 +224,42 @@ fn sweep_preflight_refusal_is_a_typed_permission_error() {
     let err = preflight_error(SweepPreflightError::ReviewFailed("x".into()));
     assert_eq!(err.kind(), "conflict");
 }
+
+/// Issue #661: a client gates sending `replicas` / `max_instances` > 1 on this
+/// flag, so an older deployer (which omits it) is never sent unknown keys.
+#[test]
+fn k8s_reports_scale_out_answers() {
+    let (_d, store) = store_with("greentic.deployer.k8s@1.0.0");
+    let out = capabilities(
+        &store,
+        &EnvPackRegistry::with_builtins(),
+        &OpFlags::default(),
+        "zain",
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.result["capabilities"]["scale_out_answers"], true);
+    assert!(
+        !out.result["missing"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("scale_out_answers"))
+    );
+}
+
+#[cfg(feature = "creds-gcp")]
+#[test]
+fn cloud_run_reports_scale_out_answers() {
+    let (_d, store) = store_with("greentic.deployer.gcp-cloudrun@1.0.0");
+    let out = capabilities(
+        &store,
+        &EnvPackRegistry::with_builtins(),
+        &OpFlags::default(),
+        "zain",
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.result["capabilities"]["scale_out_answers"], true);
+    // Reporting the answers is not a claim that scaling out is safe by itself.
+    assert_eq!(out.result["capabilities"]["multi_instance_safe"], false);
+}

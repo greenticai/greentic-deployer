@@ -388,8 +388,9 @@ pub enum MultiInstanceRefusal {
     #[error(
         "{shape}, but multi-instance Cloud Run needs a shared session store: answer {missing}. \
          Without it each instance keeps its own sessions, state and revision pins in memory, \
-         and a turn landing on another instance finds nothing. Set `max_instances` to 1 (and \
-         `min_instances` to at most 1), or answer the missing keys"
+         and a turn landing on another instance finds nothing (shared backend in the runtime: \
+         greenticai/greentic-start#735). Set `max_instances` to 1 (and `min_instances` to at \
+         most 1), or answer the missing keys"
     )]
     SharedStoreMissing { shape: String, missing: String },
     #[error(

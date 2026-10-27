@@ -55,6 +55,7 @@ use sha2::{Digest, Sha256};
 use crate::environment::runtime_config::materialize_runtime_config;
 
 pub mod ingress;
+pub mod scale_out;
 pub mod sor;
 mod telemetry;
 use crate::env_packs::telemetry::{self as telemetry_answers, TelemetryAnswers};
@@ -325,6 +326,9 @@ pub struct K8sParams {
     pub init_image: String,
     /// Router replica count. Plan step 11 mandates ≥ 2 for HA.
     pub router_replicas: u32,
+    /// Worker replica count and the shared backend that must back more than
+    /// one (`replicas` / `redis_url` answers). Default: one replica, none.
+    pub scale_out: scale_out::ScaleOut,
     /// Worker public-exposure mode. From the `tunnel` deployer answer.
     pub tunnel: TunnelMode,
     /// OCI registry authorities (`host[:port]`) the worker/router may pull
@@ -453,6 +457,7 @@ impl K8sParams {
             runtime_image: DEFAULT_RUNTIME_IMAGE.to_string(),
             init_image: DEFAULT_INIT_IMAGE.to_string(),
             router_replicas: 2,
+            scale_out: scale_out::ScaleOut::default(),
             tunnel: TunnelMode::Off,
             oci_insecure_registries: Vec::new(),
             oci_username: None,
@@ -527,6 +532,8 @@ impl K8sParams {
             "runtime_image",
             "init_image",
             "router_replicas",
+            scale_out::REPLICAS_KEY,
+            scale_out::REDIS_URL_KEY,
             "tunnel",
             "oci_insecure_registries",
             "oci_username",
@@ -699,11 +706,14 @@ impl K8sParams {
         )
         .map_err(|e| e.to_string())?;
 
+        let scale_out = scale_out::parse(obj)?;
+
         Ok(Self {
             namespace,
             runtime_image,
             init_image,
             router_replicas,
+            scale_out,
             tunnel,
             oci_insecure_registries,
             oci_username,
@@ -1345,6 +1355,7 @@ pub fn render_worker_deployment(
         json!({"name": "GREENTIC_BUNDLE_DIGEST", "value": revision.bundle_digest}),
     ]);
     env_vars.extend(telemetry::pod_env(params, "worker"));
+    env_vars.extend(params.scale_out.worker_env());
 
     // How the worker resolves `secret://` refs at runtime — see
     // [`secrets_wiring`], which the router shares.
@@ -1399,7 +1410,7 @@ pub fn render_worker_deployment(
             "labels": labels,
         },
         "spec": {
-            "replicas": 1,
+            "replicas": params.scale_out.replicas,
             "selector": {"matchLabels": {
                 "greentic.ai/revision": revision.revision_id.0.to_string(),
             }},
@@ -2063,7 +2074,10 @@ pub fn render_network_policies(env: &Environment, params: &K8sParams) -> Vec<Val
         // spec), so this is not a shape `telemetry_env` is answered with in
         // practice, and narrowing it here would need parsing the VALUE of an
         // allow-listed key rather than just its presence.
-        let allow_all = pullable || uses_vault || !params.telemetry.is_empty();
+        let allow_all = pullable
+            || uses_vault
+            || !params.telemetry.is_empty()
+            || (role == "worker" && params.scale_out.needs_egress());
         let egress = if allow_all { json!([{}]) } else { json!([]) };
         policies.push(json!({
             "apiVersion": "networking.k8s.io/v1",
@@ -2139,6 +2153,12 @@ pub fn render_environment_manifests(env: &Environment, params: &K8sParams) -> Ve
         manifests.push(render_oci_credentials_secret(env, params));
     }
     if let Some(secret) = telemetry::render_headers_secret(env, params) {
+        manifests.push(secret);
+    }
+    if let Some(secret) = params
+        .scale_out
+        .render_secret(&params.namespace, common_labels(env, "shared-state"))
+    {
         manifests.push(secret);
     }
     // Appended LAST so an env without `ingress_host` renders exactly the
