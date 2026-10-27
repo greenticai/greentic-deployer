@@ -663,6 +663,7 @@ impl Deployer for AwsEcsDeployerHandler {
             multi_instance_safe: false,
             remove: true,
             runtime_pin: false,
+            scale_out_answers: false,
         }
     }
 
