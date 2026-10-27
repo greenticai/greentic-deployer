@@ -36,9 +36,13 @@ use super::deploy_target::{
     EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, ServiceSpec, TargetGroupWeight,
     TaskSetRef, TaskSetSpec,
 };
+use crate::env_packs::RUNTIME_IMAGE_REPO;
 use crate::env_packs::deployer::{
     ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
     WarmOutcome, enforce_split_invariants, require_revision,
+};
+use crate::env_packs::telemetry::{
+    self as telemetry_answers, TelemetryAnswerError, TelemetryAnswers,
 };
 
 /// Default container image base when the binding supplies no
@@ -49,6 +53,9 @@ const DEFAULT_IMAGE_BASE: &str = "greentic/operator";
 /// Default image-tag prefix when the binding supplies no
 /// `container_image_tag_prefix`. Matches the wizard's `default_value`.
 const DEFAULT_IMAGE_TAG_PREFIX: &str = "rev-";
+
+/// Default tag of the public runtime image.
+const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
 
 /// Seam failures surface as provider failures — the verb's preconditions have
 /// already passed by the time the target is touched.
@@ -128,6 +135,24 @@ pub struct AwsEcsParams {
     /// written instead (one deployment per listener). Consumed by
     /// `apply_traffic_split`.
     pub routing: Option<ListenerRouting>,
+    /// Warm instances kept per service (wizard default 1, never 0: the
+    /// in-process runtime state needs a live task).
+    pub min_instances: u32,
+    /// Maximum tasks per service. Fixed at 1: sessions, flow state and
+    /// revision pins live per task in memory.
+    pub max_instances: u32,
+    /// Tag of the public runtime image (ignored when a digest is set).
+    pub runtime_image_tag: String,
+    /// `sha256:<64 hex>` pin of the public runtime image, overriding the tag.
+    pub runtime_image_digest: Option<String>,
+    /// Prefix of the per-env secrets the deploy stages (default `gtc-{env}`).
+    pub secret_prefix: String,
+    /// Tenant the deployed runtime resolves secrets under.
+    pub runtime_tenant: Option<String>,
+    /// Team the deployed runtime resolves secrets under.
+    pub runtime_team: Option<String>,
+    /// Telemetry profile (`telemetry_env` / `telemetry_headers`).
+    pub telemetry: TelemetryAnswers,
 }
 
 /// Why a wizard answers blob could not be read into [`AwsEcsParams`].
@@ -143,6 +168,8 @@ pub enum AwsEcsParamsError {
     Invalid { key: String, detail: String },
     #[error("launch config is incomplete: `{field}` is required")]
     MissingLaunchField { field: &'static str },
+    #[error(transparent)]
+    Telemetry(#[from] TelemetryAnswerError),
 }
 
 fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> {
@@ -193,6 +220,40 @@ fn csv_list(key: &str, value: &Value) -> Result<Vec<String>, AwsEcsParamsError> 
 
 /// Parse a `"true"` / `"false"` string answer (the `assign_public_ip` enum) to
 /// a bool.
+fn parse_u32(key: &str, value: &Value) -> Result<u32, AwsEcsParamsError> {
+    if let Some(n) = value.as_u64() {
+        return u32::try_from(n).map_err(|_| AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("{n} is out of range for a u32"),
+        });
+    }
+    let s = answer_string(key, value)?;
+    s.trim()
+        .parse::<u32>()
+        .map_err(|e| AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{s}` is not a non-negative integer: {e}"),
+        })
+}
+
+/// Optional `sha256:<64 lowercase hex>` image digest.
+fn parse_digest(key: &str, value: &Value) -> Result<Option<String>, AwsEcsParamsError> {
+    let Some(digest) = optional_string(key, value)? else {
+        return Ok(None);
+    };
+    let valid = digest.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    if valid {
+        Ok(Some(digest))
+    } else {
+        Err(AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{digest}` is not a `sha256:<64 hex>` digest"),
+        })
+    }
+}
+
 fn parse_bool(key: &str, value: &Value) -> Result<bool, AwsEcsParamsError> {
     match answer_string(key, value)?.as_str() {
         "true" => Ok(true),
@@ -327,6 +388,14 @@ impl AwsEcsParams {
             launch: None,
             target_group_pool: Vec::new(),
             routing: None,
+            min_instances: 1,
+            max_instances: 1,
+            runtime_image_tag: DEFAULT_RUNTIME_IMAGE_TAG.to_string(),
+            runtime_image_digest: None,
+            secret_prefix: format!("gtc-{}", env.environment_id.as_str()),
+            runtime_tenant: None,
+            runtime_team: None,
+            telemetry: TelemetryAnswers::default(),
         }
     }
 
@@ -361,6 +430,8 @@ impl AwsEcsParams {
         let mut launch = LaunchFields::default();
         let mut routing_host = None;
         let mut routing_path = None;
+        let mut telemetry_env = None;
+        let mut telemetry_headers = None;
         for (key, value) in obj {
             match key.as_str() {
                 "region" => params.region = answer_string(key, value)?,
@@ -388,15 +459,51 @@ impl AwsEcsParams {
                 "target_group_arns" => {
                     params.target_group_pool = parse_target_group_pool(key, value)?
                 }
+                "min_instances" => {
+                    params.min_instances = parse_u32(key, value)?;
+                    if params.min_instances == 0 {
+                        return Err(AwsEcsParamsError::Invalid {
+                            key: key.to_string(),
+                            detail: "must be at least 1 (a task must stay up)".to_string(),
+                        });
+                    }
+                }
+                "max_instances" => {
+                    params.max_instances = parse_u32(key, value)?;
+                    if params.max_instances != 1 {
+                        return Err(AwsEcsParamsError::Invalid {
+                            key: key.to_string(),
+                            detail: "must be 1 (runtime state lives per task in memory)"
+                                .to_string(),
+                        });
+                    }
+                }
+                "runtime_image_tag" => params.runtime_image_tag = answer_string(key, value)?,
+                "runtime_image_digest" => params.runtime_image_digest = parse_digest(key, value)?,
+                "secret_prefix" => params.secret_prefix = answer_string(key, value)?,
+                "runtime_tenant" => params.runtime_tenant = optional_string(key, value)?,
+                "runtime_team" => params.runtime_team = optional_string(key, value)?,
+                telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
+                telemetry_answers::TELEMETRY_HEADERS_KEY => telemetry_headers = Some(value),
                 other => return Err(AwsEcsParamsError::UnknownKey(other.to_string())),
             }
         }
+        params.telemetry = telemetry_answers::parse(telemetry_env, telemetry_headers)?;
         params.launch = launch.build()?;
         params.routing = match (routing_host, routing_path) {
             (None, None) => None,
             (host, path) => Some(ListenerRouting { host, path }),
         };
         Ok(params)
+    }
+
+    /// Public runtime image reference: digest-pinned when a digest is
+    /// answered, otherwise tag-based.
+    pub fn runtime_image(&self) -> String {
+        match &self.runtime_image_digest {
+            Some(digest) => format!("{RUNTIME_IMAGE_REPO}@{digest}"),
+            None => format!("{RUNTIME_IMAGE_REPO}:{}", self.runtime_image_tag),
+        }
     }
 
     /// Image the revision's Fargate task runs (image base + the configured
@@ -616,6 +723,10 @@ impl Deployer for AwsEcsDeployerHandler {
         Ok(outcome)
     }
 }
+
+#[cfg(test)]
+#[path = "deployer_answers_tests.rs"]
+mod answers_tests;
 
 #[cfg(test)]
 mod tests {

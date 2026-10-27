@@ -284,3 +284,76 @@ questions:
     required: false
     constraint:
       min_len: 1
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Scaling, runtime pin and tenant scope (ECS Fargate parity).
+  # `telemetry_env` / `telemetry_headers` are structured answers parsed by
+  # `env_packs::telemetry`; like on GCP they are not wizard questions.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - id: min_instances
+    type: string
+    title: Min tasks
+    description: >-
+      Warm tasks kept per service. At least `1`: runtime state lives in the
+      task's memory, so a service never scales to zero.
+    required: false
+    default_value: "1"
+    constraint:
+      pattern: '^[1-9][0-9]*$'
+
+  - id: max_instances
+    type: string
+    title: Max tasks
+    description: >-
+      Maximum tasks per service. Fixed at `1`: sessions, flow state and
+      revision pins live per task in memory. Any other value is refused.
+    required: false
+    default_value: "1"
+    constraint:
+      pattern: '^1$'
+
+  - id: runtime_image_tag
+    type: string
+    title: Runtime image tag
+    description: >-
+      Tag of the `greentic-start-distroless` runtime image to deploy (e.g.
+      `develop`). Ignored when a digest is set.
+    required: false
+    default_value: "develop"
+    constraint:
+      pattern: '^[a-zA-Z0-9_.-]+$'
+
+  - id: runtime_image_digest
+    type: string
+    title: Runtime image digest (recommended)
+    description: >-
+      RECOMMENDED. Pin the runtime image by digest (`sha256:<64 hex>`) so a
+      cold start or rollback always pulls the exact image. Overrides the tag.
+    required: false
+    constraint:
+      pattern: '^sha256:[a-f0-9]{64}$'
+
+  - id: secret_prefix
+    type: string
+    title: Secret name prefix (optional)
+    description: >-
+      Prefix for the per-env secrets the deploy stages. Leave blank to
+      default to `gtc-<env>`.
+    required: false
+
+  - id: runtime_tenant
+    type: string
+    title: Runtime tenant (optional)
+    description: >-
+      Tenant the deployed runtime resolves its secrets under. Leave blank for
+      the runtime default.
+    required: false
+
+  - id: runtime_team
+    type: string
+    title: Runtime team (optional)
+    description: >-
+      Team the deployed runtime resolves its secrets under. Leave blank for
+      the runtime default.
+    required: false

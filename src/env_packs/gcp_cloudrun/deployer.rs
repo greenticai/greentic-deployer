@@ -60,7 +60,7 @@ use super::shared_state::{
 /// Default runtime image (plan D2/D3): the public GHCR distroless image Cloud
 /// Run pulls directly. `:develop` matches this lane; digest-pinning is
 /// recommended in the answers to defeat the ≤1h tag cache.
-const DEFAULT_RUNTIME_IMAGE: &str = "ghcr.io/greenticai/greentic-start-distroless";
+use crate::env_packs::RUNTIME_IMAGE_REPO as DEFAULT_RUNTIME_IMAGE;
 const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
 
 /// Warm-readiness poll deadline (plan D4). Overridable via the env var so a
