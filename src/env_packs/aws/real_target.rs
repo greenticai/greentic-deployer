@@ -115,9 +115,10 @@ use aws_sdk_ecs::operation::describe_services::DescribeServicesOutput;
 use aws_sdk_ecs::operation::describe_task_sets::DescribeTaskSetsOutput;
 use aws_sdk_ecs::operation::register_task_definition::RegisterTaskDefinitionOutput;
 use aws_sdk_ecs::types::{
-    AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition, DeploymentController,
-    DeploymentControllerType, LoadBalancer, NetworkConfiguration, NetworkMode, PortMapping, Scale,
-    ScaleUnit, StabilityStatus, TaskSet,
+    AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerCondition, ContainerDefinition,
+    ContainerDependency, DeploymentController, DeploymentControllerType, KeyValuePair,
+    LoadBalancer, LogConfiguration, LogDriver, MountPoint, NetworkConfiguration, NetworkMode,
+    PortMapping, Scale, ScaleUnit, Secret, StabilityStatus, TaskSet, Volume,
 };
 use aws_sdk_elasticloadbalancingv2::operation::describe_target_groups::DescribeTargetGroupsOutput;
 use aws_sdk_elasticloadbalancingv2::types::{
@@ -126,10 +127,12 @@ use aws_sdk_elasticloadbalancingv2::types::{
 };
 use greentic_deploy_spec::{DeploymentId, RevisionId};
 
+use super::boot_env::SEED_MOUNT_DIR;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, ServiceSpec, TargetGroupWeight,
-    TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
+    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, SecretEnvRef, SeedInit,
+    ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
 };
+use super::seed_init::{self, SEED_INIT_CONTAINER, SEED_VOLUME};
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
 // lives in the always-compiled deployer module; re-exported here to keep the
 // `real_target::FargateLaunchConfig` public path stable.
@@ -425,7 +428,7 @@ impl EcsDeployTarget for RealEcsTarget {
             })
         })?;
 
-        let registered = self
+        let mut register = self
             .ecs
             .register_task_definition()
             .family(task_def_family(&spec.deployment_id, &spec.revision_id))
@@ -435,7 +438,22 @@ impl EcsDeployTarget for RealEcsTarget {
             .memory(&self.launch.memory)
             .execution_role_arn(&self.launch.execution_role_arn)
             .set_task_role_arn(self.launch.task_role_arn.clone())
-            .container_definitions(container_def(&self.launch, &spec.image))
+            .container_definitions(container_def(
+                &self.launch,
+                &spec.image,
+                &spec.env,
+                &spec.secret_env,
+                spec.log_group
+                    .as_deref()
+                    .map(|group| (group, spec.region.as_str())),
+                spec.seed.is_some(),
+            ));
+        if let Some(seed) = &spec.seed {
+            register = register
+                .container_definitions(seed_init_container(seed))
+                .volumes(seed_volume());
+        }
+        let registered = register
             .send()
             .await
             .map_err(|e| api("register_task_definition", e))?;
@@ -750,8 +768,20 @@ fn active_service_exists(out: &DescribeServicesOutput, name: &str) -> bool {
 
 /// The container definition for a revision: the single essential container
 /// running the revision's image, exposing the launch config's container port.
-fn container_def(launch: &FargateLaunchConfig, image: &str) -> ContainerDefinition {
-    ContainerDefinition::builder()
+///
+/// `log` is `(log group, region)` for the awslogs driver; `seed` mounts the
+/// shared seed volume read-only and waits for `seed-init` to exit 0.
+// `readonlyRootFilesystem` stays unset (false): `HOME=/tmp` must be writable and
+// the decision record leaves read-only rootfs as an open item.
+fn container_def(
+    launch: &FargateLaunchConfig,
+    image: &str,
+    env: &[(String, String)],
+    secret_env: &[SecretEnvRef],
+    log: Option<(&str, &str)>,
+    seed: bool,
+) -> ContainerDefinition {
+    let mut b = ContainerDefinition::builder()
         .name(&launch.container_name)
         .image(image)
         .essential(true)
@@ -759,8 +789,85 @@ fn container_def(launch: &FargateLaunchConfig, image: &str) -> ContainerDefiniti
             PortMapping::builder()
                 .container_port(launch.container_port)
                 .build(),
-        )
+        );
+    for (name, value) in env {
+        b = b.environment(KeyValuePair::builder().name(name).value(value).build());
+    }
+    for s in secret_env {
+        b = b.secrets(secret_entry(&s.name, &s.value_from_arn));
+    }
+    if let Some((group, region)) = log {
+        b = b.log_configuration(awslogs_config(group, region, &launch.container_name));
+    }
+    if seed {
+        b = b.mount_points(seed_mount(true)).depends_on(
+            ContainerDependency::builder()
+                .container_name(SEED_INIT_CONTAINER)
+                .condition(ContainerCondition::Success)
+                .build()
+                .expect("dependency container name and condition are set"),
+        );
+    }
+    b.build()
+}
+
+fn secret_entry(name: &str, value_from: &str) -> Secret {
+    Secret::builder()
+        .name(name)
+        .value_from(value_from)
         .build()
+        .expect("secret name and valueFrom are set")
+}
+
+fn awslogs_config(group: &str, region: &str, stream_prefix: &str) -> LogConfiguration {
+    LogConfiguration::builder()
+        .log_driver(LogDriver::Awslogs)
+        .options("awslogs-group", group)
+        .options("awslogs-region", region)
+        .options("awslogs-stream-prefix", stream_prefix)
+        .build()
+        .expect("log driver is set")
+}
+
+fn seed_mount(read_only: bool) -> MountPoint {
+    MountPoint::builder()
+        .source_volume(SEED_VOLUME)
+        .container_path(SEED_MOUNT_DIR)
+        .read_only(read_only)
+        .build()
+}
+
+/// Task-level bind-mount volume (no `host`, so Fargate ephemeral storage)
+/// shared by `seed-init` and the worker.
+fn seed_volume() -> Volume {
+    Volume::builder().name(SEED_VOLUME).build()
+}
+
+/// The non-essential init container: seed secrets arrive as env vars, are
+/// written under `/seed`, and verified against their SHA-256.
+fn seed_init_container(seed: &SeedInit) -> ContainerDefinition {
+    let mut b = ContainerDefinition::builder()
+        .name(SEED_INIT_CONTAINER)
+        .image(&seed.image)
+        .essential(false)
+        .command("sh")
+        .command("-c")
+        .command(seed_init::script(&seed.files))
+        .mount_points(seed_mount(false));
+    for f in &seed.files {
+        b = b
+            .secrets(secret_entry(
+                &seed_init::content_var(f),
+                &f.secret_value_from,
+            ))
+            .environment(
+                KeyValuePair::builder()
+                    .name(seed_init::sha_var(f))
+                    .value(&f.sha256_hex)
+                    .build(),
+            );
+    }
+    b.build()
 }
 
 /// The awsvpc network configuration for the task set's Fargate ENIs.
@@ -1177,6 +1284,7 @@ fn routing_summary(routing: &ListenerRouting) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::deploy_target::SeedFile;
     use super::*;
     use aws_sdk_ecs::types::{Service, TaskDefinition};
     use aws_sdk_elasticloadbalancingv2::types::TargetGroup;
@@ -1245,12 +1353,105 @@ mod tests {
 
     #[test]
     fn container_def_carries_image_name_and_port() {
-        let cd = container_def(&launch(), "registry/img:rev-rev1");
+        let cd = container_def(&launch(), "registry/img:rev-rev1", &[], &[], None, false);
         assert_eq!(cd.name(), Some("worker"));
         assert_eq!(cd.image(), Some("registry/img:rev-rev1"));
         assert_eq!(cd.essential(), Some(true));
         assert_eq!(cd.port_mappings().len(), 1);
         assert_eq!(cd.port_mappings()[0].container_port(), Some(8080));
+    }
+
+    #[test]
+    fn container_def_without_extras_is_unchanged() {
+        let cd = container_def(&launch(), "img", &[], &[], None, false);
+        assert!(cd.environment().is_empty());
+        assert!(cd.secrets().is_empty());
+        assert!(cd.log_configuration().is_none());
+        assert!(cd.mount_points().is_empty());
+        assert!(cd.depends_on().is_empty());
+    }
+
+    #[test]
+    fn container_def_sets_environment_and_secrets_and_log_config() {
+        let env = vec![("GREENTIC_ENV".to_string(), "dev".to_string())];
+        let secrets = vec![SecretEnvRef {
+            name: "OTLP_HEADERS".to_string(),
+            value_from_arn: "arn:aws:secretsmanager:us-east-1:1:secret:h:::v1".to_string(),
+        }];
+        let cd = container_def(
+            &launch(),
+            "img",
+            &env,
+            &secrets,
+            Some(("/ecs/gtc", "us-east-1")),
+            false,
+        );
+        assert_eq!(cd.environment()[0].name(), Some("GREENTIC_ENV"));
+        assert_eq!(cd.environment()[0].value(), Some("dev"));
+        assert_eq!(cd.secrets()[0].name(), "OTLP_HEADERS");
+        assert_eq!(
+            cd.secrets()[0].value_from(),
+            "arn:aws:secretsmanager:us-east-1:1:secret:h:::v1"
+        );
+        let log = cd.log_configuration().expect("log config");
+        assert_eq!(log.log_driver(), &LogDriver::Awslogs);
+        let opts = log.options().unwrap();
+        assert_eq!(
+            opts.get("awslogs-group").map(String::as_str),
+            Some("/ecs/gtc")
+        );
+        assert_eq!(
+            opts.get("awslogs-region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            opts.get("awslogs-stream-prefix").map(String::as_str),
+            Some("worker")
+        );
+    }
+
+    #[test]
+    fn seed_init_container_volume_and_worker_dependency_follow_the_decision_record() {
+        let seed = SeedInit {
+            image: "busybox@sha256:abc".to_string(),
+            files: vec![SeedFile {
+                name: "environment.json".to_string(),
+                secret_value_from: "arn:aws:secretsmanager:r:1:secret:e:::v7".to_string(),
+                sha256_hex: "cd".repeat(32),
+            }],
+        };
+        let init = seed_init_container(&seed);
+        assert_eq!(init.name(), Some("seed-init"));
+        assert_eq!(init.essential(), Some(false));
+        assert_eq!(init.image(), Some("busybox@sha256:abc"));
+        assert_eq!(init.mount_points()[0].source_volume(), Some("seed"));
+        assert_eq!(init.mount_points()[0].container_path(), Some("/seed"));
+        assert_eq!(init.mount_points()[0].read_only(), Some(false));
+        assert_eq!(init.secrets()[0].name(), "GREENTIC_SEED_ENVIRONMENT_JSON");
+        assert_eq!(
+            init.secrets()[0].value_from(),
+            "arn:aws:secretsmanager:r:1:secret:e:::v7"
+        );
+        let sha = init
+            .environment()
+            .iter()
+            .find(|e| e.name() == Some("GREENTIC_SEED_ENVIRONMENT_JSON_SHA256"))
+            .expect("sha env");
+        assert_eq!(sha.value(), Some("cd".repeat(32).as_str()));
+        assert_eq!(init.command()[0], "sh");
+        assert_eq!(init.command()[1], "-c");
+
+        assert_eq!(seed_volume().name(), Some("seed"));
+
+        let worker = container_def(&launch(), "img", &[], &[], None, true);
+        assert_eq!(worker.mount_points()[0].source_volume(), Some("seed"));
+        assert_eq!(worker.mount_points()[0].container_path(), Some("/seed"));
+        assert_eq!(worker.mount_points()[0].read_only(), Some(true));
+        assert_eq!(worker.depends_on()[0].container_name(), "seed-init");
+        assert_eq!(
+            worker.depends_on()[0].condition(),
+            &ContainerCondition::Success
+        );
     }
 
     #[test]

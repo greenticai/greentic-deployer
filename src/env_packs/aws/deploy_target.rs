@@ -97,6 +97,47 @@ pub struct TaskSetSpec {
     pub region: String,
     /// Container image the Fargate task runs.
     pub image: String,
+    /// Plain environment of the worker container (see `boot_env`).
+    pub env: Vec<(String, String)>,
+    /// Secrets Manager values injected into the worker as env vars.
+    pub secret_env: Vec<SecretEnvRef>,
+    /// Seed delivered by the `seed-init` container; `None` ships no seed.
+    pub seed: Option<SeedInit>,
+    /// CloudWatch log group for the awslogs driver; `None` configures no logs.
+    pub log_group: Option<String>,
+    /// Fingerprint of everything that defines the revision's configuration.
+    pub revision_intent: String,
+}
+
+/// A task-definition `secrets` entry: env var `name` resolved at task start
+/// from a Secrets Manager reference (ECS `valueFrom` form).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretEnvRef {
+    pub name: String,
+    pub value_from_arn: String,
+}
+
+/// The seed delivery plan (see `docs/aws-ecs-seed-and-bundle-delivery.md`):
+/// a non-essential init container writes each file onto a shared bind-mount
+/// volume before the worker starts. Secret values never appear in the task
+/// definition, only version-pinned ARNs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedInit {
+    /// Digest-pinned init image (busybox).
+    pub image: String,
+    pub files: Vec<SeedFile>,
+}
+
+/// One file the init container writes under `/seed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedFile {
+    /// Path relative to `/seed`, e.g. `environment.json`.
+    pub name: String,
+    /// Secrets Manager reference including the version pin
+    /// (`<arn>:::<version-id>`).
+    pub secret_value_from: String,
+    /// Expected SHA-256 of the file content, lowercase hex.
+    pub sha256_hex: String,
 }
 
 /// Identity of a task set for describe / delete.

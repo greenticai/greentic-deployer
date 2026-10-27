@@ -628,6 +628,11 @@ impl Deployer for AwsEcsDeployerHandler {
                 cluster: params.cluster.clone(),
                 region: params.region.clone(),
                 image: params.image_for(revision_id),
+                env: Vec::new(),
+                secret_env: Vec::new(),
+                seed: None,
+                log_group: None,
+                revision_intent: String::new(),
             })
             .await
             .map_err(provider)?;

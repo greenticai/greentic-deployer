@@ -25,6 +25,7 @@
 //! through the env-pack registry, which is the honest answer for a binary
 //! built without AWS support.
 
+pub(crate) mod boot_env;
 pub mod bootstrap;
 // Only the `deploy-aws-ecs` live-deploy path consumes the bound session
 // (`RealEcsTarget` injects it as a static credentials provider), so gate it the
@@ -36,6 +37,7 @@ pub mod deploy_target;
 pub mod deployer;
 #[cfg(feature = "deploy-aws-ecs")]
 pub mod real_target;
+pub(crate) mod seed_init;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
