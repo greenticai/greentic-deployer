@@ -72,6 +72,7 @@ impl Deployer for AzureAcaDeployerHandler {
             multi_instance_safe: false,
             remove: true,
             runtime_pin: true,
+            scale_out_answers: false,
         }
     }
 
