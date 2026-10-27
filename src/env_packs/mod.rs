@@ -13,6 +13,8 @@ pub mod deployer;
 pub mod gcp_cloudrun;
 pub mod k8s;
 pub mod local_process;
+#[cfg(any(feature = "creds-aws", feature = "creds-gcp"))]
+pub(crate) mod owner_stamp;
 pub mod registry;
 pub mod render;
 pub mod slot;
