@@ -278,3 +278,19 @@ fn the_default_and_one_warm_instance_stay_single() {
         1
     );
 }
+
+#[test]
+fn the_refusal_names_the_shared_backend_issue() {
+    let p = params(json!({"max_instances": "3"})).expect("parse");
+    let msg = gate(&p, &GeneratedSecretSeed::Complete)
+        .expect_err("refused")
+        .to_string();
+    assert!(msg.contains("greentic-start#735"), "{msg}");
+}
+
+#[test]
+fn max_instances_defaults_to_one_and_needs_no_backend() {
+    let p = params(json!({})).expect("parse");
+    assert_eq!(p.max_instances, 1);
+    assert!(!runs_multiple_instances(&p));
+}
