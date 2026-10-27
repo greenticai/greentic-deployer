@@ -45,8 +45,8 @@ use super::seed_init::SEED_INIT_IMAGE;
 use super::seed_stage::environment_secret_name;
 use crate::env_packs::RUNTIME_IMAGE_REPO;
 use crate::env_packs::deployer::{
-    ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
-    WarmOutcome, enforce_split_invariants, require_revision,
+    AdapterCapabilities, ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome,
+    TrafficSplitOutcome, WarmOutcome, enforce_split_invariants, require_revision,
 };
 use crate::env_packs::telemetry::{
     self as telemetry_answers, HEADER_ENV_NAMES, TelemetryAnswerError, TelemetryAnswers,
@@ -629,6 +629,30 @@ fn whole_bundle_retiring(env: &Environment, revision: &Revision) -> bool {
 
 #[async_trait]
 impl Deployer for AwsEcsDeployerHandler {
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            drain: false,
+            traffic_split: true,
+            ingress_managed: false,
+            private_registry_auth: false,
+            multi_instance_safe: false,
+            remove: true,
+            runtime_pin: false,
+        }
+    }
+
+    fn capability_notes(&self) -> &'static [&'static str] {
+        &[
+            "scale: Fargate has no scale-to-zero and runs exactly one task \
+             (min_instances >= 1, max_instances == 1)",
+            "ingress_managed: the load balancer, listener, certificate and target groups are \
+             operator-provided; the pack only discovers the URL",
+            "drain: not implemented — a retire that needs a drain window is refused",
+            "runtime_pin: no per-revision pin; the runtime image comes from the \
+             environment-wide answer",
+        ]
+    }
+
     async fn stage_revision(
         &self,
         env: &Environment,

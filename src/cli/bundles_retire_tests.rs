@@ -215,40 +215,36 @@ fn bind_deployer(store: &LocalFsStore, kind: &str) {
     store.save(&env).expect("save");
 }
 
-/// P5-R3: AWS-ECS declares no capabilities, so a retire is refused by the
-/// capability's name before anything moves — `--force-drain` included, since
-/// it relaxes the drain confirmation, never the teardown.
+/// P5-R3: AWS-ECS supports `remove` but not `drain`, so a retire that needs a
+/// drain confirmation (no `--force-drain`) is refused by the capability's name
+/// before anything moves. `--force-drain` relaxes exactly that requirement, so
+/// the preflight then passes (it is not exercised here: it would go on to
+/// touch the cloud).
 #[cfg(feature = "creds-aws")]
 #[test]
-fn an_aws_ecs_env_is_refused_by_capability_name_before_touching_anything() {
+fn an_aws_ecs_retire_that_needs_drain_is_refused_by_capability_name() {
     let dir = tempdir().expect("tempdir");
     let store = LocalFsStore::new(dir.path());
     seed(&store);
     bind_deployer(&store, "greentic.deployer.aws-ecs@1.0.0");
     let before = load(&store);
     let registry = crate::env_packs::EnvPackRegistry::with_builtins();
-    for force_drain in [false, true] {
-        let hooks = ProviderHooks {
-            store: &store,
-            registry: &registry,
-            force_drain,
-            drain_seconds: None,
-        };
-        let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
-        assert_eq!(err.kind(), "capability-missing", "{err}");
-        match &err {
-            OpError::CapabilityMissing(missing) => {
-                assert_eq!(missing.adapter, "greentic.deployer.aws-ecs");
-                assert_eq!(missing.capability, Capability::Remove);
-            }
-            other => panic!("expected CapabilityMissing, got {other:?}"),
+    let hooks = ProviderHooks {
+        store: &store,
+        registry: &registry,
+        force_drain: false,
+        drain_seconds: None,
+    };
+    let err = retire_with_hooks(&store, &hooks, payload("acme")).unwrap_err();
+    assert_eq!(err.kind(), "capability-missing", "{err}");
+    match &err {
+        OpError::CapabilityMissing(missing) => {
+            assert_eq!(missing.adapter, "greentic.deployer.aws-ecs");
+            assert_eq!(missing.capability, Capability::Drain);
         }
-        assert_eq!(
-            load(&store),
-            before,
-            "nothing mutated (force_drain={force_drain})"
-        );
+        other => panic!("expected CapabilityMissing, got {other:?}"),
     }
+    assert_eq!(load(&store), before, "nothing mutated");
 }
 
 /// K8s and Cloud Run declare `remove` and `drain`: the preflight lets them
