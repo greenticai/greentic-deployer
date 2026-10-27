@@ -565,3 +565,113 @@ fn apply_traffic_still_refuses_the_target_deployments_own_fine_split() {
         other => panic!("expected a split refusal, got {other:?}"),
     }
 }
+
+/// Rewrite the answers file without the listener.
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn drop_listener_answer(store: &LocalFsStore, env_id: &EnvId) {
+    let path = store.env_dir(env_id).unwrap().join("aws-answers.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("alb_listener_arn");
+    std::fs::write(path, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+fn env_with_split(
+    region: &str,
+    weights: &[u32],
+) -> (
+    tempfile::TempDir,
+    LocalFsStore,
+    Environment,
+    EnvId,
+    greentic_deploy_spec::DeploymentId,
+) {
+    let dir = tempdir().unwrap();
+    let store = LocalFsStore::new(dir.path());
+    let mut env = make_env("local");
+    bind_aws(&mut env);
+    let d = make_bundle_deployment("local", "bundle-a");
+    let mut revisions = Vec::new();
+    for n in 1..=weights.len() {
+        revisions.push(make_revision(
+            "local",
+            "bundle-a",
+            &d.deployment_id,
+            n as u64,
+            RevisionLifecycle::Ready,
+        ));
+    }
+    let mut split = make_traffic_split(
+        "local",
+        "bundle-a",
+        &d.deployment_id,
+        &revisions[0].revision_id,
+        "01J000000000000000000000AC",
+    );
+    split.entries = revisions
+        .iter()
+        .zip(weights)
+        .map(|(r, w)| TrafficSplitEntry {
+            revision_id: r.revision_id,
+            weight_bps: *w,
+        })
+        .collect();
+    let dep = d.deployment_id;
+    env.bundles.push(d);
+    env.revisions.extend(revisions);
+    env.traffic_splits.push(split);
+    store.save(&env).unwrap();
+    let env_id = EnvId::try_from("local").unwrap();
+    write_aws_answers(&store, &env_id, region);
+    drop_listener_answer(&store, &env_id);
+    (dir, store, env, env_id, dep)
+}
+
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[test]
+fn aws_env_up_refuses_a_multi_revision_split_without_a_listener_before_warming() {
+    use crate::env_packs::aws::deploy_target::InMemoryEcs;
+    let region = "fake-region-up-no-listener-multi";
+    let fake = Arc::new(InMemoryEcs::default());
+    let _seam = crate::cli::env::ecs_target_seam::install(region, fake.clone());
+    let (_dir, store, _env, env_id, _dep) = env_with_split(region, &[5_000, 5_000]);
+
+    match aws_env_up(&store, &registry(), &env_id) {
+        Err(OpError::Conflict(msg)) => assert!(msg.contains("alb_listener_arn"), "{msg}"),
+        other => panic!("expected a listener refusal, got {other:?}"),
+    }
+    assert_eq!(fake.create_task_set_calls(), 0, "nothing warmed");
+}
+
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[test]
+fn aws_env_up_with_a_single_revision_split_needs_no_listener() {
+    use crate::env_packs::aws::deploy_target::InMemoryEcs;
+    let region = "fake-region-up-no-listener-single";
+    let fake = Arc::new(InMemoryEcs::default());
+    let _seam = crate::cli::env::ecs_target_seam::install(region, fake.clone());
+    let (_dir, store, _env, env_id, _dep) = env_with_split(region, &[10_000]);
+
+    let out = aws_env_up(&store, &registry(), &env_id).unwrap().unwrap();
+    assert_eq!(out["applied_splits"], 1, "{out}");
+    assert!(fake.create_task_set_calls() >= 1);
+}
+
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+#[test]
+fn apply_traffic_without_a_listener_refuses_a_fifty_fifty_split() {
+    use crate::env_packs::aws::deploy_target::InMemoryEcs;
+    let region = "fake-region-apply-traffic-no-listener";
+    let fake = Arc::new(InMemoryEcs::default());
+    let _seam = crate::cli::env::ecs_target_seam::install(region, fake.clone());
+    let (_dir, store, env, env_id, dep) = env_with_split(region, &[5_000, 5_000]);
+    let answers: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(store.env_dir(&env_id).unwrap().join("aws-answers.json")).unwrap(),
+    )
+    .unwrap();
+
+    match crate::cli::env::apply_traffic_aws_ecs(&store, &env, &env_id, dep, Some(&answers)) {
+        Err(OpError::Conflict(msg)) => assert!(msg.contains("alb_listener_arn"), "{msg}"),
+        other => panic!("expected a listener refusal, got {other:?}"),
+    }
+}

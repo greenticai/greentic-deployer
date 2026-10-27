@@ -68,14 +68,20 @@ const DEFAULT_LOG_RETENTION_DAYS: i32 = 30;
 /// Default tag of the public runtime image.
 const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
 
-/// Seam failures surface as provider failures — the verb's preconditions have
-/// already passed by the time the target is touched.
 /// All traffic on one revision: expressible without any listener.
-fn is_trivial_split(entries: &[greentic_deploy_spec::TrafficSplitEntry]) -> bool {
+pub(crate) fn is_trivial_split(entries: &[greentic_deploy_spec::TrafficSplitEntry]) -> bool {
     let live: Vec<_> = entries.iter().filter(|e| e.weight_bps > 0).collect();
     matches!(live.as_slice(), [only] if only.weight_bps == 10_000)
 }
 
+/// Why a non-trivial split is refused when no listener is configured (shared
+/// by the deployer verb and the `op env up` preflight so the wording is one).
+pub(crate) const SPLIT_NEEDS_LISTENER: &str = "traffic split across several revisions (or below \
+     100%) needs the `alb_listener_arn` answer: ECS applies weights only through an \
+     operator-provided ALB listener";
+
+/// Seam failures surface as provider failures — the verb's preconditions have
+/// already passed by the time the target is touched.
 fn provider(err: EcsTargetError) -> DeployerError {
     DeployerError::Provider(err.to_string())
 }
@@ -896,12 +902,7 @@ impl Deployer for AwsEcsDeployerHandler {
         // `alb_listener_arn`, only a split that sends everything to one
         // revision is expressible; anything else fails closed.
         if params.listener_arn.is_none() && !is_trivial_split(&outcome.applied_entries) {
-            return Err(DeployerError::Provider(
-                "traffic split across several revisions (or below 100%) needs the \
-                 `alb_listener_arn` answer: ECS applies weights only through an \
-                 operator-provided ALB listener"
-                    .to_string(),
-            ));
+            return Err(DeployerError::Provider(SPLIT_NEEDS_LISTENER.to_string()));
         }
         if let Some(listener_arn) = &params.listener_arn {
             let weights: Vec<TargetGroupWeight> = outcome

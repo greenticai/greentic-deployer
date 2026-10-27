@@ -76,6 +76,25 @@ pub fn aws_env_up(
         None,
     )?;
 
+    // Without an operator-provided listener only a split sending all traffic
+    // to one revision is expressible; refuse any other BEFORE warming creates
+    // task sets that could then not be routed as recorded.
+    let has_listener = answers
+        .as_ref()
+        .and_then(|a| a.get("alb_listener_arn"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.trim().is_empty());
+    if !has_listener
+        && env
+            .traffic_splits
+            .iter()
+            .any(|s| !crate::env_packs::aws::deployer::is_trivial_split(&s.entries))
+    {
+        return Err(OpError::Conflict(
+            crate::env_packs::aws::deployer::SPLIT_NEEDS_LISTENER.to_string(),
+        ));
+    }
+
     // 1. Warm every revision that carries traffic. A deployment's revisions sit
     //    behind one listener route, so endpoints are keyed by deployment.
     let mut warmed: Vec<String> = Vec::new();
@@ -95,7 +114,8 @@ pub fn aws_env_up(
         warmed.push(service_name);
     }
 
-    // 2. Push each recorded split to the listener (a no-op live without one).
+    // 2. Push each recorded split to the listener (a single-revision split needs
+    //    none; any other was refused above when no listener is configured).
     for split in &env.traffic_splits {
         apply_traffic_non_k8s(
             store,

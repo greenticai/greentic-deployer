@@ -2676,8 +2676,9 @@ pub(super) fn apply_traffic_non_k8s(
 }
 
 /// Connect to AWS and push one deployment's recorded traffic split to its ALB
-/// listener via `apply_traffic_split` (a no-op live when no `alb_listener_arn`
-/// is configured — the recorded split's invariants are still enforced). Returns
+/// listener via `apply_traffic_split` (with no `alb_listener_arn` only a split
+/// sending all traffic to one revision is accepted; any other fails closed).
+/// The recorded split's invariants are enforced first. Returns
 /// the identity used + the enforced split. Requires the `deploy-aws-ecs`
 /// feature.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
