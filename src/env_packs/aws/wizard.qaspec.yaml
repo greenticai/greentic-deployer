@@ -107,12 +107,15 @@ questions:
 
   - id: ecr_repository_prefix
     type: string
-    title: ECR repository prefix
+    title: ECR repository prefix (optional)
     description: >-
-      Prefix appended to every revision's container image (e.g.
-      `<account>.dkr.ecr.<region>.amazonaws.com/greentic/`). The
-      deployer's `ecr:PutImage` IAM probe is scoped to this prefix.
-    required: true
+      Reserved for bundle delivery: the ECR repository prefix the
+      deployment's bundles will live under (e.g.
+      `<account>.dkr.ecr.<region>.amazonaws.com/greentic/`). It does not
+      change what a revision runs: the worker runs the public runtime image
+      and reads its bundle reference from the seeded `environment.json`.
+      Today the deploy records it and nothing else reads it.
+    required: false
     constraint:
       min_len: 1
       pattern: '^[a-zA-Z0-9._/-]+$'
@@ -156,11 +159,12 @@ questions:
 
   - id: container_image_tag_prefix
     type: string
-    title: Container image tag prefix
+    title: Container image tag prefix (optional)
     description: >-
-      Prefix every revision's image tag is built from (e.g. `rev-`).
-      Combined with the revision ULID at deploy time. Leave blank to
-      tag with the raw revision ULID.
+      Reserved for bundle delivery: the tag prefix (e.g. `rev-`) bundle
+      references will use beside the revision ULID. It does not change
+      what a revision runs; today the deploy records it and nothing else
+      reads it.
     required: false
     default_value: "rev-"
     constraint:

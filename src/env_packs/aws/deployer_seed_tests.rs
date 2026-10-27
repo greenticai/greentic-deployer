@@ -149,6 +149,43 @@ async fn rewarm_with_changed_inputs_conflicts() {
     assert_eq!(target.create_task_set_calls(), 1);
 }
 
+/// A changed launch field (here the task role) is baked into the immutable
+/// task definition, so a re-warm of the live revision must refuse rather than
+/// report success while the old role keeps serving.
+#[tokio::test]
+async fn rewarm_with_a_changed_task_role_conflicts() {
+    let (handler, target) = handler_with_fake();
+    let env = build_fixture_env();
+    let rev = env.revisions[0].revision_id;
+    let launch = |task_role: &str| {
+        json!({
+            "execution_role_arn": "arn:aws:iam::111122223333:role/exec",
+            "task_role_arn": task_role,
+            "subnets": "subnet-aaaa",
+            "security_groups": "sg-1111",
+        })
+    };
+    handler
+        .warm_revision(&env, rev, Some(&launch("arn:aws:iam::111122223333:role/a")))
+        .await
+        .unwrap();
+    // The same launch answers converge.
+    handler
+        .warm_revision(&env, rev, Some(&launch("arn:aws:iam::111122223333:role/a")))
+        .await
+        .unwrap();
+
+    let err = handler
+        .warm_revision(&env, rev, Some(&launch("arn:aws:iam::111122223333:role/b")))
+        .await
+        .unwrap_err();
+    match err {
+        DeployerError::Provider(msg) => assert!(msg.contains("immutable"), "{msg}"),
+        other => panic!("expected Provider, got {other:?}"),
+    }
+    assert_eq!(target.create_task_set_calls(), 1, "no second task set");
+}
+
 #[tokio::test]
 async fn oversized_seed_is_refused_not_truncated() {
     let (handler, target) = handler_with_fake();

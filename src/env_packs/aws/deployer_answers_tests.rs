@@ -131,3 +131,34 @@ fn log_retention_days_defaults_to_30_and_must_be_a_cloudwatch_value() {
         );
     }
 }
+
+/// `ecr_repository_prefix` no longer shapes what a revision runs (the worker
+/// runs the runtime image), so a binding without it must parse.
+#[test]
+fn answers_parse_without_the_ecr_repository_prefix() {
+    let p = parse(json!({ "region": "eu-west-1", "ecs_cluster_name": "prod" })).unwrap();
+    assert_eq!(p.region, "eu-west-1");
+}
+
+#[test]
+fn the_wizard_does_not_require_the_ecr_repository_prefix() {
+    use crate::env_packs::slot::EnvPackHandler;
+    let yaml = crate::env_packs::aws::AwsEcsDeployerHandler::default()
+        .wizard_qaspec_yaml()
+        .expect("aws-ecs handler ships a wizard QASpec");
+    let spec: qa_spec::FormSpec = serde_yaml_bw::from_str(yaml).expect("parses as FormSpec");
+    let q = spec
+        .questions
+        .iter()
+        .find(|q| q.id == "ecr_repository_prefix")
+        .expect("the question is still asked");
+    assert!(!q.required, "nothing requires the prefix any more");
+    for id in ["ecr_repository_prefix", "container_image_tag_prefix"] {
+        let q = spec.questions.iter().find(|q| q.id == id).unwrap();
+        let text = format!("{:?}", q.description);
+        assert!(
+            !text.contains("every revision"),
+            "`{id}` must not claim to shape every revision's image: {text}"
+        );
+    }
+}

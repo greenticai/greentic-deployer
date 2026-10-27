@@ -180,8 +180,8 @@ fn payload(store: &Path, name: &str, body: Value) -> PathBuf {
 }
 
 /// The provider-agnostic bundle fixture used only to create a revision RECORD;
-/// the Fargate task's image comes from `ecr_repository_prefix` + tag, not these
-/// bytes (`stage_revision` is a no-op for AWS).
+/// the Fargate task runs the public runtime image and reads its bundle from
+/// the seeded `environment.json` (`stage_revision` is a no-op for AWS).
 fn fixture_bundle() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/bundles/perf-smoke-bundle.gtbundle")
 }

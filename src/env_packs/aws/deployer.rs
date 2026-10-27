@@ -37,7 +37,10 @@ use super::deploy_target::{
     EcsDeployTarget, EcsTargetError, LOG_RETENTION_DAYS, ListenerRef, ListenerRouting, ServiceSpec,
     TargetGroupWeight, TaskSetRef, TaskSetSpec, log_group_name, valid_log_retention_days,
 };
-use super::revision_intent::{IntentVerdict, classify, revision_conflict, revision_intent};
+use super::revision_intent::{
+    IntentInputs, IntentVerdict, classify, revision_conflict, revision_intent,
+};
+use super::seed_init::SEED_INIT_IMAGE;
 use super::seed_stage::environment_secret_name;
 use crate::env_packs::RUNTIME_IMAGE_REPO;
 use crate::env_packs::deployer::{
@@ -655,20 +658,17 @@ impl Deployer for AwsEcsDeployerHandler {
         } else {
             Vec::new()
         };
-        let (cpu, memory) = params
-            .launch
-            .as_ref()
-            .map(|l| (l.cpu.as_str(), l.memory.as_str()))
-            .unwrap_or(("", ""));
-        let intent = revision_intent(
-            &image,
-            cpu,
-            memory,
-            params.min_instances,
-            &environment_secret_name(&params.secret_prefix),
-            &boot_env,
-            &secret_env_names,
-        );
+        let seed_secret = environment_secret_name(&params.secret_prefix);
+        let intent = revision_intent(&IntentInputs {
+            image: &image,
+            launch: params.launch.as_ref(),
+            desired_count: params.min_instances,
+            secret_name: &seed_secret,
+            boot_env: &boot_env,
+            secret_env_names: &secret_env_names,
+            seed_init_image: SEED_INIT_IMAGE,
+            log_retention_days: params.log_retention_days,
+        });
 
         self.target
             .ensure_service(&ServiceSpec {
