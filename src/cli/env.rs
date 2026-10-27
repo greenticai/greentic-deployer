@@ -1761,9 +1761,10 @@ async fn resolve_ecs_handler(
 
 /// Connect to AWS and drive the single revision's ECS verb: `warm_revision`
 /// when present, `archive_revision` when absent (mirrors
-/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name, None)` —
-/// AWS-ECS has no deployer-discovered endpoint (the ALB DNS is operator infra),
-/// so the endpoint slot is always `None`. Requires the `deploy-aws-ecs` feature.
+/// `apply_revision_k8s_cluster`). Returns `(identity, ECS service name,
+/// endpoint)`; the endpoint is the one a warm discovered from the configured
+/// ALB listener (`None` for drain/archive or with no listener). Requires the
+/// `deploy-aws-ecs` feature.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
 fn apply_revision_aws_ecs(
     store: &LocalFsStore,
@@ -1786,26 +1787,25 @@ fn apply_revision_aws_ecs(
     let (identity, session, launch, region, pool) =
         aws_ecs_target_inputs(store, env, env_id, answers)?;
 
-    run_aws_async(async move {
+    let endpoint = run_aws_async(async move {
         let handler = resolve_ecs_handler(&region, launch, pool, session).await?;
         match verb {
             RevisionVerb::Warm => handler
                 .warm_revision(env, revision_id, answers)
                 .await
-                .map(|_| ()),
+                .map(|outcome| outcome.endpoint_url),
             RevisionVerb::Drain => handler
                 .drain_revision(env, revision_id, answers)
                 .await
-                .map(|_| ()),
+                .map(|_| None),
             RevisionVerb::Archive => handler
                 .archive_revision(env, revision_id, answers)
                 .await
-                .map(|_| ()),
+                .map(|_| None),
         }
-        .map_err(|e| OpError::Conflict(e.to_string()))?;
-        Ok::<(), OpError>(())
+        .map_err(|e| OpError::Conflict(e.to_string()))
     })?;
-    Ok((identity, worker_name, None))
+    Ok((identity, worker_name, endpoint))
 }
 
 #[cfg(all(feature = "creds-aws", not(feature = "deploy-aws-ecs")))]

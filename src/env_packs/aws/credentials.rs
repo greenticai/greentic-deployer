@@ -117,6 +117,10 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "elasticloadbalancing:ModifyRule",
     "elasticloadbalancing:AddTags",
     "elasticloadbalancing:DescribeTags",
+    // Endpoint discovery (`discover_endpoint`): the listener's protocol, then
+    // its load balancer's DNS name.
+    "elasticloadbalancing:DescribeListeners",
+    "elasticloadbalancing:DescribeLoadBalancers",
     // Secrets Manager staging of the seed / telemetry values (`ensure_secret`,
     // `put_secret_value`, `delete_secret`).
     "secretsmanager:CreateSecret",

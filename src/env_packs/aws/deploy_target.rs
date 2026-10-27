@@ -251,6 +251,21 @@ pub struct ListenerRef {
     pub routing: Option<ListenerRouting>,
 }
 
+/// Compose a public endpoint URL from the listener's protocol, the host to
+/// reach it on (the routing host or the load balancer DNS name) and an
+/// optional path. The path is joined with exactly one `/`; an empty or `/`
+/// path adds nothing.
+pub fn compose_endpoint(protocol_is_https: bool, dns_or_host: &str, path: Option<&str>) -> String {
+    let scheme = if protocol_is_https { "https" } else { "http" };
+    let host = dns_or_host.trim().trim_end_matches('/');
+    let path = path.map(|p| p.trim().trim_matches('/')).unwrap_or("");
+    if path.is_empty() {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}/{path}")
+    }
+}
+
 /// One weighted revision in a listener rule's forward action. The revision's
 /// target group is **not** carried here: the real target maps each revision to
 /// the TG its task set is bound to (read from the live task sets), so the
@@ -348,6 +363,16 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
         weights: &[TargetGroupWeight],
     ) -> Result<(), EcsTargetError>;
 
+    /// Discover the public endpoint the listener serves: `https://<host>` for an
+    /// HTTPS listener, `http://<host>` otherwise, where `<host>` is the
+    /// listener's `routing.host` when set, else the load balancer's DNS name.
+    /// `Ok(None)` means the listener names no load balancer that has a DNS
+    /// name; a failed lookup is an error, never a silent `None`.
+    async fn discover_endpoint(
+        &self,
+        listener: &ListenerRef,
+    ) -> Result<Option<String>, EcsTargetError>;
+
     /// Create the secret `name` tagged `greentic:owner=<owner>` if absent. A
     /// create race or an existing secret surfaces as
     /// [`EnsuredSecret::Existed`] carrying the live owner stamp, never as a
@@ -413,6 +438,12 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
     ) -> Result<(), EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
+    async fn discover_endpoint(
+        &self,
+        _listener: &ListenerRef,
+    ) -> Result<Option<String>, EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
     async fn ensure_secret(
         &self,
         _name: &str,
@@ -472,6 +503,8 @@ pub struct InMemoryEcs {
         std::sync::Mutex<std::collections::BTreeMap<(DeploymentId, RevisionId), TaskSetSpec>>,
     /// `create_task_set` calls received, including idempotent re-creates.
     create_task_set_calls: std::sync::atomic::AtomicUsize,
+    /// Every listener `discover_endpoint` was asked about, in call order.
+    endpoint_queries: std::sync::Mutex<Vec<ListenerRef>>,
 }
 
 impl InMemoryEcs {
@@ -538,6 +571,14 @@ impl InMemoryEcs {
         &self,
     ) -> std::collections::BTreeMap<(DeploymentId, RevisionId), TaskSetHandle> {
         self.task_sets.lock().expect("mutex not poisoned").clone()
+    }
+
+    /// Listeners `discover_endpoint` was asked about, in call order.
+    pub fn endpoint_queries(&self) -> Vec<ListenerRef> {
+        self.endpoint_queries
+            .lock()
+            .expect("mutex not poisoned")
+            .clone()
     }
 
     /// Snapshot of the last-applied weights for a deployment.
@@ -657,6 +698,21 @@ impl EcsDeployTarget for InMemoryEcs {
             .expect("mutex not poisoned")
             .insert(listener.deployment_id, listener.routing.clone());
         Ok(())
+    }
+
+    async fn discover_endpoint(
+        &self,
+        listener: &ListenerRef,
+    ) -> Result<Option<String>, EcsTargetError> {
+        self.endpoint_queries
+            .lock()
+            .expect("mutex not poisoned")
+            .push(listener.clone());
+        let host = match listener.routing.as_ref().and_then(|r| r.host.as_deref()) {
+            Some(host) => host.to_string(),
+            None => format!("{}.alb.invalid", listener.deployment_id.0),
+        };
+        Ok(Some(compose_endpoint(true, &host, None)))
     }
 
     async fn ensure_secret(
@@ -922,5 +978,87 @@ mod secret_tests {
             r.value_from(),
             "arn:aws:secretsmanager:eu-west-1:1:secret:n-AbCdEf:::abc"
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use ulid::Ulid;
+
+    fn listener(routing: Option<ListenerRouting>) -> ListenerRef {
+        ListenerRef {
+            deployment_id: DeploymentId(Ulid::from(0x07_u128)),
+            listener_arn: "arn:aws:elasticloadbalancing:us-east-1:1:listener/app/x/y/z".into(),
+            cluster: "c".into(),
+            routing,
+        }
+    }
+
+    #[test]
+    fn compose_endpoint_picks_the_scheme_from_the_protocol() {
+        assert_eq!(
+            compose_endpoint(true, "a.example", None),
+            "https://a.example"
+        );
+        assert_eq!(
+            compose_endpoint(false, "a.example", None),
+            "http://a.example"
+        );
+    }
+
+    #[test]
+    fn compose_endpoint_trims_stray_slashes_and_whitespace() {
+        assert_eq!(
+            compose_endpoint(true, " a.example/ ", None),
+            "https://a.example"
+        );
+    }
+
+    #[test]
+    fn compose_endpoint_joins_a_path_with_one_slash() {
+        assert_eq!(
+            compose_endpoint(true, "a.example", Some("/app/")),
+            "https://a.example/app"
+        );
+        assert_eq!(
+            compose_endpoint(true, "a.example", Some("app")),
+            "https://a.example/app"
+        );
+    }
+
+    #[test]
+    fn compose_endpoint_ignores_an_empty_or_root_path() {
+        assert_eq!(
+            compose_endpoint(true, "a.example", Some("")),
+            "https://a.example"
+        );
+        assert_eq!(
+            compose_endpoint(true, "a.example", Some("/")),
+            "https://a.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_target_returns_a_deterministic_url_and_records_the_listener() {
+        let ecs = InMemoryEcs::default();
+        let l = listener(None);
+        let first = ecs.discover_endpoint(&l).await.unwrap();
+        let second = ecs.discover_endpoint(&l).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            Some(format!("https://{}.alb.invalid", l.deployment_id.0))
+        );
+        assert_eq!(ecs.endpoint_queries(), vec![l.clone(), l]);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_target_refuses_endpoint_discovery() {
+        let t = UnconfiguredEcsTarget;
+        assert!(matches!(
+            t.discover_endpoint(&listener(None)).await,
+            Err(EcsTargetError::Unconfigured)
+        ));
     }
 }

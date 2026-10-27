@@ -751,7 +751,23 @@ impl Deployer for AwsEcsDeployerHandler {
         )
         .await?;
 
-        Ok(WarmOutcome::default())
+        // Discover the public endpoint only once the revision serves. A failed
+        // lookup fails the warm (fail closed); `None` means no listener is
+        // configured or it names no load balancer DNS.
+        let endpoint_url = match &params.listener_arn {
+            Some(listener_arn) => self
+                .target
+                .discover_endpoint(&ListenerRef {
+                    deployment_id,
+                    listener_arn: listener_arn.clone(),
+                    cluster: params.cluster.clone(),
+                    routing: params.routing.clone(),
+                })
+                .await
+                .map_err(provider)?,
+            None => None,
+        };
+        Ok(WarmOutcome { endpoint_url })
     }
 
     async fn drain_revision(
@@ -1093,6 +1109,59 @@ mod tests {
         );
     }
 
+    /// A warm with a listener configured returns the listener's HTTPS endpoint
+    /// (discovered after the task set stabilizes).
+    #[tokio::test]
+    async fn warm_returns_the_https_endpoint_of_the_listener() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("https://{}.alb.invalid", rev.deployment_id.0))
+        );
+        let asked = target.endpoint_queries();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].listener_arn, TEST_LISTENER_ARN);
+    }
+
+    /// A configured routing host is the endpoint host, not the load balancer's.
+    #[tokio::test]
+    async fn a_routing_host_overrides_the_load_balancer_dns() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "app.example.com",
+        });
+        let out = handler
+            .warm_revision(&env, env.revisions[0].revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some("https://app.example.com".to_string())
+        );
+    }
+
+    /// No `alb_listener_arn`: there is nothing to discover, and that is not an error.
+    #[tokio::test]
+    async fn no_listener_means_no_endpoint() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let out = handler
+            .warm_revision(&env, env.revisions[0].revision_id, None)
+            .await
+            .unwrap();
+        assert_eq!(out.endpoint_url, None);
+        assert!(target.endpoint_queries().is_empty());
+    }
+
     /// With no `alb_listener_arn` configured, the split still produces the
     /// right outcome but the deployer leaves the ALB untouched — the runtime
     /// dispatcher stays authoritative for traffic splitting.
@@ -1218,6 +1287,12 @@ mod tests {
             _weights: &[TargetGroupWeight],
         ) -> Result<(), EcsTargetError> {
             Ok(())
+        }
+        async fn discover_endpoint(
+            &self,
+            _listener: &ListenerRef,
+        ) -> Result<Option<String>, EcsTargetError> {
+            Ok(None)
         }
         async fn ensure_secret(
             &self,

@@ -125,7 +125,8 @@ use aws_sdk_ecs::types::{
 use aws_sdk_elasticloadbalancingv2::operation::describe_target_groups::DescribeTargetGroupsOutput;
 use aws_sdk_elasticloadbalancingv2::types::{
     Action, ActionTypeEnum, ForwardActionConfig, HostHeaderConditionConfig,
-    PathPatternConditionConfig, Rule, RuleCondition, Tag, TagDescription, TargetGroupTuple,
+    PathPatternConditionConfig, ProtocolEnum, Rule, RuleCondition, Tag, TagDescription,
+    TargetGroupTuple,
 };
 use greentic_deploy_spec::{DeploymentId, RevisionId};
 
@@ -134,7 +135,7 @@ use super::deploy_target::{
     EcsDeployTarget, EcsTargetError, EnsuredSecret, ListenerRef, ListenerRouting, LiveTaskSet,
     REVISION_INTENT_TAG_KEY, SECRET_OWNER_TAG_KEY, SecretEnvRef, SecretVersionRef, SeedInit,
     ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
-    invalid_retention, secret_version_token, valid_log_retention_days,
+    compose_endpoint, invalid_retention, secret_version_token, valid_log_retention_days,
 };
 use super::seed_init::{self, SEED_INIT_CONTAINER, SEED_VOLUME};
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
@@ -175,20 +176,22 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
     // (apply_listener_weights reads each revision's target-group binding here)
     "ecs:DescribeTaskSets",
-    "ecs:DeleteTaskSet",                         // delete_task_set
-    "ecs:DeregisterTaskDefinition",              // delete_task_set
-    "elasticloadbalancing:DescribeTargetGroups", // create_task_set (resolve_pool_arns, name→ARN)
+    "ecs:DeleteTaskSet",                          // delete_task_set
+    "ecs:DeregisterTaskDefinition",               // delete_task_set
+    "elasticloadbalancing:DescribeTargetGroups",  // create_task_set (resolve_pool_arns, name→ARN)
     "elasticloadbalancing:ModifyListener", // apply_listener_weights (default-action, no routing)
     "elasticloadbalancing:DescribeRules",  // apply_listener_weights (find this deployment's rule)
     "elasticloadbalancing:CreateRule",     // apply_listener_weights (first per-deployment rule)
     "elasticloadbalancing:ModifyRule",     // apply_listener_weights (update per-deployment rule)
     "elasticloadbalancing:AddTags", // apply_listener_weights (stamp rule owner tag on create)
     "elasticloadbalancing:DescribeTags", // apply_listener_weights (prove rule ownership before modify)
-    "secretsmanager:CreateSecret",       // ensure_secret
-    "secretsmanager:DescribeSecret",     // ensure_secret (read the live owner tag)
-    "secretsmanager:PutSecretValue",     // put_secret_value
-    "secretsmanager:DeleteSecret",       // delete_secret
-    "logs:CreateLogGroup",               // ensure_log_group
+    "elasticloadbalancing:DescribeListeners", // discover_endpoint (listener protocol + load balancer ARN)
+    "elasticloadbalancing:DescribeLoadBalancers", // discover_endpoint (load balancer DNS name)
+    "secretsmanager:CreateSecret",            // ensure_secret
+    "secretsmanager:DescribeSecret",          // ensure_secret (read the live owner tag)
+    "secretsmanager:PutSecretValue",          // put_secret_value
+    "secretsmanager:DeleteSecret",            // delete_secret
+    "logs:CreateLogGroup",                    // ensure_log_group
     "logs:DescribeLogGroups", // granted for operator verification; not called by the target today
     "logs:PutRetentionPolicy", // ensure_log_group
     "logs:DeleteLogGroup",    // delete_log_group
@@ -653,6 +656,50 @@ impl EcsDeployTarget for RealEcsTarget {
             None => self.write_listener_default(listener, action).await,
             Some(routing) => self.write_listener_rule(listener, routing, action).await,
         }
+    }
+
+    /// Read the listener's protocol and its load balancer's DNS name, then
+    /// compose the endpoint. The routing host (when set) replaces the DNS name
+    /// but the scheme still comes from the listener protocol. A listener or
+    /// load balancer AWS cannot find is an error, not `None`.
+    async fn discover_endpoint(
+        &self,
+        listener: &ListenerRef,
+    ) -> Result<Option<String>, EcsTargetError> {
+        let described = self
+            .elb
+            .describe_listeners()
+            .listener_arns(&listener.listener_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_listeners", e))?;
+        let found = described.listeners().first().ok_or_else(|| {
+            EcsTargetError::Api(format!(
+                "elbv2 describe_listeners: listener `{}` not found",
+                listener.listener_arn
+            ))
+        })?;
+        let https = matches!(found.protocol(), Some(ProtocolEnum::Https));
+        let routing_host = listener.routing.as_ref().and_then(|r| r.host.as_deref());
+        if let Some(host) = routing_host {
+            return Ok(Some(compose_endpoint(https, host, None)));
+        }
+        let Some(lb_arn) = found.load_balancer_arn() else {
+            return Ok(None);
+        };
+        let lbs = self
+            .elb
+            .describe_load_balancers()
+            .load_balancer_arns(lb_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_load_balancers", e))?;
+        let dns = lbs
+            .load_balancers()
+            .first()
+            .and_then(|lb| lb.dns_name())
+            .filter(|dns| !dns.is_empty());
+        Ok(dns.map(|dns| compose_endpoint(https, dns, None)))
     }
 
     async fn ensure_secret(
