@@ -1683,7 +1683,7 @@ fn pinned_role_without_session(assume_role_arn: Option<&str>, session_present: b
 /// launch config is absent.
 #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
 #[allow(clippy::type_complexity)]
-fn aws_ecs_target_inputs(
+pub(super) fn aws_ecs_target_inputs(
     store: &LocalFsStore,
     env: &Environment,
     env_id: &EnvId,
@@ -1889,6 +1889,41 @@ pub(crate) async fn resolve_cloudrun_handler(
         Arc::new(target),
         dev_secrets,
     ))
+}
+
+/// Picks the provider teardown for the env's bound deployer descriptor. A
+/// descriptor this build has no live client for is refused-not-purged
+/// (`ProviderTeardownUnavailable`), exactly as a build with no teardown at all.
+#[cfg(any(
+    all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
+    all(feature = "creds-aws", feature = "deploy-aws-ecs")
+))]
+struct ProviderTeardownRouter;
+
+#[cfg(any(
+    all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
+    all(feature = "creds-aws", feature = "deploy-aws-ecs")
+))]
+impl crate::environment::ProviderTeardown for ProviderTeardownRouter {
+    fn teardown(
+        &self,
+        ctx: crate::environment::ProviderTeardownCtx<'_>,
+    ) -> Result<Value, crate::environment::StoreError> {
+        #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
+        if ctx.descriptor_path == "greentic.deployer.gcp-cloudrun" {
+            return CloudRunProviderTeardown.teardown(ctx);
+        }
+        #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+        if ctx.descriptor_path == "greentic.deployer.aws-ecs" {
+            return super::env_aws_teardown::EcsProviderTeardown.teardown(ctx);
+        }
+        Err(
+            crate::environment::StoreError::ProviderTeardownUnavailable {
+                env_id: ctx.env_id.clone(),
+                descriptor: ctx.descriptor_path.to_string(),
+            },
+        )
+    }
 }
 
 /// Store-injected teardown of a Cloud Run env's owned Services, run under the
@@ -3181,11 +3216,20 @@ pub fn destroy(
     // resources down; the teardown implementation is only wired when the provider
     // feature is compiled in. `--force-local` skips teardown and purges local
     // state only.
-    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
-    let cloudrun_teardown = CloudRunProviderTeardown;
-    #[cfg(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"))]
-    let teardown: Option<&dyn crate::environment::ProviderTeardown> = Some(&cloudrun_teardown);
-    #[cfg(not(all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun")))]
+    #[cfg(any(
+        all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
+        all(feature = "creds-aws", feature = "deploy-aws-ecs")
+    ))]
+    let provider_teardown = ProviderTeardownRouter;
+    #[cfg(any(
+        all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
+        all(feature = "creds-aws", feature = "deploy-aws-ecs")
+    ))]
+    let teardown: Option<&dyn crate::environment::ProviderTeardown> = Some(&provider_teardown);
+    #[cfg(not(any(
+        all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
+        all(feature = "creds-aws", feature = "deploy-aws-ecs")
+    )))]
     let teardown: Option<&dyn crate::environment::ProviderTeardown> = None;
 
     audit_and_record(store, ctx, |committed| {

@@ -40,6 +40,8 @@ pub mod real_target;
 pub(crate) mod revision_intent;
 pub(crate) mod seed_init;
 pub(crate) mod seed_stage;
+#[cfg(feature = "deploy-aws-ecs")]
+pub(crate) mod teardown;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
@@ -157,6 +159,19 @@ impl EnvPackHandler for AwsEcsDeployerHandler {
 mod tests {
     use super::*;
     use greentic_deploy_spec::PackDescriptor;
+
+    /// `op env destroy` recognizes an ECS env for provider teardown by matching
+    /// the descriptor string in the store's feature-independent list. Guards
+    /// that list against drifting from the handler's canonical `DESCRIPTOR_PATH`.
+    #[test]
+    fn descriptor_path_is_registered_for_provider_teardown() {
+        assert!(
+            crate::environment::PROVIDER_TEARDOWN_DESCRIPTORS
+                .contains(&AwsEcsDeployerHandler::DESCRIPTOR_PATH),
+            "PROVIDER_TEARDOWN_DESCRIPTORS must include the aws-ecs descriptor so \
+             `op env destroy` tears down its resources"
+        );
+    }
 
     #[test]
     fn handler_serves_deployer_slot_with_aws_ecs_path() {

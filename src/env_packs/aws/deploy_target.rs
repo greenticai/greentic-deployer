@@ -86,6 +86,22 @@ pub struct ServiceSpec {
     pub desired_count: u32,
 }
 
+/// Prefix shared by every deployment's ECS service name. Filters `ListServices`
+/// output to greentic-managed deployment services in the single-owner pool
+/// guard (`sibling_pool_bindings`), so unrelated services in the cluster are
+/// ignored.
+#[cfg(feature = "deploy-aws-ecs")]
+pub(crate) const SERVICE_NAME_PREFIX: &str = "gtc-svc-";
+
+/// Deterministic ECS service name for a deployment (one EXTERNAL-controller
+/// service per `deployment_id`). `pub(crate)` so the CLI deploy path can report
+/// the live service name in the `op env apply-revision` outcome without
+/// re-deriving the format.
+#[cfg(feature = "deploy-aws-ecs")]
+pub(crate) fn service_name(deployment_id: &DeploymentId) -> String {
+    format!("{SERVICE_NAME_PREFIX}{}", deployment_id.0)
+}
+
 /// CloudWatch log group the deployment's containers write to:
 /// `/greentic/<secret_prefix>/<deployment_id>`.
 pub fn log_group_name(secret_prefix: &str, deployment_id: &DeploymentId) -> String {
@@ -197,6 +213,16 @@ pub struct TaskSetRef {
     /// AWS region the task set lives in. ECS is regional, so describe /
     /// delete must carry it — a fresh process cannot reconstruct the region
     /// from the other identifiers. Populated from `AwsEcsParams::region`.
+    pub region: String,
+}
+
+/// Identity of a deployment's ECS service for deletion. ECS is regional and
+/// cluster-scoped, so both travel with the ref (a fresh process cannot
+/// reconstruct them from the deployment id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRef {
+    pub deployment_id: DeploymentId,
+    pub cluster: String,
     pub region: String,
 }
 
@@ -394,6 +420,21 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     /// against an already-absent set.
     async fn delete_task_set(&self, task_set: &TaskSetRef) -> Result<(), EcsTargetError>;
 
+    /// Delete the deployment's whole service: every remaining task set first
+    /// (an `EXTERNAL`-controller service cannot be deleted while it has any),
+    /// then the service itself. Idempotent: an absent (or already `INACTIVE`)
+    /// service is `Ok`. Leaves the cluster and the operator's target groups
+    /// alone.
+    async fn delete_service(&self, service: &ServiceRef) -> Result<(), EcsTargetError>;
+
+    /// Remove the deployment's own host/path listener rule, if this deployment
+    /// created one. Idempotent: an absent rule is `Ok`. Never touches the
+    /// listener itself (its default action included), another deployment's rule,
+    /// an operator-managed rule that merely shares the condition, or the load
+    /// balancer and target groups. A listener without per-deployment routing
+    /// owns no rule, so the call is a no-op.
+    async fn delete_listener_rule(&self, listener: &ListenerRef) -> Result<(), EcsTargetError>;
+
     /// Set the listener's weighted forward action across the deployment's
     /// task-set target groups (the ALB mirror of the env's `TrafficSplit`).
     async fn apply_listener_weights(
@@ -418,6 +459,12 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
     /// silent adoption.
     async fn ensure_secret(&self, name: &str, owner: &str)
     -> Result<EnsuredSecret, EcsTargetError>;
+
+    /// Read the owner stamp of the secret `name` WITHOUT creating it. `None` =
+    /// no such secret; `Some("")` = it exists with no owner tag (a foreign
+    /// secret on this lane, see [`secret_owner_conflict`](super::seed_stage)).
+    /// The teardown's probe; the warm path uses [`Self::ensure_secret`].
+    async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, EcsTargetError>;
 
     /// Store `bytes` as a value of the existing secret `name`. Content
     /// idempotent: identical bytes yield the same version (the request token is
@@ -470,6 +517,12 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
     async fn delete_task_set(&self, _task_set: &TaskSetRef) -> Result<(), EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
+    async fn delete_service(&self, _service: &ServiceRef) -> Result<(), EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
+    async fn delete_listener_rule(&self, _listener: &ListenerRef) -> Result<(), EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
     async fn apply_listener_weights(
         &self,
         _listener: &ListenerRef,
@@ -488,6 +541,9 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
         _name: &str,
         _owner: &str,
     ) -> Result<EnsuredSecret, EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
+    async fn get_secret_owner(&self, _name: &str) -> Result<Option<String>, EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
     async fn put_secret_value(
@@ -546,11 +602,39 @@ pub struct InMemoryEcs {
     endpoint_queries: std::sync::Mutex<Vec<ListenerRef>>,
     /// When set, `discover_endpoint` fails with this message.
     endpoint_failure: std::sync::Mutex<Option<String>>,
+    /// Deployments whose per-deployment listener rule `delete_listener_rule`
+    /// removed, in call order (only calls that carried routing are recorded).
+    rule_deletions: std::sync::Mutex<Vec<DeploymentId>>,
     /// Set when the fake listener is plain HTTP (default: HTTPS).
     listener_is_http: std::sync::atomic::AtomicBool,
 }
 
 impl InMemoryEcs {
+    /// Seed a secret with an arbitrary owner stamp (`""` = unstamped), as if
+    /// another environment or an operator had created it.
+    pub fn seed_secret(&self, name: &str, owner: &str) {
+        self.secrets
+            .lock()
+            .expect("mutex not poisoned")
+            .insert(name.to_string(), owner.to_string());
+    }
+
+    /// Seed a service as if it had been ensured earlier.
+    pub fn seed_service(&self, deployment_id: DeploymentId, desired_count: u32) {
+        self.services
+            .lock()
+            .expect("mutex not poisoned")
+            .insert(deployment_id, desired_count);
+    }
+
+    /// Deployments whose listener rule was deleted, in call order.
+    pub fn rule_deletions(&self) -> Vec<DeploymentId> {
+        self.rule_deletions
+            .lock()
+            .expect("mutex not poisoned")
+            .clone()
+    }
+
     /// Snapshot of the ensured secrets (name -> owner stamp).
     pub fn secrets(&self) -> std::collections::BTreeMap<String, String> {
         self.secrets.lock().expect("mutex not poisoned").clone()
@@ -738,6 +822,51 @@ impl EcsDeployTarget for InMemoryEcs {
         Ok(())
     }
 
+    async fn delete_service(&self, service: &ServiceRef) -> Result<(), EcsTargetError> {
+        // Idempotent: like the real target, every task set goes first, then the
+        // service; absent is Ok.
+        let dep = service.deployment_id;
+        {
+            let mut sets = self.task_sets.lock().expect("mutex not poisoned");
+            sets.retain(|(d, _), _| *d != dep);
+        }
+        self.task_set_specs
+            .lock()
+            .expect("mutex not poisoned")
+            .retain(|(d, _), _| *d != dep);
+        self.services
+            .lock()
+            .expect("mutex not poisoned")
+            .remove(&dep);
+        Ok(())
+    }
+
+    async fn delete_listener_rule(&self, listener: &ListenerRef) -> Result<(), EcsTargetError> {
+        // Without routing the deployment owns no rule (it wrote the listener's
+        // default action, which is not ours to remove).
+        if listener.routing.is_none() {
+            return Ok(());
+        }
+        let dep = listener.deployment_id;
+        let had_rule = self
+            .routing
+            .lock()
+            .expect("mutex not poisoned")
+            .remove(&dep)
+            .is_some();
+        self.weights
+            .lock()
+            .expect("mutex not poisoned")
+            .remove(&dep);
+        if had_rule {
+            self.rule_deletions
+                .lock()
+                .expect("mutex not poisoned")
+                .push(dep);
+        }
+        Ok(())
+    }
+
     async fn apply_listener_weights(
         &self,
         listener: &ListenerRef,
@@ -795,6 +924,15 @@ impl EcsDeployTarget for InMemoryEcs {
         }
         secrets.insert(name.to_string(), owner.to_string());
         Ok(EnsuredSecret::Created)
+    }
+
+    async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, EcsTargetError> {
+        Ok(self
+            .secrets
+            .lock()
+            .expect("mutex not poisoned")
+            .get(name)
+            .cloned())
     }
 
     async fn put_secret_value(

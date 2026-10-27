@@ -134,8 +134,8 @@ use super::boot_env::SEED_MOUNT_DIR;
 use super::deploy_target::{
     EcsDeployTarget, EcsTargetError, EnsuredSecret, ListenerRef, ListenerRouting, LiveTaskSet,
     REVISION_INTENT_TAG_KEY, SECRET_OWNER_TAG_KEY, SecretEnvRef, SecretVersionRef, SeedInit,
-    ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
-    compose_endpoint, endpoint_host, invalid_retention, secret_version_token,
+    ServiceRef, ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec,
+    TaskSetStability, compose_endpoint, endpoint_host, invalid_retention, secret_version_token,
     valid_log_retention_days,
 };
 use super::seed_init::{self, SEED_INIT_CONTAINER, SEED_VOLUME};
@@ -177,13 +177,15 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
     // (apply_listener_weights reads each revision's target-group binding here)
     "ecs:DescribeTaskSets",
-    "ecs:DeleteTaskSet",                          // delete_task_set
-    "ecs:DeregisterTaskDefinition",               // delete_task_set
-    "elasticloadbalancing:DescribeTargetGroups",  // create_task_set (resolve_pool_arns, name→ARN)
+    "ecs:DeleteTaskSet",            // delete_task_set / delete_service
+    "ecs:DeleteService",            // delete_service
+    "ecs:DeregisterTaskDefinition", // delete_task_set
+    "elasticloadbalancing:DescribeTargetGroups", // create_task_set (resolve_pool_arns, name→ARN)
     "elasticloadbalancing:ModifyListener", // apply_listener_weights (default-action, no routing)
-    "elasticloadbalancing:DescribeRules",  // apply_listener_weights (find this deployment's rule)
-    "elasticloadbalancing:CreateRule",     // apply_listener_weights (first per-deployment rule)
-    "elasticloadbalancing:ModifyRule",     // apply_listener_weights (update per-deployment rule)
+    "elasticloadbalancing:DescribeRules", // apply_listener_weights (find this deployment's rule)
+    "elasticloadbalancing:CreateRule", // apply_listener_weights (first per-deployment rule)
+    "elasticloadbalancing:ModifyRule", // apply_listener_weights (update per-deployment rule)
+    "elasticloadbalancing:DeleteRule", // delete_listener_rule (this deployment's own rule only)
     "elasticloadbalancing:AddTags", // apply_listener_weights (stamp rule owner tag on create)
     "elasticloadbalancing:DescribeTags", // apply_listener_weights (prove rule ownership before modify)
     "elasticloadbalancing:DescribeListeners", // discover_endpoint (listener protocol + load balancer ARN)
@@ -612,6 +614,94 @@ impl EcsDeployTarget for RealEcsTarget {
         Ok(())
     }
 
+    async fn delete_service(&self, service: &ServiceRef) -> Result<(), EcsTargetError> {
+        let name = service_name(&service.deployment_id);
+        let described = self
+            .ecs
+            .describe_services()
+            .cluster(&service.cluster)
+            .services(&name)
+            .send()
+            .await
+            .map_err(|e| api("describe_services", e))?;
+        // Idempotent: an absent (or INACTIVE, already deleted) service is done.
+        if !active_service_exists(&described, &name) {
+            return Ok(());
+        }
+        // An EXTERNAL-controller service holds its task sets itself: remove
+        // every one still there (and its task definition) before the service.
+        let sets = self
+            .ecs
+            .describe_task_sets()
+            .cluster(&service.cluster)
+            .service(&name)
+            .send()
+            .await
+            .map_err(|e| api("describe_task_sets", e))?;
+        for found in all_task_sets_for_delete(&sets) {
+            self.ecs
+                .delete_task_set()
+                .cluster(&service.cluster)
+                .service(&name)
+                .task_set(&found.id)
+                .force(true)
+                .send()
+                .await
+                .map_err(|e| api("delete_task_set", e))?;
+            if let Some(arn) = found.task_definition {
+                self.ecs
+                    .deregister_task_definition()
+                    .task_definition(&arn)
+                    .send()
+                    .await
+                    .map_err(|e| api("deregister_task_definition", e))?;
+            }
+        }
+        // `force` lets ECS delete the service without scaling it to zero first.
+        self.ecs
+            .delete_service()
+            .cluster(&service.cluster)
+            .service(&name)
+            .force(true)
+            .send()
+            .await
+            .map_err(|e| api("delete_service", e))?;
+        Ok(())
+    }
+
+    async fn delete_listener_rule(&self, listener: &ListenerRef) -> Result<(), EcsTargetError> {
+        // No routing: the deployment wrote the listener's default action and
+        // owns no rule. The listener is the operator's, so it is left alone.
+        let Some(routing) = &listener.routing else {
+            return Ok(());
+        };
+        let existing = self
+            .elb
+            .describe_rules()
+            .listener_arn(&listener.listener_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_rules", e))?;
+        let Some(rule_arn) = match_rule(existing.rules(), routing) else {
+            return Ok(());
+        };
+        // Only a rule THIS deployment created (its owner tag) is removed; a
+        // sibling's or operator-managed rule sharing the condition stays.
+        if !self
+            .rule_owned_by_deployment(&rule_arn, &listener.deployment_id)
+            .await?
+        {
+            return Ok(());
+        }
+        self.elb
+            .delete_rule()
+            .rule_arn(&rule_arn)
+            .send()
+            .await
+            .map_err(|e| api("delete_rule", e))?;
+        Ok(())
+    }
+
     /// Mirror the deployment's `TrafficSplit` onto the ALB as a weighted forward
     /// across the revisions' target groups.
     ///
@@ -737,6 +827,19 @@ impl EcsDeployTarget for RealEcsTarget {
                 })
             }
             Err(e) => Err(secrets_api("CreateSecret", &e)),
+        }
+    }
+
+    async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, EcsTargetError> {
+        match self.secrets.describe_secret().secret_id(name).send().await {
+            Ok(described) => Ok(Some(owner_from_tags(described.tags()))),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(secrets_api("DescribeSecret", &e)),
         }
     }
 
@@ -1011,19 +1114,9 @@ fn api<E: std::fmt::Display>(op: &str, err: E) -> EcsTargetError {
     EcsTargetError::Api(format!("ecs {op}: {err}"))
 }
 
-/// Prefix shared by every deployment's ECS service name. Filters `ListServices`
-/// output to greentic-managed deployment services in the single-owner pool
-/// guard (`sibling_pool_bindings`), so unrelated services in the cluster are
-/// ignored.
-const SERVICE_NAME_PREFIX: &str = "gtc-svc-";
-
-/// Deterministic ECS service name for a deployment (one EXTERNAL-controller
-/// service per `deployment_id`). `pub(crate)` so the CLI deploy path can report
-/// the live service name in the `op env apply-revision` outcome without
-/// re-deriving the format.
-pub(crate) fn service_name(deployment_id: &DeploymentId) -> String {
-    format!("{SERVICE_NAME_PREFIX}{}", deployment_id.0)
-}
+// `service_name` / `SERVICE_NAME_PREFIX` live in `deploy_target` (ungated) so the
+// teardown report can name services without this feature; re-exported here.
+pub(crate) use super::deploy_target::{SERVICE_NAME_PREFIX, service_name};
 
 /// Render a 128-bit id as a UUID-form (36-char) string for use as an ECS
 /// idempotency `clientToken` (the field accepts "up to 36 ASCII characters in
@@ -1318,6 +1411,20 @@ fn task_set_for_delete(out: &DescribeTaskSetsOutput, external_id: &str) -> Optio
         id: ts.id()?.to_string(),
         task_definition: ts.task_definition().map(str::to_string),
     })
+}
+
+/// Every task set in a DescribeTaskSets response, for deleting a whole service.
+/// Entries without an id cannot be addressed and are skipped.
+fn all_task_sets_for_delete(out: &DescribeTaskSetsOutput) -> Vec<TaskSetToDelete> {
+    out.task_sets()
+        .iter()
+        .filter_map(|ts| {
+            Some(TaskSetToDelete {
+                id: ts.id()?.to_string(),
+                task_definition: ts.task_definition().map(str::to_string),
+            })
+        })
+        .collect()
 }
 
 /// Find the task set carrying our `externalId` in a DescribeTaskSets response.

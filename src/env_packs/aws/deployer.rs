@@ -34,8 +34,9 @@ use tokio::time::{Instant, sleep};
 use super::AwsEcsDeployerHandler;
 use super::boot_env::ecs_boot_env;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, LOG_RETENTION_DAYS, ListenerRef, ListenerRouting, ServiceSpec,
-    TargetGroupWeight, TaskSetRef, TaskSetSpec, log_group_name, valid_log_retention_days,
+    EcsDeployTarget, EcsTargetError, LOG_RETENTION_DAYS, ListenerRef, ListenerRouting, ServiceRef,
+    ServiceSpec, TargetGroupWeight, TaskSetRef, TaskSetSpec, log_group_name,
+    valid_log_retention_days,
 };
 use super::revision_intent::{
     IntentInputs, IntentVerdict, classify, revision_conflict, revision_intent,
@@ -615,6 +616,17 @@ impl AwsEcsDeployerHandler {
     }
 }
 
+/// True when the revision's whole deployment is retiring (`op bundles retire`
+/// marked its bundle `archived`). One ECS service serves a deployment, so the
+/// unit being removed is then the service itself, not just this task set.
+/// Mirrors the Cloud Run lane's rule.
+fn whole_bundle_retiring(env: &Environment, revision: &Revision) -> bool {
+    env.bundles.iter().any(|b| {
+        b.deployment_id == revision.deployment_id
+            && b.status == greentic_deploy_spec::BundleDeploymentStatus::Archived
+    })
+}
+
 #[async_trait]
 impl Deployer for AwsEcsDeployerHandler {
     async fn stage_revision(
@@ -798,11 +810,36 @@ impl Deployer for AwsEcsDeployerHandler {
             .delete_task_set(&TaskSetRef {
                 deployment_id: revision.deployment_id,
                 revision_id,
-                cluster: params.cluster,
-                region: params.region,
+                cluster: params.cluster.clone(),
+                region: params.region.clone(),
             })
             .await
             .map_err(provider)?;
+        // The deployment's last revision going away takes the whole bundle with
+        // it (`op bundles retire` marked it archived): nothing is left to serve,
+        // so its listener rule and service must not leak. A single revision of a
+        // live bundle keeps both.
+        if whole_bundle_retiring(env, revision) {
+            if let Some(listener_arn) = &params.listener_arn {
+                self.target
+                    .delete_listener_rule(&ListenerRef {
+                        deployment_id: revision.deployment_id,
+                        listener_arn: listener_arn.clone(),
+                        cluster: params.cluster.clone(),
+                        routing: params.routing.clone(),
+                    })
+                    .await
+                    .map_err(provider)?;
+            }
+            self.target
+                .delete_service(&ServiceRef {
+                    deployment_id: revision.deployment_id,
+                    cluster: params.cluster,
+                    region: params.region,
+                })
+                .await
+                .map_err(provider)?;
+        }
         Ok(ArchiveOutcome::default())
     }
 
@@ -997,6 +1034,58 @@ mod tests {
             .archive_revision(&env, rev.revision_id, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_of_a_single_revision_keeps_the_service() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        handler
+            .archive_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        assert!(target.task_sets().is_empty());
+        assert!(
+            target.services().contains(&rev.deployment_id),
+            "a bundle that is not retiring keeps its service"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_of_a_retiring_bundle_deletes_the_service() {
+        let (handler, target) = handler_with_fake();
+        let mut env = build_fixture_env();
+        let rev = env.revisions[0].clone();
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        handler
+            .apply_traffic_split(&env, rev.deployment_id, Some(&answers))
+            .await
+            .unwrap();
+        for b in &mut env.bundles {
+            if b.deployment_id == rev.deployment_id {
+                b.status = greentic_deploy_spec::BundleDeploymentStatus::Archived;
+            }
+        }
+        handler
+            .archive_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert!(
+            !target.services().contains(&rev.deployment_id),
+            "retiring the whole bundle deletes its service"
+        );
+        assert!(target.task_sets().is_empty());
+        // The fixture binds no routing, so no per-deployment rule is owned.
+        assert!(target.rule_deletions().is_empty());
     }
 
     /// A valid ALB listener ARN (passes the wizard's `^arn:...:listener/.+$`
@@ -1366,6 +1455,21 @@ mod tests {
         }
         async fn delete_task_set(&self, _task_set: &TaskSetRef) -> Result<(), EcsTargetError> {
             Ok(())
+        }
+        async fn delete_service(
+            &self,
+            _service: &super::super::deploy_target::ServiceRef,
+        ) -> Result<(), EcsTargetError> {
+            Ok(())
+        }
+        async fn delete_listener_rule(
+            &self,
+            _listener: &ListenerRef,
+        ) -> Result<(), EcsTargetError> {
+            Ok(())
+        }
+        async fn get_secret_owner(&self, _name: &str) -> Result<Option<String>, EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
         }
         async fn apply_listener_weights(
             &self,

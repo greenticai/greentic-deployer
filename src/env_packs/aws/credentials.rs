@@ -103,6 +103,7 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "ecs:CreateTaskSet",
     "ecs:DescribeTaskSets",
     "ecs:DeleteTaskSet",
+    "ecs:DeleteService",
     "ecs:DeregisterTaskDefinition",
     // Image-push staging + passing the task execution/task roles to ECS.
     "ecr:PutImage",
@@ -115,6 +116,7 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "elasticloadbalancing:DescribeRules",
     "elasticloadbalancing:CreateRule",
     "elasticloadbalancing:ModifyRule",
+    "elasticloadbalancing:DeleteRule",
     "elasticloadbalancing:AddTags",
     "elasticloadbalancing:DescribeTags",
     // Endpoint discovery (`discover_endpoint`): the listener's protocol, then
