@@ -1097,6 +1097,23 @@ mod tests {
         ) -> Result<(), EcsTargetError> {
             Ok(())
         }
+        async fn ensure_secret(
+            &self,
+            _name: &str,
+            _owner: &str,
+        ) -> Result<super::super::deploy_target::EnsuredSecret, EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
+        }
+        async fn put_secret_value(
+            &self,
+            _name: &str,
+            _bytes: &[u8],
+        ) -> Result<super::super::deploy_target::SecretVersionRef, EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
+        }
+        async fn delete_secret(&self, _name: &str) -> Result<(), EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
+        }
     }
 
     fn task_set_ref() -> TaskSetRef {

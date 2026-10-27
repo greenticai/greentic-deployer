@@ -115,6 +115,12 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "elasticloadbalancing:ModifyRule",
     "elasticloadbalancing:AddTags",
     "elasticloadbalancing:DescribeTags",
+    // Secrets Manager staging of the seed / telemetry values (`ensure_secret`,
+    // `put_secret_value`, `delete_secret`).
+    "secretsmanager:CreateSecret",
+    "secretsmanager:DescribeSecret",
+    "secretsmanager:PutSecretValue",
+    "secretsmanager:DeleteSecret",
 ];
 
 /// Returns the canonical capability ID for an IAM verb.

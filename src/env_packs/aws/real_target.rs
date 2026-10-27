@@ -129,8 +129,9 @@ use greentic_deploy_spec::{DeploymentId, RevisionId};
 
 use super::boot_env::SEED_MOUNT_DIR;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, SecretEnvRef, SeedInit,
-    ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
+    EcsDeployTarget, EcsTargetError, EnsuredSecret, ListenerRef, ListenerRouting,
+    SECRET_OWNER_TAG_KEY, SecretEnvRef, SecretVersionRef, SeedInit, ServiceSpec, TargetGroupWeight,
+    TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability, secret_version_token,
 };
 use super::seed_init::{self, SEED_INIT_CONTAINER, SEED_VOLUME};
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
@@ -145,6 +146,7 @@ pub use super::deployer::FargateLaunchConfig;
 pub struct RealEcsTarget {
     ecs: aws_sdk_ecs::Client,
     elb: aws_sdk_elasticloadbalancingv2::Client,
+    secrets: aws_sdk_secretsmanager::Client,
     launch: FargateLaunchConfig,
     /// Operator-supplied ALB target groups (ARNs or names) the target assigns
     /// revisions to, one per live revision. Blue/green needs ≥2; assignment is
@@ -176,6 +178,10 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "elasticloadbalancing:ModifyRule",     // apply_listener_weights (update per-deployment rule)
     "elasticloadbalancing:AddTags", // apply_listener_weights (stamp rule owner tag on create)
     "elasticloadbalancing:DescribeTags", // apply_listener_weights (prove rule ownership before modify)
+    "secretsmanager:CreateSecret",       // ensure_secret
+    "secretsmanager:DescribeSecret",     // ensure_secret (read the live owner tag)
+    "secretsmanager:PutSecretValue",     // put_secret_value
+    "secretsmanager:DeleteSecret",       // delete_secret
 ];
 
 impl RealEcsTarget {
@@ -215,6 +221,7 @@ impl RealEcsTarget {
         Ok(Self {
             ecs: aws_sdk_ecs::Client::new(&config),
             elb: aws_sdk_elasticloadbalancingv2::Client::new(&config),
+            secrets: aws_sdk_secretsmanager::Client::new(&config),
             launch,
             target_group_pool,
         })
@@ -583,6 +590,128 @@ impl EcsDeployTarget for RealEcsTarget {
             None => self.write_listener_default(listener, action).await,
             Some(routing) => self.write_listener_rule(listener, routing, action).await,
         }
+    }
+
+    async fn ensure_secret(
+        &self,
+        name: &str,
+        owner: &str,
+    ) -> Result<EnsuredSecret, EcsTargetError> {
+        let created = self
+            .secrets
+            .create_secret()
+            .name(name)
+            .set_tags(Some(owner_tags(owner)?))
+            .send()
+            .await;
+        match created {
+            Ok(_) => Ok(EnsuredSecret::Created),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_exists_exception()) =>
+            {
+                let described = self
+                    .secrets
+                    .describe_secret()
+                    .secret_id(name)
+                    .send()
+                    .await
+                    .map_err(|e| secrets_api("DescribeSecret", &e))?;
+                Ok(EnsuredSecret::Existed {
+                    owner: owner_from_tags(described.tags()),
+                })
+            }
+            Err(e) => Err(secrets_api("CreateSecret", &e)),
+        }
+    }
+
+    async fn put_secret_value(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<SecretVersionRef, EcsTargetError> {
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            EcsTargetError::Api(format!(
+                "secretsmanager PutSecretValue: value for `{name}` is not valid UTF-8"
+            ))
+        })?;
+        let out = self
+            .secrets
+            .put_secret_value()
+            .secret_id(name)
+            .secret_string(text)
+            .client_request_token(secret_version_token(bytes))
+            .send()
+            .await
+            .map_err(|e| secrets_api("PutSecretValue", &e))?;
+        secret_version_from(out.arn(), out.version_id())
+    }
+
+    async fn delete_secret(&self, name: &str) -> Result<(), EcsTargetError> {
+        match self
+            .secrets
+            .delete_secret()
+            .secret_id(name)
+            .force_delete_without_recovery(true)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(secrets_api("DeleteSecret", &e)),
+        }
+    }
+}
+
+/// Error mapper for Secrets Manager calls, rendering the full SDK error chain.
+fn secrets_api<E>(op: &str, err: &E) -> EcsTargetError
+where
+    E: std::error::Error + 'static,
+{
+    EcsTargetError::Api(format!(
+        "secretsmanager {op}: {}",
+        aws_sdk_secretsmanager::error::DisplayErrorContext(err)
+    ))
+}
+
+/// The `greentic:owner` tag set stamped on a secret at creation.
+fn owner_tags(owner: &str) -> Result<Vec<aws_sdk_secretsmanager::types::Tag>, EcsTargetError> {
+    Ok(vec![
+        aws_sdk_secretsmanager::types::Tag::builder()
+            .key(SECRET_OWNER_TAG_KEY)
+            .value(owner)
+            .build(),
+    ])
+}
+
+/// The live owner stamp from a secret's tags; empty when unstamped.
+fn owner_from_tags(tags: &[aws_sdk_secretsmanager::types::Tag]) -> String {
+    tags.iter()
+        .find(|t| t.key() == Some(SECRET_OWNER_TAG_KEY))
+        .and_then(|t| t.value())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Build the [`SecretVersionRef`] from a `PutSecretValue` response; both parts
+/// are required for a version-pinned `valueFrom`.
+fn secret_version_from(
+    arn: Option<&str>,
+    version_id: Option<&str>,
+) -> Result<SecretVersionRef, EcsTargetError> {
+    match (arn, version_id) {
+        (Some(arn), Some(version_id)) => Ok(SecretVersionRef {
+            arn: arn.to_string(),
+            version_id: version_id.to_string(),
+        }),
+        _ => Err(EcsTargetError::Api(
+            "secretsmanager PutSecretValue: response carried no ARN or version id".to_string(),
+        )),
     }
 }
 
@@ -1289,6 +1418,39 @@ mod tests {
     use aws_sdk_ecs::types::{Service, TaskDefinition};
     use aws_sdk_elasticloadbalancingv2::types::TargetGroup;
     use ulid::Ulid;
+
+    #[test]
+    fn owner_tag_round_trips_and_missing_tag_reads_empty() {
+        let tags = owner_tags("env-abc").unwrap();
+        assert_eq!(tags[0].key(), Some("greentic:owner"));
+        assert_eq!(owner_from_tags(&tags), "env-abc");
+        assert_eq!(owner_from_tags(&[]), "");
+    }
+
+    #[test]
+    fn secret_version_from_requires_arn_and_version() {
+        let ok = secret_version_from(Some("arn:x"), Some("v1")).unwrap();
+        assert_eq!(ok.value_from(), "arn:x:::v1");
+        assert!(secret_version_from(Some("arn:x"), None).is_err());
+        assert!(secret_version_from(None, Some("v1")).is_err());
+    }
+
+    #[test]
+    fn secret_version_token_is_64_lowercase_hex_and_content_derived() {
+        let t = secret_version_token(b"abc");
+        assert_eq!(t.len(), 64);
+        assert!(
+            t.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_eq!(t, secret_version_token(b"abc"));
+        assert_ne!(t, secret_version_token(b"abd"));
+        // Known SHA-256 of "abc".
+        assert_eq!(
+            t,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn launch() -> FargateLaunchConfig {
         FargateLaunchConfig {

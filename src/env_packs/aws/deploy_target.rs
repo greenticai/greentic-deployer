@@ -213,6 +213,49 @@ pub struct TargetGroupWeight {
     pub weight_bps: u32,
 }
 
+/// Tag key carrying the owning environment's stamp on a Secrets Manager secret
+/// (the AWS twin of the GCP `greentic-owner` label).
+pub const SECRET_OWNER_TAG_KEY: &str = "greentic:owner";
+
+/// Outcome of [`EcsDeployTarget::ensure_secret`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnsuredSecret {
+    /// This call created the secret, stamped with the caller's owner.
+    Created,
+    /// The secret already existed, stamped by `owner` (empty = no stamp). The
+    /// caller decides whether that owner is itself or a conflict.
+    Existed { owner: String },
+}
+
+/// One stored secret version: the secret ARN plus the version id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretVersionRef {
+    pub arn: String,
+    pub version_id: String,
+}
+
+impl SecretVersionRef {
+    /// The ECS task-definition `valueFrom` string pinning this exact version.
+    ///
+    /// ECS `valueFrom` is `<secret-arn>:<json-key>:<version-stage>:<version-id>`;
+    /// leaving the json-key and version-stage empty and giving the version id is
+    /// `<arn>:::<version-id>` (see `docs/aws-ecs-seed-and-bundle-delivery.md`,
+    /// "Pin a secret version"). Needs Fargate platform 1.4.0+.
+    pub fn value_from(&self) -> String {
+        format!("{}:::{}", self.arn, self.version_id)
+    }
+}
+
+/// Content-derived `ClientRequestToken` / version id for a secret value:
+/// lowercase hex SHA-256 (64 chars, inside Secrets Manager's 32-64 limit).
+/// Identical bytes therefore map to the same version, which keeps a re-staged
+/// unchanged seed from minting a new version (unlabeled versions beyond 100 are
+/// garbage-collected after 24h, which would orphan version-pinned task defs).
+pub fn secret_version_token(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
 /// The side-effect seam the AWS-ECS deployer verbs drive.
 ///
 /// Object-safe (`async_trait`) so the handler holds `Arc<dyn EcsDeployTarget>`
@@ -249,6 +292,26 @@ pub trait EcsDeployTarget: std::fmt::Debug + Send + Sync {
         listener: &ListenerRef,
         weights: &[TargetGroupWeight],
     ) -> Result<(), EcsTargetError>;
+
+    /// Create the secret `name` tagged `greentic:owner=<owner>` if absent. A
+    /// create race or an existing secret surfaces as
+    /// [`EnsuredSecret::Existed`] carrying the live owner stamp, never as a
+    /// silent adoption.
+    async fn ensure_secret(&self, name: &str, owner: &str)
+    -> Result<EnsuredSecret, EcsTargetError>;
+
+    /// Store `bytes` as a value of the existing secret `name`. Content
+    /// idempotent: identical bytes yield the same version (the request token is
+    /// [`secret_version_token`]), different bytes a new one.
+    async fn put_secret_value(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<SecretVersionRef, EcsTargetError>;
+
+    /// Delete the secret immediately, without a recovery window. Idempotent
+    /// against an absent secret.
+    async fn delete_secret(&self, name: &str) -> Result<(), EcsTargetError>;
 }
 
 /// The default target for a handler with no real client wired. Every provider
@@ -280,6 +343,23 @@ impl EcsDeployTarget for UnconfiguredEcsTarget {
     ) -> Result<(), EcsTargetError> {
         Err(EcsTargetError::Unconfigured)
     }
+    async fn ensure_secret(
+        &self,
+        _name: &str,
+        _owner: &str,
+    ) -> Result<EnsuredSecret, EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
+    async fn put_secret_value(
+        &self,
+        _name: &str,
+        _bytes: &[u8],
+    ) -> Result<SecretVersionRef, EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
+    async fn delete_secret(&self, _name: &str) -> Result<(), EcsTargetError> {
+        Err(EcsTargetError::Unconfigured)
+    }
 }
 
 /// In-memory fake target for unit tests + the conformance bench.
@@ -301,9 +381,28 @@ pub struct InMemoryEcs {
     /// per-deployment rule). Records the deployer's contract decision, which the
     /// real target turns into a `ModifyListener` vs `CreateRule`/`ModifyRule`.
     routing: std::sync::Mutex<std::collections::BTreeMap<DeploymentId, Option<ListenerRouting>>>,
+    /// Secrets by name -> owner stamp.
+    secrets: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    /// Version ids per secret, in creation order.
+    secret_versions: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 impl InMemoryEcs {
+    /// Snapshot of the ensured secrets (name -> owner stamp).
+    pub fn secrets(&self) -> std::collections::BTreeMap<String, String> {
+        self.secrets.lock().expect("mutex not poisoned").clone()
+    }
+
+    /// Version ids stored for a secret, in creation order.
+    pub fn secret_versions_of(&self, name: &str) -> Vec<String> {
+        self.secret_versions
+            .lock()
+            .expect("mutex not poisoned")
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Snapshot of the ensured services.
     pub fn services(&self) -> std::collections::BTreeSet<DeploymentId> {
         self.services.lock().expect("mutex not poisoned").clone()
@@ -398,5 +497,149 @@ impl EcsDeployTarget for InMemoryEcs {
             .expect("mutex not poisoned")
             .insert(listener.deployment_id, listener.routing.clone());
         Ok(())
+    }
+
+    async fn ensure_secret(
+        &self,
+        name: &str,
+        owner: &str,
+    ) -> Result<EnsuredSecret, EcsTargetError> {
+        let mut secrets = self.secrets.lock().expect("mutex not poisoned");
+        if let Some(live) = secrets.get(name) {
+            return Ok(EnsuredSecret::Existed {
+                owner: live.clone(),
+            });
+        }
+        secrets.insert(name.to_string(), owner.to_string());
+        Ok(EnsuredSecret::Created)
+    }
+
+    async fn put_secret_value(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<SecretVersionRef, EcsTargetError> {
+        if !self
+            .secrets
+            .lock()
+            .expect("mutex not poisoned")
+            .contains_key(name)
+        {
+            return Err(EcsTargetError::Api(format!(
+                "secretsmanager PutSecretValue: secret `{name}` not found"
+            )));
+        }
+        // Mimic the real target: the version id is the content token, so
+        // identical bytes are one version.
+        let version_id = secret_version_token(bytes);
+        let mut versions = self.secret_versions.lock().expect("mutex not poisoned");
+        let list = versions.entry(name.to_string()).or_default();
+        if !list.contains(&version_id) {
+            list.push(version_id.clone());
+        }
+        Ok(SecretVersionRef {
+            arn: format!("arn:aws:secretsmanager:in-memory:000000000000:secret:{name}-AAAAAA"),
+            version_id,
+        })
+    }
+
+    async fn delete_secret(&self, name: &str) -> Result<(), EcsTargetError> {
+        self.secrets
+            .lock()
+            .expect("mutex not poisoned")
+            .remove(name);
+        self.secret_versions
+            .lock()
+            .expect("mutex not poisoned")
+            .remove(name);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_secret_reports_existing_owner() {
+        let ecs = InMemoryEcs::default();
+        assert_eq!(
+            ecs.ensure_secret("s1", "owner-a").await.unwrap(),
+            EnsuredSecret::Created
+        );
+        assert_eq!(
+            ecs.ensure_secret("s1", "owner-b").await.unwrap(),
+            EnsuredSecret::Existed {
+                owner: "owner-a".to_string()
+            }
+        );
+        assert_eq!(ecs.secrets().get("s1").map(String::as_str), Some("owner-a"));
+    }
+
+    #[tokio::test]
+    async fn delete_secret_is_idempotent() {
+        let ecs = InMemoryEcs::default();
+        ecs.ensure_secret("s1", "o").await.unwrap();
+        ecs.put_secret_value("s1", b"x").await.unwrap();
+        ecs.delete_secret("s1").await.unwrap();
+        ecs.delete_secret("s1").await.unwrap();
+        assert!(ecs.secrets().is_empty());
+        assert!(ecs.secret_versions_of("s1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_secret_value_returns_a_new_version_each_time_for_different_bytes() {
+        let ecs = InMemoryEcs::default();
+        ecs.ensure_secret("s1", "o").await.unwrap();
+        let a = ecs.put_secret_value("s1", b"one").await.unwrap();
+        let b = ecs.put_secret_value("s1", b"two").await.unwrap();
+        assert_ne!(a.version_id, b.version_id);
+        assert_eq!(a.arn, b.arn);
+        assert_eq!(ecs.secret_versions_of("s1").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn put_secret_value_is_idempotent_for_identical_bytes() {
+        let ecs = InMemoryEcs::default();
+        ecs.ensure_secret("s1", "o").await.unwrap();
+        let a = ecs.put_secret_value("s1", b"same").await.unwrap();
+        let b = ecs.put_secret_value("s1", b"same").await.unwrap();
+        assert_eq!(a, b);
+        assert_eq!(ecs.secret_versions_of("s1").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn put_secret_value_on_a_missing_secret_fails() {
+        let ecs = InMemoryEcs::default();
+        assert!(ecs.put_secret_value("nope", b"x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_target_refuses_secret_calls() {
+        let t = UnconfiguredEcsTarget;
+        assert!(matches!(
+            t.ensure_secret("s", "o").await,
+            Err(EcsTargetError::Unconfigured)
+        ));
+        assert!(matches!(
+            t.put_secret_value("s", b"x").await,
+            Err(EcsTargetError::Unconfigured)
+        ));
+        assert!(matches!(
+            t.delete_secret("s").await,
+            Err(EcsTargetError::Unconfigured)
+        ));
+    }
+
+    #[test]
+    fn value_from_pins_the_version_with_three_colons() {
+        let r = SecretVersionRef {
+            arn: "arn:aws:secretsmanager:eu-west-1:1:secret:n-AbCdEf".to_string(),
+            version_id: "abc".to_string(),
+        };
+        assert_eq!(
+            r.value_from(),
+            "arn:aws:secretsmanager:eu-west-1:1:secret:n-AbCdEf:::abc"
+        );
     }
 }

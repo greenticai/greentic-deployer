@@ -95,6 +95,9 @@ enum ActionBucket {
     AlbReadOnly,
     /// `elasticloadbalancing:*` — ALB mutation, scoped to listener ARN.
     Alb,
+    /// `secretsmanager:*` — seed / telemetry secret staging, scoped to the
+    /// secret ARN prefix the deployer owns.
+    SecretsManager,
     /// `iam:PassRole` — privilege-sensitive, scoped + conditioned.
     PassRole,
     /// Unrecognized action — falls to a review bucket.
@@ -122,6 +125,9 @@ fn classify_action(action: &str) -> ActionBucket {
     }
     if action.starts_with("elasticloadbalancing:") {
         return ActionBucket::Alb;
+    }
+    if action.starts_with("secretsmanager:") {
+        return ActionBucket::SecretsManager;
     }
     ActionBucket::Unrecognized
 }
@@ -186,6 +192,12 @@ const BUCKET_SPECS: &[BucketSpec] = &[
         bucket: ActionBucket::Alb,
         comment: "ALB listener mutation — admin scopes to listener ARN.",
         resource: "<REPLACE_WITH_ALB_LISTENER_ARNS>",
+        extra: None,
+    },
+    BucketSpec {
+        bucket: ActionBucket::SecretsManager,
+        comment: "Secrets Manager seed staging — admin scopes to the deployer's secret ARN prefix.",
+        resource: "<REPLACE_WITH_SECRET_ARNS>",
         extra: None,
     },
     BucketSpec {
