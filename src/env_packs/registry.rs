@@ -101,6 +101,12 @@ impl EnvPackRegistry {
         registry
             .register(Box::new(super::aws::AwsEcsDeployerHandler::default()))
             .expect("aws-ecs deployer handler path is unique");
+        #[cfg(feature = "creds-azure")]
+        if let Err(err) = registry.register(Box::new(
+            super::azure_aca::AzureAcaDeployerHandler::default(),
+        )) {
+            tracing::error!(%err, "azure-aca deployer handler was not registered");
+        }
         #[cfg(feature = "creds-gcp")]
         registry
             .register(Box::new(
@@ -231,8 +237,10 @@ mod tests {
         // of the `local` env's default bindings, but the registry resolves them
         // so `gtc op env-packs add … --kind greentic.deployer.<cloud>` resolves.
         let registry = EnvPackRegistry::with_builtins();
-        let expected =
-            6 + cfg!(feature = "creds-aws") as usize + cfg!(feature = "creds-gcp") as usize;
+        let expected = 6
+            + cfg!(feature = "creds-aws") as usize
+            + cfg!(feature = "creds-gcp") as usize
+            + cfg!(feature = "creds-azure") as usize;
         assert_eq!(registry.len(), expected);
     }
 

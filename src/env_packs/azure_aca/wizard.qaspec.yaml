@@ -1,0 +1,145 @@
+# wizard.qaspec.yaml -- Azure Container Apps deployer env-pack.
+#
+# Collects the NON-SECRET identifiers the deployer needs. The service principal
+# secret (AZURE_CLIENT_SECRET) is never collected here: it is bound as the
+# environment's deployer credential or read from the AZURE_* variables.
+# `oci_username` / `oci_password` (the ACR repository-scoped token) and
+# `telemetry_env` / `telemetry_headers` are answers the designer supplies, not
+# questions: this wizard never collects credential material.
+#
+# The managed environment, Log Analytics workspace and ACR are operator-provided
+# (`op credentials bootstrap` renders an `az` setup script for them).
+
+id: greentic.deployer.azure-aca.wizard
+title: Azure Container Apps deployer
+version: "0.1.0"
+description: >-
+  Records the Azure scope the Container Apps deployer operates against: which
+  subscription, tenant, resource group and managed environment. Credential
+  material is never collected here.
+presentation:
+  intro: >-
+    Bind an Azure Container Apps environment. The managed environment must
+    already exist in the resource group; the deployer creates one Container App
+    per deployment inside it.
+
+questions:
+  - id: subscription_id
+    type: string
+    title: Subscription ID
+    description: Azure subscription GUID that holds the resource group.
+    required: true
+    constraint:
+      pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+  - id: tenant_id
+    type: string
+    title: Entra tenant ID
+    description: Entra ID (Azure AD) tenant GUID the service principal lives in.
+    required: true
+    constraint:
+      pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+  - id: resource_group
+    type: string
+    title: Resource group
+    description: Resource group holding the managed environment and the Container Apps.
+    required: true
+    constraint:
+      min_len: 1
+      max_len: 90
+      pattern: '^[a-zA-Z0-9_-]+$'
+
+  - id: environment_name
+    type: string
+    title: Container Apps environment
+    description: >-
+      Name of the existing managed environment the apps are created in. This
+      wizard does not provision it.
+    required: true
+    constraint:
+      min_len: 1
+      max_len: 90
+      pattern: '^[a-zA-Z0-9_-]+$'
+
+  - id: location
+    type: string
+    title: Location
+    description: Azure location of the apps; must match the managed environment.
+    required: false
+    default_value: southeastasia
+    constraint:
+      pattern: '^[a-z0-9]+$'
+
+  - id: acr_login_server
+    type: string
+    title: Container registry (optional)
+    description: >-
+      ACR login server the bundles are pushed to (e.g. `myacr.azurecr.io`).
+      Recorded for the designer; the worker pulls with the `oci_*` token.
+    required: false
+    constraint:
+      pattern: '^[a-zA-Z0-9.-]+\.[a-zA-Z]+$'
+
+  - id: log_analytics_workspace_id
+    type: string
+    title: Log Analytics workspace ID (optional)
+    description: Workspace the managed environment logs to; read by the designer for logs.
+    required: false
+
+  - id: min_instances
+    type: string
+    title: Min replicas
+    description: "`0` scales to zero when idle (default); `1` keeps one replica warm."
+    required: false
+    default_value: "0"
+    constraint:
+      pattern: '^[01]$'
+
+  - id: max_instances
+    type: string
+    title: Max replicas
+    description: Fixed at `1`; the per-replica seed has a single writer.
+    required: false
+    default_value: "1"
+    constraint:
+      pattern: '^1$'
+
+  - id: cpu
+    type: string
+    title: CPU cores (optional)
+    description: Snapped up to a valid consumption size (0.25 to 4). Blank sizes from memory.
+    required: false
+
+  - id: memory
+    type: string
+    title: Memory (optional)
+    description: e.g. `1Gi` or `832Mi`; snapped up to a valid consumption size (max 8Gi).
+    required: false
+
+  - id: runtime_image_tag
+    type: string
+    title: Runtime image tag
+    description: Tag of the public greentic-start runtime image.
+    required: false
+    default_value: develop
+
+  - id: runtime_image_digest
+    type: string
+    title: Runtime image digest (optional)
+    description: "`sha256:<64 hex>` pin; overrides the tag."
+    required: false
+    constraint:
+      pattern: '^sha256:[0-9a-f]{64}$'
+
+  - id: runtime_tenant
+    type: string
+    title: Runtime tenant (optional)
+    description: Tenant the deployed runtime resolves secrets under.
+    required: false
+
+  - id: runtime_team
+    type: string
+    title: Runtime team (optional)
+    description: Team the deployed runtime resolves secrets under.
+    required: false

@@ -1040,6 +1040,7 @@ impl LocalFsStore {
 pub const PROVIDER_TEARDOWN_DESCRIPTORS: &[&str] = &[
     "greentic.deployer.gcp-cloudrun",
     "greentic.deployer.aws-ecs",
+    "greentic.deployer.azure-aca",
 ];
 
 /// Inputs to [`ProviderTeardown::teardown`], assembled by the store from the

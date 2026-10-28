@@ -33,7 +33,7 @@ categories = [
 ]
 
 [features]
-default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "creds-gcp", "deploy-gcp-cloudrun", "k8s-client"]
+default = ["bundle-upload-aws", "runtime-secrets-aws", "creds-aws", "deploy-aws-ecs", "creds-gcp", "deploy-gcp-cloudrun", "creds-azure", "deploy-azure-aca", "k8s-client"]
 internal-tools = []
 test-utils = []
 bundle-upload-aws = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-smithy-runtime-api"]
@@ -63,6 +63,15 @@ k8s-client = ["dep:kube", "dep:k8s-openapi", "dep:rustls"]
 # `google-cloud-*`-backed real target + validator land behind a follow-up
 # `deploy-gcp-cloudrun` feature.
 creds-gcp = []
+# Azure Container Apps deployer env-pack: wizard answers, naming, revision
+# intent, ARM request bodies, the `AcaDeployTarget` seam + in-memory fake, the
+# Deployer verbs, the credentials validator and the RBAC bootstrap. Pure Rust,
+# no extra dependencies.
+creds-azure = []
+# Azure Container Apps live target: the ARM REST client (`RealAcaTarget`) over a
+# mockable `AzureHttp` transport plus the Entra client-credentials token fetch.
+# Uses the already-present `reqwest`; no azure_* crates (decision D1).
+deploy-azure-aca = ["creds-azure"]
 # GCP Cloud Run real target + real ADC-backed validator client. Adds the
 # `google-cloud-*` SDK deps (all optional, pulled only when this feature is on)
 # and compiles `real_target.rs` + `bound_session.rs` + the real

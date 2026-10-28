@@ -1250,7 +1250,11 @@ pub fn apply_revision(
     // paths; any other registered deployer (e.g. local-process) does not.
     let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
     let is_k8s = descriptor.path() == k8s_path;
-    if !is_k8s && !is_aws_ecs_kind(&descriptor) && !is_cloudrun_kind(&descriptor) {
+    if !is_k8s
+        && !is_aws_ecs_kind(&descriptor)
+        && !is_cloudrun_kind(&descriptor)
+        && !is_azure_aca_kind(&descriptor)
+    {
         return Err(unsupported_apply_kind(&descriptor));
     }
 
@@ -1573,6 +1577,13 @@ fn is_aws_ecs_kind(_descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
     false
 }
 
+/// True when the descriptor is the Azure Container Apps deployer kind. Matched by
+/// path in EVERY build, so a build without the live client refuses by name
+/// rather than treating the kind as unknown.
+pub(crate) fn is_azure_aca_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> bool {
+    descriptor.path() == super::env_azure::AZURE_ACA_DEPLOYER_PATH
+}
+
 /// True when the descriptor is the GCP Cloud Run deployer kind. `false` on
 /// builds without the GCP env-pack compiled in (`creds-gcp` off) — the kind
 /// cannot be served, so the applicability gate rejects it. Mirrors
@@ -1593,8 +1604,9 @@ pub(crate) fn is_cloudrun_kind(_descriptor: &greentic_deploy_spec::PackDescripto
 fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> OpError {
     OpError::Conflict(format!(
         "env apply-revision is only supported for the `{}` (K8s), \
-         `greentic.deployer.aws-ecs` (AWS-ECS), and `greentic.deployer.gcp-cloudrun` \
-         (Cloud Run) deployer env-packs today; `{}` has no live single-revision apply path",
+         `greentic.deployer.aws-ecs` (AWS-ECS), `greentic.deployer.azure-aca` (Azure \
+         Container Apps), and `greentic.deployer.gcp-cloudrun` (Cloud Run) deployer \
+         env-packs today; `{}` has no live single-revision apply path",
         crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH,
         descriptor.path()
     ))
@@ -1605,7 +1617,6 @@ fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> 
 /// rejected. Returns `(identity, worker_name, endpoint_url)` — the analogue of
 /// the K8s `(bound|ambient, worker Deployment name)`, plus the live endpoint URL
 /// when the backend discovers one (Cloud Run's `*.run.app`; `None` for AWS-ECS).
-#[cfg(any(feature = "creds-aws", feature = "creds-gcp"))]
 #[allow(clippy::too_many_arguments)]
 fn apply_revision_non_k8s(
     store: &LocalFsStore,
@@ -1618,8 +1629,19 @@ fn apply_revision_non_k8s(
     force_drain: bool,
     drain_window: Option<std::time::Duration>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
-    // AWS-ECS has no drain capability, so its archive is not gated.
+    // AWS-ECS and Azure Container Apps have no drain capability, so their archive
+    // is not gated.
     let _ = (force_drain, drain_window);
+    if is_azure_aca_kind(descriptor) {
+        return super::env_azure::apply_revision_azure(
+            store,
+            env,
+            env_id,
+            revision_id,
+            verb,
+            answers,
+        );
+    }
     #[cfg(feature = "creds-aws")]
     {
         if is_aws_ecs_kind(descriptor) {
@@ -1641,22 +1663,6 @@ fn apply_revision_non_k8s(
             );
         }
     }
-    Err(unsupported_apply_kind(descriptor))
-}
-
-#[cfg(not(any(feature = "creds-aws", feature = "creds-gcp")))]
-#[allow(clippy::too_many_arguments)]
-fn apply_revision_non_k8s(
-    _store: &LocalFsStore,
-    _env: &Environment,
-    _env_id: &EnvId,
-    _revision_id: RevisionId,
-    _verb: RevisionVerb,
-    _answers: Option<&Value>,
-    descriptor: &greentic_deploy_spec::PackDescriptor,
-    _force_drain: bool,
-    _drain_window: Option<std::time::Duration>,
-) -> Result<(&'static str, String, Option<String>), OpError> {
     Err(unsupported_apply_kind(descriptor))
 }
 
@@ -1960,13 +1966,15 @@ pub(crate) async fn resolve_cloudrun_handler(
 /// (`ProviderTeardownUnavailable`), exactly as a build with no teardown at all.
 #[cfg(any(
     all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
-    all(feature = "creds-aws", feature = "deploy-aws-ecs")
+    all(feature = "creds-aws", feature = "deploy-aws-ecs"),
+    all(feature = "creds-azure", feature = "deploy-azure-aca")
 ))]
 struct ProviderTeardownRouter;
 
 #[cfg(any(
     all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
-    all(feature = "creds-aws", feature = "deploy-aws-ecs")
+    all(feature = "creds-aws", feature = "deploy-aws-ecs"),
+    all(feature = "creds-azure", feature = "deploy-azure-aca")
 ))]
 impl crate::environment::ProviderTeardown for ProviderTeardownRouter {
     fn teardown(
@@ -1980,6 +1988,10 @@ impl crate::environment::ProviderTeardown for ProviderTeardownRouter {
         #[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
         if ctx.descriptor_path == super::env_aws_up::AWS_ECS_DEPLOYER_PATH {
             return super::env_aws_teardown::EcsProviderTeardown.teardown(ctx);
+        }
+        #[cfg(all(feature = "creds-azure", feature = "deploy-azure-aca"))]
+        if ctx.descriptor_path == super::env_azure::AZURE_ACA_DEPLOYER_PATH {
+            return super::env_azure::AcaProviderTeardown.teardown(ctx);
         }
         Err(
             crate::environment::StoreError::ProviderTeardownUnavailable {
@@ -2140,9 +2152,10 @@ impl crate::environment::ProviderTeardown for CloudRunProviderTeardown {
 /// deployer credentials persisted there — into the runtime seed.
 #[cfg(any(
     all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
-    all(feature = "creds-aws", feature = "deploy-aws-ecs")
+    all(feature = "creds-aws", feature = "deploy-aws-ecs"),
+    all(feature = "creds-azure", feature = "deploy-azure-aca")
 ))]
-fn env_stages_dev_secrets(env: &Environment) -> bool {
+pub(super) fn env_stages_dev_secrets(env: &Environment) -> bool {
     env.packs.iter().any(|p| p.slot == CapabilitySlot::Secrets) && secrets_backend_is_dev_store(env)
 }
 
@@ -2364,10 +2377,14 @@ pub fn apply_traffic(
     // serve splits from their in-process router (runtime config), so there is no
     // listener to write — `op traffic set` suffices. Gate on the typed-const
     // helpers (not literals) so the paths can't drift from the descriptor consts.
-    if !is_aws_ecs_kind(&descriptor) && !is_cloudrun_kind(&descriptor) {
+    if !is_aws_ecs_kind(&descriptor)
+        && !is_cloudrun_kind(&descriptor)
+        && !is_azure_aca_kind(&descriptor)
+    {
         return Err(OpError::Conflict(format!(
-            "env apply-traffic is only supported for the `greentic.deployer.aws-ecs` (AWS-ECS) \
-             and `greentic.deployer.gcp-cloudrun` (Cloud Run) deployer env-packs; `{}` serves \
+            "env apply-traffic is only supported for the `greentic.deployer.aws-ecs` (AWS-ECS), \
+             `greentic.deployer.azure-aca` (Azure Container Apps) and \
+             `greentic.deployer.gcp-cloudrun` (Cloud Run) deployer env-packs; `{}` serves \
              traffic splits from its runtime router — record the split with `op traffic set` and \
              the runtime applies it",
             descriptor.path()
@@ -2663,6 +2680,9 @@ pub(super) fn apply_traffic_non_k8s(
     ),
     OpError,
 > {
+    if is_azure_aca_kind(descriptor) {
+        return super::env_azure::apply_traffic_azure(store, env, env_id, deployment_id, answers);
+    }
     #[cfg(feature = "creds-gcp")]
     {
         if is_cloudrun_kind(descriptor) {
@@ -3321,17 +3341,20 @@ pub fn destroy(
     // state only.
     #[cfg(any(
         all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
-        all(feature = "creds-aws", feature = "deploy-aws-ecs")
+        all(feature = "creds-aws", feature = "deploy-aws-ecs"),
+        all(feature = "creds-azure", feature = "deploy-azure-aca")
     ))]
     let provider_teardown = ProviderTeardownRouter;
     #[cfg(any(
         all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
-        all(feature = "creds-aws", feature = "deploy-aws-ecs")
+        all(feature = "creds-aws", feature = "deploy-aws-ecs"),
+        all(feature = "creds-azure", feature = "deploy-azure-aca")
     ))]
     let teardown: Option<&dyn crate::environment::ProviderTeardown> = Some(&provider_teardown);
     #[cfg(not(any(
         all(feature = "creds-gcp", feature = "deploy-gcp-cloudrun"),
-        all(feature = "creds-aws", feature = "deploy-aws-ecs")
+        all(feature = "creds-aws", feature = "deploy-aws-ecs"),
+        all(feature = "creds-azure", feature = "deploy-azure-aca")
     )))]
     let teardown: Option<&dyn crate::environment::ProviderTeardown> = None;
 

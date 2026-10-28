@@ -1,0 +1,51 @@
+{
+  "location": "southeastasia",
+  "tags": {"greentic:owner": "owner-1"},
+  "properties": {
+    "managedEnvironmentId": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.App/managedEnvironments/e",
+    "configuration": {
+      "activeRevisionsMode": "Multiple",
+      "ingress": {
+        "external": true,
+        "targetPort": 8080,
+        "transport": "auto",
+        "allowInsecure": false,
+        "traffic": [
+          {"revisionName": "gtc-00000000000000000000000001--r0000000000000000000000000g", "weight": 100, "latestRevision": false}
+        ]
+      },
+      "secrets": [
+        {"name": "seed-env-aaaaaaaaaaaa", "value": "SEEDCONTENT"},
+        {"name": "oci-pw", "value": "hunter2"}
+      ]
+    },
+    "template": {
+      "revisionSuffix": "r0000000000000000000000000g",
+      "initContainers": [
+        {
+          "name": "seed-init",
+          "image": "busybox",
+          "command": ["sh", "-c"],
+          "args": ["set -eu\n"],
+          "env": [{"name": "GREENTIC_SEED_ENVIRONMENT_JSON", "secretRef": "seed-env-aaaaaaaaaaaa"}],
+          "resources": {"cpu": 0.25, "memory": "0.5Gi"},
+          "volumeMounts": [{"volumeName": "seed", "mountPath": "/seed"}]
+        }
+      ],
+      "containers": [
+        {
+          "name": "worker",
+          "image": "ghcr.io/x/runtime:develop",
+          "env": [
+            {"name": "GREENTIC_ENV", "value": "e"},
+            {"name": "OCI_PASSWORD", "secretRef": "oci-pw"}
+          ],
+          "resources": {"cpu": 0.5, "memory": "1Gi"},
+          "volumeMounts": [{"volumeName": "seed", "mountPath": "/seed"}]
+        }
+      ],
+      "scale": {"minReplicas": 0, "maxReplicas": 1},
+      "volumes": [{"name": "seed", "storageType": "EmptyDir"}]
+    }
+  }
+}
