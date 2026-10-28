@@ -51,6 +51,9 @@ pub mod dispatch;
 pub(crate) mod dispatch_remote;
 pub mod env;
 pub mod env_apply;
+#[cfg(all(feature = "creds-aws", feature = "deploy-aws-ecs"))]
+pub(crate) mod env_aws_teardown;
+pub mod env_aws_up;
 pub(crate) mod env_cloudrun_sor;
 pub mod env_drain;
 pub mod env_manifest;

@@ -48,7 +48,7 @@ creds-aws = ["dep:aws-sdk-sts", "dep:aws-sdk-iam", "dep:aws-config", "dep:aws-sm
 # actions. Default-on alongside the other AWS deps. The seam / fake / verbs
 # from PR-1 are SDK-free under `creds-aws`; this feature only adds the real
 # client, so `--no-default-features --features creds-aws` still builds.
-deploy-aws-ecs = ["dep:aws-sdk-ecs", "dep:aws-sdk-elasticloadbalancingv2", "dep:aws-config", "dep:aws-smithy-runtime-api"]
+deploy-aws-ecs = ["dep:aws-sdk-ecs", "dep:aws-sdk-elasticloadbalancingv2", "dep:aws-sdk-secretsmanager", "dep:aws-sdk-cloudwatchlogs", "dep:aws-config", "dep:aws-smithy-runtime-api"]
 # Phase D K8s slice (PR-5.2): typed Kubernetes API client behind the
 # `K8sCluster` / `K8sValidatorClient` seams. Default-on alongside the AWS
 # deps; kube's defaults are client + rustls-tls + ring (no openssl). The
@@ -338,6 +338,15 @@ features = [
 ]
 
 [dependencies.aws-sdk-ecs]
+version = "1"
+optional = true
+default-features = false
+features = [
+    "default-https-client",
+    "rt-tokio",
+]
+
+[dependencies.aws-sdk-cloudwatchlogs]
 version = "1"
 optional = true
 default-features = false

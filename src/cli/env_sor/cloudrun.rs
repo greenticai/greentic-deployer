@@ -93,7 +93,7 @@ pub(super) fn prepare_cloud_run_with_override(
 
 /// On Cloud Run a worker reaches its SoR only through the route document in
 /// its seed, and `op env up` stages the dev store as a seed only when the env
-/// binds a `Secrets`-slot pack (`env::cloudrun_stages_dev_secrets`).
+/// binds a `Secrets`-slot pack (`env::env_stages_dev_secrets`).
 fn require_secrets_binding(env: &Environment) -> Result<(), OpError> {
     if env.pack_for_slot(CapabilitySlot::Secrets).is_some() {
         return Ok(());

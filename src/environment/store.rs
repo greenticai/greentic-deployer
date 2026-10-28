@@ -1037,7 +1037,10 @@ impl LocalFsStore {
 /// rather than silently orphaning cloud resources. A feature-gated equality test
 /// in each provider module guards against the string drifting from the handler's
 /// `DESCRIPTOR_PATH`.
-pub const PROVIDER_TEARDOWN_DESCRIPTORS: &[&str] = &["greentic.deployer.gcp-cloudrun"];
+pub const PROVIDER_TEARDOWN_DESCRIPTORS: &[&str] = &[
+    "greentic.deployer.gcp-cloudrun",
+    "greentic.deployer.aws-ecs",
+];
 
 /// Inputs to [`ProviderTeardown::teardown`], assembled by the store from the
 /// env's persisted state while the destroy flock is held. Borrows the env the

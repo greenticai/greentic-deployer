@@ -15,7 +15,7 @@
 //!   DescribeRules / CreateRule / ModifyRule plus AddTags / DescribeTags
 //!   (owner-tagging) for per-deployment listener rules)
 //!   plus this
-//!   handler's STS/IAM self-probes, `iam:PassRole`, and `ecr:PutImage` staging.
+//!   handler's STS/IAM self-probes, and `iam:PassRole`.
 //!   Keeping the list in parity with the real target's runtime calls means a
 //!   role that passes `gtc op credentials requirements` does not then fail on
 //!   the first live warm / traffic-shift / archive.
@@ -81,8 +81,8 @@ pub const AWS_STS_CALLER_IDENTITY_CAP: &str = "aws.sts.caller-identity";
 /// this slice, so the grouping is free to change).
 ///
 /// Covers the full ECS task-set rollout surface `RealEcsTarget` exercises at
-/// deploy time, this handler's own STS/IAM self-probes, image-push staging, and
-/// `iam:PassRole`. The runtime subset the real target actually calls is listed
+/// deploy time, this handler's own STS/IAM self-probes, Secrets Manager / CloudWatch Logs
+/// staging, and `iam:PassRole`. The runtime subset the real target actually calls is listed
 /// in `real_target::REAL_ECS_TARGET_IAM_ACTIONS`; a test pins it ⊆ this list, so
 /// adding an SDK call to the real target without a matching verb here fails CI
 /// rather than the customer's first live deploy. Each verb maps to a capability
@@ -96,14 +96,18 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "ecs:DescribeServices",
     "ecs:ListServices",
     "ecs:CreateService",
-    "ecs:UpdateService",
     "ecs:RegisterTaskDefinition",
+    "ecs:TagResource",
+    "ecs:DescribeTaskDefinition",
+    // DescribeTaskDefinition with include=TAGS (unverified: AWS may or may not
+    // require this separately; granted as a read-only precaution, see Task 12).
+    "ecs:ListTagsForResource",
     "ecs:CreateTaskSet",
     "ecs:DescribeTaskSets",
     "ecs:DeleteTaskSet",
+    "ecs:DeleteService",
     "ecs:DeregisterTaskDefinition",
-    // Image-push staging + passing the task execution/task roles to ECS.
-    "ecr:PutImage",
+    // Passing the task execution/task roles to ECS.
     "iam:PassRole",
     // ELBv2 weighted traffic shifting across the revisions' target groups.
     // ModifyListener serves the legacy default-action path (one deployment per
@@ -113,8 +117,25 @@ pub const VALIDATED_IAM_VERBS: &[&str] = &[
     "elasticloadbalancing:DescribeRules",
     "elasticloadbalancing:CreateRule",
     "elasticloadbalancing:ModifyRule",
+    "elasticloadbalancing:DeleteRule",
     "elasticloadbalancing:AddTags",
     "elasticloadbalancing:DescribeTags",
+    // Endpoint discovery (`discover_endpoint`): the listener's protocol, then
+    // its load balancer's DNS name.
+    "elasticloadbalancing:DescribeListeners",
+    "elasticloadbalancing:DescribeLoadBalancers",
+    // Secrets Manager staging of the seed / telemetry values (`ensure_secret`,
+    // `put_secret_value`, `delete_secret`).
+    "secretsmanager:CreateSecret",
+    "secretsmanager:DescribeSecret",
+    "secretsmanager:PutSecretValue",
+    "secretsmanager:TagResource",
+    "secretsmanager:DeleteSecret",
+    // CloudWatch Logs group of the deployment's containers (`ensure_log_group`,
+    // `delete_log_group`).
+    "logs:CreateLogGroup",
+    "logs:PutRetentionPolicy",
+    "logs:DeleteLogGroup",
 ];
 
 /// Returns the canonical capability ID for an IAM verb.
@@ -521,7 +542,12 @@ impl AwsDeployerCredentials {
     /// only the first validate pays the chain-resolve cost.
     fn resolve_client(&self) -> Result<Arc<dyn AwsValidatorClient>, AwsClientError> {
         // Fast path: client already built.
-        if let Some(c) = self.client.lock().expect("mutex not poisoned").as_ref() {
+        if let Some(c) = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
             return Ok(Arc::clone(c));
         }
         // Slow path: build the real client on a dedicated thread + runtime.
@@ -529,7 +555,10 @@ impl AwsDeployerCredentials {
         // parent runtime, so we always isolate via std::thread::scope.
         let built = run_aws_async(RealAwsClient::resolve())?;
         let arc: Arc<dyn AwsValidatorClient> = Arc::new(built);
-        let mut slot = self.client.lock().expect("mutex not poisoned");
+        let mut slot = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Another thread may have raced us — keep their client to avoid
         // tearing down a perfectly good SDK client.
         if let Some(c) = slot.as_ref() {
@@ -807,7 +836,8 @@ where
                 rt.block_on(fut)
             })
             .join()
-            .expect("AWS validate thread did not panic")
+            // Re-raise the worker thread's own panic instead of masking it.
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     })
 }
 

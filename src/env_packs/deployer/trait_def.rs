@@ -26,8 +26,9 @@ pub struct StageOutcome {}
 /// `endpoint_url` carries a provider-discovered public endpoint when the backend
 /// assigns one — Cloud Run returns the Service's `*.run.app` URL here (read from
 /// the upsert response, so no extra round-trip). `None` for backends with no
-/// deployer-discovered endpoint (a K8s ingress host / the AWS-ECS ALB DNS are
-/// operator-supplied, not discovered by the warm).
+/// deployer-discovered endpoint (a K8s ingress host is operator-supplied).
+/// AWS-ECS returns the listener's endpoint here (the routing host or the load
+/// balancer DNS name) when an `alb_listener_arn` is configured, `None` otherwise.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WarmOutcome {
     pub endpoint_url: Option<String>,

@@ -14,7 +14,7 @@
 //! | Verb | Provider side-effect |
 //! |---|---|
 //! | `stage_revision` | None. Image/bundle delivery is a separate cross-provider slice (K8s defers it too). |
-//! | `warm_revision` | Ensure the deployment's `EXTERNAL`-controller service + create the revision's task set; wait until it stabilizes. |
+//! | `warm_revision` | Ensure the deployment's `EXTERNAL`-controller service and log group; unless the revision's task set already carries this warm's intent, stage the seed into Secrets Manager and create the task set (runtime image, boot env, `seed-init`); wait until it stabilizes. A task set stamped with a different intent is refused (task definitions are immutable). |
 //! | `drain_revision` | None — routing-side. Traffic shifts via `apply_traffic_split`; target-group deregistration-delay drains in-flight. |
 //! | `archive_revision` | Delete the revision's task set + deregister its task definition (idempotent against absent). |
 //! | `apply_traffic_split` | Write the listener rule's weighted forward action across the deployment's task-set target groups. Never re-creates task sets. |
@@ -32,23 +32,54 @@ use serde_json::Value;
 use tokio::time::{Instant, sleep};
 
 use super::AwsEcsDeployerHandler;
+use super::boot_env::ecs_boot_env;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, ServiceSpec, TargetGroupWeight,
-    TaskSetRef, TaskSetSpec,
+    EcsDeployTarget, EcsTargetError, LOG_RETENTION_DAYS, ListenerRef, ListenerRouting, ServiceRef,
+    ServiceSpec, TargetGroupWeight, TaskSetRef, TaskSetSpec, log_group_name,
+    valid_log_retention_days,
 };
+use super::registry_credential::{self, OCI_PASSWORD_ENV, RegistryCredential};
+use super::revision_intent::{
+    IntentInputs, IntentVerdict, classify, revision_conflict, revision_intent,
+};
+use super::seed_init::SEED_INIT_IMAGE;
+use super::seed_stage::environment_secret_name;
+use crate::env_packs::RUNTIME_IMAGE_REPO;
 use crate::env_packs::deployer::{
-    ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome, TrafficSplitOutcome,
-    WarmOutcome, enforce_split_invariants, require_revision,
+    AdapterCapabilities, ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome,
+    TrafficSplitOutcome, WarmOutcome, enforce_split_invariants, require_revision,
+};
+use crate::env_packs::telemetry::{
+    self as telemetry_answers, HEADER_ENV_NAMES, TelemetryAnswerError, TelemetryAnswers,
 };
 
-/// Default container image base when the binding supplies no
-/// `ecr_repository_prefix`. The in-memory path never pulls it; the real target
-/// requires the operator to scope `ecr_repository_prefix` to their account.
+/// Default repository base when the binding supplies no
+/// `ecr_repository_prefix`. RESERVED: parsed (the wizard still collects it) but
+/// read by nothing; the worker container always runs the public runtime image
+/// (`runtime_image`) and the deployer pushes no images.
 const DEFAULT_IMAGE_BASE: &str = "greentic/operator";
 
 /// Default image-tag prefix when the binding supplies no
 /// `container_image_tag_prefix`. Matches the wizard's `default_value`.
 const DEFAULT_IMAGE_TAG_PREFIX: &str = "rev-";
+
+/// Default retention of the deployment's log group (a CloudWatch-allowed value).
+const DEFAULT_LOG_RETENTION_DAYS: i32 = 30;
+
+/// Default tag of the public runtime image.
+const DEFAULT_RUNTIME_IMAGE_TAG: &str = "develop";
+
+/// All traffic on one revision: expressible without any listener.
+pub(crate) fn is_trivial_split(entries: &[greentic_deploy_spec::TrafficSplitEntry]) -> bool {
+    let live: Vec<_> = entries.iter().filter(|e| e.weight_bps > 0).collect();
+    matches!(live.as_slice(), [only] if only.weight_bps == 10_000)
+}
+
+/// Why a non-trivial split is refused when no listener is configured (shared
+/// by the deployer verb and the `op env up` preflight so the wording is one).
+pub(crate) const SPLIT_NEEDS_LISTENER: &str = "traffic split across several revisions (or below \
+     100%) needs the `alb_listener_arn` answer: ECS applies weights only through an \
+     operator-provided ALB listener";
 
 /// Seam failures surface as provider failures — the verb's preconditions have
 /// already passed by the time the target is touched.
@@ -98,14 +129,17 @@ pub struct AwsEcsParams {
     pub region: String,
     /// ECS cluster name the deployer manages services in.
     pub cluster: String,
-    /// Container image base every revision's image is built from.
+    /// RESERVED: repository base answered as `ecr_repository_prefix`, kept for
+    /// answer compatibility and read by nothing. Not the worker
+    /// image: the worker runs [`Self::runtime_image`] and reads its bundle
+    /// from `bundle_source_uri` in the seeded `environment.json`.
     pub image_base: String,
-    /// Prefix the revision's image tag is built from (wizard default `rev-`).
-    /// Blank tags with the raw revision ULID.
+    /// RESERVED (wizard answer `container_image_tag_prefix`, default `rev-`):
+    /// parsed for answer compatibility, read by nothing.
     pub image_tag_prefix: String,
     /// ALB listener ARN the weighted forward action is written to. `None`
-    /// means no ALB mirror is configured: `apply_traffic_split` skips the
-    /// listener update and the runtime dispatcher stays authoritative.
+    /// means no listener is configured: `apply_traffic_split` then accepts only
+    /// a split sending all traffic to one revision and refuses any other.
     pub listener_arn: Option<String>,
     /// Scoped deployer role ARN to assume for a bound STS session (the role
     /// the rules-pack Terraform creates). `None` means no role hop: render-only
@@ -128,6 +162,31 @@ pub struct AwsEcsParams {
     /// written instead (one deployment per listener). Consumed by
     /// `apply_traffic_split`.
     pub routing: Option<ListenerRouting>,
+    /// Warm instances kept per service (wizard default 1, never 0: the
+    /// in-process runtime state needs a live task).
+    pub min_instances: u32,
+    /// Maximum tasks per service. Fixed at 1: sessions, flow state and
+    /// revision pins live per task in memory.
+    pub max_instances: u32,
+    /// Tag of the public runtime image (ignored when a digest is set).
+    pub runtime_image_tag: String,
+    /// `sha256:<64 hex>` pin of the public runtime image, overriding the tag.
+    pub runtime_image_digest: Option<String>,
+    /// Prefix of the per-env secrets the deploy stages (default `gtc-{env}`).
+    pub secret_prefix: String,
+    /// Tenant the deployed runtime resolves secrets under.
+    pub runtime_tenant: Option<String>,
+    /// Team the deployed runtime resolves secrets under.
+    pub runtime_team: Option<String>,
+    /// Telemetry profile (`telemetry_env` / `telemetry_headers`).
+    pub telemetry: TelemetryAnswers,
+    /// Registry credential for the worker's bundle pull (`oci_username` /
+    /// `oci_password`); `None` pulls anonymously (or with an ambient
+    /// credential the runtime finds itself).
+    pub(crate) registry: Option<RegistryCredential>,
+    /// Retention of the deployment's CloudWatch log group, in days. Always one
+    /// of the values CloudWatch Logs accepts (default 30).
+    pub log_retention_days: i32,
 }
 
 /// Why a wizard answers blob could not be read into [`AwsEcsParams`].
@@ -143,6 +202,8 @@ pub enum AwsEcsParamsError {
     Invalid { key: String, detail: String },
     #[error("launch config is incomplete: `{field}` is required")]
     MissingLaunchField { field: &'static str },
+    #[error(transparent)]
+    Telemetry(#[from] TelemetryAnswerError),
 }
 
 fn answer_string(key: &str, value: &Value) -> Result<String, AwsEcsParamsError> {
@@ -193,6 +254,40 @@ fn csv_list(key: &str, value: &Value) -> Result<Vec<String>, AwsEcsParamsError> 
 
 /// Parse a `"true"` / `"false"` string answer (the `assign_public_ip` enum) to
 /// a bool.
+fn parse_u32(key: &str, value: &Value) -> Result<u32, AwsEcsParamsError> {
+    if let Some(n) = value.as_u64() {
+        return u32::try_from(n).map_err(|_| AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("{n} is out of range for a u32"),
+        });
+    }
+    let s = answer_string(key, value)?;
+    s.trim()
+        .parse::<u32>()
+        .map_err(|e| AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{s}` is not a non-negative integer: {e}"),
+        })
+}
+
+/// Optional `sha256:<64 lowercase hex>` image digest.
+fn parse_digest(key: &str, value: &Value) -> Result<Option<String>, AwsEcsParamsError> {
+    let Some(digest) = optional_string(key, value)? else {
+        return Ok(None);
+    };
+    let valid = digest.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    if valid {
+        Ok(Some(digest))
+    } else {
+        Err(AwsEcsParamsError::Invalid {
+            key: key.to_string(),
+            detail: format!("`{digest}` is not a `sha256:<64 hex>` digest"),
+        })
+    }
+}
+
 fn parse_bool(key: &str, value: &Value) -> Result<bool, AwsEcsParamsError> {
     match answer_string(key, value)?.as_str() {
         "true" => Ok(true),
@@ -327,6 +422,16 @@ impl AwsEcsParams {
             launch: None,
             target_group_pool: Vec::new(),
             routing: None,
+            min_instances: 1,
+            max_instances: 1,
+            runtime_image_tag: DEFAULT_RUNTIME_IMAGE_TAG.to_string(),
+            runtime_image_digest: None,
+            secret_prefix: format!("gtc-{}", env.environment_id.as_str()),
+            runtime_tenant: None,
+            runtime_team: None,
+            telemetry: TelemetryAnswers::default(),
+            registry: None,
+            log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
         }
     }
 
@@ -361,6 +466,10 @@ impl AwsEcsParams {
         let mut launch = LaunchFields::default();
         let mut routing_host = None;
         let mut routing_path = None;
+        let mut telemetry_env = None;
+        let mut telemetry_headers = None;
+        let mut oci_username = None;
+        let mut oci_password = None;
         for (key, value) in obj {
             match key.as_str() {
                 "region" => params.region = answer_string(key, value)?,
@@ -388,9 +497,58 @@ impl AwsEcsParams {
                 "target_group_arns" => {
                     params.target_group_pool = parse_target_group_pool(key, value)?
                 }
+                "min_instances" => {
+                    params.min_instances = parse_u32(key, value)?;
+                    if params.min_instances == 0 {
+                        return Err(AwsEcsParamsError::Invalid {
+                            key: key.to_string(),
+                            detail: "must be at least 1 (a task must stay up)".to_string(),
+                        });
+                    }
+                }
+                "max_instances" => {
+                    params.max_instances = parse_u32(key, value)?;
+                    if params.max_instances != 1 {
+                        return Err(AwsEcsParamsError::Invalid {
+                            key: key.to_string(),
+                            detail: "must be 1 (runtime state lives per task in memory)"
+                                .to_string(),
+                        });
+                    }
+                }
+                "runtime_image_tag" => params.runtime_image_tag = answer_string(key, value)?,
+                "runtime_image_digest" => params.runtime_image_digest = parse_digest(key, value)?,
+                // Blank keeps the `gtc-{env}` default: the prefix names every
+                // staged secret, and `-environment` alone is not a usable name.
+                "secret_prefix" => {
+                    if let Some(prefix) = optional_string(key, value)? {
+                        params.secret_prefix = prefix;
+                    }
+                }
+                "log_retention_days" => {
+                    let days = parse_u32(key, value)?;
+                    params.log_retention_days = i32::try_from(days)
+                        .ok()
+                        .filter(|d| valid_log_retention_days(*d))
+                        .ok_or_else(|| AwsEcsParamsError::Invalid {
+                            key: key.to_string(),
+                            detail: format!(
+                                "{days} is not a CloudWatch Logs retention; allowed: \
+                                 {LOG_RETENTION_DAYS:?}"
+                            ),
+                        })?;
+                }
+                "runtime_tenant" => params.runtime_tenant = optional_string(key, value)?,
+                "runtime_team" => params.runtime_team = optional_string(key, value)?,
+                registry_credential::USERNAME_KEY => oci_username = Some(value),
+                registry_credential::PASSWORD_KEY => oci_password = Some(value),
+                telemetry_answers::TELEMETRY_ENV_KEY => telemetry_env = Some(value),
+                telemetry_answers::TELEMETRY_HEADERS_KEY => telemetry_headers = Some(value),
                 other => return Err(AwsEcsParamsError::UnknownKey(other.to_string())),
             }
         }
+        params.telemetry = telemetry_answers::parse(telemetry_env, telemetry_headers)?;
+        params.registry = registry_credential::parse(oci_username, oci_password)?;
         params.launch = launch.build()?;
         params.routing = match (routing_host, routing_path) {
             (None, None) => None,
@@ -399,13 +557,13 @@ impl AwsEcsParams {
         Ok(params)
     }
 
-    /// Image the revision's Fargate task runs (image base + the configured
-    /// tag prefix + the revision ULID).
-    fn image_for(&self, revision_id: RevisionId) -> String {
-        format!(
-            "{}:{}{}",
-            self.image_base, self.image_tag_prefix, revision_id.0
-        )
+    /// Public runtime image reference: digest-pinned when a digest is
+    /// answered, otherwise tag-based.
+    pub fn runtime_image(&self) -> String {
+        match &self.runtime_image_digest {
+            Some(digest) => format!("{RUNTIME_IMAGE_REPO}@{digest}"),
+            None => format!("{RUNTIME_IMAGE_REPO}:{}", self.runtime_image_tag),
+        }
     }
 }
 
@@ -483,8 +641,49 @@ impl AwsEcsDeployerHandler {
     }
 }
 
+/// True when the revision's whole deployment is retiring (`op bundles retire`
+/// marked its bundle `archived`). One ECS service serves a deployment, so the
+/// unit being removed is then the service itself, not just this task set.
+/// Mirrors the Cloud Run lane's rule.
+fn whole_bundle_retiring(env: &Environment, revision: &Revision) -> bool {
+    env.bundles.iter().any(|b| {
+        b.deployment_id == revision.deployment_id
+            && b.status == greentic_deploy_spec::BundleDeploymentStatus::Archived
+    })
+}
+
 #[async_trait]
 impl Deployer for AwsEcsDeployerHandler {
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            drain: false,
+            traffic_split: true,
+            ingress_managed: false,
+            private_registry_auth: true,
+            multi_instance_safe: false,
+            remove: true,
+            runtime_pin: false,
+            scale_out_answers: false,
+        }
+    }
+
+    fn capability_notes(&self) -> &'static [&'static str] {
+        &[
+            "scale: Fargate has no scale-to-zero and runs exactly one task \
+             (min_instances >= 1, max_instances == 1)",
+            "ingress_managed: the load balancer, listener, certificate and target groups are \
+             operator-provided; the pack only discovers the URL",
+            "traffic_split: requires an operator-provided listener (`alb_listener_arn`); a \
+             split across several revisions is refused without one",
+            "private_registry_auth: `oci_username` / `oci_password` answers; the password is a \
+             Secrets Manager secret injected as `OCI_PASSWORD`. Amazon ECR is not covered (it \
+             has no long-lived password)",
+            "drain: not implemented — a retire that needs a drain window is refused",
+            "runtime_pin: no per-revision pin; the runtime image comes from the \
+             environment-wide answer",
+        ]
+    }
+
     async fn stage_revision(
         &self,
         env: &Environment,
@@ -502,28 +701,112 @@ impl Deployer for AwsEcsDeployerHandler {
         answers: Option<&Value>,
     ) -> Result<WarmOutcome, DeployerError> {
         require_revision(env, revision_id)?;
-        let revision = Self::revision(env, revision_id).expect("require_revision passed");
+        let revision = Self::revision(env, revision_id).ok_or(DeployerError::RevisionNotFound {
+            env_id: env.environment_id.clone(),
+            revision_id,
+        })?;
         let params = params_from_answers(env, answers)?;
         let deployment_id = revision.deployment_id;
+        let task_set_ref = TaskSetRef {
+            deployment_id,
+            revision_id,
+            cluster: params.cluster.clone(),
+            region: params.region.clone(),
+        };
+
+        // What this warm intends, computed BEFORE staging so a retry stages
+        // nothing to learn it. The worker runs the public runtime image; the
+        // bundle it serves is named by `bundle_source_uri` inside the seeded
+        // `environment.json` (decision record section 4), not by the image.
+        let image = params.runtime_image();
+        let boot_env = ecs_boot_env(env, revision, &params);
+        let mut secret_env_names: Vec<&str> = if params.telemetry.headers().is_some() {
+            HEADER_ENV_NAMES.to_vec()
+        } else {
+            Vec::new()
+        };
+        if params.registry.is_some() {
+            secret_env_names.push(OCI_PASSWORD_ENV);
+        }
+        let seed_secret = environment_secret_name(&params.secret_prefix);
+        let intent = revision_intent(&IntentInputs {
+            image: &image,
+            launch: params.launch.as_ref(),
+            desired_count: params.min_instances,
+            secret_name: &seed_secret,
+            boot_env: &boot_env,
+            secret_env_names: &secret_env_names,
+            seed_init_image: SEED_INIT_IMAGE,
+        });
 
         self.target
             .ensure_service(&ServiceSpec {
                 deployment_id,
                 cluster: params.cluster.clone(),
                 region: params.region.clone(),
+                desired_count: params.min_instances,
             })
             .await
             .map_err(provider)?;
+        // The log group is not part of the immutable revision: converge it on
+        // every warm so a changed retention answer lands.
+        let log_group = log_group_name(&params.secret_prefix, &deployment_id);
         self.target
-            .create_task_set(&TaskSetSpec {
-                deployment_id,
-                revision_id,
-                cluster: params.cluster.clone(),
-                region: params.region.clone(),
-                image: params.image_for(revision_id),
-            })
+            .ensure_log_group(&log_group, params.log_retention_days)
             .await
             .map_err(provider)?;
+
+        let live = self
+            .target
+            .live_revision_intent(&task_set_ref)
+            .await
+            .map_err(provider)?;
+        match classify(live, &intent) {
+            // The same warm, retried: the revision keeps the seed versions it
+            // was created with (a task definition cannot pick up new ones).
+            IntentVerdict::Converge => {}
+            IntentVerdict::Conflict { live } => {
+                return Err(revision_conflict(revision_id, &intent, live));
+            }
+            IntentVerdict::Create => {
+                let staged = super::seed_stage::stage(
+                    self.target.as_ref(),
+                    env,
+                    revision_id,
+                    &params,
+                    self.dev_secrets.as_ref().map(super::DevSecrets::as_bytes),
+                )
+                .await?;
+                self.target
+                    .create_task_set(&TaskSetSpec {
+                        deployment_id,
+                        revision_id,
+                        cluster: params.cluster.clone(),
+                        region: params.region.clone(),
+                        image,
+                        env: boot_env,
+                        secret_env: staged.secret_env,
+                        seed: Some(staged.seed),
+                        log_group: Some(log_group),
+                        revision_intent: intent.clone(),
+                    })
+                    .await
+                    .map_err(provider)?;
+                // `create_task_set` returns an existing task set unchanged, so
+                // a rival warm that created this revision between the probe
+                // and the create would otherwise be adopted silently. Re-read
+                // the stamp; a task set not yet visible is left to the
+                // stability wait.
+                let after = self
+                    .target
+                    .live_revision_intent(&task_set_ref)
+                    .await
+                    .map_err(provider)?;
+                if let IntentVerdict::Conflict { live } = classify(after, &intent) {
+                    return Err(revision_conflict(revision_id, &intent, live));
+                }
+            }
+        }
 
         // The task set is created; the revision is only Ready once it reaches
         // steady state (running == desired AND its target group is healthy). A
@@ -532,18 +815,29 @@ impl Deployer for AwsEcsDeployerHandler {
         // tasks.
         wait_for_task_set_stability(
             self.target.as_ref(),
-            &TaskSetRef {
-                deployment_id,
-                revision_id,
-                cluster: params.cluster.clone(),
-                region: params.region.clone(),
-            },
+            &task_set_ref,
             warm_stabilize_timeout(),
             WARM_STABILIZE_POLL_INTERVAL,
         )
         .await?;
 
-        Ok(WarmOutcome::default())
+        // Discover the public endpoint only once the revision serves. A failed
+        // lookup fails the warm (fail closed); `None` means no listener is
+        // configured or it names no load balancer DNS.
+        let endpoint_url = match &params.listener_arn {
+            Some(listener_arn) => self
+                .target
+                .discover_endpoint(&ListenerRef {
+                    deployment_id,
+                    listener_arn: listener_arn.clone(),
+                    cluster: params.cluster.clone(),
+                    routing: params.routing.clone(),
+                })
+                .await
+                .map_err(provider)?,
+            None => None,
+        };
+        Ok(WarmOutcome { endpoint_url })
     }
 
     async fn drain_revision(
@@ -565,17 +859,49 @@ impl Deployer for AwsEcsDeployerHandler {
         answers: Option<&Value>,
     ) -> Result<ArchiveOutcome, DeployerError> {
         require_revision(env, revision_id)?;
-        let revision = Self::revision(env, revision_id).expect("require_revision passed");
+        let revision = Self::revision(env, revision_id).ok_or(DeployerError::RevisionNotFound {
+            env_id: env.environment_id.clone(),
+            revision_id,
+        })?;
         let params = params_from_answers(env, answers)?;
-        self.target
-            .delete_task_set(&TaskSetRef {
-                deployment_id: revision.deployment_id,
-                revision_id,
-                cluster: params.cluster,
-                region: params.region,
-            })
-            .await
-            .map_err(provider)?;
+        // The deployment's last revision going away takes the whole bundle with
+        // it (`op bundles retire` marked it archived): nothing is left to serve,
+        // so its listener rule and service must not leak. Deleting the service
+        // removes every task set, so no per-set delete runs here: after the
+        // first revision's archive the service is gone and any task-set call
+        // would fail, wedging the retire of a multi-revision bundle and every
+        // retry. A single revision of a live bundle only loses its task set.
+        if whole_bundle_retiring(env, revision) {
+            if let Some(listener_arn) = &params.listener_arn {
+                self.target
+                    .delete_listener_rule(&ListenerRef {
+                        deployment_id: revision.deployment_id,
+                        listener_arn: listener_arn.clone(),
+                        cluster: params.cluster.clone(),
+                        routing: params.routing.clone(),
+                    })
+                    .await
+                    .map_err(provider)?;
+            }
+            self.target
+                .delete_service(&ServiceRef {
+                    deployment_id: revision.deployment_id,
+                    cluster: params.cluster,
+                    region: params.region,
+                })
+                .await
+                .map_err(provider)?;
+        } else {
+            self.target
+                .delete_task_set(&TaskSetRef {
+                    deployment_id: revision.deployment_id,
+                    revision_id,
+                    cluster: params.cluster,
+                    region: params.region,
+                })
+                .await
+                .map_err(provider)?;
+        }
         Ok(ArchiveOutcome::default())
     }
 
@@ -588,9 +914,14 @@ impl Deployer for AwsEcsDeployerHandler {
         // Preconditions + outcome construction BEFORE any AWS call.
         let outcome = enforce_split_invariants(env, deployment_id)?;
         let params = params_from_answers(env, answers)?;
-        // Only touch the ALB when a listener is configured; with no
-        // `alb_listener_arn` the runtime dispatcher stays authoritative for
-        // traffic splitting, so there is no listener to write.
+        // Weights can only be applied on an operator-provided ALB listener:
+        // every ECS task set runs at 100% scale and the seed carries a single
+        // revision, so no runtime dispatcher splits traffic. Without
+        // `alb_listener_arn`, only a split that sends everything to one
+        // revision is expressible; anything else fails closed.
+        if params.listener_arn.is_none() && !is_trivial_split(&outcome.applied_entries) {
+            return Err(DeployerError::Provider(SPLIT_NEEDS_LISTENER.to_string()));
+        }
         if let Some(listener_arn) = &params.listener_arn {
             let weights: Vec<TargetGroupWeight> = outcome
                 .applied_entries
@@ -618,6 +949,14 @@ impl Deployer for AwsEcsDeployerHandler {
 }
 
 #[cfg(test)]
+#[path = "deployer_answers_tests.rs"]
+mod answers_tests;
+
+#[cfg(test)]
+#[path = "deployer_seed_tests.rs"]
+mod seed_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -635,9 +974,79 @@ mod tests {
 
     // ---- conformance: the Phase D entry gate ----------------------------
 
+    /// The shared bench passes `None` answers everywhere, but its fixture split
+    /// spans several revisions, which AWS applies only through a listener. This
+    /// wrapper supplies the operator's listener to `apply_traffic_split` alone.
+    #[derive(Debug)]
+    struct WithListener(AwsEcsDeployerHandler);
+
+    #[async_trait::async_trait]
+    impl Deployer for WithListener {
+        async fn stage_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+        ) -> Result<StageOutcome, DeployerError> {
+            self.0.stage_revision(env, revision_id).await
+        }
+        async fn warm_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<WarmOutcome, DeployerError> {
+            self.0.warm_revision(env, revision_id, answers).await
+        }
+        async fn drain_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<DrainOutcome, DeployerError> {
+            self.0.drain_revision(env, revision_id, answers).await
+        }
+        async fn confirm_drained(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<crate::env_packs::deployer::DrainEvidence, DeployerError> {
+            self.0.confirm_drained(env, revision_id, answers).await
+        }
+        fn capabilities(&self) -> AdapterCapabilities {
+            self.0.capabilities()
+        }
+        fn capability_notes(&self) -> &'static [&'static str] {
+            self.0.capability_notes()
+        }
+        async fn archive_revision(
+            &self,
+            env: &Environment,
+            revision_id: RevisionId,
+            answers: Option<&Value>,
+        ) -> Result<ArchiveOutcome, DeployerError> {
+            self.0.archive_revision(env, revision_id, answers).await
+        }
+        async fn apply_traffic_split(
+            &self,
+            env: &Environment,
+            deployment_id: DeploymentId,
+            _answers: Option<&Value>,
+        ) -> Result<TrafficSplitOutcome, DeployerError> {
+            let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+            self.0
+                .apply_traffic_split(env, deployment_id, Some(&answers))
+                .await
+        }
+        fn report_runtime_config(&self, env: &Environment) -> greentic_deploy_spec::RuntimeConfig {
+            self.0.report_runtime_config(env)
+        }
+    }
+
     #[tokio::test]
     async fn aws_ecs_deployer_passes_conformance() {
         let (handler, _target) = handler_with_fake();
+        let handler = WithListener(handler);
         run_conformance(&handler)
             .await
             .expect("AWS-ECS deployer satisfies the Phase D conformance contract");
@@ -666,6 +1075,19 @@ mod tests {
             sets.contains_key(&(rev.deployment_id, rev.revision_id)),
             "task set keyed by (deployment, revision)"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_passes_min_instances_as_desired_count() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({ "min_instances": "3" });
+        handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(target.desired_count_of(rev.deployment_id), Some(3));
     }
 
     #[tokio::test]
@@ -749,6 +1171,114 @@ mod tests {
             .archive_revision(&env, rev.revision_id, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retiring_a_two_revision_bundle_archives_every_revision() {
+        let (handler, target) = handler_with_fake();
+        target.require_service_for_task_set_ops(true);
+        let mut env = build_fixture_env();
+        let dep = env.revisions[0].deployment_id;
+        let revs: Vec<_> = env
+            .revisions
+            .iter()
+            .filter(|r| r.deployment_id == dep)
+            .map(|r| r.revision_id)
+            .collect();
+        assert!(revs.len() >= 2, "fixture must hold a 2-revision bundle");
+        for r in &revs {
+            handler.warm_revision(&env, *r, None).await.unwrap();
+        }
+        for b in &mut env.bundles {
+            if b.deployment_id == dep {
+                b.status = greentic_deploy_spec::BundleDeploymentStatus::Archived;
+            }
+        }
+        for r in &revs {
+            handler
+                .archive_revision(&env, *r, None)
+                .await
+                .expect("every revision of a retiring bundle archives");
+        }
+        assert!(!target.services().contains(&dep));
+        assert!(target.task_sets().keys().all(|(d, _)| *d != dep));
+    }
+
+    #[tokio::test]
+    async fn archive_retry_after_service_deleted_is_ok() {
+        let (handler, target) = handler_with_fake();
+        target.require_service_for_task_set_ops(true);
+        let mut env = build_fixture_env();
+        let rev = env.revisions[0].clone();
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        for b in &mut env.bundles {
+            if b.deployment_id == rev.deployment_id {
+                b.status = greentic_deploy_spec::BundleDeploymentStatus::Archived;
+            }
+        }
+        handler
+            .archive_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        handler
+            .archive_revision(&env, rev.revision_id, None)
+            .await
+            .expect("a retry after the service is gone converges");
+    }
+
+    #[tokio::test]
+    async fn archive_of_a_single_revision_keeps_the_service() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        handler
+            .warm_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        handler
+            .archive_revision(&env, rev.revision_id, None)
+            .await
+            .unwrap();
+        assert!(target.task_sets().is_empty());
+        assert!(
+            target.services().contains(&rev.deployment_id),
+            "a bundle that is not retiring keeps its service"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_of_a_retiring_bundle_deletes_the_service() {
+        let (handler, target) = handler_with_fake();
+        let mut env = build_fixture_env();
+        let rev = env.revisions[0].clone();
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        handler
+            .apply_traffic_split(&env, rev.deployment_id, Some(&answers))
+            .await
+            .unwrap();
+        for b in &mut env.bundles {
+            if b.deployment_id == rev.deployment_id {
+                b.status = greentic_deploy_spec::BundleDeploymentStatus::Archived;
+            }
+        }
+        handler
+            .archive_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert!(
+            !target.services().contains(&rev.deployment_id),
+            "retiring the whole bundle deletes its service"
+        );
+        assert!(target.task_sets().is_empty());
+        // The fixture binds no routing, so no per-deployment rule is owned.
+        assert!(target.rule_deletions().is_empty());
     }
 
     /// A valid ALB listener ARN (passes the wizard's `^arn:...:listener/.+$`
@@ -861,21 +1391,190 @@ mod tests {
         );
     }
 
-    /// With no `alb_listener_arn` configured, the split still produces the
-    /// right outcome but the deployer leaves the ALB untouched — the runtime
-    /// dispatcher stays authoritative for traffic splitting.
+    /// A warm with a listener configured returns the listener's HTTPS endpoint
+    /// (discovered after the task set stabilizes).
     #[tokio::test]
-    async fn traffic_split_without_a_listener_skips_the_alb() {
+    async fn warm_returns_the_https_endpoint_of_the_listener() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("https://{}.alb.invalid", rev.deployment_id.0))
+        );
+        let asked = target.endpoint_queries();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].listener_arn, TEST_LISTENER_ARN);
+    }
+
+    /// A configured routing host is the endpoint host, not the load balancer's.
+    #[tokio::test]
+    async fn a_routing_host_overrides_the_load_balancer_dns() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "app.example.com",
+        });
+        let out = handler
+            .warm_revision(&env, env.revisions[0].revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some("https://app.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_routing_host_falls_back_to_the_load_balancer_dns() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "*.example.com",
+        });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("https://{}.alb.invalid", rev.deployment_id.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_unicode_routing_host_falls_back_to_the_load_balancer_dns() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "b\u{fc}cher-shop.de",
+        });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("https://{}.alb.invalid", rev.deployment_id.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheme_prefixed_routing_host_is_not_doubled() {
+        let (handler, _target) = handler_with_fake();
+        let env = build_fixture_env();
+        let answers = serde_json::json!({
+            "alb_listener_arn": TEST_LISTENER_ARN,
+            "alb_routing_host": "https://app.example.com",
+        });
+        let out = handler
+            .warm_revision(&env, env.revisions[0].revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some("https://app.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_error_fails_the_warm() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        target.fail_endpoint_discovery("elb unreachable");
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        let err = handler
+            .warm_revision(&env, env.revisions[0].revision_id, Some(&answers))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("elb unreachable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn warm_over_http_listener_returns_an_http_endpoint() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let rev = &env.revisions[0];
+        target.set_listener_https(false);
+        let answers = serde_json::json!({ "alb_listener_arn": TEST_LISTENER_ARN });
+        let out = handler
+            .warm_revision(&env, rev.revision_id, Some(&answers))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.endpoint_url,
+            Some(format!("http://{}.alb.invalid", rev.deployment_id.0))
+        );
+    }
+
+    /// No `alb_listener_arn`: there is nothing to discover, and that is not an error.
+    #[tokio::test]
+    async fn no_listener_means_no_endpoint() {
+        let (handler, target) = handler_with_fake();
+        let env = build_fixture_env();
+        let out = handler
+            .warm_revision(&env, env.revisions[0].revision_id, None)
+            .await
+            .unwrap();
+        assert_eq!(out.endpoint_url, None);
+        assert!(target.endpoint_queries().is_empty());
+    }
+
+    /// A split that actually divides traffic needs the operator's listener:
+    /// every ECS task set scales to 100%, so nothing else can apply weights.
+    /// Without `alb_listener_arn` it is refused, naming the answer, and the
+    /// target stays untouched.
+    #[tokio::test]
+    async fn a_non_trivial_split_without_a_listener_is_refused() {
         let (handler, target) = handler_with_fake();
         let env = build_fixture_env();
         let dep = env.bundles[0].deployment_id;
+        assert!(
+            env.traffic_splits
+                .iter()
+                .find(|s| s.deployment_id == dep)
+                .is_some_and(|s| s.entries.iter().filter(|e| e.weight_bps > 0).count() > 1),
+            "fixture precondition: a split across several revisions"
+        );
+
+        let err = handler
+            .apply_traffic_split(&env, dep, None)
+            .await
+            .unwrap_err();
+        match err {
+            DeployerError::Provider(msg) => assert!(msg.contains("alb_listener_arn"), "{msg}"),
+            other => panic!("expected a Provider refusal, got {other:?}"),
+        }
+        assert!(target.weights_for(dep).is_none());
+    }
+
+    /// A trivial split (all traffic to one revision) needs no listener.
+    #[tokio::test]
+    async fn a_single_revision_split_without_a_listener_is_ok() {
+        let (handler, target) = handler_with_fake();
+        let mut env = build_fixture_env();
+        let dep = env.bundles[0].deployment_id;
+        let split = env
+            .traffic_splits
+            .iter_mut()
+            .find(|s| s.deployment_id == dep)
+            .unwrap();
+        split.entries.truncate(1);
+        split.entries[0].weight_bps = 10_000;
 
         let outcome = handler.apply_traffic_split(&env, dep, None).await.unwrap();
         assert_eq!(outcome.applied_deployment_id, dep);
-        assert!(
-            target.weights_for(dep).is_none(),
-            "no listener configured: the ALB must be left untouched"
-        );
+        assert!(target.weights_for(dep).is_none());
     }
 
     /// Preconditions run BEFORE any target call: unknown revision / invalid
@@ -960,6 +1659,12 @@ mod tests {
                 task_def_arn: "td".into(),
             })
         }
+        async fn live_revision_intent(
+            &self,
+            _task_set: &TaskSetRef,
+        ) -> Result<super::super::deploy_target::LiveTaskSet, EcsTargetError> {
+            Ok(super::super::deploy_target::LiveTaskSet::Absent)
+        }
         async fn task_set_stability(
             &self,
             _task_set: &TaskSetRef,
@@ -974,12 +1679,56 @@ mod tests {
         async fn delete_task_set(&self, _task_set: &TaskSetRef) -> Result<(), EcsTargetError> {
             Ok(())
         }
+        async fn delete_service(
+            &self,
+            _service: &super::super::deploy_target::ServiceRef,
+        ) -> Result<bool, EcsTargetError> {
+            Ok(false)
+        }
+        async fn delete_listener_rule(
+            &self,
+            _listener: &ListenerRef,
+        ) -> Result<(), EcsTargetError> {
+            Ok(())
+        }
+        async fn get_secret_owner(&self, _name: &str) -> Result<Option<String>, EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
+        }
         async fn apply_listener_weights(
             &self,
             _listener: &ListenerRef,
             _weights: &[TargetGroupWeight],
         ) -> Result<(), EcsTargetError> {
             Ok(())
+        }
+        async fn discover_endpoint(
+            &self,
+            _listener: &ListenerRef,
+        ) -> Result<Option<String>, EcsTargetError> {
+            Ok(None)
+        }
+        async fn ensure_secret(
+            &self,
+            _name: &str,
+            _owner: &str,
+        ) -> Result<super::super::deploy_target::EnsuredSecret, EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
+        }
+        async fn put_secret_value(
+            &self,
+            _name: &str,
+            _bytes: &[u8],
+        ) -> Result<super::super::deploy_target::SecretVersionRef, EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
+        }
+        async fn delete_secret(&self, _name: &str) -> Result<(), EcsTargetError> {
+            Err(EcsTargetError::Unconfigured)
+        }
+        async fn ensure_log_group(&self, _n: &str, _r: i32) -> Result<(), EcsTargetError> {
+            Ok(())
+        }
+        async fn delete_log_group(&self, _n: &str) -> Result<bool, EcsTargetError> {
+            Ok(false)
         }
     }
 
@@ -1069,31 +1818,6 @@ mod tests {
         assert_eq!(
             params.assume_role_arn.as_deref(),
             Some("arn:aws:iam::111122223333:role/greentic-deployer")
-        );
-    }
-
-    #[test]
-    fn image_for_honors_the_configured_tag_prefix() {
-        let env = build_fixture_env();
-        let rev = env.revisions[0].revision_id;
-
-        // Default prefix → `<base>:rev-<ulid>`.
-        let default = AwsEcsParams::for_env(&env);
-        assert_eq!(
-            default.image_for(rev),
-            format!("{}:rev-{}", default.image_base, rev.0)
-        );
-
-        // Blank prefix → raw revision ULID tag (`<base>:<ulid>`), matching the
-        // wizard's "leave blank to tag with the raw revision ULID".
-        let blank = AwsEcsParams::from_answers(
-            &env,
-            Some(&serde_json::json!({ "container_image_tag_prefix": "" })),
-        )
-        .unwrap();
-        assert_eq!(
-            blank.image_for(rev),
-            format!("{}:{}", blank.image_base, rev.0)
         );
     }
 

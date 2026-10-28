@@ -110,26 +110,35 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use aws_sdk_ecs::error::{BuildError, ProvideErrorMetadata};
 use aws_sdk_ecs::operation::create_task_set::CreateTaskSetOutput;
 use aws_sdk_ecs::operation::describe_services::DescribeServicesOutput;
 use aws_sdk_ecs::operation::describe_task_sets::DescribeTaskSetsOutput;
 use aws_sdk_ecs::operation::register_task_definition::RegisterTaskDefinitionOutput;
 use aws_sdk_ecs::types::{
-    AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition, DeploymentController,
-    DeploymentControllerType, LoadBalancer, NetworkConfiguration, NetworkMode, PortMapping, Scale,
-    ScaleUnit, StabilityStatus, TaskSet,
+    AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerCondition, ContainerDefinition,
+    ContainerDependency, DeploymentController, DeploymentControllerType, KeyValuePair,
+    LoadBalancer, LogConfiguration, LogDriver, MountPoint, NetworkConfiguration, NetworkMode,
+    PortMapping, Scale, ScaleUnit, Secret, StabilityStatus, Tag as EcsTag, TaskDefinitionField,
+    TaskSet, Volume,
 };
 use aws_sdk_elasticloadbalancingv2::operation::describe_target_groups::DescribeTargetGroupsOutput;
 use aws_sdk_elasticloadbalancingv2::types::{
     Action, ActionTypeEnum, ForwardActionConfig, HostHeaderConditionConfig,
-    PathPatternConditionConfig, Rule, RuleCondition, Tag, TagDescription, TargetGroupTuple,
+    PathPatternConditionConfig, ProtocolEnum, Rule, RuleCondition, Tag, TagDescription,
+    TargetGroupTuple,
 };
 use greentic_deploy_spec::{DeploymentId, RevisionId};
 
+use super::boot_env::SEED_MOUNT_DIR;
 use super::deploy_target::{
-    EcsDeployTarget, EcsTargetError, ListenerRef, ListenerRouting, ServiceSpec, TargetGroupWeight,
-    TaskSetHandle, TaskSetRef, TaskSetSpec, TaskSetStability,
+    EcsDeployTarget, EcsTargetError, EnsuredSecret, ListenerRef, ListenerRouting, LiveTaskSet,
+    REVISION_INTENT_TAG_KEY, SECRET_OWNER_TAG_KEY, SecretEnvRef, SecretVersionRef, SeedInit,
+    ServiceRef, ServiceSpec, TargetGroupWeight, TaskSetHandle, TaskSetRef, TaskSetSpec,
+    TaskSetStability, compose_endpoint, endpoint_host, invalid_retention, secret_version_token,
+    valid_log_retention_days,
 };
+use super::seed_init::{self, SEED_INIT_CONTAINER, SEED_VOLUME};
 // The launch config is pure data parsed by `AwsEcsParams::from_answers`, so it
 // lives in the always-compiled deployer module; re-exported here to keep the
 // `real_target::FargateLaunchConfig` public path stable.
@@ -142,6 +151,8 @@ pub use super::deployer::FargateLaunchConfig;
 pub struct RealEcsTarget {
     ecs: aws_sdk_ecs::Client,
     elb: aws_sdk_elasticloadbalancingv2::Client,
+    secrets: aws_sdk_secretsmanager::Client,
+    logs: aws_sdk_cloudwatchlogs::Client,
     launch: FargateLaunchConfig,
     /// Operator-supplied ALB target groups (ARNs or names) the target assigns
     /// revisions to, one per live revision. Blue/green needs ≥2; assignment is
@@ -160,19 +171,82 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "ecs:ListServices",           // create_task_set (single-owner pool guard)
     "ecs:CreateService",          // ensure_service
     "ecs:RegisterTaskDefinition", // create_task_set
-    "ecs:CreateTaskSet",          // create_task_set
+    "ecs:TagResource",            // create_task_set (revision-intent tag on the task definition)
+    "ecs:DescribeTaskDefinition", // live_revision_intent (read the revision-intent tag)
+    "ecs:ListTagsForResource", // live_revision_intent (include=TAGS; may be required, verify live)
+    "ecs:CreateTaskSet",       // create_task_set
     // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
     // (apply_listener_weights reads each revision's target-group binding here)
     "ecs:DescribeTaskSets",
-    "ecs:DeleteTaskSet",                         // delete_task_set
-    "ecs:DeregisterTaskDefinition",              // delete_task_set
+    "ecs:DeleteTaskSet",            // delete_task_set / delete_service
+    "ecs:DeleteService",            // delete_service
+    "ecs:DeregisterTaskDefinition", // delete_task_set
     "elasticloadbalancing:DescribeTargetGroups", // create_task_set (resolve_pool_arns, name→ARN)
     "elasticloadbalancing:ModifyListener", // apply_listener_weights (default-action, no routing)
-    "elasticloadbalancing:DescribeRules",  // apply_listener_weights (find this deployment's rule)
-    "elasticloadbalancing:CreateRule",     // apply_listener_weights (first per-deployment rule)
-    "elasticloadbalancing:ModifyRule",     // apply_listener_weights (update per-deployment rule)
+    "elasticloadbalancing:DescribeRules", // apply_listener_weights (find this deployment's rule)
+    "elasticloadbalancing:CreateRule", // apply_listener_weights (first per-deployment rule)
+    "elasticloadbalancing:ModifyRule", // apply_listener_weights (update per-deployment rule)
+    "elasticloadbalancing:DeleteRule", // delete_listener_rule (this deployment's own rule only)
     "elasticloadbalancing:AddTags", // apply_listener_weights (stamp rule owner tag on create)
     "elasticloadbalancing:DescribeTags", // apply_listener_weights (prove rule ownership before modify)
+    "elasticloadbalancing:DescribeListeners", // discover_endpoint (listener protocol + load balancer ARN)
+    "elasticloadbalancing:DescribeLoadBalancers", // discover_endpoint (load balancer DNS name)
+    "secretsmanager:CreateSecret",            // ensure_secret
+    "secretsmanager:TagResource",             // ensure_secret (CreateSecret with Tags needs it)
+    "secretsmanager:DescribeSecret",          // ensure_secret (read the live owner tag)
+    "secretsmanager:PutSecretValue",          // put_secret_value
+    "secretsmanager:DeleteSecret",            // delete_secret
+    "logs:CreateLogGroup",                    // ensure_log_group
+    "logs:PutRetentionPolicy",                // ensure_log_group
+    "logs:DeleteLogGroup",                    // delete_log_group
+];
+
+/// Every AWS SDK operation `RealEcsTarget` sends, with the IAM verb(s) it
+/// needs (an operation may need more than one: a tagged create also needs the
+/// tag verb). The first element is the SDK builder method, so a test can prove
+/// the call still exists in this file; the audit test proves each verb is both
+/// listed in [`REAL_ECS_TARGET_IAM_ACTIONS`] and validated by the preflight.
+#[cfg(test)]
+const REAL_ECS_TARGET_SDK_CALLS: &[(&str, &str)] = &[
+    ("describe_services", "ecs:DescribeServices"),
+    ("list_services", "ecs:ListServices"),
+    ("create_service", "ecs:CreateService"),
+    ("register_task_definition", "ecs:RegisterTaskDefinition"),
+    ("register_task_definition", "ecs:TagResource"), // revision-intent tag
+    ("describe_task_definition", "ecs:DescribeTaskDefinition"),
+    ("describe_task_definition", "ecs:ListTagsForResource"), // include=TAGS; verify live (Task 12)
+    ("create_task_set", "ecs:CreateTaskSet"),
+    ("describe_task_sets", "ecs:DescribeTaskSets"),
+    ("delete_task_set", "ecs:DeleteTaskSet"),
+    ("delete_service", "ecs:DeleteService"),
+    ("deregister_task_definition", "ecs:DeregisterTaskDefinition"),
+    (
+        "describe_target_groups",
+        "elasticloadbalancing:DescribeTargetGroups",
+    ),
+    ("modify_listener", "elasticloadbalancing:ModifyListener"),
+    ("describe_rules", "elasticloadbalancing:DescribeRules"),
+    ("create_rule", "elasticloadbalancing:CreateRule"),
+    ("create_rule", "elasticloadbalancing:AddTags"), // owner tag on the rule
+    ("modify_rule", "elasticloadbalancing:ModifyRule"),
+    ("delete_rule", "elasticloadbalancing:DeleteRule"),
+    ("describe_tags", "elasticloadbalancing:DescribeTags"),
+    (
+        "describe_listeners",
+        "elasticloadbalancing:DescribeListeners",
+    ),
+    (
+        "describe_load_balancers",
+        "elasticloadbalancing:DescribeLoadBalancers",
+    ),
+    ("create_secret", "secretsmanager:CreateSecret"),
+    ("create_secret", "secretsmanager:TagResource"), // owner tag at creation
+    ("describe_secret", "secretsmanager:DescribeSecret"),
+    ("put_secret_value", "secretsmanager:PutSecretValue"),
+    ("delete_secret", "secretsmanager:DeleteSecret"),
+    ("create_log_group", "logs:CreateLogGroup"),
+    ("put_retention_policy", "logs:PutRetentionPolicy"),
+    ("delete_log_group", "logs:DeleteLogGroup"),
 ];
 
 impl RealEcsTarget {
@@ -212,6 +286,8 @@ impl RealEcsTarget {
         Ok(Self {
             ecs: aws_sdk_ecs::Client::new(&config),
             elb: aws_sdk_elasticloadbalancingv2::Client::new(&config),
+            secrets: aws_sdk_secretsmanager::Client::new(&config),
+            logs: aws_sdk_cloudwatchlogs::Client::new(&config),
             launch,
             target_group_pool,
         })
@@ -342,17 +418,27 @@ impl EcsDeployTarget for RealEcsTarget {
         // has no dedicated already-exists error; a naked duplicate surfaces as
         // `InvalidParameterException`). The describe stays as a fast path that
         // skips the create entirely once the service is ACTIVE.
+        // `desiredCount` is the service-level task count; the EXTERNAL
+        // controller has no scheduler of its own, but ECS still takes the
+        // service's desired count, and each task set's `scale` (100% in
+        // `create_task_set`) is a percentage OF that count. Setting it here is
+        // therefore what makes `min_instances` real. AWS documents
+        // `create-service --deployment-controller type=EXTERNAL
+        // --desired-count N` for this controller; not verified against a live
+        // account in this task. An already-ACTIVE service keeps its count
+        // (the early return above): this method never resizes.
         self.ecs
             .create_service()
             .cluster(&spec.cluster)
             .service_name(&service)
+            .desired_count(service_desired_count(spec))
             .client_token(service_client_token(&spec.deployment_id))
-            .deployment_controller(
+            .deployment_controller(built(
+                "deployment controller",
                 DeploymentController::builder()
                     .r#type(DeploymentControllerType::External)
-                    .build()
-                    .expect("deployment controller type is set"),
-            )
+                    .build(),
+            )?)
             .send()
             .await
             .map_err(|e| api("create_service", e))?;
@@ -425,7 +511,7 @@ impl EcsDeployTarget for RealEcsTarget {
             })
         })?;
 
-        let registered = self
+        let mut register = self
             .ecs
             .register_task_definition()
             .family(task_def_family(&spec.deployment_id, &spec.revision_id))
@@ -435,7 +521,28 @@ impl EcsDeployTarget for RealEcsTarget {
             .memory(&self.launch.memory)
             .execution_role_arn(&self.launch.execution_role_arn)
             .set_task_role_arn(self.launch.task_role_arn.clone())
-            .container_definitions(container_def(&self.launch, &spec.image))
+            .container_definitions(container_def(
+                &self.launch,
+                &spec.image,
+                &spec.env,
+                &spec.secret_env,
+                spec.log_group
+                    .as_deref()
+                    .map(|group| (group, spec.region.as_str())),
+                spec.seed.is_some(),
+            )?);
+        if let Some(seed) = &spec.seed {
+            register = register
+                .container_definitions(seed_init_container(seed)?)
+                .volumes(seed_volume());
+        }
+        // The intent stamp a re-warm compares (see `revision_intent`). Task
+        // definitions are immutable, so the stamp written here is the one that
+        // revision carries for life.
+        if !spec.revision_intent.is_empty() {
+            register = register.tags(intent_tag(&spec.revision_intent));
+        }
+        let registered = register
             .send()
             .await
             .map_err(|e| api("register_task_definition", e))?;
@@ -449,7 +556,7 @@ impl EcsDeployTarget for RealEcsTarget {
             .task_definition(&task_def_arn)
             .external_id(&external_id)
             .client_token(task_set_client_token(&spec.revision_id))
-            .network_configuration(network_config(&self.launch))
+            .network_configuration(network_config(&self.launch)?)
             .load_balancers(load_balancer(&self.launch, &target_group_arn))
             .scale(
                 Scale::builder()
@@ -462,6 +569,42 @@ impl EcsDeployTarget for RealEcsTarget {
             .map_err(|e| api("create_task_set", e))?;
 
         task_set_handle_from(&created, task_def_arn)
+    }
+
+    async fn live_revision_intent(
+        &self,
+        task_set: &TaskSetRef,
+    ) -> Result<LiveTaskSet, EcsTargetError> {
+        let service = service_name(&task_set.deployment_id);
+        let external_id = task_set_external_id(&task_set.revision_id);
+        let sets = self
+            .ecs
+            .describe_task_sets()
+            .cluster(&task_set.cluster)
+            .service(&service)
+            .send()
+            .await
+            .map_err(|e| api("describe_task_sets", e))?;
+        let Some(task_def_arn) =
+            find_task_set(&sets, &external_id).map(|ts| ts.task_definition().map(str::to_string))
+        else {
+            return Ok(LiveTaskSet::Absent);
+        };
+        // A task set with no task definition cannot be verified.
+        let Some(task_def_arn) = task_def_arn else {
+            return Ok(LiveTaskSet::Present { intent: None });
+        };
+        let described = self
+            .ecs
+            .describe_task_definition()
+            .task_definition(&task_def_arn)
+            .include(TaskDefinitionField::Tags)
+            .send()
+            .await
+            .map_err(|e| api("describe_task_definition", e))?;
+        Ok(LiveTaskSet::Present {
+            intent: intent_from_tags(described.tags()),
+        })
     }
 
     async fn task_set_stability(
@@ -490,8 +633,15 @@ impl EcsDeployTarget for RealEcsTarget {
             .cluster(&task_set.cluster)
             .service(&service)
             .send()
-            .await
-            .map_err(|e| api("describe_task_sets", e))?;
+            .await;
+        let out = match out {
+            Ok(out) => out,
+            // The whole service is gone (deleted by a retire/destroy that
+            // already removed every task set): nothing left to delete. A
+            // missing CLUSTER is deliberately NOT in this class.
+            Err(e) if is_service_gone_code(e.code()) => return Ok(()),
+            Err(e) => return Err(api("describe_task_sets", e)),
+        };
         // Idempotent: an absent task set is a no-op success.
         let Some(found) = task_set_for_delete(&out, &external_id) else {
             return Ok(());
@@ -517,6 +667,94 @@ impl EcsDeployTarget for RealEcsTarget {
                 .await
                 .map_err(|e| api("deregister_task_definition", e))?;
         }
+        Ok(())
+    }
+
+    async fn delete_service(&self, service: &ServiceRef) -> Result<bool, EcsTargetError> {
+        let name = service_name(&service.deployment_id);
+        let described = self
+            .ecs
+            .describe_services()
+            .cluster(&service.cluster)
+            .services(&name)
+            .send()
+            .await
+            .map_err(|e| api("describe_services", e))?;
+        // Idempotent: an absent (or INACTIVE, already deleted) service is done.
+        if !active_service_exists(&described, &name) {
+            return Ok(false);
+        }
+        // An EXTERNAL-controller service holds its task sets itself: remove
+        // every one still there (and its task definition) before the service.
+        let sets = self
+            .ecs
+            .describe_task_sets()
+            .cluster(&service.cluster)
+            .service(&name)
+            .send()
+            .await
+            .map_err(|e| api("describe_task_sets", e))?;
+        for found in all_task_sets_for_delete(&sets) {
+            self.ecs
+                .delete_task_set()
+                .cluster(&service.cluster)
+                .service(&name)
+                .task_set(&found.id)
+                .force(true)
+                .send()
+                .await
+                .map_err(|e| api("delete_task_set", e))?;
+            if let Some(arn) = found.task_definition {
+                self.ecs
+                    .deregister_task_definition()
+                    .task_definition(&arn)
+                    .send()
+                    .await
+                    .map_err(|e| api("deregister_task_definition", e))?;
+            }
+        }
+        // `force` lets ECS delete the service without scaling it to zero first.
+        self.ecs
+            .delete_service()
+            .cluster(&service.cluster)
+            .service(&name)
+            .force(true)
+            .send()
+            .await
+            .map_err(|e| api("delete_service", e))?;
+        Ok(true)
+    }
+
+    async fn delete_listener_rule(&self, listener: &ListenerRef) -> Result<(), EcsTargetError> {
+        // No routing: the deployment wrote the listener's default action and
+        // owns no rule. The listener is the operator's, so it is left alone.
+        let Some(routing) = &listener.routing else {
+            return Ok(());
+        };
+        let existing = self
+            .elb
+            .describe_rules()
+            .listener_arn(&listener.listener_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_rules", e))?;
+        let Some(rule_arn) = match_rule(existing.rules(), routing) else {
+            return Ok(());
+        };
+        // Only a rule THIS deployment created (its owner tag) is removed; a
+        // sibling's or operator-managed rule sharing the condition stays.
+        if !self
+            .rule_owned_by_deployment(&rule_arn, &listener.deployment_id)
+            .await?
+        {
+            return Ok(());
+        }
+        self.elb
+            .delete_rule()
+            .rule_arn(&rule_arn)
+            .send()
+            .await
+            .map_err(|e| api("delete_rule", e))?;
         Ok(())
     }
 
@@ -565,6 +803,263 @@ impl EcsDeployTarget for RealEcsTarget {
             None => self.write_listener_default(listener, action).await,
             Some(routing) => self.write_listener_rule(listener, routing, action).await,
         }
+    }
+
+    /// Read the listener's protocol and its load balancer's DNS name, then
+    /// compose the endpoint. The routing host (when set) replaces the DNS name
+    /// but the scheme still comes from the listener protocol. A listener or
+    /// load balancer AWS cannot find is an error, not `None`.
+    async fn discover_endpoint(
+        &self,
+        listener: &ListenerRef,
+    ) -> Result<Option<String>, EcsTargetError> {
+        let described = self
+            .elb
+            .describe_listeners()
+            .listener_arns(&listener.listener_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_listeners", e))?;
+        let found = described.listeners().first().ok_or_else(|| {
+            EcsTargetError::Api(format!(
+                "elbv2 describe_listeners: listener `{}` not found",
+                listener.listener_arn
+            ))
+        })?;
+        let https = matches!(found.protocol(), Some(ProtocolEnum::Https));
+        let routing_host = listener
+            .routing
+            .as_ref()
+            .and_then(|r| r.host.as_deref())
+            .and_then(endpoint_host);
+        if let Some(host) = routing_host {
+            return Ok(Some(compose_endpoint(https, &host, None)));
+        }
+        let Some(lb_arn) = found.load_balancer_arn() else {
+            return Ok(None);
+        };
+        let lbs = self
+            .elb
+            .describe_load_balancers()
+            .load_balancer_arns(lb_arn)
+            .send()
+            .await
+            .map_err(|e| api("describe_load_balancers", e))?;
+        let dns = lbs
+            .load_balancers()
+            .first()
+            .and_then(|lb| lb.dns_name())
+            .filter(|dns| !dns.is_empty());
+        Ok(dns.map(|dns| compose_endpoint(https, dns, None)))
+    }
+
+    async fn ensure_secret(
+        &self,
+        name: &str,
+        owner: &str,
+    ) -> Result<EnsuredSecret, EcsTargetError> {
+        let created = self
+            .secrets
+            .create_secret()
+            .name(name)
+            .set_tags(Some(owner_tags(owner)?))
+            .send()
+            .await;
+        match created {
+            Ok(_) => Ok(EnsuredSecret::Created),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_exists_exception()) =>
+            {
+                let described = self
+                    .secrets
+                    .describe_secret()
+                    .secret_id(name)
+                    .send()
+                    .await
+                    .map_err(|e| secrets_api("DescribeSecret", &e))?;
+                Ok(EnsuredSecret::Existed {
+                    owner: owner_from_tags(described.tags()),
+                })
+            }
+            Err(e) => Err(secrets_api("CreateSecret", &e)),
+        }
+    }
+
+    async fn get_secret_owner(&self, name: &str) -> Result<Option<String>, EcsTargetError> {
+        match self.secrets.describe_secret().secret_id(name).send().await {
+            Ok(described) => Ok(Some(owner_from_tags(described.tags()))),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(secrets_api("DescribeSecret", &e)),
+        }
+    }
+
+    /// Idempotent per content: the client request token is derived from the
+    /// bytes, so re-putting identical bytes returns the version that already
+    /// holds them. Caveat (A, B, A): re-putting bytes equal to an OLDER version
+    /// returns that older version but does NOT move `AWSCURRENT` back to it. The
+    /// seed is delivered through a pinned `valueFrom` version reference, so
+    /// the pinned task definition is unaffected; only a consumer reading
+    /// `AWSCURRENT` would observe the difference.
+    async fn put_secret_value(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<SecretVersionRef, EcsTargetError> {
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            EcsTargetError::Api(format!(
+                "secretsmanager PutSecretValue: value for `{name}` is not valid UTF-8"
+            ))
+        })?;
+        let out = self
+            .secrets
+            .put_secret_value()
+            .secret_id(name)
+            .secret_string(text)
+            .client_request_token(secret_version_token(bytes))
+            .send()
+            .await
+            .map_err(|e| secrets_api("PutSecretValue", &e))?;
+        secret_version_from(out.arn(), out.version_id())
+    }
+
+    async fn delete_secret(&self, name: &str) -> Result<(), EcsTargetError> {
+        match self
+            .secrets
+            .delete_secret()
+            .secret_id(name)
+            .force_delete_without_recovery(true)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(secrets_api("DeleteSecret", &e)),
+        }
+    }
+
+    async fn ensure_log_group(
+        &self,
+        name: &str,
+        retention_days: i32,
+    ) -> Result<(), EcsTargetError> {
+        if !valid_log_retention_days(retention_days) {
+            return Err(invalid_retention(retention_days));
+        }
+        match self
+            .logs
+            .create_log_group()
+            .log_group_name(name)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_already_exists_exception()) => {}
+            Err(e) => return Err(logs_api("CreateLogGroup", &e)),
+        }
+        // Retention is (re)applied on every call so a changed answer converges.
+        self.logs
+            .put_retention_policy()
+            .log_group_name(name)
+            .retention_in_days(retention_days)
+            .send()
+            .await
+            .map_err(|e| logs_api("PutRetentionPolicy", &e))?;
+        Ok(())
+    }
+
+    async fn delete_log_group(&self, name: &str) -> Result<bool, EcsTargetError> {
+        match self
+            .logs
+            .delete_log_group()
+            .log_group_name(name)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(logs_api("DeleteLogGroup", &e)),
+        }
+    }
+}
+
+/// Error mapper for CloudWatch Logs calls, rendering the full SDK error chain.
+fn logs_api<E>(op: &str, err: &E) -> EcsTargetError
+where
+    E: std::error::Error + 'static,
+{
+    EcsTargetError::Api(format!(
+        "cloudwatchlogs {op}: {}",
+        aws_sdk_cloudwatchlogs::error::DisplayErrorContext(err)
+    ))
+}
+
+/// The service's desired task count as the SDK's `i32`, saturating.
+fn service_desired_count(spec: &ServiceSpec) -> i32 {
+    i32::try_from(spec.desired_count).unwrap_or(i32::MAX)
+}
+
+/// Error mapper for Secrets Manager calls, rendering the full SDK error chain.
+fn secrets_api<E>(op: &str, err: &E) -> EcsTargetError
+where
+    E: std::error::Error + 'static,
+{
+    EcsTargetError::Api(format!(
+        "secretsmanager {op}: {}",
+        aws_sdk_secretsmanager::error::DisplayErrorContext(err)
+    ))
+}
+
+/// The `greentic:owner` tag set stamped on a secret at creation.
+fn owner_tags(owner: &str) -> Result<Vec<aws_sdk_secretsmanager::types::Tag>, EcsTargetError> {
+    Ok(vec![
+        aws_sdk_secretsmanager::types::Tag::builder()
+            .key(SECRET_OWNER_TAG_KEY)
+            .value(owner)
+            .build(),
+    ])
+}
+
+/// The live owner stamp from a secret's tags; empty when unstamped.
+fn owner_from_tags(tags: &[aws_sdk_secretsmanager::types::Tag]) -> String {
+    tags.iter()
+        .find(|t| t.key() == Some(SECRET_OWNER_TAG_KEY))
+        .and_then(|t| t.value())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Build the [`SecretVersionRef`] from a `PutSecretValue` response; both parts
+/// are required for a version-pinned `valueFrom`.
+fn secret_version_from(
+    arn: Option<&str>,
+    version_id: Option<&str>,
+) -> Result<SecretVersionRef, EcsTargetError> {
+    match (arn, version_id) {
+        (Some(arn), Some(version_id)) => Ok(SecretVersionRef {
+            arn: arn.to_string(),
+            version_id: version_id.to_string(),
+        }),
+        _ => Err(EcsTargetError::Api(
+            "secretsmanager PutSecretValue: response carried no ARN or version id".to_string(),
+        )),
     }
 }
 
@@ -682,19 +1177,9 @@ fn api<E: std::fmt::Display>(op: &str, err: E) -> EcsTargetError {
     EcsTargetError::Api(format!("ecs {op}: {err}"))
 }
 
-/// Prefix shared by every deployment's ECS service name. Filters `ListServices`
-/// output to greentic-managed deployment services in the single-owner pool
-/// guard (`sibling_pool_bindings`), so unrelated services in the cluster are
-/// ignored.
-const SERVICE_NAME_PREFIX: &str = "gtc-svc-";
-
-/// Deterministic ECS service name for a deployment (one EXTERNAL-controller
-/// service per `deployment_id`). `pub(crate)` so the CLI deploy path can report
-/// the live service name in the `op env apply-revision` outcome without
-/// re-deriving the format.
-pub(crate) fn service_name(deployment_id: &DeploymentId) -> String {
-    format!("{SERVICE_NAME_PREFIX}{}", deployment_id.0)
-}
+// `service_name` / `SERVICE_NAME_PREFIX` live in `deploy_target` (compiled in every build) so the
+// teardown report can name services without this feature; re-exported here.
+pub(crate) use super::deploy_target::{SERVICE_NAME_PREFIX, service_name};
 
 /// Render a 128-bit id as a UUID-form (36-char) string for use as an ECS
 /// idempotency `clientToken` (the field accepts "up to 36 ASCII characters in
@@ -750,8 +1235,20 @@ fn active_service_exists(out: &DescribeServicesOutput, name: &str) -> bool {
 
 /// The container definition for a revision: the single essential container
 /// running the revision's image, exposing the launch config's container port.
-fn container_def(launch: &FargateLaunchConfig, image: &str) -> ContainerDefinition {
-    ContainerDefinition::builder()
+///
+/// `log` is `(log group, region)` for the awslogs driver; `seed` mounts the
+/// shared seed volume read-only and waits for `seed-init` to exit 0.
+// `readonlyRootFilesystem` stays unset (false): `HOME=/tmp` must be writable and
+// the decision record leaves read-only rootfs as an open item.
+fn container_def(
+    launch: &FargateLaunchConfig,
+    image: &str,
+    env: &[(String, String)],
+    secret_env: &[SecretEnvRef],
+    log: Option<(&str, &str)>,
+    seed: bool,
+) -> Result<ContainerDefinition, EcsTargetError> {
+    let mut b = ContainerDefinition::builder()
         .name(&launch.container_name)
         .image(image)
         .essential(true)
@@ -759,27 +1256,137 @@ fn container_def(launch: &FargateLaunchConfig, image: &str) -> ContainerDefiniti
             PortMapping::builder()
                 .container_port(launch.container_port)
                 .build(),
-        )
+        );
+    for (name, value) in env {
+        b = b.environment(KeyValuePair::builder().name(name).value(value).build());
+    }
+    for s in secret_env {
+        b = b.secrets(secret_entry(&s.name, &s.value_from_arn)?);
+    }
+    if let Some((group, region)) = log {
+        b = b.log_configuration(awslogs_config(group, region, &launch.container_name)?);
+    }
+    if seed {
+        b = b.mount_points(seed_mount(true)).depends_on(built(
+            "container dependency",
+            ContainerDependency::builder()
+                .container_name(SEED_INIT_CONTAINER)
+                .condition(ContainerCondition::Success)
+                .build(),
+        )?);
+    }
+    Ok(b.build())
+}
+
+/// Map an SDK builder's missing-required-field error to a seam error rather
+/// than panicking: the inputs come from operator answers, so a gap is an
+/// operator-visible failure, not a bug to crash on.
+fn built<T>(what: &str, result: Result<T, BuildError>) -> Result<T, EcsTargetError> {
+    result.map_err(|e| EcsTargetError::Api(format!("building the {what}: {e}")))
+}
+
+fn secret_entry(name: &str, value_from: &str) -> Result<Secret, EcsTargetError> {
+    built(
+        "secret reference",
+        Secret::builder().name(name).value_from(value_from).build(),
+    )
+}
+
+fn awslogs_config(
+    group: &str,
+    region: &str,
+    stream_prefix: &str,
+) -> Result<LogConfiguration, EcsTargetError> {
+    built(
+        "awslogs configuration",
+        LogConfiguration::builder()
+            .log_driver(LogDriver::Awslogs)
+            .options("awslogs-group", group)
+            .options("awslogs-region", region)
+            .options("awslogs-stream-prefix", stream_prefix)
+            .build(),
+    )
+}
+
+/// The ECS tag carrying a task definition's revision intent.
+fn intent_tag(intent: &str) -> EcsTag {
+    EcsTag::builder()
+        .key(REVISION_INTENT_TAG_KEY)
+        .value(intent)
         .build()
 }
 
+/// The revision intent stamped on a task definition; `None` when unstamped or
+/// blank.
+fn intent_from_tags(tags: &[EcsTag]) -> Option<String> {
+    tags.iter()
+        .find(|t| t.key() == Some(REVISION_INTENT_TAG_KEY))
+        .and_then(|t| t.value())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn seed_mount(read_only: bool) -> MountPoint {
+    MountPoint::builder()
+        .source_volume(SEED_VOLUME)
+        .container_path(SEED_MOUNT_DIR)
+        .read_only(read_only)
+        .build()
+}
+
+/// Task-level bind-mount volume (no `host`, so Fargate ephemeral storage)
+/// shared by `seed-init` and the worker.
+fn seed_volume() -> Volume {
+    Volume::builder().name(SEED_VOLUME).build()
+}
+
+/// The non-essential init container: seed secrets arrive as env vars, are
+/// written under `/seed`, and verified against their SHA-256.
+fn seed_init_container(seed: &SeedInit) -> Result<ContainerDefinition, EcsTargetError> {
+    let script = seed_init::script(&seed.files)
+        .map_err(|e| EcsTargetError::Api(format!("seed-init: {e}")))?;
+    let mut b = ContainerDefinition::builder()
+        .name(SEED_INIT_CONTAINER)
+        .image(&seed.image)
+        .essential(false)
+        .command("sh")
+        .command("-c")
+        .command(script)
+        .mount_points(seed_mount(false));
+    for f in &seed.files {
+        b = b
+            .secrets(secret_entry(
+                &seed_init::content_var(f),
+                &f.secret_value_from,
+            )?)
+            .environment(
+                KeyValuePair::builder()
+                    .name(seed_init::sha_var(f))
+                    .value(&f.sha256_hex)
+                    .build(),
+            );
+    }
+    Ok(b.build())
+}
+
 /// The awsvpc network configuration for the task set's Fargate ENIs.
-fn network_config(launch: &FargateLaunchConfig) -> NetworkConfiguration {
+fn network_config(launch: &FargateLaunchConfig) -> Result<NetworkConfiguration, EcsTargetError> {
     let assign = if launch.assign_public_ip {
         AssignPublicIp::Enabled
     } else {
         AssignPublicIp::Disabled
     };
-    NetworkConfiguration::builder()
-        .awsvpc_configuration(
-            AwsVpcConfiguration::builder()
-                .set_subnets(Some(launch.subnets.clone()))
-                .set_security_groups(Some(launch.security_groups.clone()))
-                .assign_public_ip(assign)
-                .build()
-                .expect("awsvpc subnets are set"),
-        )
-        .build()
+    let vpc = built(
+        "awsvpc configuration",
+        AwsVpcConfiguration::builder()
+            .set_subnets(Some(launch.subnets.clone()))
+            .set_security_groups(Some(launch.security_groups.clone()))
+            .assign_public_ip(assign)
+            .build(),
+    )?;
+    Ok(NetworkConfiguration::builder()
+        .awsvpc_configuration(vpc)
+        .build())
 }
 
 /// The load-balancer binding for the task set: register the launch config's
@@ -869,6 +1476,30 @@ fn task_set_for_delete(out: &DescribeTaskSetsOutput, external_id: &str) -> Optio
         id: ts.id()?.to_string(),
         task_definition: ts.task_definition().map(str::to_string),
     })
+}
+
+/// True for the ECS error codes that mean the deployment's service no longer
+/// exists (or is draining), so its task sets are already gone. A missing
+/// cluster (`ClusterNotFoundException`) is a different fact and stays an error.
+fn is_service_gone_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("ServiceNotFoundException" | "ServiceNotActiveException")
+    )
+}
+
+/// Every task set in a DescribeTaskSets response, for deleting a whole service.
+/// Entries without an id cannot be addressed and are skipped.
+fn all_task_sets_for_delete(out: &DescribeTaskSetsOutput) -> Vec<TaskSetToDelete> {
+    out.task_sets()
+        .iter()
+        .filter_map(|ts| {
+            Some(TaskSetToDelete {
+                id: ts.id()?.to_string(),
+                task_definition: ts.task_definition().map(str::to_string),
+            })
+        })
+        .collect()
 }
 
 /// Find the task set carrying our `externalId` in a DescribeTaskSets response.
@@ -1046,8 +1677,13 @@ fn forward_action(tuples: &[(u32, String)]) -> Result<Action, EcsTargetError> {
 /// to the API's 999 ceiling (only a lone 100% revision hits it, and a single
 /// non-zero tuple takes all traffic regardless).
 fn elb_weight(weight_bps: u32) -> i32 {
-    (weight_bps / 10).min(999) as i32
+    (weight_bps / ELB_WEIGHT_GRANULARITY_BPS).min(999) as i32
 }
+
+/// Finest split weight (in bps) an ALB forward action can express: one ELB
+/// weight unit. The CLI preflights recorded splits against this same constant,
+/// so a weight `elb_weight` would truncate is refused before it is applied.
+pub(crate) const ELB_WEIGHT_GRANULARITY_BPS: u32 = 10;
 
 /// Build the ELBv2 rule conditions for a deployment's routing: a host-header
 /// condition and/or a path-pattern condition (ELBv2 AND-combines them when both
@@ -1177,10 +1813,56 @@ fn routing_summary(routing: &ListenerRouting) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::deploy_target::SeedFile;
     use super::*;
     use aws_sdk_ecs::types::{Service, TaskDefinition};
     use aws_sdk_elasticloadbalancingv2::types::TargetGroup;
     use ulid::Ulid;
+
+    #[test]
+    fn intent_tag_round_trips_and_missing_or_blank_reads_none() {
+        assert_eq!(
+            intent_from_tags(&[intent_tag("abc")]),
+            Some("abc".to_string())
+        );
+        assert_eq!(intent_from_tags(&[]), None);
+        assert_eq!(intent_from_tags(&[intent_tag("")]), None);
+        let other = EcsTag::builder().key("k").value("v").build();
+        assert_eq!(intent_from_tags(&[other]), None);
+    }
+
+    #[test]
+    fn owner_tag_round_trips_and_missing_tag_reads_empty() {
+        let tags = owner_tags("env-abc").unwrap();
+        assert_eq!(tags[0].key(), Some("greentic:owner"));
+        assert_eq!(owner_from_tags(&tags), "env-abc");
+        assert_eq!(owner_from_tags(&[]), "");
+    }
+
+    #[test]
+    fn secret_version_from_requires_arn_and_version() {
+        let ok = secret_version_from(Some("arn:x"), Some("v1")).unwrap();
+        assert_eq!(ok.value_from(), "arn:x:::v1");
+        assert!(secret_version_from(Some("arn:x"), None).is_err());
+        assert!(secret_version_from(None, Some("v1")).is_err());
+    }
+
+    #[test]
+    fn secret_version_token_is_64_lowercase_hex_and_content_derived() {
+        let t = secret_version_token(b"abc");
+        assert_eq!(t.len(), 64);
+        assert!(
+            t.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_eq!(t, secret_version_token(b"abc"));
+        assert_ne!(t, secret_version_token(b"abd"));
+        // Known SHA-256 of "abc".
+        assert_eq!(
+            t,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn launch() -> FargateLaunchConfig {
         FargateLaunchConfig {
@@ -1245,7 +1927,7 @@ mod tests {
 
     #[test]
     fn container_def_carries_image_name_and_port() {
-        let cd = container_def(&launch(), "registry/img:rev-rev1");
+        let cd = container_def(&launch(), "registry/img:rev-rev1", &[], &[], None, false).unwrap();
         assert_eq!(cd.name(), Some("worker"));
         assert_eq!(cd.image(), Some("registry/img:rev-rev1"));
         assert_eq!(cd.essential(), Some(true));
@@ -1254,8 +1936,114 @@ mod tests {
     }
 
     #[test]
+    fn container_def_without_extras_is_unchanged() {
+        let cd = container_def(&launch(), "img", &[], &[], None, false).unwrap();
+        assert!(cd.environment().is_empty());
+        assert!(cd.secrets().is_empty());
+        assert!(cd.log_configuration().is_none());
+        assert!(cd.mount_points().is_empty());
+        assert!(cd.depends_on().is_empty());
+    }
+
+    #[test]
+    fn ensure_service_records_desired_count() {
+        let spec = |n| ServiceSpec {
+            deployment_id: dep(),
+            cluster: "c".to_string(),
+            region: "r".to_string(),
+            desired_count: n,
+        };
+        assert_eq!(service_desired_count(&spec(3)), 3);
+        assert_eq!(service_desired_count(&spec(u32::MAX)), i32::MAX);
+    }
+
+    #[test]
+    fn container_def_sets_environment_and_secrets_and_log_config() {
+        let env = vec![("GREENTIC_ENV".to_string(), "dev".to_string())];
+        let secrets = vec![SecretEnvRef {
+            name: "OTLP_HEADERS".to_string(),
+            value_from_arn: "arn:aws:secretsmanager:us-east-1:1:secret:h:::v1".to_string(),
+        }];
+        let cd = container_def(
+            &launch(),
+            "img",
+            &env,
+            &secrets,
+            Some(("/ecs/gtc", "us-east-1")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(cd.environment()[0].name(), Some("GREENTIC_ENV"));
+        assert_eq!(cd.environment()[0].value(), Some("dev"));
+        assert_eq!(cd.secrets()[0].name(), "OTLP_HEADERS");
+        assert_eq!(
+            cd.secrets()[0].value_from(),
+            "arn:aws:secretsmanager:us-east-1:1:secret:h:::v1"
+        );
+        let log = cd.log_configuration().expect("log config");
+        assert_eq!(log.log_driver(), &LogDriver::Awslogs);
+        let opts = log.options().unwrap();
+        assert_eq!(
+            opts.get("awslogs-group").map(String::as_str),
+            Some("/ecs/gtc")
+        );
+        assert_eq!(
+            opts.get("awslogs-region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            opts.get("awslogs-stream-prefix").map(String::as_str),
+            Some("worker")
+        );
+    }
+
+    #[test]
+    fn seed_init_container_volume_and_worker_dependency_follow_the_decision_record() {
+        let seed = SeedInit {
+            image: "busybox@sha256:abc".to_string(),
+            files: vec![SeedFile {
+                name: "environment.json".to_string(),
+                secret_value_from: "arn:aws:secretsmanager:r:1:secret:e:::v7".to_string(),
+                sha256_hex: "cd".repeat(32),
+            }],
+        };
+        let init = seed_init_container(&seed).unwrap();
+        assert_eq!(init.name(), Some("seed-init"));
+        assert_eq!(init.essential(), Some(false));
+        assert_eq!(init.image(), Some("busybox@sha256:abc"));
+        assert_eq!(init.mount_points()[0].source_volume(), Some("seed"));
+        assert_eq!(init.mount_points()[0].container_path(), Some("/seed"));
+        assert_eq!(init.mount_points()[0].read_only(), Some(false));
+        assert_eq!(init.secrets()[0].name(), "GREENTIC_SEED_ENVIRONMENT_JSON");
+        assert_eq!(
+            init.secrets()[0].value_from(),
+            "arn:aws:secretsmanager:r:1:secret:e:::v7"
+        );
+        let sha = init
+            .environment()
+            .iter()
+            .find(|e| e.name() == Some("GREENTIC_SEED_ENVIRONMENT_JSON_SHA256"))
+            .expect("sha env");
+        assert_eq!(sha.value(), Some("cd".repeat(32).as_str()));
+        assert_eq!(init.command()[0], "sh");
+        assert_eq!(init.command()[1], "-c");
+
+        assert_eq!(seed_volume().name(), Some("seed"));
+
+        let worker = container_def(&launch(), "img", &[], &[], None, true).unwrap();
+        assert_eq!(worker.mount_points()[0].source_volume(), Some("seed"));
+        assert_eq!(worker.mount_points()[0].container_path(), Some("/seed"));
+        assert_eq!(worker.mount_points()[0].read_only(), Some(true));
+        assert_eq!(worker.depends_on()[0].container_name(), "seed-init");
+        assert_eq!(
+            worker.depends_on()[0].condition(),
+            &ContainerCondition::Success
+        );
+    }
+
+    #[test]
     fn network_config_maps_subnets_security_groups_and_public_ip() {
-        let nc = network_config(&launch());
+        let nc = network_config(&launch()).unwrap();
         let vpc = nc.awsvpc_configuration().expect("awsvpc config present");
         assert_eq!(vpc.subnets(), ["subnet-a", "subnet-b"]);
         assert_eq!(vpc.security_groups(), ["sg-1"]);
@@ -1263,7 +2051,7 @@ mod tests {
 
         let mut public = launch();
         public.assign_public_ip = true;
-        let nc = network_config(&public);
+        let nc = network_config(&public).unwrap();
         assert_eq!(
             nc.awsvpc_configuration().unwrap().assign_public_ip(),
             Some(&AssignPublicIp::Enabled)
@@ -1698,6 +2486,15 @@ mod tests {
     /// credentials preflight's validated verb list, so a role that passes
     /// `gtc op credentials requirements` can actually warm / shift / archive.
     #[test]
+    fn service_gone_codes_are_recognised_and_a_missing_cluster_is_not() {
+        assert!(is_service_gone_code(Some("ServiceNotFoundException")));
+        assert!(is_service_gone_code(Some("ServiceNotActiveException")));
+        assert!(!is_service_gone_code(Some("ClusterNotFoundException")));
+        assert!(!is_service_gone_code(Some("AccessDeniedException")));
+        assert!(!is_service_gone_code(None));
+    }
+
+    #[test]
     fn real_target_iam_actions_are_a_subset_of_validated_verbs() {
         use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;
         for action in REAL_ECS_TARGET_IAM_ACTIONS {
@@ -1708,6 +2505,101 @@ mod tests {
                  role does not fail on the first live deploy"
             );
         }
+    }
+
+    /// The SDK-call table, the declared action list and the validated verbs are
+    /// one set: every operation's verb is declared and validated, and nothing is
+    /// declared that no operation needs. The table's operations are also proven
+    /// to still be called in this file.
+    #[test]
+    fn every_verb_the_real_target_needs_is_validated() {
+        use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;
+        let source = include_str!("real_target.rs");
+        for (op, verb) in REAL_ECS_TARGET_SDK_CALLS {
+            assert!(
+                source.contains(&format!(".{op}()")),
+                "table names SDK operation `{op}` but real_target.rs never calls it"
+            );
+            assert!(
+                REAL_ECS_TARGET_IAM_ACTIONS.contains(verb),
+                "`{op}` needs `{verb}` but REAL_ECS_TARGET_IAM_ACTIONS omits it"
+            );
+            assert!(
+                VALIDATED_IAM_VERBS.contains(verb),
+                "`{op}` needs `{verb}` but the preflight does not validate it"
+            );
+        }
+        for action in REAL_ECS_TARGET_IAM_ACTIONS {
+            assert!(
+                REAL_ECS_TARGET_SDK_CALLS.iter().any(|(_, v)| v == action),
+                "`{action}` is declared but no SDK operation in the table needs it"
+            );
+        }
+    }
+
+    /// An env whose only split weights its revisions 1 bps off a whole granule.
+    fn finer_than_one_granule_env() -> greentic_deploy_spec::Environment {
+        use crate::cli::tests_common::{
+            make_bundle_deployment, make_env, make_revision, make_traffic_split,
+        };
+        use greentic_deploy_spec::{RevisionLifecycle, TrafficSplitEntry};
+        let mut env = make_env("local");
+        let d = make_bundle_deployment("local", "bundle-a");
+        let r1 = make_revision(
+            "local",
+            "bundle-a",
+            &d.deployment_id,
+            1,
+            RevisionLifecycle::Ready,
+        );
+        let r2 = make_revision(
+            "local",
+            "bundle-a",
+            &d.deployment_id,
+            2,
+            RevisionLifecycle::Ready,
+        );
+        let mut split = make_traffic_split(
+            "local",
+            "bundle-a",
+            &d.deployment_id,
+            &r1.revision_id,
+            "01J000000000000000000000AC",
+        );
+        split.entries = vec![
+            TrafficSplitEntry {
+                revision_id: r1.revision_id,
+                weight_bps: ELB_WEIGHT_GRANULARITY_BPS + 1,
+            },
+            TrafficSplitEntry {
+                revision_id: r2.revision_id,
+                weight_bps: 10_000 - ELB_WEIGHT_GRANULARITY_BPS - 1,
+            },
+        ];
+        env.bundles.push(d);
+        env.revisions.extend([r1, r2]);
+        env.traffic_splits.push(split);
+        env
+    }
+
+    /// The preflight granularity is the unit `elb_weight` divides by: one
+    /// granule is ELB weight 1, and a split one bps finer is refused by the
+    /// real preflight (not merely by arithmetic on the constant).
+    #[test]
+    fn preflight_granularity_matches_elb_weight() {
+        use crate::cli::env::preflight_split_granularity;
+        assert_eq!(elb_weight(ELB_WEIGHT_GRANULARITY_BPS), 1);
+        let err = preflight_split_granularity(
+            &finer_than_one_granule_env(),
+            ELB_WEIGHT_GRANULARITY_BPS,
+            "ALB",
+            "0.1%",
+            None,
+        );
+        assert!(
+            err.is_err(),
+            "a weight finer than one ELB unit must be refused"
+        );
     }
 
     /// The bound-session injection maps all three STS parts onto the static

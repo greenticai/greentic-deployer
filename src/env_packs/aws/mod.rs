@@ -25,6 +25,7 @@
 //! through the env-pack registry, which is the honest answer for a binary
 //! built without AWS support.
 
+pub(crate) mod boot_env;
 pub mod bootstrap;
 // Only the `deploy-aws-ecs` live-deploy path consumes the bound session
 // (`RealEcsTarget` injects it as a static credentials provider), so gate it the
@@ -36,6 +37,12 @@ pub mod deploy_target;
 pub mod deployer;
 #[cfg(feature = "deploy-aws-ecs")]
 pub mod real_target;
+pub(crate) mod registry_credential;
+pub(crate) mod revision_intent;
+pub(crate) mod seed_init;
+pub(crate) mod seed_stage;
+#[cfg(feature = "deploy-aws-ecs")]
+pub(crate) mod teardown;
 
 use greentic_deploy_spec::CapabilitySlot;
 use semver::VersionReq;
@@ -44,6 +51,24 @@ use super::slot::EnvPackHandler;
 use crate::tool_check::ToolCheck;
 
 pub use credentials::{AwsDeployerCredentials, AwsValidatorClient};
+
+/// Raw dev-store bytes. `Debug` redacts the content: the handler derives
+/// `Debug` and these bytes are credentials. (The GCP Cloud Run handler holds
+/// its dev secrets the same way and is not changed here.)
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DevSecrets(Vec<u8>);
+
+impl DevSecrets {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DevSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted {} bytes>", self.0.len())
+    }
+}
 
 /// Native handler for the AWS-ECS deployer env-pack.
 #[derive(Debug)]
@@ -55,6 +80,9 @@ pub struct AwsEcsDeployerHandler {
     /// verbs honestly); the real aws-sdk-backed target is wired in a follow-up
     /// PR behind the `deploy-aws-ecs` feature.
     pub(crate) target: std::sync::Arc<dyn deploy_target::EcsDeployTarget>,
+    /// Raw `.dev.secrets.env` bytes the CLI read from the env's store, staged
+    /// as the second seed file. `None` for an env with no dev store.
+    pub(crate) dev_secrets: Option<DevSecrets>,
 }
 
 impl Default for AwsEcsDeployerHandler {
@@ -62,6 +90,7 @@ impl Default for AwsEcsDeployerHandler {
         Self {
             creds: AwsDeployerCredentials::default(),
             target: std::sync::Arc::new(deploy_target::UnconfiguredEcsTarget),
+            dev_secrets: None,
         }
     }
 }
@@ -83,15 +112,26 @@ impl AwsEcsDeployerHandler {
         Self {
             creds: AwsDeployerCredentials::with_client(client),
             target: std::sync::Arc::new(deploy_target::UnconfiguredEcsTarget),
+            dev_secrets: None,
         }
     }
 
     /// Construct with a pluggable deploy-target seam. Tests pass the in-memory
     /// fake; the orchestration wiring passes a connected aws-sdk-backed target.
     pub fn with_target(target: std::sync::Arc<dyn deploy_target::EcsDeployTarget>) -> Self {
+        Self::with_target_and_dev_secrets(target, None)
+    }
+
+    /// [`Self::with_target`] plus the env's dev-store bytes, staged by
+    /// `warm_revision` as `/seed/.greentic/dev/.dev.secrets.env`.
+    pub fn with_target_and_dev_secrets(
+        target: std::sync::Arc<dyn deploy_target::EcsDeployTarget>,
+        dev_secrets: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             creds: AwsDeployerCredentials::default(),
             target,
+            dev_secrets: dev_secrets.map(DevSecrets),
         }
     }
 }
@@ -138,6 +178,19 @@ impl EnvPackHandler for AwsEcsDeployerHandler {
 mod tests {
     use super::*;
     use greentic_deploy_spec::PackDescriptor;
+
+    /// `op env destroy` recognizes an ECS env for provider teardown by matching
+    /// the descriptor string in the store's feature-independent list. Guards
+    /// that list against drifting from the handler's canonical `DESCRIPTOR_PATH`.
+    #[test]
+    fn descriptor_path_is_registered_for_provider_teardown() {
+        assert!(
+            crate::environment::PROVIDER_TEARDOWN_DESCRIPTORS
+                .contains(&AwsEcsDeployerHandler::DESCRIPTOR_PATH),
+            "PROVIDER_TEARDOWN_DESCRIPTORS must include the aws-ecs descriptor so \
+             `op env destroy` tears down its resources"
+        );
+    }
 
     #[test]
     fn handler_serves_deployer_slot_with_aws_ecs_path() {
@@ -219,5 +272,20 @@ mod tests {
             spec.questions.iter().any(|q| q.id == "target_group_arns"),
             "aws-ecs wizard must collect the target-group pool",
         );
+    }
+
+    #[test]
+    fn debug_of_the_handler_never_prints_dev_secret_bytes() {
+        let handler = AwsEcsDeployerHandler::with_target_and_dev_secrets(
+            std::sync::Arc::new(deploy_target::UnconfiguredEcsTarget),
+            Some(b"SUPERSECRET".to_vec()),
+        );
+        let shown = format!("{handler:?}");
+        assert!(!shown.contains("SUPERSECRET"), "{shown}");
+        assert!(
+            !shown.contains("83, 85, 80"),
+            "bytes leaked as a list: {shown}"
+        );
+        assert!(shown.contains("<redacted 11 bytes>"), "{shown}");
     }
 }

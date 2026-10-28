@@ -13,10 +13,16 @@ pub mod deployer;
 pub mod gcp_cloudrun;
 pub mod k8s;
 pub mod local_process;
+#[cfg(any(feature = "creds-aws", feature = "creds-gcp"))]
+pub(crate) mod owner_stamp;
 pub mod registry;
 pub mod render;
 pub mod slot;
 pub mod telemetry;
+
+/// Public GHCR repository of the runtime image every cloud lane deploys.
+#[cfg(any(feature = "creds-aws", feature = "creds-gcp"))]
+pub(crate) const RUNTIME_IMAGE_REPO: &str = "ghcr.io/greenticai/greentic-start-distroless";
 
 #[cfg(feature = "creds-aws")]
 pub use aws::{AwsDeployerCredentials, AwsEcsDeployerHandler, AwsValidatorClient};

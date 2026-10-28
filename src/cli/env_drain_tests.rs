@@ -54,6 +54,45 @@ fn capabilities_is_honest_about_cloud_run_multi_instance() {
     assert!(notes.contains("/tmp"), "{notes}");
 }
 
+#[cfg(feature = "creds-aws")]
+#[test]
+fn capabilities_reports_the_aws_ecs_flags() {
+    let (_d, store) = store_with("greentic.deployer.aws-ecs@1.0.0");
+    let out = capabilities(
+        &store,
+        &EnvPackRegistry::with_builtins(),
+        &OpFlags::default(),
+        "zain",
+        None,
+    )
+    .unwrap();
+    let caps = &out.result["capabilities"];
+    assert_eq!(caps["drain"], false);
+    assert_eq!(caps["traffic_split"], true);
+    assert_eq!(caps["ingress_managed"], false);
+    assert_eq!(caps["private_registry_auth"], true);
+    assert_eq!(caps["multi_instance_safe"], false);
+    assert_eq!(caps["remove"], true);
+    assert_eq!(caps["runtime_pin"], false);
+}
+
+#[cfg(feature = "creds-aws")]
+#[test]
+fn aws_ecs_capability_notes_state_the_single_task_and_operator_provided_ingress() {
+    let (_d, store) = store_with("greentic.deployer.aws-ecs@1.0.0");
+    let out = capabilities(
+        &store,
+        &EnvPackRegistry::with_builtins(),
+        &OpFlags::default(),
+        "zain",
+        None,
+    )
+    .unwrap();
+    let notes = out.result["notes"].to_string();
+    assert!(notes.contains("scale-to-zero"), "{notes}");
+    assert!(notes.contains("operator-provided"), "{notes}");
+}
+
 /// k8s builds without `creds-gcp`, so its half of the runtime_pin claim is
 /// asserted ungated (unified update L2b: it declares it, like Cloud Run).
 #[test]

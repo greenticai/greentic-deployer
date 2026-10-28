@@ -107,12 +107,15 @@ questions:
 
   - id: ecr_repository_prefix
     type: string
-    title: ECR repository prefix
+    title: ECR repository prefix (optional)
     description: >-
-      Prefix appended to every revision's container image (e.g.
-      `<account>.dkr.ecr.<region>.amazonaws.com/greentic/`). The
-      deployer's `ecr:PutImage` IAM probe is scoped to this prefix.
-    required: true
+      Reserved for bundle delivery: the ECR repository prefix the
+      deployment's bundles will live under (e.g.
+      `<account>.dkr.ecr.<region>.amazonaws.com/greentic/`). It does not
+      change what a revision runs: the worker runs the public runtime image
+      and reads its bundle reference from the seeded `environment.json`.
+      Today the deploy records it and nothing else reads it.
+    required: false
     constraint:
       min_len: 1
       pattern: '^[a-zA-Z0-9._/-]+$'
@@ -156,11 +159,12 @@ questions:
 
   - id: container_image_tag_prefix
     type: string
-    title: Container image tag prefix
+    title: Container image tag prefix (optional)
     description: >-
-      Prefix every revision's image tag is built from (e.g. `rev-`).
-      Combined with the revision ULID at deploy time. Leave blank to
-      tag with the raw revision ULID.
+      Reserved for bundle delivery: the tag prefix (e.g. `rev-`) bundle
+      references will use beside the revision ULID. It does not change
+      what a revision runs; today the deploy records it and nothing else
+      reads it.
     required: false
     default_value: "rev-"
     constraint:
@@ -284,3 +288,91 @@ questions:
     required: false
     constraint:
       min_len: 1
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Scaling, runtime pin and tenant scope (ECS Fargate parity).
+  # `telemetry_env` / `telemetry_headers` are structured answers parsed by
+  # `env_packs::telemetry`; like on GCP they are not wizard questions.
+  # `oci_username` / `oci_password` (the registry credential for the worker's
+  # bundle pull) are likewise answers the designer supplies, not questions:
+  # this wizard never collects credential material.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - id: min_instances
+    type: string
+    title: Min tasks
+    description: >-
+      Warm tasks kept per service. At least `1`: runtime state lives in the
+      task's memory, so a service never scales to zero.
+    required: false
+    default_value: "1"
+    constraint:
+      pattern: '^[1-9][0-9]*$'
+
+  - id: max_instances
+    type: string
+    title: Max tasks
+    description: >-
+      Maximum tasks per service. Fixed at `1`: sessions, flow state and
+      revision pins live per task in memory. Any other value is refused.
+    required: false
+    default_value: "1"
+    constraint:
+      pattern: '^1$'
+
+  - id: runtime_image_tag
+    type: string
+    title: Runtime image tag
+    description: >-
+      Tag of the `greentic-start-distroless` runtime image to deploy (e.g.
+      `develop`). Ignored when a digest is set.
+    required: false
+    default_value: "develop"
+    constraint:
+      pattern: '^[a-zA-Z0-9_.-]+$'
+
+  - id: runtime_image_digest
+    type: string
+    title: Runtime image digest (recommended)
+    description: >-
+      RECOMMENDED. Pin the runtime image by digest (`sha256:<64 hex>`) so a
+      cold start or rollback always pulls the exact image. Overrides the tag.
+    required: false
+    constraint:
+      pattern: '^sha256:[a-f0-9]{64}$'
+
+  - id: secret_prefix
+    type: string
+    title: Secret name prefix (optional)
+    description: >-
+      Prefix for the per-env secrets the deploy stages. Leave blank to
+      default to `gtc-<env>`.
+    required: false
+
+  - id: log_retention_days
+    type: string
+    title: Log retention (days)
+    description: >-
+      How long the deployment's CloudWatch log group keeps entries. Must be a
+      value CloudWatch Logs accepts (1, 3, 5, 7, 14, 30, 60, 90, 120, 150,
+      180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653).
+    required: false
+    default_value: "30"
+    constraint:
+      pattern: '^(1|3|5|7|14|30|60|90|120|150|180|365|400|545|731|1096|1827|2192|2557|2922|3288|3653)$'
+
+  - id: runtime_tenant
+    type: string
+    title: Runtime tenant (optional)
+    description: >-
+      Tenant the deployed runtime resolves its secrets under. Leave blank for
+      the runtime default.
+    required: false
+
+  - id: runtime_team
+    type: string
+    title: Runtime team (optional)
+    description: >-
+      Team the deployed runtime resolves its secrets under. Leave blank for
+      the runtime default.
+    required: false
