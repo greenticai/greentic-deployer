@@ -595,6 +595,7 @@ impl Deployer for K8sDeployerHandler {
             remove: true,
             runtime_pin: true,
             scale_out_answers: true,
+            infra_secret_category: true,
         }
     }
 
@@ -613,6 +614,8 @@ impl Deployer for K8sDeployerHandler {
              always runs the runtime_image answer and moves only when that answer is edited \
              (after every unit is on the new worker)",
             "scale_out_answers: `replicas` > 1 is accepted only with `redis_url`; default 1",
+            "infra_secret_category: `infra`-category secrets are written at the `default` env \
+             segment, where the runtime reads them",
         ]
     }
 

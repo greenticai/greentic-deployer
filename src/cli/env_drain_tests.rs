@@ -263,3 +263,53 @@ fn cloud_run_reports_scale_out_answers() {
     // Reporting the answers is not a claim that scaling out is safe by itself.
     assert_eq!(out.result["capabilities"]["multi_instance_safe"], false);
 }
+
+#[test]
+fn k8s_reports_infra_secret_category() {
+    let (_d, store) = store_with("greentic.deployer.k8s@1.0.0");
+    let out = capabilities(
+        &store,
+        &EnvPackRegistry::with_builtins(),
+        &OpFlags::default(),
+        "zain",
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.result["capabilities"]["infra_secret_category"], true);
+    assert!(
+        !out.result["missing"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("infra_secret_category"))
+    );
+}
+
+#[cfg(feature = "creds-gcp")]
+#[test]
+fn cloud_run_reports_infra_secret_category() {
+    let (_d, store) = store_with("greentic.deployer.gcp-cloudrun@1.0.0");
+    let out = capabilities(
+        &store,
+        &EnvPackRegistry::with_builtins(),
+        &OpFlags::default(),
+        "zain",
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.result["capabilities"]["infra_secret_category"], true);
+}
+
+#[cfg(feature = "creds-aws")]
+#[test]
+fn aws_ecs_does_not_claim_infra_secret_category() {
+    let (_d, store) = store_with("greentic.deployer.aws-ecs@1.0.0");
+    let out = capabilities(
+        &store,
+        &EnvPackRegistry::with_builtins(),
+        &OpFlags::default(),
+        "zain",
+        None,
+    )
+    .unwrap();
+    assert_eq!(out.result["capabilities"]["infra_secret_category"], false);
+}

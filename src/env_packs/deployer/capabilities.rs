@@ -36,11 +36,16 @@ pub enum Capability {
     /// keys to a deployer that does not report this: older ones refuse them
     /// as unknown answer keys (k8s) or accept `max_instances` with no gate.
     ScaleOutAnswers,
+    /// The deployer writes `infra`-category secrets (`op secrets put`) at the
+    /// `default` env segment, where the runtime reads them. A client must not
+    /// stage infra connections through a deployer that does not report this:
+    /// it would write them under the environment id and nothing reads them.
+    InfraSecretCategory,
 }
 
 impl Capability {
     /// Every capability, in report order.
-    pub const ALL: [Capability; 8] = [
+    pub const ALL: [Capability; 9] = [
         Capability::Drain,
         Capability::TrafficSplit,
         Capability::IngressManaged,
@@ -49,6 +54,7 @@ impl Capability {
         Capability::Remove,
         Capability::RuntimePin,
         Capability::ScaleOutAnswers,
+        Capability::InfraSecretCategory,
     ];
 
     /// Wire name (matches the serde spelling).
@@ -62,6 +68,7 @@ impl Capability {
             Capability::Remove => "remove",
             Capability::RuntimePin => "runtime_pin",
             Capability::ScaleOutAnswers => "scale_out_answers",
+            Capability::InfraSecretCategory => "infra_secret_category",
         }
     }
 }
@@ -91,6 +98,7 @@ pub struct AdapterCapabilities {
     pub remove: bool,
     pub runtime_pin: bool,
     pub scale_out_answers: bool,
+    pub infra_secret_category: bool,
 }
 
 impl AdapterCapabilities {
@@ -104,6 +112,7 @@ impl AdapterCapabilities {
         remove: false,
         runtime_pin: false,
         scale_out_answers: false,
+        infra_secret_category: false,
     };
 
     /// Whether `capability` is present.
@@ -117,6 +126,7 @@ impl AdapterCapabilities {
             Capability::Remove => self.remove,
             Capability::RuntimePin => self.runtime_pin,
             Capability::ScaleOutAnswers => self.scale_out_answers,
+            Capability::InfraSecretCategory => self.infra_secret_category,
         }
     }
 
@@ -197,6 +207,18 @@ mod tests {
     }
 
     #[test]
+    fn the_capability_report_lists_nine_wire_names() {
+        assert_eq!(Capability::ALL.len(), 9);
+        for c in Capability::ALL {
+            assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
+        }
+        assert_eq!(
+            Capability::InfraSecretCategory.as_str(),
+            "infra_secret_category"
+        );
+    }
+
+    #[test]
     fn report_serializes_wire_names_and_missing() {
         let caps = AdapterCapabilities {
             drain: true,
@@ -214,7 +236,8 @@ mod tests {
                 "private_registry_auth",
                 "multi_instance_safe",
                 "runtime_pin",
-                "scale_out_answers"
+                "scale_out_answers",
+                "infra_secret_category"
             ])
         );
         for c in Capability::ALL {
