@@ -207,6 +207,7 @@ fn aws_answers() -> Value {
         ("GTC_AWS_E2E_ROUTING_PATH", "alb_routing_path"),
         ("GTC_AWS_E2E_ASSIGN_PUBLIC_IP", "assign_public_ip"),
         ("GTC_AWS_E2E_CONTAINER_PORT", "container_port"),
+        ("GTC_AWS_E2E_SECRET_PREFIX", "secret_prefix"),
     ] {
         if let Ok(value) = std::env::var(var) {
             obj.insert(key.to_string(), json!(value));
