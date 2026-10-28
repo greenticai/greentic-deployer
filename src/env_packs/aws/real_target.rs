@@ -110,14 +110,14 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use aws_sdk_ecs::error::{BuildError, ProvideErrorMetadata};
+use aws_sdk_ecs::error::{BuildError, DisplayErrorContext};
 use aws_sdk_ecs::operation::create_task_set::CreateTaskSetOutput;
 use aws_sdk_ecs::operation::describe_services::DescribeServicesOutput;
 use aws_sdk_ecs::operation::describe_task_sets::DescribeTaskSetsOutput;
 use aws_sdk_ecs::operation::register_task_definition::RegisterTaskDefinitionOutput;
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerCondition, ContainerDefinition,
-    ContainerDependency, DeploymentController, DeploymentControllerType, KeyValuePair,
+    ContainerDependency, DeploymentController, DeploymentControllerType, KeyValuePair, LaunchType,
     LoadBalancer, LogConfiguration, LogDriver, MountPoint, NetworkConfiguration, NetworkMode,
     PortMapping, Scale, ScaleUnit, Secret, StabilityStatus, Tag as EcsTag, TaskDefinitionField,
     TaskSet, Volume,
@@ -177,7 +177,6 @@ pub const REAL_ECS_TARGET_IAM_ACTIONS: &[&str] = &[
     "ecs:CreateTaskSet",       // create_task_set
     // create_task_set / task_set_stability / delete_task_set / apply_listener_weights
     // (apply_listener_weights reads each revision's target-group binding here)
-    "ecs:DescribeTaskSets",
     "ecs:DeleteTaskSet",            // delete_task_set / delete_service
     "ecs:DeleteService",            // delete_service
     "ecs:DeregisterTaskDefinition", // delete_task_set
@@ -216,7 +215,6 @@ const REAL_ECS_TARGET_SDK_CALLS: &[(&str, &str)] = &[
     ("describe_task_definition", "ecs:DescribeTaskDefinition"),
     ("describe_task_definition", "ecs:ListTagsForResource"), // include=TAGS; verify live (Task 12)
     ("create_task_set", "ecs:CreateTaskSet"),
-    ("describe_task_sets", "ecs:DescribeTaskSets"),
     ("delete_task_set", "ecs:DeleteTaskSet"),
     ("delete_service", "ecs:DeleteService"),
     ("deregister_task_definition", "ecs:DeregisterTaskDefinition"),
@@ -325,6 +323,38 @@ impl RealEcsTarget {
         pool_arns_from(&self.target_group_pool, &resolved)
     }
 
+    /// The task sets of one EXTERNAL-controller service, shaped like a
+    /// `DescribeTaskSets` answer so the pure helpers below keep working.
+    ///
+    /// Real AWS rejects `DescribeTaskSets` without an explicit `taskSets` list
+    /// (`TaskSets cannot be empty`), so enumerating a service's task sets goes
+    /// through `DescribeServices`, which returns them inline. A missing or
+    /// INACTIVE service has none: an empty answer, never an error, matching how
+    /// a deleted service was already treated as "nothing left".
+    async fn service_task_sets(
+        &self,
+        cluster: &str,
+        service: &str,
+    ) -> Result<DescribeTaskSetsOutput, EcsTargetError> {
+        let described = self
+            .ecs
+            .describe_services()
+            .cluster(cluster)
+            .services(service)
+            .send()
+            .await
+            .map_err(|e| api("describe_services", e))?;
+        let sets = described
+            .services()
+            .iter()
+            .find(|s| s.service_name() == Some(service))
+            .map(|s| s.task_sets().to_vec())
+            .unwrap_or_default();
+        Ok(DescribeTaskSetsOutput::builder()
+            .set_task_sets(Some(sets))
+            .build())
+    }
+
     /// Enumerate this cluster's other deployment services (`gtc-svc-*` other than
     /// `me`) and read each one's bound pool target groups. Feeds the single-owner
     /// pool guard in [`create_task_set`](EcsDeployTarget::create_task_set). Thin
@@ -354,14 +384,7 @@ impl RealEcsTarget {
                 if name == me || !name.starts_with(SERVICE_NAME_PREFIX) {
                     continue;
                 }
-                let task_sets = self
-                    .ecs
-                    .describe_task_sets()
-                    .cluster(cluster)
-                    .service(name)
-                    .send()
-                    .await
-                    .map_err(|e| api("describe_task_sets", e))?;
+                let task_sets = self.service_task_sets(cluster, name).await?;
                 let bound: Vec<String> = assigned_pool_members(&task_sets).into_iter().collect();
                 if !bound.is_empty() {
                     bindings.push((name.to_string(), bound));
@@ -458,14 +481,7 @@ impl EcsDeployTarget for RealEcsTarget {
         // ACTIVE task-def revision); reclaiming it requires comparing the
         // deduped response's task-def to the registered one and deregistering
         // the loser's, which is a PR-4 live-verification item.
-        let existing = self
-            .ecs
-            .describe_task_sets()
-            .cluster(&spec.cluster)
-            .service(&service)
-            .send()
-            .await
-            .map_err(|e| api("describe_task_sets", e))?;
+        let existing = self.service_task_sets(&spec.cluster, &service).await?;
         if let Some(handle) = existing_task_set_handle(&existing, &external_id) {
             return Ok(handle);
         }
@@ -556,6 +572,10 @@ impl EcsDeployTarget for RealEcsTarget {
             .task_definition(&task_def_arn)
             .external_id(&external_id)
             .client_token(task_set_client_token(&spec.revision_id))
+            // Required for `assignPublicIp` (and Fargate placement) on an
+            // EXTERNAL-controller task set: without it AWS answers
+            // `Assign public IP is not supported for this launch type`.
+            .launch_type(LaunchType::Fargate)
             .network_configuration(network_config(&self.launch)?)
             .load_balancers(load_balancer(&self.launch, &target_group_arn))
             .scale(
@@ -577,14 +597,7 @@ impl EcsDeployTarget for RealEcsTarget {
     ) -> Result<LiveTaskSet, EcsTargetError> {
         let service = service_name(&task_set.deployment_id);
         let external_id = task_set_external_id(&task_set.revision_id);
-        let sets = self
-            .ecs
-            .describe_task_sets()
-            .cluster(&task_set.cluster)
-            .service(&service)
-            .send()
-            .await
-            .map_err(|e| api("describe_task_sets", e))?;
+        let sets = self.service_task_sets(&task_set.cluster, &service).await?;
         let Some(task_def_arn) =
             find_task_set(&sets, &external_id).map(|ts| ts.task_definition().map(str::to_string))
         else {
@@ -613,35 +626,14 @@ impl EcsDeployTarget for RealEcsTarget {
     ) -> Result<TaskSetStability, EcsTargetError> {
         let service = service_name(&task_set.deployment_id);
         let external_id = task_set_external_id(&task_set.revision_id);
-        let out = self
-            .ecs
-            .describe_task_sets()
-            .cluster(&task_set.cluster)
-            .service(&service)
-            .send()
-            .await
-            .map_err(|e| api("describe_task_sets", e))?;
+        let out = self.service_task_sets(&task_set.cluster, &service).await?;
         stability_from(&out, &external_id)
     }
 
     async fn delete_task_set(&self, task_set: &TaskSetRef) -> Result<(), EcsTargetError> {
         let service = service_name(&task_set.deployment_id);
         let external_id = task_set_external_id(&task_set.revision_id);
-        let out = self
-            .ecs
-            .describe_task_sets()
-            .cluster(&task_set.cluster)
-            .service(&service)
-            .send()
-            .await;
-        let out = match out {
-            Ok(out) => out,
-            // The whole service is gone (deleted by a retire/destroy that
-            // already removed every task set): nothing left to delete. A
-            // missing CLUSTER is deliberately NOT in this class.
-            Err(e) if is_service_gone_code(e.code()) => return Ok(()),
-            Err(e) => return Err(api("describe_task_sets", e)),
-        };
+        let out = self.service_task_sets(&task_set.cluster, &service).await?;
         // Idempotent: an absent task set is a no-op success.
         let Some(found) = task_set_for_delete(&out, &external_id) else {
             return Ok(());
@@ -686,14 +678,7 @@ impl EcsDeployTarget for RealEcsTarget {
         }
         // An EXTERNAL-controller service holds its task sets itself: remove
         // every one still there (and its task definition) before the service.
-        let sets = self
-            .ecs
-            .describe_task_sets()
-            .cluster(&service.cluster)
-            .service(&name)
-            .send()
-            .await
-            .map_err(|e| api("describe_task_sets", e))?;
+        let sets = self.service_task_sets(&service.cluster, &name).await?;
         for found in all_task_sets_for_delete(&sets) {
             self.ecs
                 .delete_task_set()
@@ -789,14 +774,7 @@ impl EcsDeployTarget for RealEcsTarget {
         // weight and the ARN is read back from the live task sets here — no
         // name lookup, and no deployer-computed target-group name.
         let service = service_name(&listener.deployment_id);
-        let out = self
-            .ecs
-            .describe_task_sets()
-            .cluster(&listener.cluster)
-            .service(&service)
-            .send()
-            .await
-            .map_err(|e| api("describe_task_sets", e))?;
+        let out = self.service_task_sets(&listener.cluster, &service).await?;
         let tuples = weighted_target_groups(weights, &out)?;
         let action = forward_action(&tuples)?;
         match &listener.routing {
@@ -1173,8 +1151,12 @@ impl RealEcsTarget {
 
 /// Map any SDK error to a [`EcsTargetError::Api`] carrying the operation name +
 /// the response detail, so operators get an actionable message.
-fn api<E: std::fmt::Display>(op: &str, err: E) -> EcsTargetError {
-    EcsTargetError::Api(format!("ecs {op}: {err}"))
+///
+/// An SDK error's plain `Display` is just `service error`; the error context
+/// carries the service code and message (e.g. `InvalidParameterException:
+/// Assign public IP is not supported for this launch type`).
+fn api<E: std::error::Error>(op: &str, err: E) -> EcsTargetError {
+    EcsTargetError::Api(format!("ecs {op}: {}", DisplayErrorContext(&err)))
 }
 
 // `service_name` / `SERVICE_NAME_PREFIX` live in `deploy_target` (compiled in every build) so the
@@ -1476,16 +1458,6 @@ fn task_set_for_delete(out: &DescribeTaskSetsOutput, external_id: &str) -> Optio
         id: ts.id()?.to_string(),
         task_definition: ts.task_definition().map(str::to_string),
     })
-}
-
-/// True for the ECS error codes that mean the deployment's service no longer
-/// exists (or is draining), so its task sets are already gone. A missing
-/// cluster (`ClusterNotFoundException`) is a different fact and stays an error.
-fn is_service_gone_code(code: Option<&str>) -> bool {
-    matches!(
-        code,
-        Some("ServiceNotFoundException" | "ServiceNotActiveException")
-    )
 }
 
 /// Every task set in a DescribeTaskSets response, for deleting a whole service.
@@ -2485,15 +2457,6 @@ mod tests {
     /// Parity guard: every IAM action the real target calls must be in the
     /// credentials preflight's validated verb list, so a role that passes
     /// `gtc op credentials requirements` can actually warm / shift / archive.
-    #[test]
-    fn service_gone_codes_are_recognised_and_a_missing_cluster_is_not() {
-        assert!(is_service_gone_code(Some("ServiceNotFoundException")));
-        assert!(is_service_gone_code(Some("ServiceNotActiveException")));
-        assert!(!is_service_gone_code(Some("ClusterNotFoundException")));
-        assert!(!is_service_gone_code(Some("AccessDeniedException")));
-        assert!(!is_service_gone_code(None));
-    }
-
     #[test]
     fn real_target_iam_actions_are_a_subset_of_validated_verbs() {
         use crate::env_packs::aws::credentials::VALIDATED_IAM_VERBS;
