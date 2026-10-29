@@ -39,6 +39,8 @@ use super::{
 };
 
 #[cfg(test)]
+mod answers_tests;
+#[cfg(test)]
 mod delete_tests;
 mod dev_store_keys;
 
@@ -1404,7 +1406,7 @@ fn resolve_payload<T: serde::de::DeserializeOwned>(
         return Ok(p);
     }
     if let Some(path) = &flags.answers {
-        return super::load_answers::<T>(path);
+        return super::load_answers_redacted::<T>(path);
     }
     Err(OpError::InvalidArgument(
         "no payload provided: pass --answers <path> or supply the payload directly".to_string(),

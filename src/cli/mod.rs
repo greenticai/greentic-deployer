@@ -571,6 +571,55 @@ pub fn load_answers<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> R
     }
 }
 
+/// Like [`load_answers`], but a parse failure never carries serde's own text.
+///
+/// serde echoes the offending value (`invalid type: string "<value>"`), and the
+/// `op secrets` payloads carry credentials. The message is built from the
+/// error class and position only. Used by the `secrets` verbs; every other
+/// verb keeps [`load_answers`] byte-for-byte.
+pub fn load_answers_redacted<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, OpError> {
+    let bytes = std::fs::read(path).map_err(|source| OpError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let json_err = |e: serde_json::Error| {
+        format!(
+            "json: {} at line {} column {} (details withheld: the file may hold a secret)",
+            match e.classify() {
+                serde_json::error::Category::Io => "i/o error",
+                serde_json::error::Category::Syntax => "syntax error",
+                serde_json::error::Category::Data => "unexpected value or type",
+                serde_json::error::Category::Eof => "unexpected end of input",
+            },
+            e.line(),
+            e.column()
+        )
+    };
+    let yaml_err = |_e: serde_yaml_bw::Error| {
+        "yaml: could not be parsed (details withheld: the file may hold a secret)".to_string()
+    };
+    let fail = |message: String| OpError::AnswersParse {
+        path: path.to_path_buf(),
+        message,
+    };
+    match ext.as_deref() {
+        Some("yaml") | Some("yml") => {
+            serde_yaml_bw::from_slice(&bytes).map_err(|e| fail(yaml_err(e)))
+        }
+        Some("json") => serde_json::from_slice(&bytes).map_err(|e| fail(json_err(e))),
+        _ => serde_json::from_slice(&bytes).or_else(|je| {
+            serde_yaml_bw::from_slice(&bytes)
+                .map_err(|ye| fail(format!("{}; {}", json_err(je), yaml_err(ye))))
+        }),
+    }
+}
+
 /// Render an `OpError` into the standard JSON error envelope.
 pub fn render_error(noun: &'static str, op: &'static str, err: &OpError) -> Value {
     serde_json::json!({

@@ -140,6 +140,28 @@ Useful surfaces when you need ground truth rather than a guess:
   that reports a deployer kind this binary cannot execute.
 - `op env tool-check` — per-binding external-tool preflight.
 
+## Secret categories (`op secrets put` / `get` / `delete`)
+
+The category is the PACK position (third segment) of `<tenant>/<team>/<pack>/<name>`.
+It decides the env segment of the dev-store key and how the name is validated
+(`dev_store_key` / `validate_dev_store_secret_path` in `src/cli/secrets.rs`).
+A category missing from this table silently lands at the environment id, one
+segment away from where the runtime reads it, with a green deploy.
+
+| Category | Env segment | Name | Reader |
+|---|---|---|---|
+| `mcp`, `a2a`, `sorla` | `default` | verbatim | greentic-runner (`mcp_secrets`, `sorla_route`) |
+| `llm`, `knowledge`, `infra` | `default` | canonical | greentic-runner (`resolve_in_process_llm_key`, `scoped_secrets`, `infra_connection`) |
+| anything else | the environment id (`local`) | canonical | pack-scoped readers |
+
+`op secrets put` has no category allow-list: an unlisted category is accepted.
+The `infra_secret_category` capability (`op env capabilities`) lets a client
+verify the binary it resolved writes `infra` at `default`.
+
+An answers-file parse error for the `secrets` verbs never carries serde's own
+text (`load_answers_redacted`): serde echoes the offending value, and a `put`
+payload is a credential.
+
 ## Which binary?
 
 - **`greentic-deployer`** — this crate. On the develop lane it publishes as
