@@ -91,8 +91,13 @@ fn fetch_oci_to_cache(oci_ref: &str) -> Result<PathBuf, OpError> {
             // short-lived OAuth token the push path uses, for AR hosts only:
             // every other registry keeps the anonymous client, which is what
             // public packs need.
+            //
+            // Amazon ECR is the same shape: a pull needs a credential, and the
+            // only one this process is handed is the `OCI_USERNAME` /
+            // `OCI_PASSWORD` pair the caller minted from `ecr:GetAuthorizationToken`
+            // (the same pair that authenticates the worker's own boot pull).
             let fetcher: OciPackFetcher<DefaultRegistryClient> =
-                match artifact_registry_client(&rt, oci_ref) {
+                match artifact_registry_client(&rt, oci_ref).or_else(|| ecr_client(oci_ref)) {
                     Some(client) => OciPackFetcher::with_client(client, opts),
                     None => OciPackFetcher::new(opts),
                 };
@@ -105,6 +110,73 @@ fn fetch_oci_to_cache(oci_ref: &str) -> Result<PathBuf, OpError> {
             Err(_) => Err(OpError::Fetch("oci fetch thread panicked".to_string())),
         }
     })
+}
+
+/// Whether `host` is an Amazon ECR registry endpoint:
+/// `<12 digits>.dkr.ecr[-fips].<region>.amazonaws.com[.cn]`.
+///
+/// Deliberately strict. The credential below is attached to a host only when
+/// this matches, so a manifest that also names `ghcr.io` or a customer's own
+/// registry never receives an ECR token.
+fn is_ecr_host(host: &str) -> bool {
+    let host = host.split(':').next().unwrap_or_default();
+    let Some((account, rest)) = host.split_once('.') else {
+        return false;
+    };
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(rest) = rest
+        .strip_prefix("dkr.ecr.")
+        .or_else(|| rest.strip_prefix("dkr.ecr-fips."))
+    else {
+        return false;
+    };
+    let Some(region) = rest
+        .strip_suffix(".amazonaws.com")
+        .or_else(|| rest.strip_suffix(".amazonaws.com.cn"))
+    else {
+        return false;
+    };
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The `OCI_USERNAME` / `OCI_PASSWORD` pair, only when both are non-empty —
+/// the rule greentic-start applies to its own boot pull
+/// (`bundle_ref::generic_registry_credentials`), so the two processes
+/// authenticate the same reference the same way.
+fn oci_credentials_from(get: impl Fn(&str) -> Option<String>) -> Option<(String, String)> {
+    let non_blank = |name: &str| get(name).filter(|v| !v.trim().is_empty());
+    Some((non_blank("OCI_USERNAME")?, non_blank("OCI_PASSWORD")?))
+}
+
+/// An authenticated client for an Amazon ECR reference when `credentials` is
+/// present, else `None` (the anonymous client then lets the registry report
+/// the denial itself, exactly as for any other host).
+fn ecr_client_with(
+    oci_ref: &str,
+    credentials: Option<(String, String)>,
+) -> Option<DefaultRegistryClient> {
+    let host = oci_ref
+        .trim_start_matches(OCI_SCHEME)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if !is_ecr_host(host) {
+        return None;
+    }
+    let (user, password) = credentials?;
+    Some(DefaultRegistryClient::with_basic_auth(user, password))
+}
+
+fn ecr_client(oci_ref: &str) -> Option<DefaultRegistryClient> {
+    ecr_client_with(
+        oci_ref,
+        oci_credentials_from(|name| std::env::var(name).ok()),
+    )
 }
 
 /// Host suffix that identifies a Google Artifact Registry reference.
@@ -302,6 +374,71 @@ mod tests {
         let err = fetch_bundle_uri_to_local("oci://this-host-does-not-exist.invalid/repo:tag")
             .unwrap_err();
         assert_eq!(err.kind(), "fetch");
+    }
+
+    #[test]
+    fn ecr_hosts_are_recognised_and_nothing_else_is() {
+        for host in [
+            "599558443099.dkr.ecr.ap-southeast-1.amazonaws.com",
+            "599558443099.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
+            "599558443099.dkr.ecr.cn-north-1.amazonaws.com.cn",
+            "599558443099.dkr.ecr.eu-west-1.amazonaws.com:443",
+        ] {
+            assert!(is_ecr_host(host), "{host} is an ECR endpoint");
+        }
+        for host in [
+            "ghcr.io",
+            "docker.io",
+            "us-docker.pkg.dev",
+            "59955844309.dkr.ecr.eu-west-1.amazonaws.com",
+            "5995584430999.dkr.ecr.eu-west-1.amazonaws.com",
+            "abcdefghijkl.dkr.ecr.eu-west-1.amazonaws.com",
+            "599558443099.dkr.ecr..amazonaws.com",
+            "599558443099.dkr.ecr.eu-west-1.amazonaws.com.evil.example",
+            "evil.example/599558443099.dkr.ecr.eu-west-1.amazonaws.com",
+            "",
+        ] {
+            assert!(!is_ecr_host(host), "{host:?} is not an ECR endpoint");
+        }
+    }
+
+    #[test]
+    fn the_credential_needs_both_halves() {
+        let env = |user: Option<&'static str>, pass: Option<&'static str>| {
+            oci_credentials_from(move |name| match name {
+                "OCI_USERNAME" => user.map(str::to_string),
+                "OCI_PASSWORD" => pass.map(str::to_string),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            env(Some("AWS"), Some("tok")),
+            Some(("AWS".into(), "tok".into()))
+        );
+        assert_eq!(env(Some("AWS"), None), None);
+        assert_eq!(env(None, Some("tok")), None);
+        assert_eq!(env(Some("AWS"), Some("  ")), None);
+    }
+
+    #[test]
+    fn only_an_ecr_host_ever_gets_the_credential() {
+        let creds = || Some(("AWS".to_string(), "tok".to_string()));
+        assert!(ecr_client_with("oci://ghcr.io/greenticai/x:v1", creds()).is_none());
+        assert!(
+            ecr_client_with(
+                "oci://599558443099.dkr.ecr.eu-west-1.amazonaws.com/r:t",
+                creds()
+            )
+            .is_some()
+        );
+        assert!(
+            ecr_client_with(
+                "oci://599558443099.dkr.ecr.eu-west-1.amazonaws.com/r:t",
+                None
+            )
+            .is_none(),
+            "no credential handed over: stay anonymous"
+        );
     }
 
     #[test]
