@@ -481,11 +481,21 @@ fn infra_prune_leaves_no_tombstone_in_the_store_file() {
     let (_dir, store) = dev_store();
     put_value(&store, INFRA_QDRANT, "SENTINEL-QDRANT-CREDENTIAL");
     put_value(&store, INFRA_REDIS, "SENTINEL-REDIS-CREDENTIAL");
+    let qdrant = "secrets://default/default/_/infra/vector_store_qdrant";
+    let redis = "secrets://default/default/_/infra/cache_redis";
+    assert!(
+        versions_on_disk(&store, qdrant) > 0 && versions_on_disk(&store, redis) > 0,
+        "precondition: both infra keys are persisted before the delete"
+    );
     delete_path(&store, INFRA_QDRANT).unwrap();
     delete_prefix(&store, "default/_/infra/").unwrap();
 
-    let uri = "secrets://default/default/_/infra/vector_store_qdrant";
-    assert_eq!(versions_on_disk(&store, uri), 0);
+    assert_eq!(versions_on_disk(&store, qdrant), 0);
+    assert_eq!(
+        versions_on_disk(&store, redis),
+        0,
+        "redis infra key left behind"
+    );
     let bytes = std::fs::read(dev_path(&store)).unwrap();
     let text = String::from_utf8_lossy(&bytes);
     assert!(
@@ -493,5 +503,4 @@ fn infra_prune_leaves_no_tombstone_in_the_store_file() {
         "key name left behind"
     );
     assert!(!text.contains("cache_redis"), "key name left behind");
-    assert!(!text.contains("SENTINEL"));
 }

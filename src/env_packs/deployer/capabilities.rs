@@ -36,10 +36,10 @@ pub enum Capability {
     /// keys to a deployer that does not report this: older ones refuse them
     /// as unknown answer keys (k8s) or accept `max_instances` with no gate.
     ScaleOutAnswers,
-    /// The deployer writes `infra`-category secrets (`op secrets put`) at the
-    /// `default` env segment, where the runtime reads them. A client must not
-    /// stage infra connections through a deployer that does not report this:
-    /// it would write them under the environment id and nothing reads them.
+    /// This lane's runtime reads `infra`-category secrets at the `default`
+    /// env segment (`op secrets put` writes them there). A client must not
+    /// stage infra connections for a lane that does not report this: nothing
+    /// in its runtime would read them.
     InfraSecretCategory,
 }
 
