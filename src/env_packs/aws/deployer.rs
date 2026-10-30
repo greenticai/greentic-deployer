@@ -664,6 +664,7 @@ impl Deployer for AwsEcsDeployerHandler {
             remove: true,
             runtime_pin: false,
             scale_out_answers: false,
+            infra_secret_category: false,
         }
     }
 

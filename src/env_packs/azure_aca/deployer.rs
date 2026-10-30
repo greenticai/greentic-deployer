@@ -73,6 +73,7 @@ impl Deployer for AzureAcaDeployerHandler {
             remove: true,
             runtime_pin: true,
             scale_out_answers: false,
+            infra_secret_category: false,
         }
     }
 

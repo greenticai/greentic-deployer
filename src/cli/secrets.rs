@@ -39,6 +39,8 @@ use super::{
 };
 
 #[cfg(test)]
+mod answers_tests;
+#[cfg(test)]
 mod delete_tests;
 mod dev_store_keys;
 
@@ -136,13 +138,24 @@ const LLM_CATEGORY: &str = "llm";
 /// The name is canonical, so the ordinary name validation still applies.
 const KNOWLEDGE_CATEGORY: &str = "knowledge";
 
+/// The `infra` category: a platform-provided resource connection (Qdrant,
+/// Redis, ...) staged by greentic-designer's `infra_stage` as one JSON
+/// document per canonical kind (`default/_/infra/vector_store_qdrant`).
+///
+/// greentic-runner's `greentic_aw_runtime::infra_connection` reads it at the
+/// hardcoded `default` env segment, the same shape as [`LLM_CATEGORY`] and
+/// [`KNOWLEDGE_CATEGORY`]. Before this was listed, the write landed under the
+/// environment id and no runtime ever found the entry, with a green deploy.
+/// The name is canonical, so the ordinary name validation still applies.
+const INFRA_CATEGORY: &str = "infra";
+
 /// Whether `rel_path` names a category read at the `default` env segment with
-/// a canonical name — `llm` or `knowledge` (pack position only, like
+/// a canonical name — `llm`, `knowledge` or `infra` (pack position only, like
 /// [`is_verbatim_category_rel_path`]).
 fn is_default_segment_category_rel_path(rel_path: &str) -> bool {
     matches!(
         rel_path.split('/').nth(2),
-        Some(LLM_CATEGORY | KNOWLEDGE_CATEGORY)
+        Some(LLM_CATEGORY | KNOWLEDGE_CATEGORY | INFRA_CATEGORY)
     )
 }
 
@@ -1393,7 +1406,7 @@ fn resolve_payload<T: serde::de::DeserializeOwned>(
         return Ok(p);
     }
     if let Some(path) = &flags.answers {
-        return super::load_answers::<T>(path);
+        return super::load_answers_redacted::<T>(path);
     }
     Err(OpError::InvalidArgument(
         "no payload provided: pass --answers <path> or supply the payload directly".to_string(),
@@ -2110,6 +2123,36 @@ mod tests {
         // before lookup, exactly as it does for `llm`.
         assert!(validate_dev_store_secret_path("default/_/knowledge/embedding-key").is_err());
         assert!(validate_dev_store_secret_path("default/_/knowledge/embedding_key").is_ok());
+    }
+
+    #[test]
+    fn an_infra_key_is_written_under_the_default_env_segment() {
+        for env in ["local", "prod"] {
+            let env_id = EnvId::try_from(env).unwrap();
+            assert_eq!(
+                dev_store_key(&env_id, "default/_/infra/cache_redis"),
+                "secrets://default/default/_/infra/cache_redis"
+            );
+            assert_eq!(
+                dev_store_key(&env_id, "default/_/infra/vector_store_qdrant"),
+                "secrets://default/default/_/infra/vector_store_qdrant"
+            );
+        }
+    }
+
+    #[test]
+    fn an_infra_name_must_still_be_canonical() {
+        assert!(validate_dev_store_secret_path("default/_/infra/vector-store-qdrant").is_err());
+        assert!(validate_dev_store_secret_path("default/_/infra/vector_store_qdrant").is_ok());
+    }
+
+    #[test]
+    fn infra_in_a_non_category_position_is_an_ordinary_key() {
+        let env_id = EnvId::try_from("local").unwrap();
+        assert_eq!(
+            dev_store_key(&env_id, "infra/_/mypack/k"),
+            "secrets://local/infra/_/mypack/k"
+        );
     }
 
     #[test]

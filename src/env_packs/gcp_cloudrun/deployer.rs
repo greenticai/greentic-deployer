@@ -1020,6 +1020,7 @@ impl Deployer for GcpCloudRunDeployerHandler {
             remove: true,
             runtime_pin: true,
             scale_out_answers: true,
+            infra_secret_category: true,
         }
     }
 
@@ -1037,6 +1038,8 @@ impl Deployer for GcpCloudRunDeployerHandler {
              update L2); unpinned revisions run the binding answer",
             "scale_out_answers: `max_instances` > 1 is accepted only with `redis_url` + a VPC \
              route (and pre-minted generated secrets); otherwise refused",
+            "infra_secret_category: `infra`-category secrets are written at the `default` env \
+             segment, where the runtime reads them",
         ]
     }
 

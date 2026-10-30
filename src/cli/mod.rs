@@ -540,6 +540,57 @@ impl OpOutcome {
 /// fall back to JSON (with a YAML retry on parse failure) so callers can pipe
 /// `gtc … --schema | jq … > answers.txt` without re-extensioning.
 pub fn load_answers<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, OpError> {
+    read_answers(
+        path,
+        |e: serde_json::Error| format!("json: {e}"),
+        |e: serde_yaml_bw::Error| format!("yaml: {e}"),
+    )
+}
+
+/// Like [`load_answers`], but a parse failure never carries serde's own text.
+///
+/// serde echoes the offending value (`invalid type: string "<value>"`), and the
+/// `op secrets` payloads carry credentials. The message is built from the
+/// error class and position only. Used by the `secrets` verbs and the remote
+/// dispatch payload loader; shares file reading and extension dispatch with
+/// [`load_answers`] through [`read_answers`].
+pub fn load_answers_redacted<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+) -> Result<T, OpError> {
+    const WITHHELD: &str = "details withheld: the file may hold a secret";
+    read_answers(
+        path,
+        |e: serde_json::Error| {
+            format!(
+                "json: {} at line {} column {} ({WITHHELD})",
+                match e.classify() {
+                    serde_json::error::Category::Io => "i/o error",
+                    serde_json::error::Category::Syntax => "syntax error",
+                    serde_json::error::Category::Data => "unexpected value or type",
+                    serde_json::error::Category::Eof => "unexpected end of input",
+                },
+                e.line(),
+                e.column()
+            )
+        },
+        |e: serde_yaml_bw::Error| match e.location() {
+            Some(loc) => format!(
+                "yaml: could not be parsed at line {} column {} ({WITHHELD})",
+                loc.line(),
+                loc.column()
+            ),
+            None => format!("yaml: could not be parsed ({WITHHELD})"),
+        },
+    )
+}
+
+/// The single file-read + extension dispatch behind both answers loaders.
+/// Callers differ only in how a parse error is rendered.
+fn read_answers<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    json_msg: impl Fn(serde_json::Error) -> String,
+    yaml_msg: impl Fn(serde_yaml_bw::Error) -> String,
+) -> Result<T, OpError> {
     let bytes = std::fs::read(path).map_err(|source| OpError::Io {
         path: path.to_path_buf(),
         source,
@@ -548,24 +599,20 @@ pub fn load_answers<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> R
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase());
+    let fail = |message: String| OpError::AnswersParse {
+        path: path.to_path_buf(),
+        message,
+    };
     match ext.as_deref() {
         Some("yaml") | Some("yml") => {
-            serde_yaml_bw::from_slice(&bytes).map_err(|e| OpError::AnswersParse {
-                path: path.to_path_buf(),
-                message: format!("yaml: {e}"),
-            })
+            serde_yaml_bw::from_slice(&bytes).map_err(|e| fail(yaml_msg(e)))
         }
-        Some("json") => serde_json::from_slice(&bytes).map_err(|e| OpError::AnswersParse {
-            path: path.to_path_buf(),
-            message: format!("json: {e}"),
-        }),
+        Some("json") => serde_json::from_slice(&bytes).map_err(|e| fail(json_msg(e))),
         _ => {
             // Heuristic: try JSON first, then YAML.
-            serde_json::from_slice(&bytes).or_else(|json_err| {
-                serde_yaml_bw::from_slice(&bytes).map_err(|yaml_err| OpError::AnswersParse {
-                    path: path.to_path_buf(),
-                    message: format!("json: {json_err}; yaml: {yaml_err}"),
-                })
+            serde_json::from_slice(&bytes).or_else(|je| {
+                serde_yaml_bw::from_slice(&bytes)
+                    .map_err(|ye| fail(format!("{}; {}", json_msg(je), yaml_msg(ye))))
             })
         }
     }

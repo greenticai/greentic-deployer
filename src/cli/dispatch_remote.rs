@@ -329,7 +329,7 @@ fn resolve_payload<T: serde::de::DeserializeOwned>(
         return Ok(p);
     }
     if let Some(path) = &flags.answers {
-        return super::load_answers::<T>(path);
+        return super::load_answers_redacted::<T>(path);
     }
     Err(OpError::InvalidArgument(
         "no payload provided: pass --answers <path> or supply the payload directly".to_string(),
@@ -2736,6 +2736,44 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Probe {
+        count: u32,
+    }
+
+    #[test]
+    fn resolve_payload_errors_never_echo_an_answers_file_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("a.json", r#"{"count": "TOPSECRET-VALUE"}"#),
+            ("a.yaml", "count: TOPSECRET-VALUE\n"),
+            ("a.txt", "count: TOPSECRET-VALUE\n"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            let flags = OpFlags {
+                schema_only: false,
+                answers: Some(path),
+            };
+            let err = resolve_payload::<Probe>(&flags, None).unwrap_err();
+            let rendered = format!(
+                "{err} | {err:?} | {}",
+                crate::cli::render_error("env", "x", &err)
+            );
+            assert!(!rendered.contains("TOPSECRET"), "{name} echoed: {rendered}");
+        }
+    }
+
+    #[test]
+    fn yaml_parse_errors_keep_line_and_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.yaml");
+        std::fs::write(&path, "count: 1\nbad: [unclosed\n").unwrap();
+        let err = crate::cli::load_answers_redacted::<Probe>(&path).unwrap_err();
+        assert!(format!("{err}").contains("line"), "{err}");
+    }
 
     /// Refusing is the point. Decomposing `add-did` into N ordinary
     /// `add_trusted_key` calls would appear to work while the server durably

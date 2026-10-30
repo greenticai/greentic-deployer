@@ -411,3 +411,96 @@ fn prefix_parsing_accepts_three_or_four_segments_only() {
         );
     }
 }
+
+const INFRA_QDRANT: &str = "default/_/infra/vector_store_qdrant";
+const INFRA_REDIS: &str = "default/_/infra/cache_redis";
+const KNOWLEDGE_KEY: &str = "default/_/knowledge/embedding_key";
+
+#[test]
+fn infra_prune_delete_prefix_removes_every_infra_entry_and_nothing_else() {
+    let (_dir, store) = dev_store();
+    put_value(&store, INFRA_QDRANT, "{\"credential\":\"q\"}");
+    put_value(&store, INFRA_REDIS, "{\"credential\":\"r\"}");
+    put_value(&store, KNOWLEDGE_KEY, "emb");
+
+    let outcome = delete_prefix(&store, "default/_/infra/").unwrap();
+
+    assert_eq!(outcome.result["deleted_count"], 2);
+    let keys = outcome.result["deleted_keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    for key in keys {
+        assert!(
+            key["store_uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("secrets://default/default/_/infra/"),
+            "{key}"
+        );
+    }
+    assert_eq!(get_value(&store, INFRA_QDRANT), None);
+    assert_eq!(get_value(&store, INFRA_REDIS), None);
+    assert_eq!(get_value(&store, KNOWLEDGE_KEY).as_deref(), Some("emb"));
+}
+
+#[test]
+fn infra_prune_delete_one_path_is_idempotent() {
+    let (_dir, store) = dev_store();
+    put_value(&store, INFRA_REDIS, "v");
+    assert_eq!(
+        delete_path(&store, INFRA_REDIS).unwrap().result["deleted"],
+        true
+    );
+    assert_eq!(
+        delete_path(&store, INFRA_REDIS).unwrap().result["deleted"],
+        false
+    );
+}
+
+#[test]
+fn infra_prune_list_prefix_names_infra_keys_without_values() {
+    let (_dir, store) = dev_store();
+    put_value(&store, INFRA_QDRANT, "SENTINEL-QDRANT-CREDENTIAL");
+    put_value(&store, INFRA_REDIS, "SENTINEL-REDIS-CREDENTIAL");
+
+    let outcome = list_prefix(&store, Some("default/_/infra/")).unwrap();
+
+    let mut paths = stored_paths(&outcome, "stored_keys");
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![INFRA_REDIS.to_string(), INFRA_QDRANT.to_string()]
+    );
+    let text = outcome.result.to_string();
+    assert!(!text.contains("SENTINEL"), "no value may be listed: {text}");
+}
+
+#[test]
+fn infra_prune_leaves_no_tombstone_in_the_store_file() {
+    // The store file ships whole into every workload (R12): a deleted
+    // credential must not remain in it.
+    let (_dir, store) = dev_store();
+    put_value(&store, INFRA_QDRANT, "SENTINEL-QDRANT-CREDENTIAL");
+    put_value(&store, INFRA_REDIS, "SENTINEL-REDIS-CREDENTIAL");
+    let qdrant = "secrets://default/default/_/infra/vector_store_qdrant";
+    let redis = "secrets://default/default/_/infra/cache_redis";
+    assert!(
+        versions_on_disk(&store, qdrant) > 0 && versions_on_disk(&store, redis) > 0,
+        "precondition: both infra keys are persisted before the delete"
+    );
+    delete_path(&store, INFRA_QDRANT).unwrap();
+    delete_prefix(&store, "default/_/infra/").unwrap();
+
+    assert_eq!(versions_on_disk(&store, qdrant), 0);
+    assert_eq!(
+        versions_on_disk(&store, redis),
+        0,
+        "redis infra key left behind"
+    );
+    let bytes = std::fs::read(dev_path(&store)).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("vector_store_qdrant"),
+        "key name left behind"
+    );
+    assert!(!text.contains("cache_redis"), "key name left behind");
+}

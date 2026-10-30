@@ -12,7 +12,7 @@ const MAX_UNIT_ID_LEN: usize = 55;
 /// Store categories a SoR input may never live in: their names are stored
 /// verbatim or under a different env segment, and `sorla` is where the route
 /// documents themselves are written.
-const RESERVED_CATEGORIES: &[&str] = &["mcp", "a2a", "sorla", "llm"];
+const RESERVED_CATEGORIES: &[&str] = &["mcp", "a2a", "sorla", "llm", "infra"];
 
 pub(crate) fn validate_sor_units(units: &[SorUnit]) -> Result<(), OpError> {
     let mut ids = BTreeSet::new();
@@ -227,6 +227,13 @@ mod tests {
         let mut u = unit();
         u.shared_secret_ref = "default/_/sorla/shared_secret".into();
         assert!(refused(&[u]).contains("category `sorla`"));
+    }
+
+    #[test]
+    fn a_sor_input_may_not_live_in_the_infra_category() {
+        let mut u = unit();
+        u.shared_secret_ref = "default/_/infra/shared_secret".into();
+        assert!(refused(&[u]).contains("category `infra`"));
     }
 
     #[test]
