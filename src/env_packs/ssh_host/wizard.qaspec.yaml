@@ -1,0 +1,118 @@
+# wizard.qaspec.yaml — ssh-host deployer env-pack.
+#
+# Collects where the VM is and how to log in. NO secret value is collected:
+# `identity_file` is a PATH on the operator's machine to a private key the
+# deployer's `ssh` uses; the key itself is never read into the env store.
+# Host keys are always verified — there is no "skip host key checking" answer;
+# point `known_hosts_file` at a dedicated file if the default is not wanted.
+#
+# Every value that reaches a remote command (install_dir, service_name) is
+# restricted to letters, digits, `.`, `_`, `/`, `-`. The deployer re-validates
+# all answers regardless of these patterns.
+#
+# C6 ↔ Phase D split applies: answers are recorded on the binding
+# (`answers_ref`); the deployer verbs read them through `answers`.
+
+id: greentic.deployer.ssh-host.wizard
+title: SSH-host deployer
+version: "0.1.0"
+description: >-
+  Deploy greentic-start to a Linux VM with systemd over SSH. The deployer
+  synchronizes the environment store to the VM and runs greentic-start as a
+  systemd service. Login must be non-interactive: key-based, host key already
+  trusted, and passwordless sudo (or a root login) for installing the unit.
+questions:
+  - id: host
+    type: string
+    title: VM hostname or IPv4 address
+    description: Hostname or IPv4 address of the VM. IPv6 literals are not supported.
+    required: true
+    constraint:
+      pattern: '^[A-Za-z0-9][A-Za-z0-9.-]*$'
+  - id: port
+    type: string
+    title: SSH port
+    required: false
+    default_value: "22"
+    constraint:
+      pattern: '^[0-9]+$'
+  - id: user
+    type: string
+    title: SSH login user
+    description: >-
+      The service runs as this user (unless it is root), so prefer a dedicated
+      non-root user that owns the install directory.
+    required: true
+    constraint:
+      pattern: '^[A-Za-z0-9_][A-Za-z0-9._-]*$'
+  - id: identity_file
+    type: string
+    title: Private key file (path on this machine)
+    description: >-
+      Absolute path to the SSH private key. Leave blank to use ssh-agent or the
+      default key. The key is referenced by path and never stored.
+    required: false
+    constraint:
+      pattern: '^/.*$'
+  - id: known_hosts_file
+    type: string
+    title: known_hosts file (path on this machine)
+    description: >-
+      Absolute path to a known_hosts file holding the VM's host key. Leave blank
+      for the user's default. Host keys are always verified.
+    required: false
+    constraint:
+      pattern: '^/.*$'
+  - id: install_dir
+    type: string
+    title: Install directory on the VM
+    description: >-
+      Absolute path owned by the login user. Holds bin/, the synchronized store
+      and the two store slots.
+    required: false
+    default_value: "/opt/greentic"
+    constraint:
+      pattern: '^/[A-Za-z0-9._/-]*$'
+  - id: service_name
+    type: string
+    title: systemd service name
+    description: Defaults to `greentic-<env id>`.
+    required: false
+    constraint:
+      pattern: '^[A-Za-z0-9_][A-Za-z0-9_-]*$'
+  - id: start_binary
+    type: string
+    title: Local greentic-start binary to copy (optional)
+    description: >-
+      Absolute path on this machine. When set, the deployer copies it to the VM
+      (for VMs that may not download it). When blank, greentic-start must already
+      be installed at <install_dir>/bin/greentic-start.
+    required: false
+    constraint:
+      pattern: '^/.*$'
+  - id: listen_port
+    type: string
+    title: Port greentic-start serves on
+    required: false
+    default_value: "8080"
+    constraint:
+      pattern: '^[0-9]+$'
+  - id: expose
+    type: string
+    title: Listen on all interfaces (true/false)
+    description: >-
+      `false` (the default) binds 127.0.0.1, so greentic-start is reachable only
+      from the VM itself and needs a reverse proxy (nginx, Caddy) in front for
+      TLS and public access. `true` binds 0.0.0.0 over PLAIN HTTP on the listen
+      port, so anyone who can reach the VM can reach the runtime.
+    required: false
+    default_value: "false"
+    constraint:
+      pattern: '^(true|false)$'
+  - id: use_sudo
+    type: string
+    title: Use sudo for systemd operations (true/false)
+    description: Defaults to true unless the login user is root.
+    required: false
+    constraint:
+      pattern: '^(true|false)$'
