@@ -242,6 +242,18 @@ impl FakeRemote {
             "id" if rest == ["-u"] => {
                 RemoteOutput::with_stdout(if privileged { "0\n" } else { "1000\n" })
             }
+            "id" if rest.len() == 2 && rest[0] == "-u" => RemoteOutput::with_stdout("1001\n"),
+            "chown" if rest.len() >= 4 && rest[0] == "-R" && rest[1] == "-h" => {
+                if !privileged {
+                    return err(1, "chown: Operation not permitted");
+                }
+                for path in &rest[3..] {
+                    if !sim.exists(path.trim_end_matches("/.")) {
+                        return err(1, "chown: cannot access: No such file or directory");
+                    }
+                }
+                RemoteOutput::ok()
+            }
             "uname" if rest == ["-m"] => RemoteOutput::with_stdout(format!("{}\n", self.arch)),
             "getconf" if rest == ["GNU_LIBC_VERSION"] => {
                 RemoteOutput::with_stdout(format!("glibc {}\n", self.glibc))

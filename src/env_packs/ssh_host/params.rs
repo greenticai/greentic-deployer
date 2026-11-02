@@ -39,6 +39,7 @@ pub const ANSWER_KEYS: &[&str] = &[
     "listen_port",
     "expose",
     "use_sudo",
+    "service_user",
 ];
 
 /// Why the binding's answers were refused.
@@ -88,6 +89,10 @@ pub struct SshHostParams {
     /// default `127.0.0.1`, which needs a reverse proxy in front.
     pub expose: bool,
     pub use_sudo: bool,
+    /// Account the service runs as, when it must differ from the login user
+    /// (typically: log in as root, run as an unprivileged account). `None` runs
+    /// it as the login user. The account must already exist on the VM.
+    pub service_user: Option<String>,
 }
 
 impl fmt::Debug for SshHostParams {
@@ -107,6 +112,7 @@ impl fmt::Debug for SshHostParams {
             .field("listen_port", &self.listen_port)
             .field("expose", &self.expose)
             .field("use_sudo", &self.use_sudo)
+            .field("service_user", &self.service_user)
             .finish()
     }
 }
@@ -150,6 +156,10 @@ impl SshHostParams {
             Some(v) => parse_bool("use_sudo", v)?,
             None => user != "root",
         };
+        let service_user = match optional_string(obj.get("service_user"), "service_user")? {
+            Some(s) => Some(parse_account("service_user", &s)?),
+            None => None,
+        };
         Ok(Self {
             host,
             port,
@@ -166,7 +176,19 @@ impl SshHostParams {
             listen_port,
             expose,
             use_sudo,
+            service_user,
         })
+    }
+
+    /// The account the systemd unit runs the service as.
+    pub fn runs_as(&self) -> &str {
+        self.service_user.as_deref().unwrap_or(&self.user)
+    }
+
+    /// The service account, only when it is NOT the login user (the case that
+    /// needs a lookup and a `chown`).
+    pub fn foreign_service_user(&self) -> Option<&str> {
+        self.service_user.as_deref().filter(|u| *u != self.user)
     }
 
     /// `<install_dir>/<rel>` — `rel` is always one of this module's constants.
@@ -265,6 +287,11 @@ fn parse_host(raw: &str) -> Result<String, SshHostParamsError> {
 }
 
 fn parse_user(raw: &str) -> Result<String, SshHostParamsError> {
+    parse_account("user", raw)
+}
+
+/// A login/account name: letters, digits, `.`, `_`, `-`, not starting with `-`.
+fn parse_account(key: &str, raw: &str) -> Result<String, SshHostParamsError> {
     let ok = !raw.is_empty()
         && raw.len() <= 32
         && !raw.starts_with('-')
@@ -275,8 +302,8 @@ fn parse_user(raw: &str) -> Result<String, SshHostParamsError> {
         Ok(raw.to_string())
     } else {
         Err(invalid(
-            "user",
-            format!("{raw:?} is not a valid login name (letters, digits, `.`, `_`, `-`)"),
+            key,
+            format!("{raw:?} is not a valid account name (letters, digits, `.`, `_`, `-`)"),
         ))
     }
 }
@@ -403,6 +430,26 @@ mod tests {
         assert!(!p.expose, "loopback unless the operator opts in");
         assert_eq!(p.bind_addr(), "127.0.0.1");
         assert!(p.identity_file.is_none() && p.start_binary.is_none());
+    }
+
+    #[test]
+    fn service_user_defaults_to_the_login_user_and_is_validated() {
+        let e = env();
+        let p = SshHostParams::from_answers(&e, &base()).unwrap();
+        assert_eq!(p.runs_as(), "greentic");
+        assert!(p.foreign_service_user().is_none());
+        let p = SshHostParams::from_answers(&e, &with("service_user", json!("nobody"))).unwrap();
+        assert_eq!(p.runs_as(), "nobody");
+        assert_eq!(p.foreign_service_user(), Some("nobody"));
+        let same =
+            SshHostParams::from_answers(&e, &with("service_user", json!("greentic"))).unwrap();
+        assert!(same.foreign_service_user().is_none());
+        for bad in ["-x", "a b", "a;b", "$(id)"] {
+            assert!(
+                SshHostParams::from_answers(&e, &with("service_user", json!(bad))).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

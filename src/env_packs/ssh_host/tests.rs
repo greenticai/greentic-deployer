@@ -585,6 +585,81 @@ async fn a_start_binary_that_does_not_run_is_never_installed() {
     assert!(remote.file(UNIT).is_none());
 }
 
+// ---- warm: the service account ---------------------------------------------
+
+#[tokio::test]
+async fn a_service_user_owns_what_the_runtime_writes_and_runs_the_unit() {
+    let (handler, remote, _store) = {
+        let remote = Arc::new(FakeRemote::default());
+        remote.put_executable("/opt/greentic/bin/greentic-start", b"#!binary");
+        let (h, s) = bound(&remote, params(json!({"service_user": "nobody"})));
+        (h, remote, s)
+    };
+    warm(&handler, &build_fixture_env()).await.unwrap();
+    let cmds = remote.commands();
+    let pos = |needle: &str| cmds.iter().position(|c| c.contains(needle)).unwrap();
+    // The account is looked up before anything is created or changed.
+    assert!(pos("id -u nobody") < pos("mkdir -p"));
+    // home/logs are handed over, and the NEW slot is handed over before it is live.
+    assert!(
+        cmds.iter().any(|c| c.contains(
+            "sudo -n chown -R -h nobody /opt/greentic/home /opt/greentic/logs"
+        )),
+        "{cmds:?}"
+    );
+    assert!(
+        pos("sudo -n chown -R -h nobody /opt/greentic/store-a")
+            < pos("mv -T /opt/greentic/store.next /opt/greentic/store")
+    );
+    assert!(remote.file_text(UNIT).unwrap().contains("\nUser=nobody\n"));
+
+    // An unchanged store is re-owned (the account may have changed), not re-sent.
+    remote.clear_calls();
+    warm(&handler, &build_fixture_env()).await.unwrap();
+    let again = remote.commands();
+    assert!(
+        again
+            .iter()
+            .any(|c| c.contains("chown -R -h nobody /opt/greentic/store/."))
+    );
+    assert!(!again.iter().any(|c| c.contains("tar -xf")));
+    assert_eq!(remote.restarts(), 1);
+}
+
+#[tokio::test]
+async fn an_unknown_service_user_fails_before_anything_is_created() {
+    let remote = Arc::new(FakeRemote::default());
+    remote.put_executable("/opt/greentic/bin/greentic-start", b"#!binary");
+    remote.fail_command(
+        "id -u ghost",
+        RemoteOutput::failed(1, "id: 'ghost': no such user"),
+    );
+    let (handler, _store) = bound(&remote, params(json!({"service_user": "ghost"})));
+    let msg = provider_message(warm(&handler, &build_fixture_env()).await.unwrap_err());
+    assert!(msg.contains("checking the service account"), "{msg}");
+    assert!(msg.contains("no such user"), "{msg}");
+    assert!(remote.symlink_target("/opt/greentic/store").is_none());
+    assert!(remote.file(UNIT).is_none());
+    assert!(!remote.commands().iter().any(|c| c.contains("mkdir")));
+}
+
+#[tokio::test]
+async fn a_service_user_equal_to_the_login_user_changes_nothing() {
+    let (handler, remote, _store) = {
+        let remote = Arc::new(FakeRemote::default());
+        remote.put_executable("/opt/greentic/bin/greentic-start", b"#!binary");
+        let (h, s) = bound(&remote, params(json!({"service_user": "greentic"})));
+        (h, remote, s)
+    };
+    warm(&handler, &build_fixture_env()).await.unwrap();
+    assert!(
+        !remote
+            .commands()
+            .iter()
+            .any(|c| c.contains("chown") || c.contains("id -u"))
+    );
+}
+
 // ---- warm: failures leave no half-done swap ----------------------------------
 
 /// (command needle that fails, phrase the error must contain)

@@ -14,16 +14,17 @@ use super::params::SshHostParams;
 /// * The bind address and port are set both here and in the shipped
 ///   `runtime.json` (see `snapshot`), so whichever the runtime honours agrees.
 ///
-/// `User=` is omitted for root so a root login runs the service
-/// as root rather than naming it redundantly; a non-root login runs the service
-/// as that same user, which owns the install dir and the synchronized store.
+/// `User=` is omitted for root so a root service is not named redundantly. The
+/// service runs as `service_user` when set, else as the login user; either way
+/// that account owns `home/`, `logs/` and the synchronized store (see `steps`).
 pub fn render_unit(env: &Environment, params: &SshHostParams) -> String {
     let env_id = env.environment_id.as_str();
     let dir = &params.install_dir;
-    let user_line = if params.user == "root" {
+    let runs_as = params.runs_as();
+    let user_line = if runs_as == "root" {
         String::new()
     } else {
-        format!("User={}\n", params.user)
+        format!("User={runs_as}\n")
     };
     format!(
         "[Unit]\n\
@@ -107,6 +108,18 @@ mod tests {
             "{unit}"
         );
         assert!(unit.contains("GREENTIC_GATEWAY_PORT=8080\n"), "{unit}");
+    }
+
+    #[test]
+    fn unit_runs_as_the_service_user_not_the_login_user() {
+        let p = SshHostParams::from_answers(
+            &build_fixture_env(),
+            &json!({"host": "h", "user": "root", "service_user": "nobody"}),
+        )
+        .unwrap();
+        let unit = render_unit(&build_fixture_env(), &p);
+        assert!(unit.contains("\nUser=nobody\n"), "{unit}");
+        assert!(!unit.contains("User=root"), "{unit}");
     }
 
     #[test]

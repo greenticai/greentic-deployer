@@ -40,8 +40,8 @@ questions:
     type: string
     title: SSH login user
     description: >-
-      The service runs as this user (unless it is root), so prefer a dedicated
-      non-root user that owns the install directory.
+      The service runs as this user unless `service_user` names another account.
+      Prefer a dedicated non-root user that owns the install directory.
     required: true
     constraint:
       pattern: '^[A-Za-z0-9_][A-Za-z0-9._-]*$'
@@ -116,3 +116,14 @@ questions:
     required: false
     constraint:
       pattern: '^(true|false)$'
+  - id: service_user
+    type: string
+    title: Account the service runs as (optional)
+    description: >-
+      By default the service runs as the SSH login user. Set this to run it as
+      another, already existing account (typically: log in as root and run as an
+      unprivileged user). The deployer hands that account the store, `home` and
+      `logs` directories.
+    required: false
+    constraint:
+      pattern: '^[A-Za-z0-9_][A-Za-z0-9._-]*$'

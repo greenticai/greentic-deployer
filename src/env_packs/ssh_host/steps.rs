@@ -166,6 +166,11 @@ pub(super) struct WarmInput {
 
 pub(super) fn warm(session: &Session<'_>, input: &WarmInput) -> Result<WarmOutcome, DeployerError> {
     let p = session.params;
+    // Before anything changes: a typo'd account would otherwise be found only
+    // when systemd fails to start the unit.
+    if let Some(account) = p.foreign_service_user() {
+        session.run_ok("checking the service account", &["id", "-u", account])?;
+    }
     session.run_ok(
         "creating the install directories",
         &[
@@ -176,6 +181,21 @@ pub(super) fn warm(session: &Session<'_>, input: &WarmInput) -> Result<WarmOutco
             &p.path("logs"),
         ],
     )?;
+    if let Some(account) = p.foreign_service_user() {
+        // The runtime writes under `home` and `logs`; both are created by the
+        // login user, so hand them to the account the service runs as.
+        session.run_privileged_ok(
+            "giving the service account its directories",
+            &[
+                "chown",
+                "-R",
+                "-h",
+                account,
+                &p.path("home"),
+                &p.path("logs"),
+            ],
+        )?;
+    }
     let mut changed = sync_binary(session)?;
     changed |= sync_store(session, input)?;
     changed |= install_unit(session, &input.env)?;
@@ -269,6 +289,13 @@ fn sync_store(session: &Session<'_>, input: &WarmInput) -> Result<bool, Deployer
         &["cat", &p.path(&format!("store/{STORE_MARKER_FILE}"))],
     )?;
     if marker.success() && marker.stdout.trim() == archive.content_sha256 {
+        // Unchanged store, but the service account may have changed since.
+        if let Some(account) = p.foreign_service_user() {
+            session.run_privileged_ok(
+                "giving the service account the store",
+                &["chown", "-R", "-h", account, &p.path("store/.")],
+            )?;
+        }
         return Ok(false);
     }
 
@@ -314,6 +341,14 @@ fn sync_store(session: &Session<'_>, input: &WarmInput) -> Result<bool, Deployer
         &["ln", "-sfn", &p.path("logs"), &format!("{slot}/logs")],
     )?;
 
+    // Extraction ran as the login user (root keeps the archive's uid 0), so the
+    // new slot is handed over BEFORE it becomes the live store.
+    if let Some(account) = p.foreign_service_user() {
+        session.run_privileged_ok(
+            "giving the service account the new store",
+            &["chown", "-R", "-h", account, &slot],
+        )?;
+    }
     session.run_ok(
         "preparing the store switch",
         &["ln", "-sfn", &slot, &next_link],
