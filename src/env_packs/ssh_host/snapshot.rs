@@ -8,6 +8,7 @@
 //! | rel. to `<env_id>/` | treatment |
 //! |---|---|
 //! | `backups/`, `audit/` | skipped (local history, not runtime state) |
+//! | `revision-signing.key`, `logs/` | skipped (runtime-written state; the VM keeps its own) |
 //! | any file named exactly `.lock` or `.dev.secrets.env.lock` | skipped (flock files) |
 //! | `revisions/*/bundle.gtbundle` | skipped |
 //! | `.greentic/dev/.dev.secrets.env` | **replaced** by the filtered bytes the caller injects (omitted if none) |
@@ -22,7 +23,7 @@
 //! and `bundle-lock.json` are shipped; a test pins it.
 //!
 //! Files outside `<env_id>/` (other environments, and the runtime's own
-//! `revision-signing.key` and `logs/` at the store root) are never read. A
+//! store-root state) are never read. A
 //! symlink anywhere in the tree is refused rather than followed.
 //!
 //! The dev-store bytes MUST come from the filtered read the Cloud Run lane uses
@@ -87,6 +88,9 @@ fn classify(rel: &[String], is_dir: bool) -> Verdict {
     let parts: Vec<&str> = rel.iter().map(String::as_str).collect();
     match parts.as_slice() {
         ["backups"] | ["audit"] => Verdict::Skip,
+        // Runtime-written state of the machine it ran on: the signing key must be
+        // the VM's own (carried between slots by `steps`), and logs stay local.
+        ["revision-signing.key"] | ["logs"] => Verdict::Skip,
         ["revisions", _, "bundle.gtbundle"] if !is_dir => Verdict::Skip,
         [".greentic", "dev", ".dev.secrets.env"] if !is_dir => Verdict::ReplaceDevStore,
         [".greentic", "state", "dev", ".dev.secrets.env"] if !is_dir => Verdict::Skip,
@@ -333,6 +337,8 @@ pub(crate) mod tests {
             ),
             ("revision-signing.key", "RUNTIME-KEY"),
             ("logs/x.log", "log"),
+            ("conformance/revision-signing.key", "LOCAL-ENV-KEY"),
+            ("conformance/logs/y.log", "log"),
             ("other-env/environment.json", "{}"),
         ];
         for (path, content) in files {

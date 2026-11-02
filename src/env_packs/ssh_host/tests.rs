@@ -201,7 +201,9 @@ async fn warm_on_a_fresh_vm_runs_the_steps_in_order() {
     assert!(pos("cat /opt/greentic/store/") < pos("readlink /opt/greentic/store"));
     assert!(pos("readlink") < pos("rm -rf /opt/greentic/store-a"));
     assert!(pos("rm -rf") < pos("tar -xf - -C /opt/greentic/store-a"));
-    assert!(pos("tar -xf") < pos("ln -sfn /opt/greentic/logs /opt/greentic/store-a/logs"));
+    assert!(
+        pos("tar -xf") < pos("ln -sfn /opt/greentic/logs /opt/greentic/store-a/conformance/logs")
+    );
     assert!(
         pos("ln -sfn /opt/greentic/logs")
             < pos("ln -sfn /opt/greentic/store-a /opt/greentic/store.next")
@@ -307,6 +309,17 @@ async fn the_vm_gets_the_portable_set_and_none_of_the_excluded_files() {
     assert!(
         remote
             .file("/opt/greentic/store/revision-signing.key")
+            .is_none()
+    );
+    // ...nor does the env dir's own signing key or logs: the VM keeps its own.
+    assert!(
+        remote
+            .file("/opt/greentic/store/conformance/revision-signing.key")
+            .is_none()
+    );
+    assert!(
+        remote
+            .file("/opt/greentic/store/conformance/logs/y.log")
             .is_none()
     );
     assert!(
@@ -726,9 +739,13 @@ async fn runtime_state_survives_a_store_change() {
     let (handler, remote, store) = setup();
     let env = build_fixture_env();
     warm(&handler, &env).await.unwrap();
-    // The runtime writes its signing key into the store root and logs beside it.
-    remote.put_file("/opt/greentic/store/revision-signing.key", b"RUNTIME-KEY-1");
-    remote.put_file("/opt/greentic/store/logs/run.log", b"line");
+    // The runtime writes its signing key and logs INSIDE the env dir (measured
+    // on a real VM; not at the store root).
+    remote.put_file(
+        "/opt/greentic/store/conformance/revision-signing.key",
+        b"RUNTIME-KEY-1",
+    );
+    remote.put_file("/opt/greentic/store/conformance/logs/run.log", b"line");
     assert_eq!(
         remote.file("/opt/greentic/logs/run.log").as_deref(),
         Some(&b"line"[..])
@@ -739,13 +756,15 @@ async fn runtime_state_survives_a_store_change() {
         warm(&handler, &env).await.unwrap();
         assert_eq!(
             remote
-                .file("/opt/greentic/store/revision-signing.key")
+                .file("/opt/greentic/store/conformance/revision-signing.key")
                 .as_deref(),
             Some(&b"RUNTIME-KEY-1"[..]),
             "round {round}: the signing key must be carried over"
         );
         assert_eq!(
-            remote.file("/opt/greentic/store/logs/run.log").as_deref(),
+            remote
+                .file("/opt/greentic/store/conformance/logs/run.log")
+                .as_deref(),
             Some(&b"line"[..]),
             "round {round}: logs live outside the slots"
         );

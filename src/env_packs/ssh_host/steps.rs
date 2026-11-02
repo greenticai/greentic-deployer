@@ -9,8 +9,8 @@
 //!    SHA-256 differs from the installed one, or verified present;
 //! 3. the store — a deterministic snapshot ([`super::snapshot`]) is STREAMED over
 //!    ssh into `tar -xf -` in the INACTIVE one of two slots (`store-a` /
-//!    `store-b`), the runtime-written `revision-signing.key` is carried over from
-//!    the active slot and `logs` is linked to the persistent directory, then the
+//!    `store-b`), the runtime-written `<env_id>/revision-signing.key` is carried
+//!    over from the active slot and `<env_id>/logs` is linked to the persistent directory, then the
 //!    `store` symlink is renamed into place (`mv -T`, one `rename(2)`). So
 //!    `<install_dir>/store` is always either the old complete store or the new
 //!    complete one, and a rsync-style delete can never eat the runtime's state.
@@ -258,7 +258,10 @@ fn sync_binary(session: &Session<'_>) -> Result<bool, DeployerError> {
     // a real VM.
     let probe = session.run("checking the new greentic-start", &[&staged, "--version"])?;
     if !probe.success() || probe.stdout.trim().is_empty() {
-        let _ = session.run("removing the rejected greentic-start", &["rm", "-f", &staged]);
+        let _ = session.run(
+            "removing the rejected greentic-start",
+            &["rm", "-f", &staged],
+        );
         return Err(session.fail(
             "checking the new greentic-start",
             format!(
@@ -324,11 +327,16 @@ fn sync_store(session: &Session<'_>, input: &WarmInput) -> Result<bool, Deployer
     session.run_ok("creating the inactive store slot", &["mkdir", "-p", &slot])?;
     stream_archive(session, &archive.bytes, &slot)?;
 
-    // Runtime-written state must survive a store change: the signing key is
-    // copied from the active slot (a first deploy has none), and `logs` is a
-    // link to a directory that is not part of any slot.
+    // Runtime-written state must survive a store change. Both live INSIDE the env
+    // directory (`<slot>/<env_id>/`), not at the store root — measured on a real
+    // VM: the signing key is copied from the active slot (a first deploy has
+    // none) and `logs` is a link to a directory that is not part of any slot.
+    let env_id = input.env.environment_id.as_str();
     if let Some(active_idx) = active_slot {
-        let old_key = p.path(&format!("{}/{RUNTIME_KEY_FILE}", STORE_SLOTS[active_idx]));
+        let old_key = p.path(&format!(
+            "{}/{env_id}/{RUNTIME_KEY_FILE}",
+            STORE_SLOTS[active_idx]
+        ));
         if session
             .run(
                 "looking for the runtime signing key",
@@ -338,13 +346,23 @@ fn sync_store(session: &Session<'_>, input: &WarmInput) -> Result<bool, Deployer
         {
             session.run_ok(
                 "carrying over the runtime signing key",
-                &["cp", "-p", &old_key, &format!("{slot}/{RUNTIME_KEY_FILE}")],
+                &[
+                    "cp",
+                    "-p",
+                    &old_key,
+                    &format!("{slot}/{env_id}/{RUNTIME_KEY_FILE}"),
+                ],
             )?;
         }
     }
     session.run_ok(
         "linking the persistent logs directory",
-        &["ln", "-sfn", &p.path("logs"), &format!("{slot}/logs")],
+        &[
+            "ln",
+            "-sfn",
+            &p.path("logs"),
+            &format!("{slot}/{env_id}/logs"),
+        ],
     )?;
 
     // Extraction ran as the login user (root keeps the archive's uid 0), so the
