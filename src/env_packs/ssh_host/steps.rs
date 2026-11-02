@@ -251,20 +251,26 @@ fn sync_binary(session: &Session<'_>) -> Result<bool, DeployerError> {
     )?;
     // Run the staged file BEFORE it replaces the working one: an empty file, a
     // binary for another architecture or one needing a newer glibc would
-    // otherwise take the service down at the next restart.
+    // otherwise take the service down at the next restart. The probe must also
+    // PRINT something: the remote shell runs a file the kernel refuses to
+    // execute (an empty one, or a script without an interpreter line) as a shell
+    // script, so an empty file "succeeds" with exit 0 and no output — measured on
+    // a real VM.
     let probe = session.run("checking the new greentic-start", &[&staged, "--version"])?;
-    if !probe.success() {
-        let _ = session.run(
-            "removing the rejected greentic-start",
-            &["rm", "-f", &staged],
-        );
+    if !probe.success() || probe.stdout.trim().is_empty() {
+        let _ = session.run("removing the rejected greentic-start", &["rm", "-f", &staged]);
         return Err(session.fail(
             "checking the new greentic-start",
             format!(
-                "`{staged} --version` exited {}: {}. The binary from `start_binary` does not run \
-                 on this VM, so it was NOT installed and the previous one is untouched",
+                "`{staged} --version` exited {} and printed {}. The binary from `start_binary` \
+                 does not run on this VM, so it was NOT installed and the previous one is \
+                 untouched",
                 probe.status,
-                probe.stderr.trim()
+                if probe.stdout.trim().is_empty() {
+                    format!("nothing (stderr: {:?})", probe.stderr.trim())
+                } else {
+                    "a version".to_string()
+                }
             ),
         ));
     }

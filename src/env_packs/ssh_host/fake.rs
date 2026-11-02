@@ -229,13 +229,15 @@ impl FakeRemote {
         match cmd {
             "true" | "sleep" => RemoteOutput::ok(),
             // Running an uploaded file: only `--version`, and only a non-empty
-            // executable "runs" (an empty file is `Exec format error`, as on Linux).
+            // executable prints a version.
             path if path.starts_with('/') && rest == ["--version"] => {
                 match sim.files.get(&sim.resolve(path)) {
                     Some(bytes) if !bytes.is_empty() && sim.executable(path) => {
                         RemoteOutput::with_stdout("greentic-start 0.0.0-fake\n")
                     }
-                    Some(_) => err(126, "cannot execute binary file: Exec format error"),
+                    // What a real login shell does with an empty file the kernel
+                    // refuses to exec: runs it as an (empty) script — exit 0, no output.
+                    Some(_) => RemoteOutput::ok(),
                     None => err(127, "No such file or directory"),
                 }
             }
