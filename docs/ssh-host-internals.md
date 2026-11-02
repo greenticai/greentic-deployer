@@ -24,19 +24,30 @@ service", and `warm_revision` does:
    outlives store changes.
 2. **Binary.** With `start_binary` set, compare its SHA-256 to
    `sha256sum <install_dir>/bin/greentic-start`; if different, upload
-   `greentic-start.new`, `chmod 0755`, `mv -f` over the live name. Without it,
+   `greentic-start.new`, `chmod 0755`, **run `greentic-start.new --version`** (it
+   must exit 0 AND print something — the remote shell runs an empty file as an empty
+   script, exit 0, no output), then `mv -f` over the live name; a rejected file is
+   removed and the installed binary is untouched. Without it,
    `test -x` the installed binary and fail with a pointer to `start_binary`.
 3. **Store.** Build a deterministic snapshot of the local `<store_root>/<env_id>/`
    (see below), skip it if `<install_dir>/store/.greentic-store.sha256` already
    holds its content hash, otherwise **stream** it over ssh into
    `tar -xf - -C <inactive slot>` (`store-a` / `store-b`), carry the runtime's
-   `revision-signing.key` over from the active slot, link `<slot>/logs` to
-   `<install_dir>/logs`, and activate with `ln -sfn` + `mv -T` (a single
-   `rename(2)` of the `store` symlink).
+   `<env_id>/revision-signing.key` over from the active slot, link
+   `<slot>/<env_id>/logs` to `<install_dir>/logs`, hand the slot to `service_user`
+   (when set), and activate with `ln -sfn` + `mv -T` (a single `rename(2)` of the
+   `store` symlink).
 4. **Unit.** Render, upload, `cmp -s` against `/etc/systemd/system/<svc>.service`;
    `sudo -n install` + `daemon-reload` only if it differs.
-5. `enable` + `restart` if 2, 3 or 4 changed anything, else `enable --now`; then
-   `systemctl is-active` must say `active`.
+5. `enable` + `restart` if 2, 3 or 4 changed anything, else `enable --now`; wait
+   3 s (a process that dies at startup is `activating (auto-restart)`, and an
+   immediate check can read `active` for it), then `systemctl is-active` must say
+   `active`. On failure the error quotes the last 12 journal lines.
+
+With `service_user` set (and different from the login user) the account is looked
+up first (`id -u`, before anything changes), `home/`, `logs/` and the store are
+`chown -R -h`'d to it, and the unit gets `User=`. Use it to log in as root and run
+as an unprivileged account.
 
 `WarmOutcome.endpoint_url` is `http://<host>:<listen_port>` only when
 `expose=true`; a loopback bind returns `None` (see "Listen address").
@@ -54,6 +65,7 @@ and positions, relative to the env dir):
 | path | treatment |
 |---|---|
 | `backups/`, `audit/` | skipped |
+| `revision-signing.key`, `logs/` | skipped (runtime-written; the VM keeps its own) |
 | files named exactly `.lock` or `.dev.secrets.env.lock` | skipped |
 | `revisions/*/bundle.gtbundle` | skipped |
 | `.greentic/dev/.dev.secrets.env` | **replaced** by the injected, filtered bytes (omitted if none) |
@@ -66,7 +78,7 @@ answers `/healthz` 200 while webchat fails with "deployment ... not known to
 dispatcher". `pack-list.lock`, `bundle.lock.json`, `bundle-lock.json` ship (a
 test pins it). A `bundle/.greentic/dev/.dev.secrets.env` inside a revision
 belongs to the bundle and ships as-is. Other envs, and the runtime's own
-`revision-signing.key` / `logs/` at the store root, are never read. A symlink in
+store-root state, are never read. A symlink in
 the tree is refused. Limit 256 MiB.
 
 The dev-store bytes MUST come from `cli::env::read_dev_secrets_bytes` (it strips
@@ -79,11 +91,13 @@ No SSH credential is ever put in the store.
 
 ## Runtime state survives a store change
 
-greentic-start writes `revision-signing.key` and `logs/` inside the store root. A
-changed snapshot goes to a *fresh* slot, so without care that state would be
-lost. Instead: the key is `cp -p`'d from the active slot into the new one before
-activation, and `<slot>/logs` is a symlink to `<install_dir>/logs`, outside any
-slot. There is no `rsync --delete` anywhere. A store change still orphans
+greentic-start writes `revision-signing.key` and `logs/` inside the ENV
+directory, `<slot>/<env_id>/` (measured on a real VM — the first implementation
+looked at the slot root, so every store change silently generated a new key and
+the persistent `logs/` stayed empty). A changed snapshot goes to a *fresh* slot,
+so without care that state would be lost. Instead: the key is `cp -p`'d from the
+active slot into the new one before activation, and `<slot>/<env_id>/logs` is a
+symlink to `<install_dir>/logs`, outside any slot. There is no `rsync --delete` anywhere. A store change still orphans
 anything *else* the runtime wrote into the old slot (it stays there, in the
 previous generation).
 
@@ -97,8 +111,9 @@ and `GREENTIC_GATEWAY_LISTEN_ADDR` / `GREENTIC_GATEWAY_PORT` in the unit — so
 whichever the runtime honours agrees. A loopback deploy needs a reverse proxy
 (nginx, Caddy) for TLS and public access; the deployer does not set one up.
 (`op config set --listen-addr` would change the local store instead; rewriting
-it in the snapshot keeps the operator's local store untouched.) Which of
-`runtime.json` and the environment variables wins in the runtime is unverified.
+it in the snapshot keeps the operator's local store untouched.) Both were
+applied in the live run and the service listened on exactly `127.0.0.1:<listen_port>`;
+which of the two wins when they disagree was not isolated.
 
 ## Module map
 
@@ -167,26 +182,72 @@ it in the snapshot keeps the operator's local store untouched.) Which of
    binding's answers, building the handler, passing `store.root()` and
    `read_dev_secrets_bytes`.
 2. **A `Vm` deploy target in the contract** (`DeployTarget::Vm`, designer/admin).
-3. **A readiness wait.** `is-active` is checked once; there is no `/healthz`
-   poll from the operator machine.
+3. **A readiness wait on `/healthz`.** The deployer checks `is-active` after a 3 s
+   settle, not the HTTP endpoint (the live test polls `/healthz` itself).
+4. **No rollback on a failed start.** A store/unit change whose service then fails
+   to stay active leaves the new generation active and the service restarting
+   (`Restart=on-failure`); the previous store is still in the other slot. A
+   rejected *binary* is the exception (it is never swapped in).
+5. **Resumable uploads.** The 164 MB binary upload restarts from zero if the
+   connection stalls (ServerAlive: 3x15 s); one run lost a 15 MB partial upload
+   that way on a slow link.
+
+## Verified on a real VM, and what is not
+
+`tests/ssh_host_live.rs` (`#[ignore]`d, see below) was run against Ubuntu 24.04
+(glibc 2.39, systemd 255, GNU coreutils 9.4) over a real `sshd` with a real
+greentic-start `v1.2.40985621765`. It proved: the six credential probes; first
+install (upload of the binary, snapshot stream, slot swap, unit install, start,
+`/healthz` 200 and the demo bundle's webchat page 200); an unchanged warm is a
+no-op (same start time, same install dir); a small store change flips the slot,
+restarts and keeps the signing key; a binary that does not run is refused with the
+old one still serving; drain stops the service only when no traffic is routed;
+archive touches nothing. GNU `mv -T`, `ln -sfn`, `cmp -s`, `cp -p`, `install`,
+`sha256sum` and `tar -xf -` behaved as assumed, the runtime accepted
+`.greentic-store.sha256` at the slot root, glibc 2.39 is sufficient for this
+release (a lower floor was not tested), and plain ssh uploads work.
+
+Wrong assumptions the run corrected (each fixed in its own commit): the runtime's
+state lives under `<slot>/<env_id>/`, not the slot root; an empty binary passes a
+bare `--version` exit-code probe; a single `is-active` right after `restart`
+cannot see a startup crash; and on a busy box root can be out of inotify
+instances (128 per uid), so the service has to run as another account
+(`service_user`) — greentic-start dies at boot with "Too many open files" otherwise.
+
+### Running the live test
+
+```text
+GREENTIC_SSH_LIVE_HOST=...        GREENTIC_SSH_LIVE_USER=root
+GREENTIC_SSH_LIVE_KNOWN_HOSTS=/path/to/known_hosts   # already trusts the VM
+GREENTIC_SSH_LIVE_START_BINARY=/path/to/greentic-start-for-the-vm
+GREENTIC_SSH_LIVE_STORE=/path/to/store-root          # holds <env_id>/, copied not modified
+GREENTIC_SSH_LIVE_INSTALL_DIR=/opt/greentic-vmtest   # must contain "vmtest"
+GREENTIC_SSH_LIVE_SERVICE=greentic-vmtest            # must start with that
+GREENTIC_SSH_LIVE_LISTEN_PORT=18647                  # loopback, must be free
+# optional: _PORT, _IDENTITY, _UI_PATH (a path that must answer 200), _SERVICE_USER, _KEEP=1
+cargo test --test ssh_host_live -- --ignored --nocapture
+```
+
+There are no defaults, so nothing about a machine is ever committed. The test
+prints "WILL CHANGE ON THE VM" before each mutating step and removes the unit and
+the install dir at the end, also on failure (`_KEEP=1` skips that, to inspect a
+failure or avoid re-uploading the binary; remove them yourself afterwards). It
+only touches the install dir and the one unit, and refuses names that do not
+contain `vmtest`. Note a first install uploads the whole binary (~160 MB).
 
 ## Not verified
 
-Everything here ran against `FakeRemote`, which implements the command
-vocabulary with the semantics it was given. Unverified against reality:
-
-* **Linux, sshd, systemd.** The spike proved the store layout and the exclusion
-  set macOS-arm64 path-to-path only. `SystemSsh` has been exercised for its
-  argument construction and quoting, never against a running `sshd`. The unit has
-  never been loaded by systemd.
-* GNU coreutils behaviour assumed on the VM: `mv -T`, `ln -sfn`, `cmp -s`,
-  `cp -p`, `install -o root -g root`, `sha256sum`, `tar -xf -`.
-* The glibc floor (2.39) is the coordinator's reading of the release build host.
-* Whether `runtime.json` or the environment variables decide the bind address,
-  and that `.greentic-store.sha256` at the store root is tolerated by the runtime.
-* The `.greentic/state/dev/.dev.secrets.env` exclusion is this deployer's
-  fail-safe addition, not part of the proven set.
+* A non-root login (`sudo -n` paths, a non-root `User=`) against a real VM; the
+  live run logged in as root.
+* `systemd` versions other than 255, distros other than Ubuntu 24.04.
 * `bundle_source_uri` is not touched: the VM's greentic-start must be able to
   fetch every revision's bundle itself (`revisions/*/bundle.gtbundle` is not
-  shipped, and a `file://` source on the operator's machine will not resolve).
+  shipped, and a `file://` source on the operator's machine will not resolve). The
+  demo bundle in the live run was already inside the shipped `revisions/*/bundle/`.
+* The `.greentic/state/dev/.dev.secrets.env` exclusion is this deployer's
+  fail-safe addition, not part of the proven set; the live run shipped no
+  dev-store at all (`dev_secrets = None`).
+* Which of `runtime.json` and the unit's environment variables decides the bind
+  address when they disagree.
+* Network flakiness on large uploads (see "Not wired" 5).
 * TLS and DNS are not handled.
