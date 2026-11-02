@@ -93,8 +93,7 @@ jobs:
       - name: Load the develop runtime image for the serving E2E
         run: |
           IMG=ghcr.io/greenticai/greentic-start-distroless:develop
-          docker pull "$IMG"
-          kind load docker-image "$IMG" --name gtc-e2e
+          .github/scripts/kind-load-image.sh "$IMG" gtc-e2e
           echo "GREENTIC_K8S_SERVING_IMAGE=$IMG" >> "$GITHUB_ENV"
           echo "::notice::loaded $IMG; the serving E2Es will run"
       # SoR unit E2E: the sorx image (public on ghcr) and the landlord pack from
@@ -103,8 +102,7 @@ jobs:
       - name: Load the sorx image and the landlord pack for the SoR E2E
         run: |
           IMG=ghcr.io/greenticai/greentic-sorx:develop
-          docker pull "$IMG"
-          kind load docker-image "$IMG" --name gtc-e2e
+          .github/scripts/kind-load-image.sh "$IMG" gtc-e2e
           echo "GREENTIC_K8S_SORX_IMAGE=$IMG" >> "$GITHUB_ENV"
           PACK="$RUNNER_TEMP/landlord-tenant-sor.gtpack"
           curl -fsSL -o "$PACK" \
