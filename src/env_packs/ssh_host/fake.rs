@@ -228,6 +228,17 @@ impl FakeRemote {
         };
         match cmd {
             "true" | "sleep" => RemoteOutput::ok(),
+            // Running an uploaded file: only `--version`, and only a non-empty
+            // executable "runs" (an empty file is `Exec format error`, as on Linux).
+            path if path.starts_with('/') && rest == ["--version"] => {
+                match sim.files.get(&sim.resolve(path)) {
+                    Some(bytes) if !bytes.is_empty() && sim.executable(path) => {
+                        RemoteOutput::with_stdout("greentic-start 0.0.0-fake\n")
+                    }
+                    Some(_) => err(126, "cannot execute binary file: Exec format error"),
+                    None => err(127, "No such file or directory"),
+                }
+            }
             "id" if rest == ["-u"] => {
                 RemoteOutput::with_stdout(if privileged { "0\n" } else { "1000\n" })
             }

@@ -229,6 +229,25 @@ fn sync_binary(session: &Session<'_>) -> Result<bool, DeployerError> {
         "making greentic-start executable",
         &["chmod", "0755", &staged],
     )?;
+    // Run the staged file BEFORE it replaces the working one: an empty file, a
+    // binary for another architecture or one needing a newer glibc would
+    // otherwise take the service down at the next restart.
+    let probe = session.run("checking the new greentic-start", &[&staged, "--version"])?;
+    if !probe.success() {
+        let _ = session.run(
+            "removing the rejected greentic-start",
+            &["rm", "-f", &staged],
+        );
+        return Err(session.fail(
+            "checking the new greentic-start",
+            format!(
+                "`{staged} --version` exited {}: {}. The binary from `start_binary` does not run \
+                 on this VM, so it was NOT installed and the previous one is untouched",
+                probe.status,
+                probe.stderr.trim()
+            ),
+        ));
+    }
     session.run_ok(
         "installing greentic-start",
         &["mv", "-f", &staged, &installed],

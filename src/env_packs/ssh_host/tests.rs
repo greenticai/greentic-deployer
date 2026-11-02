@@ -558,6 +558,33 @@ async fn an_unreadable_start_binary_is_a_clear_error() {
     );
 }
 
+#[tokio::test]
+async fn a_start_binary_that_does_not_run_is_never_installed() {
+    let local = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(local.path(), b"").unwrap(); // an empty file does not execute
+    let remote = Arc::new(FakeRemote::default());
+    remote.put_executable("/opt/greentic/bin/greentic-start", b"working v1");
+    let p = params(json!({"start_binary": local.path().to_str().unwrap()}));
+    let (handler, _store) = bound(&remote, p);
+    let msg = provider_message(warm(&handler, &build_fixture_env()).await.unwrap_err());
+    assert!(msg.contains("checking the new greentic-start"), "{msg}");
+    assert!(msg.contains("NOT installed"), "{msg}");
+    // The working binary is untouched, the staged file is gone, nothing restarted
+    // and no store or unit was touched.
+    assert_eq!(
+        remote.file("/opt/greentic/bin/greentic-start").as_deref(),
+        Some(&b"working v1"[..])
+    );
+    assert!(
+        remote
+            .file("/opt/greentic/bin/greentic-start.new")
+            .is_none()
+    );
+    assert_eq!(remote.restarts(), 0);
+    assert!(remote.symlink_target("/opt/greentic/store").is_none());
+    assert!(remote.file(UNIT).is_none());
+}
+
 // ---- warm: failures leave no half-done swap ----------------------------------
 
 /// (command needle that fails, phrase the error must contain)
