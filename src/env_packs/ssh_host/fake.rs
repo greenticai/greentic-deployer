@@ -227,7 +227,7 @@ impl FakeRemote {
             return err(127, "empty command");
         };
         match cmd {
-            "true" => RemoteOutput::ok(),
+            "true" | "sleep" => RemoteOutput::ok(),
             "id" if rest == ["-u"] => {
                 RemoteOutput::with_stdout(if privileged { "0\n" } else { "1000\n" })
             }

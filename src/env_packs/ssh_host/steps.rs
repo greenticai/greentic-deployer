@@ -363,6 +363,17 @@ fn install_unit(session: &Session<'_>, env: &Environment) -> Result<bool, Deploy
     Ok(true)
 }
 
+/// Seconds a freshly (re)started service runs before it is judged. A process
+/// that dies on startup (measured on a real VM: greentic-start exits within
+/// ~0.3 s when it cannot create an inotify instance) is seen by systemd as
+/// `activating (auto-restart)`; checking `is-active` right after `restart`
+/// races that and can read `active` for a process about to die.
+const SETTLE_SECS: &str = "3";
+/// Journal lines quoted in a "did not stay active" error, and the most
+/// characters kept of each.
+const JOURNAL_LINES: &str = "12";
+const JOURNAL_LINE_CHARS: usize = 200;
+
 fn start_service(session: &Session<'_>, changed: bool) -> Result<(), DeployerError> {
     let service = session.params.service_name.as_str();
     if changed {
@@ -374,6 +385,7 @@ fn start_service(session: &Session<'_>, changed: bool) -> Result<(), DeployerErr
             &["systemctl", "enable", "--now", service],
         )?;
     }
+    session.run_ok("letting the service settle", &["sleep", SETTLE_SECS])?;
     let state = session.run("checking the service", &["systemctl", "is-active", service])?;
     if state.success() && state.stdout.trim() == "active" {
         return Ok(());
@@ -381,11 +393,41 @@ fn start_service(session: &Session<'_>, changed: bool) -> Result<(), DeployerErr
     Err(session.fail(
         "checking the service",
         format!(
-            "{service} is not active after start (systemctl says {:?}); inspect it on the VM \
-             with `journalctl -u {service}`",
-            state.stdout.trim()
+            "{service} is not active {SETTLE_SECS}s after start (systemctl says {:?}); inspect \
+             it on the VM with `journalctl -u {service}`{}",
+            state.stdout.trim(),
+            journal_tail(session, service)
         ),
     ))
+}
+
+/// The last journal lines of `service`, formatted for an error message; empty
+/// when they cannot be read (a non-root login that is not in the journal group).
+fn journal_tail(session: &Session<'_>, service: &str) -> String {
+    let Ok(out) = session.run_privileged(
+        "reading the service log",
+        &[
+            "journalctl",
+            "-u",
+            service,
+            "-n",
+            JOURNAL_LINES,
+            "--no-pager",
+            "-o",
+            "cat",
+        ],
+    ) else {
+        return String::new();
+    };
+    if !out.success() || out.stdout.trim().is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = out
+        .stdout
+        .lines()
+        .map(|l| l.chars().take(JOURNAL_LINE_CHARS).collect())
+        .collect();
+    format!("\nlast log lines:\n{}", lines.join("\n"))
 }
 
 /// Stop the service. A unit that is not installed (systemd exit 5) is already

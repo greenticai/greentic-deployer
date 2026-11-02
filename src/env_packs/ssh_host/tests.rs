@@ -742,6 +742,48 @@ async fn a_service_that_does_not_stay_active_points_at_the_journal() {
 }
 
 #[tokio::test]
+async fn a_service_that_does_not_stay_active_quotes_the_journal_tail() {
+    let (handler, remote, _store) = setup();
+    remote.fail_command("is-active", RemoteOutput::failed(3, "activating\n"));
+    remote.fail_command(
+        "journalctl",
+        RemoteOutput::with_stdout(
+            "Error: creating runtime-config debouncer\nToo many open files\n",
+        ),
+    );
+    let msg = provider_message(warm(&handler, &build_fixture_env()).await.unwrap_err());
+    assert!(msg.contains("last log lines:"), "{msg}");
+    assert!(msg.contains("Too many open files"), "{msg}");
+    // Read as root-or-sudo: a journal readable only by privileged users.
+    assert!(
+        remote
+            .commands()
+            .iter()
+            .any(|c| c.contains("sudo -n journalctl -u greentic-conformance"))
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_journal_leaves_the_error_without_a_tail() {
+    let (handler, remote, _store) = setup();
+    remote.fail_command("is-active", RemoteOutput::failed(3, ""));
+    remote.fail_command("journalctl", RemoteOutput::failed(1, "not permitted"));
+    let msg = provider_message(warm(&handler, &build_fixture_env()).await.unwrap_err());
+    assert!(msg.contains("journalctl -u greentic-conformance"), "{msg}");
+    assert!(!msg.contains("last log lines"), "{msg}");
+}
+
+#[tokio::test]
+async fn the_service_is_judged_only_after_it_has_had_time_to_crash() {
+    let (handler, remote, _store) = setup();
+    warm(&handler, &build_fixture_env()).await.unwrap();
+    let cmds = remote.commands();
+    let pos = |needle: &str| cmds.iter().position(|c| c.contains(needle)).unwrap();
+    assert!(pos("systemctl restart") < pos("sleep 3"));
+    assert!(pos("sleep 3") < pos("systemctl is-active"));
+}
+
+#[tokio::test]
 async fn the_identity_file_path_never_appears_in_commands_uploads_or_errors() {
     let remote = Arc::new(FakeRemote::default());
     remote.put_executable("/opt/greentic/bin/greentic-start", b"x");
