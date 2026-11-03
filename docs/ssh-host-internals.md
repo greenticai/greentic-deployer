@@ -5,12 +5,59 @@ greentic-start to a plain Linux VM with systemd over SSH. Opt-in per env: bind i
 with `op env-packs add <env> --slot deployer --kind greentic.deployer.ssh-host@0.1.0`;
 it is not a `local` default.
 
-> **Status: draft, not wired into the CLI.** The `Deployer` verbs, the
-> credentials probes, the wizard and the registry entry exist and are tested
-> against a simulated VM. `op env apply-revision` / `op credentials requirements`
-> do not yet dispatch to it — see "Not wired" below. Nothing here has run against
-> a real `sshd`, a real systemd or a Linux host. The store layout was proven
-> path-to-path on macOS arm64 only.
+> **Status: wired into the CLI, verified on one real VM.** The `Deployer` verbs,
+> the credentials probes, the wizard and the registry entry are tested against a
+> simulated VM, and `tests/ssh_host_live.rs` ran them (library and CLI) against a
+> real Ubuntu 24.04 VM. See "Using it from the CLI" for the operator flow and
+> "Verified on a real VM" for what was and was not proved.
+
+## Using it from the CLI
+
+The wiring is `src/cli/ssh_host.rs`; every path uses the same strict answers
+parser as the deployer (`params.rs`), so a bad answer is refused where it is written.
+
+1. **Bind** the deployer with its answers (host, user, port, identity_file,
+   known_hosts_file, install_dir, service_name, start_binary, listen_port, expose,
+   use_sudo, service_user — see `wizard.qaspec.yaml`). Either:
+   * `op --answers payload.json env-packs add|update` with
+     `{"environment_id","slot":"deployer","kind":"greentic.deployer.ssh-host@0.1.0","pack_ref","answers_ref":"env-packs/deployer/answers.json"}`
+     (`answers_ref` is relative to the env dir; the file is validated when the binding
+     is written), or
+   * `op --answers manifest.json env apply|up` with a `packs[]` entry carrying
+     `answers` inline or `answers_ref` (validated at plan time, before anything changes).
+2. `op credentials requirements` binds the answers' SSH target to the handler's
+   credentials, so the six probes really run. A binding with no answers still fails
+   closed (every capability `Fail`, "records no answers").
+3. **Deploy** with `op --answers manifest.json env up --yes --non-interactive`
+   (a minimal manifest `{"schema":"greentic.env-manifest.v1","environment":{"id":"<env>"}}`
+   is enough for an env that already has the binding) or, for one revision,
+   `op env apply-revision <env> <revision>`.
+
+Why `env up`: it is the repo's "bring this environment up" verb and already
+dispatches per deployer kind after the deployer-agnostic apply (Cloud Run does the
+same in `cloudrun_env_up`). `apply-revision` is the granular verb the other
+imperative backends (AWS, Cloud Run) already have, so it dispatches too. ssh-host
+needs neither the `k8s-client` nor the `deploy-gcp-cloudrun` feature, and `env up`
+skips that feature gate for it.
+
+`env up` warms ONCE for every revision the VM serves (`cloudrun_revisions_to_warm`:
+the revisions a traffic split names, or the newest of a split-less deployment) because
+the VM runs one service over one store; `apply-revision` warms the same set plus the
+named revision, so the two verbs produce the same store and are idempotent with each
+other. It fails with a pointer to `op deploy` when the env has no such revision.
+
+`env up` prints one JSON envelope on stdout:
+`{"op":"up","noun":"env","result":{environment_id, kind, host, service, install_dir,
+listen_addr, store_slot ("store-a"|"store-b"|null), changed (bool: false = the VM was
+already converged, nothing uploaded or restarted), exposed, revisions[], endpoint_url
+(only when exposed)}}`. Errors are the standard stderr envelope, exit code non-zero.
+The SSH identity is never in any output. `--dry-run` stops after the plan and never
+reaches the VM. `apply-revision` reports `identity` as `ssh-identity-file` or
+`ssh-default` (how ssh authenticates, never with what) and `worker_name` = the unit.
+
+Dev-store: shipped (filtered by `read_dev_secrets_bytes`) only when a `Secrets`-slot
+pack is bound and it is the dev-store backend, the same rule as Cloud Run; a
+Vault-backed env ships none.
 
 ## The shape of a deploy
 
@@ -50,7 +97,11 @@ up first (`id -u`, before anything changes), `home/`, `logs/` and the store are
 as an unprivileged account.
 
 `WarmOutcome.endpoint_url` is `http://<host>:<listen_port>` only when
-`expose=true`; a loopback bind returns `None` (see "Listen address").
+`expose=true`; a loopback bind returns `None` (see "Listen address"). The CLI calls
+`SshHostDeployerHandler::warm_with_report(env, revision_ids, answers)`, the same
+procedure for several revisions that also reports service, listen address, whether
+anything changed and the live store slot (one extra `readlink`; `warm_revision`
+stays exactly as before).
 
 `drain_revision` stops the service only when the env routes **no** traffic at
 all (one service serves every routed revision, so stopping it for one drained
@@ -171,26 +222,21 @@ which of the two wins when they disagree was not isolated.
 * `--no-updates` stops greentic-start from replacing the binary on the VM behind
   the deployer's back.
 
-## Not wired (follow-ups)
+## Follow-ups
 
-1. **CLI dispatch.** `cli::env::apply_revision` only dispatches K8s / AWS-ECS /
-   Cloud Run, and `op credentials requirements` resolves the handler's own
-   default credentials, which hold no target — so on a real env today the probes
-   fail closed with "no SSH target is bound". The seams exist:
-   `SshHostCredentials::with_target`, `SshHostDeployerHandler::with_remote`,
-   `with_local_store(store_root, dev_secrets)`. Missing: the CLI reading the
-   binding's answers, building the handler, passing `store.root()` and
-   `read_dev_secrets_bytes`.
-2. **A `Vm` deploy target in the contract** (`DeployTarget::Vm`, designer/admin).
-3. **A readiness wait on `/healthz`.** The deployer checks `is-active` after a 3 s
-   settle, not the HTTP endpoint (the live test polls `/healthz` itself).
-4. **No rollback on a failed start.** A store/unit change whose service then fails
+1. **A `Vm` deploy target in the contract** (`DeployTarget::Vm`, designer/admin).
+2. **A readiness wait on `/healthz`.** The deployer checks `is-active` after a 3 s
+   settle, not the HTTP endpoint (the live tests poll `/healthz` themselves).
+3. **No rollback on a failed start.** A store/unit change whose service then fails
    to stay active leaves the new generation active and the service restarting
    (`Restart=on-failure`); the previous store is still in the other slot. A
    rejected *binary* is the exception (it is never swapped in).
-5. **Resumable uploads.** The 164 MB binary upload restarts from zero if the
+4. **Resumable uploads.** The 164 MB binary upload restarts from zero if the
    connection stalls (ServerAlive: 3x15 s); one run lost a 15 MB partial upload
    that way on a slow link.
+5. `op env drain-revision` / `op bundles retire` for ssh-host go through the
+   generic paths (the adapter claims no `drain`/`remove` capability); `env up` is
+   the only verb that adds a revision to the VM.
 
 ## Verified on a real VM, and what is not
 
@@ -213,6 +259,21 @@ bare `--version` exit-code probe; a single `is-active` right after `restart`
 cannot see a startup crash; and on a busy box root can be out of inotify
 instances (128 per uid), so the service has to run as another account
 (`service_user`) — greentic-start dies at boot with "Too many open files" otherwise.
+
+### The CLI live test
+
+`ssh_host_through_the_cli` (same file, same variables) drives the real binary:
+`env-packs update` (bind), `credentials requirements` (all six probes must pass),
+`env up`, `env up` again (must report `changed: false`, same start stamp, same
+install-dir fingerprint), `/healthz` and the UI path 200, then the same cleanup. Run
+one test by name: `cargo test --test ssh_host_live ssh_host_through_the_cli -- --ignored --nocapture`.
+Its store is an `op env init` + `op deploy` store (the CLI test rebinds the deployer
+to ssh-host in a copy). Run once against Ubuntu 24.04 with a root login and
+`service_user=nobody`: passed, and the VM was left empty afterwards.
+
+`tests/ssh_host_cli.rs` (not ignored) runs the binary against a stub `ssh` on
+`PATH`: it proves the answers reach the ssh command line, bad input is refused
+before anything is contacted, and the identity path never appears in output.
 
 ### Running the live test
 
@@ -238,7 +299,7 @@ contain `vmtest`. Note a first install uploads the whole binary (~160 MB).
 ## Not verified
 
 * A non-root login (`sudo -n` paths, a non-root `User=`) against a real VM; the
-  live run logged in as root.
+  live runs (library and CLI) logged in as root.
 * `systemd` versions other than 255, distros other than Ubuntu 24.04.
 * `bundle_source_uri` is not touched: the VM's greentic-start must be able to
   fetch every revision's bundle itself (`revisions/*/bundle.gtbundle` is not
@@ -249,5 +310,5 @@ contain `vmtest`. Note a first install uploads the whole binary (~160 MB).
   dev-store at all (`dev_secrets = None`).
 * Which of `runtime.json` and the unit's environment variables decides the bind
   address when they disagree.
-* Network flakiness on large uploads (see "Not wired" 5).
+* Network flakiness on large uploads (see "Follow-ups" 4).
 * TLS and DNS are not handled.

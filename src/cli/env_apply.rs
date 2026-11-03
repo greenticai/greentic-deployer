@@ -1323,6 +1323,21 @@ fn resolve_and_validate(
                     resolved.display()
                 )));
             }
+            // The ssh-host deployer's answers are validated here, where a typo
+            // is cheap, instead of at the first `op env up`.
+            if p.slot == CapabilitySlot::Deployer
+                && greentic_deploy_spec::PackDescriptor::try_new(&p.kind)
+                    .is_ok_and(|d| super::ssh_host::is_ssh_host_kind(&d))
+            {
+                super::ssh_host::validate_answers_file(env_id.as_str(), &resolved).map_err(
+                    |e| match e {
+                        OpError::Conflict(msg) => {
+                            OpError::InvalidArgument(format!("packs[] slot `{}`: {msg}", p.slot))
+                        }
+                        other => other,
+                    },
+                )?;
+            }
         }
     }
     for ext in &manifest.extensions {

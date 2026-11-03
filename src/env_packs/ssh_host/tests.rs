@@ -492,6 +492,72 @@ async fn dev_secrets_travel_only_inside_the_private_snapshot() {
     assert!(!remote.file_text(UNIT).unwrap().contains("VERY-SECRET"));
 }
 
+// ---- warm: the report the CLI prints ---------------------------------------
+
+#[tokio::test]
+async fn warm_with_report_names_the_service_slot_and_whether_anything_changed() {
+    let (handler, _remote, store) = setup();
+    let env = build_fixture_env();
+    let ids = [first_revision(&env)];
+
+    let first = handler.warm_with_report(&env, &ids, None).await.unwrap();
+    assert_eq!(first.service_name, SERVICE);
+    assert_eq!(first.listen_addr, "127.0.0.1:8080");
+    assert_eq!(first.install_dir, "/opt/greentic");
+    assert_eq!(first.active_slot.as_deref(), Some("store-a"));
+    assert!(first.changed);
+    assert_eq!(first.endpoint_url, None);
+
+    let again = handler.warm_with_report(&env, &ids, None).await.unwrap();
+    assert!(!again.changed, "a converged VM reports no change");
+    assert_eq!(again.active_slot.as_deref(), Some("store-a"));
+
+    let handler = with_dev(handler, &store, b"ciphertext");
+    let flipped = handler.warm_with_report(&env, &ids, None).await.unwrap();
+    assert!(flipped.changed);
+    assert_eq!(flipped.active_slot.as_deref(), Some("store-b"));
+}
+
+#[tokio::test]
+async fn only_the_report_path_reads_the_slot_back() {
+    let (handler, remote, _store) = setup();
+    let env = build_fixture_env();
+    warm(&handler, &env).await.unwrap();
+    let readlinks = |remote: &FakeRemote| {
+        remote
+            .commands()
+            .iter()
+            .filter(|c| c.starts_with("readlink"))
+            .count()
+    };
+    let during_warm = readlinks(&remote);
+    handler
+        .warm_with_report(&env, &[first_revision(&env)], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        readlinks(&remote),
+        during_warm + 1,
+        "only the report path reads the slot back (an unchanged store has no sync readlink)"
+    );
+}
+
+#[tokio::test]
+async fn warm_with_report_refuses_no_revisions_and_unknown_ones() {
+    let (handler, remote, _store) = setup();
+    let env = build_fixture_env();
+    let none = provider_message(handler.warm_with_report(&env, &[], None).await.unwrap_err());
+    assert!(none.contains("at least one revision"), "{none}");
+
+    let unknown = greentic_deploy_spec::RevisionId::new();
+    let err = handler
+        .warm_with_report(&env, &[first_revision(&env), unknown], None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(&unknown.to_string()), "{err}");
+    assert!(remote.commands().is_empty(), "refused before any ssh");
+}
+
 // ---- warm: the binary --------------------------------------------------------
 
 #[tokio::test]

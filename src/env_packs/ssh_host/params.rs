@@ -121,13 +121,21 @@ impl SshHostParams {
     /// Parse the binding answers for `env`. `host` and `user` are required;
     /// everything else has a default.
     pub fn from_answers(env: &Environment, answers: &Value) -> Result<Self, SshHostParamsError> {
+        Self::from_answers_for_env_id(env.environment_id.as_str(), answers)
+    }
+
+    /// [`Self::from_answers`] when only the env id is known — the manifest
+    /// planner validates a binding's answers before the environment exists.
+    pub fn from_answers_for_env_id(
+        env_id: &str,
+        answers: &Value,
+    ) -> Result<Self, SshHostParamsError> {
         let obj = answers.as_object().ok_or(SshHostParamsError::NotAnObject)?;
         for key in obj.keys() {
             if !ANSWER_KEYS.contains(&key.as_str()) {
                 return Err(SshHostParamsError::UnknownKey(key.clone()));
             }
         }
-        let env_id = env.environment_id.as_str();
         check_env_id(env_id)?;
 
         let host = parse_host(required_string(obj.get("host"), "host")?)?;

@@ -57,6 +57,25 @@ pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// What one warm did, for operator output (`op env up`). `warm_revision` itself
+/// reports only the [`WarmOutcome`](crate::env_packs::deployer::WarmOutcome)
+/// every deployer shares; this is the ssh-host-specific superset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmReport {
+    /// `http://<host>:<listen_port>` only when the service is exposed.
+    pub endpoint_url: Option<String>,
+    pub service_name: String,
+    /// The address greentic-start binds on the VM, e.g. `127.0.0.1:8080`.
+    pub listen_addr: String,
+    pub install_dir: String,
+    /// Whether the binary, the store or the unit changed (and the service was
+    /// restarted). `false` means the VM was already converged.
+    pub changed: bool,
+    /// `store-a` / `store-b`: which store slot is live after the warm.
+    /// `None` when it could not be read back.
+    pub active_slot: Option<String>,
+}
+
 /// Native handler for the ssh-host deployer env-pack.
 #[derive(Debug)]
 pub struct SshHostDeployerHandler {

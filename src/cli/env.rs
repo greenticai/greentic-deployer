@@ -1250,7 +1250,11 @@ pub fn apply_revision(
     // paths; any other registered deployer (e.g. local-process) does not.
     let k8s_path = crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH;
     let is_k8s = descriptor.path() == k8s_path;
-    if !is_k8s && !is_aws_ecs_kind(&descriptor) && !is_cloudrun_kind(&descriptor) {
+    if !is_k8s
+        && !is_aws_ecs_kind(&descriptor)
+        && !is_cloudrun_kind(&descriptor)
+        && !super::ssh_host::is_ssh_host_kind(&descriptor)
+    {
         return Err(unsupported_apply_kind(&descriptor));
     }
 
@@ -1593,8 +1597,9 @@ pub(crate) fn is_cloudrun_kind(_descriptor: &greentic_deploy_spec::PackDescripto
 fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> OpError {
     OpError::Conflict(format!(
         "env apply-revision is only supported for the `{}` (K8s), \
-         `greentic.deployer.aws-ecs` (AWS-ECS), and `greentic.deployer.gcp-cloudrun` \
-         (Cloud Run) deployer env-packs today; `{}` has no live single-revision apply path",
+         `greentic.deployer.aws-ecs` (AWS-ECS), `greentic.deployer.gcp-cloudrun` \
+         (Cloud Run) and `greentic.deployer.ssh-host` (a Linux VM over SSH) deployer \
+         env-packs today; `{}` has no live single-revision apply path",
         crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH,
         descriptor.path()
     ))
@@ -1620,6 +1625,9 @@ fn apply_revision_non_k8s(
 ) -> Result<(&'static str, String, Option<String>), OpError> {
     // AWS-ECS has no drain capability, so its archive is not gated.
     let _ = (force_drain, drain_window);
+    if super::ssh_host::is_ssh_host_kind(descriptor) {
+        return super::ssh_host::apply_revision(store, env, env_id, revision_id, verb, answers);
+    }
     #[cfg(feature = "creds-aws")]
     {
         if is_aws_ecs_kind(descriptor) {
@@ -1647,16 +1655,19 @@ fn apply_revision_non_k8s(
 #[cfg(not(any(feature = "creds-aws", feature = "creds-gcp")))]
 #[allow(clippy::too_many_arguments)]
 fn apply_revision_non_k8s(
-    _store: &LocalFsStore,
-    _env: &Environment,
-    _env_id: &EnvId,
-    _revision_id: RevisionId,
-    _verb: RevisionVerb,
-    _answers: Option<&Value>,
+    store: &LocalFsStore,
+    env: &Environment,
+    env_id: &EnvId,
+    revision_id: RevisionId,
+    verb: RevisionVerb,
+    answers: Option<&Value>,
     descriptor: &greentic_deploy_spec::PackDescriptor,
     _force_drain: bool,
     _drain_window: Option<std::time::Duration>,
 ) -> Result<(&'static str, String, Option<String>), OpError> {
+    if super::ssh_host::is_ssh_host_kind(descriptor) {
+        return super::ssh_host::apply_revision(store, env, env_id, revision_id, verb, answers);
+    }
     Err(unsupported_apply_kind(descriptor))
 }
 
@@ -2697,7 +2708,7 @@ pub(crate) fn load_render_answers(
 /// under the env dir (fail-closed on path escape or a missing file). Shared by
 /// [`load_render_answers`] (Deployer slot) and [`load_secrets_answers`]
 /// (Secrets slot).
-fn read_binding_answers(
+pub(crate) fn read_binding_answers(
     store: &LocalFsStore,
     env: &greentic_deploy_spec::Environment,
     rel_path: &std::path::Path,
