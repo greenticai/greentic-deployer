@@ -80,8 +80,10 @@ fn replicas_above_one_is_accepted_with_redis_and_rendered() {
     for n in [
         "GREENTIC_RUNNER_SESSION_BACKEND",
         "GREENTIC_RUNNER_STATE_BACKEND",
+        "GREENTIC_AW_STATE_BACKEND",
         "GREENTIC_RUNNER_REDIS_URL",
         "GREENTIC_REVISION_PIN_REDIS_URL",
+        "GREENTIC_AW_REDIS_URL",
     ] {
         assert!(names.contains(&n.to_string()), "missing {n}");
     }

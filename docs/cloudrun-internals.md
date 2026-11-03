@@ -372,6 +372,11 @@ Not gaps to fix casually — each has a reason:
     when this env stamped it).
   - **Revision pins** — the same version also feeds
     `GREENTIC_REVISION_PIN_REDIS_URL`.
+  - **Agent conversation state** — `GREENTIC_AW_STATE_BACKEND=redis` plus the
+    same version as `GREENTIC_AW_REDIS_URL`. An Agentic Worker's memory of the
+    earlier turns of a session is its own store (default: in-process memory), so
+    without this an agent forgets the conversation when its instance restarts
+    or scales to zero, even with sessions and flow state already in Redis.
   - **Generated secrets** — greentic-start's `revision_secrets` mints a missing
     declared `generated` secret at boot, per instance. The CLI
     (`cli::cloudrun_generated_secrets`) pre-mints each one into the env dev store

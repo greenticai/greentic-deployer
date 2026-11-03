@@ -46,13 +46,20 @@ pub const VPC_EGRESS_KEY: &str = "vpc_egress";
 /// The runner-host selectors that move sessions and flow state into Redis.
 pub const SESSION_BACKEND_ENV: &str = "GREENTIC_RUNNER_SESSION_BACKEND";
 pub const STATE_BACKEND_ENV: &str = "GREENTIC_RUNNER_STATE_BACKEND";
+/// The selector for an Agentic Worker's conversation state (its memory of the
+/// earlier turns of a session). It is a separate store from the two above and
+/// defaults to in-process memory, so without it an agent forgets the
+/// conversation whenever its instance restarts or scales to zero.
+pub const AGENT_STATE_BACKEND_ENV: &str = "GREENTIC_AW_STATE_BACKEND";
 const REDIS_BACKEND: &str = "redis";
 
-/// The two variables the Redis URL reaches the runtime through — both rendered
+/// The variables the Redis URL reaches the runtime through — all rendered
 /// from ONE pinned Secret Manager version, never a literal in the template.
-pub const REDIS_URL_ENV_NAMES: [&str; 2] = [
+/// `GREENTIC_AW_REDIS_URL` is the Agentic Worker state store's own URL.
+pub const REDIS_URL_ENV_NAMES: [&str; 3] = [
     "GREENTIC_RUNNER_REDIS_URL",
     "GREENTIC_REVISION_PIN_REDIS_URL",
+    "GREENTIC_AW_REDIS_URL",
 ];
 
 /// The Redis URL (it carries the AUTH string). Never printed by `Debug`.
@@ -119,16 +126,20 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Literal boot env: the two backend selectors, only when Redis is
+    /// Literal boot env: the three backend selectors, only when Redis is
     /// answered. The URL itself is secret-sourced ([`REDIS_URL_ENV_NAMES`]).
     pub fn boot_env(&self) -> Vec<(String, String)> {
         if self.redis_url.is_none() {
             return Vec::new();
         }
-        [SESSION_BACKEND_ENV, STATE_BACKEND_ENV]
-            .into_iter()
-            .map(|name| (name.to_string(), REDIS_BACKEND.to_string()))
-            .collect()
+        [
+            SESSION_BACKEND_ENV,
+            STATE_BACKEND_ENV,
+            AGENT_STATE_BACKEND_ENV,
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), REDIS_BACKEND.to_string()))
+        .collect()
     }
 
     /// Names of the secret-sourced env vars this state adds (none when Redis is
