@@ -80,10 +80,15 @@ An env-pack binds a **capability slot** on an environment. Deployer slots:
 | `greentic.deployer.aws-ecs` | `src/env_packs/aws/` | yes |
 | `greentic.deployer.k8s` | `src/env_packs/k8s/` | yes — `kube` client |
 | `greentic.deployer.local-process` | `src/env_packs/local_process/` | local only |
+| `greentic.deployer.ssh-host` | `src/env_packs/ssh_host/` | yes — system `ssh` to a Linux VM (systemd); not CLI-wired yet |
 
 Shared plumbing: `registry.rs` (descriptor → handler), `slot.rs`
 (`EnvPackHandler`), `deployer/` (the `Deployer` trait every deployer implements),
 `render.rs`.
+
+For the ssh-host subsystem (a plain Linux VM over SSH) — module map, invariants,
+and what is not yet verified or wired — read
+**[`docs/ssh-host-internals.md`](docs/ssh-host-internals.md)**.
 
 For the Cloud Run subsystem specifically — module map, the seam, the invariants
 a change must not break, and how to test without touching GCP — read
@@ -224,6 +229,7 @@ the exact var, not an opaque GCP error three calls later.
 |---|---|---|
 | `docs/cloudrun-deployment.md` | operators | how to deploy to Cloud Run |
 | `docs/cloudrun-internals.md` | agents / contributors | how the Cloud Run deployer is built |
+| `docs/ssh-host-internals.md` | agents / contributors | how the ssh-host deployer is built, and what is unverified |
 | `docs/k8s-deployment.md` | operators | the declarative sibling path |
 | `docs/removal.md` | operators | `op traffic clear`, `op bundles retire`, `op env apply --prune` |
 | `docs/env-packs.md` | contributors | authoring an env-pack |

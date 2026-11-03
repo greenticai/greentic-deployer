@@ -16,6 +16,7 @@ pub mod local_process;
 pub mod registry;
 pub mod render;
 pub mod slot;
+pub mod ssh_host;
 pub mod telemetry;
 
 #[cfg(feature = "creds-aws")]
@@ -27,3 +28,4 @@ pub use local_process::{LocalProcessCredentials, LocalProcessDeployerHandler};
 pub use registry::{EnvPackRegistry, RegistryError};
 pub use render::ManifestRenderer;
 pub use slot::{BUILTIN_HANDLERS, BuiltinHandler, EnvPackHandler};
+pub use ssh_host::{SshHostCredentials, SshHostDeployerHandler};
