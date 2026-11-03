@@ -85,6 +85,11 @@ impl EnvPackRegistry {
     /// `greentic.deployer.k8s` — likewise opt-in per env, never a `local`
     /// default. Unconditional (the scaffold carries no heavy SDK deps);
     /// the typed cluster client lands behind its own seam.
+    ///
+    /// Also registers the ssh-host deployer handler
+    /// ([`SshHostDeployerHandler`](super::ssh_host::SshHostDeployerHandler)) under
+    /// `greentic.deployer.ssh-host` — opt-in per env, unconditional (it needs no
+    /// SDK: it drives the system `ssh` binary).
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         for handler in BUILTIN_HANDLERS {
@@ -116,6 +121,9 @@ impl EnvPackRegistry {
         registry
             .register(Box::new(super::k8s::K8sDeployerHandler::default()))
             .expect("k8s deployer handler path is unique");
+        registry
+            .register(Box::new(super::ssh_host::SshHostDeployerHandler::default()))
+            .expect("ssh-host deployer handler path is unique");
         registry
     }
 
@@ -231,13 +239,15 @@ mod tests {
     #[test]
     fn with_builtins_registers_baseline_handlers() {
         // Five `local` handlers (Secrets / Telemetry / Sessions / State +
-        // local-process Deployer) plus the Phase D K8s deployer (6 baseline).
+        // local-process Deployer) plus the Phase D K8s and ssh-host deployers
+        // (7 baseline).
         // Each cloud deployer adds one when its feature is on: `creds-aws` for
-        // AWS-ECS, `creds-gcp` for GCP Cloud Run. Neither cloud handler is part
+        // AWS-ECS, `creds-gcp` for GCP Cloud Run, `creds-azure` for Azure
+        // Container Apps. No cloud handler is part
         // of the `local` env's default bindings, but the registry resolves them
         // so `gtc op env-packs add … --kind greentic.deployer.<cloud>` resolves.
         let registry = EnvPackRegistry::with_builtins();
-        let expected = 6
+        let expected = 7
             + cfg!(feature = "creds-aws") as usize
             + cfg!(feature = "creds-gcp") as usize
             + cfg!(feature = "creds-azure") as usize;

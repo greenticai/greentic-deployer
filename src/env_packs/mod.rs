@@ -20,6 +20,7 @@ pub(crate) mod owner_stamp;
 pub mod registry;
 pub mod render;
 pub mod slot;
+pub mod ssh_host;
 pub mod telemetry;
 
 /// Public GHCR repository of the runtime image every cloud lane deploys.
@@ -35,3 +36,4 @@ pub use local_process::{LocalProcessCredentials, LocalProcessDeployerHandler};
 pub use registry::{EnvPackRegistry, RegistryError};
 pub use render::ManifestRenderer;
 pub use slot::{BUILTIN_HANDLERS, BuiltinHandler, EnvPackHandler};
+pub use ssh_host::{SshHostCredentials, SshHostDeployerHandler};
