@@ -5,6 +5,10 @@
 //! the manifest declared; the derived `kind-<name>` context is applied only to
 //! this reconcile. A later bare `op env reconcile` uses the ambient context —
 //! which `kind create cluster` already sets as current-context.
+//!
+//! Other deployers branch off after the apply: Cloud Run warms its revisions
+//! (`cloudrun_env_up`) and ssh-host synchronizes the store to its VM
+//! (`ssh_host::env_up`); neither reaches the k8s phases.
 
 #[cfg(any(feature = "k8s-client", test))]
 use serde_json::Value;
@@ -123,12 +127,15 @@ pub(crate) fn up(
     let targets_azure = manifest_targets_azure(store, &env_id, &manifest)?;
     let targets_cloudrun = manifest_targets_cloudrun(store, &env_id, &manifest)?;
     let targets_aws_ecs = manifest_targets_aws_ecs(store, &env_id, &manifest)?;
+    // The ssh-host deployer needs neither feature: it drives the system `ssh`.
+    let targets_ssh_host = manifest_targets_ssh_host(store, &env_id, &manifest)?;
     if targets_azure && !cfg!(all(feature = "creds-azure", feature = "deploy-azure-aca")) {
         return Err(OpError::Conflict(
             super::env_azure::NO_DEPLOY_FEATURE.to_string(),
         ));
     }
     if !targets_azure
+        && !targets_ssh_host
         && let Err(missing) = env_up_deployer_gate(
             targets_cloudrun,
             targets_aws_ecs,
@@ -277,6 +284,13 @@ pub(crate) fn up(
     // other deployer kind returns `None` and falls through to the k8s
     // convergence phases below, unchanged.
     if let Some(result) = imperative_bring_up(store, registry, &env_id)? {
+        return Ok((OpOutcome::new(NOUN, "up", result), None));
+    }
+
+    // ── Deployer dispatch: ssh-host bring-up ─────────────────────────
+    // A plain Linux VM over SSH: synchronize the env store and (re)start the
+    // service. No cluster, no reconcile, no port-forward.
+    if let Some(result) = super::ssh_host::env_up(store, registry, &env_id)? {
         return Ok((OpOutcome::new(NOUN, "up", result), None));
     }
 
@@ -492,6 +506,19 @@ fn manifest_targets_azure(
 ) -> Result<bool, OpError> {
     Ok(manifest_deployer_kind(store, env_id, manifest)?
         .is_some_and(|d| super::env_azure_up::names_azure_aca_deployer(&d)))
+}
+
+/// Whether `op env up`'s effective desired deployer is ssh-host (a Linux VM over
+/// SSH). Recognized by descriptor path in every build: the deployer drives the
+/// system `ssh` and needs no cargo feature, so it must bypass the feature gate
+/// rather than be treated as k8s.
+fn manifest_targets_ssh_host(
+    store: &LocalFsStore,
+    env_id: &greentic_deploy_spec::EnvId,
+    manifest: &EnvManifest,
+) -> Result<bool, OpError> {
+    Ok(manifest_deployer_kind(store, env_id, manifest)?
+        .is_some_and(|d| super::ssh_host::is_ssh_host_kind(&d)))
 }
 
 /// Phase 5 — reconcile + rollout, gated on `k8s-client`.

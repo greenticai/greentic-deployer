@@ -70,6 +70,7 @@ pub mod pack_config_stage;
 pub(crate) mod release_artifacts;
 pub mod revisions;
 pub mod secrets;
+pub(crate) mod ssh_host;
 pub mod traffic;
 pub mod traffic_clear;
 pub mod trust_root;

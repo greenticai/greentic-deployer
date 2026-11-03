@@ -32,12 +32,13 @@ use std::path::{Path, PathBuf};
 use greentic_deploy_spec::{Environment, RevisionId};
 use sha2::{Digest, Sha256};
 
+use super::WarmReport;
 use super::params::SshHostParams;
 use super::remote::{Remote, RemoteOutput, RemoteTarget};
 use super::render::render_unit;
 use super::snapshot::{SnapshotInput, build_store_archive};
 use super::{RUNTIME_KEY_FILE, STORE_MARKER_FILE, STORE_SLOTS};
-use crate::env_packs::deployer::{DeployerError, WarmOutcome};
+use crate::env_packs::deployer::DeployerError;
 
 /// One VM, one set of validated params.
 pub(super) struct Session<'a> {
@@ -159,12 +160,13 @@ pub(crate) fn hash_file(path: &Path) -> std::io::Result<String> {
 /// Everything `warm` needs, owned so it can cross into `spawn_blocking`.
 pub(super) struct WarmInput {
     pub env: Environment,
-    pub revision_id: RevisionId,
+    /// Every revision the VM serves (at least one); see `SnapshotInput`.
+    pub revision_ids: Vec<RevisionId>,
     pub store_root: PathBuf,
     pub dev_secrets: Option<Vec<u8>>,
 }
 
-pub(super) fn warm(session: &Session<'_>, input: &WarmInput) -> Result<WarmOutcome, DeployerError> {
+pub(super) fn warm(session: &Session<'_>, input: &WarmInput) -> Result<WarmReport, DeployerError> {
     let p = session.params;
     // Before anything changes: a typo'd account would otherwise be found only
     // when systemd fails to start the unit.
@@ -200,13 +202,40 @@ pub(super) fn warm(session: &Session<'_>, input: &WarmInput) -> Result<WarmOutco
     changed |= sync_store(session, input)?;
     changed |= install_unit(session, &input.env)?;
     start_service(session, changed)?;
-    Ok(WarmOutcome {
+    Ok(WarmReport {
         // Only a network-reachable bind is an endpoint; a loopback bind is
         // reached through the operator's own reverse proxy.
         endpoint_url: p
             .expose
             .then(|| format!("http://{}:{}", p.host, p.listen_port)),
+        service_name: p.service_name.clone(),
+        listen_addr: format!("{}:{}", p.bind_addr(), p.listen_port),
+        install_dir: p.install_dir.clone(),
+        changed,
+        active_slot: None,
     })
+}
+
+/// Which of the two store slots `<install_dir>/store` points at, read from the
+/// VM. Only one of OUR two slot paths is ever matched: whatever else `readlink`
+/// prints (or a failed `readlink`) reads as "no active slot".
+fn read_active_slot(session: &Session<'_>) -> Result<Option<usize>, DeployerError> {
+    let p = session.params;
+    let active = session.run(
+        "reading the active store slot",
+        &["readlink", &p.path("store")],
+    )?;
+    Ok(active
+        .success()
+        .then(|| active.stdout.trim().to_string())
+        .and_then(|target| STORE_SLOTS.iter().position(|s| p.path(s) == target)))
+}
+
+/// The name (`store-a` / `store-b`) of the active store slot, for operator
+/// output. Not part of `warm` itself so the warm's command sequence is exactly
+/// what the idempotency tests pin.
+pub(super) fn active_slot_name(session: &Session<'_>) -> Result<Option<String>, DeployerError> {
+    Ok(read_active_slot(session)?.map(|i| STORE_SLOTS[i].to_string()))
 }
 
 fn sync_binary(session: &Session<'_>) -> Result<bool, DeployerError> {
@@ -289,7 +318,7 @@ fn sync_store(session: &Session<'_>, input: &WarmInput) -> Result<bool, Deployer
     let archive = build_store_archive(&SnapshotInput {
         store_root: &input.store_root,
         env: &input.env,
-        revision_id: input.revision_id,
+        revision_ids: &input.revision_ids,
         dev_secrets: input.dev_secrets.as_deref(),
         params: p,
     })?;
@@ -312,11 +341,7 @@ fn sync_store(session: &Session<'_>, input: &WarmInput) -> Result<bool, Deployer
     let next_link = p.path("store.next");
     // Which slot is active is read from the VM, but only one of OUR two slot
     // paths is ever acted on: whatever else `readlink` prints is ignored.
-    let active = session.run("reading the active store slot", &["readlink", &live])?;
-    let active_slot = active
-        .success()
-        .then(|| active.stdout.trim().to_string())
-        .and_then(|target| STORE_SLOTS.iter().position(|s| p.path(s) == target));
+    let active_slot = read_active_slot(session)?;
     let next_slot = match active_slot {
         Some(0) => 1,
         _ => 0,

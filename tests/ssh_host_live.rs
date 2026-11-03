@@ -30,6 +30,12 @@
 //! GREENTIC_SSH_LIVE_HOST=... cargo test --test ssh_host_live -- --ignored --nocapture
 //! ```
 //!
+//! Two tests share the variables: `ssh_host_against_a_real_vm` drives the
+//! deployer library directly; `ssh_host_through_the_cli` drives the real
+//! `greentic-deployer` binary the way an operator would (bind the deployer,
+//! `op credentials requirements`, `op env up`, `op env up` again). Run one with
+//! its name after `--ignored`.
+//!
 //! The two names guarded by `vmtest` / `greentic-vmtest` exist so a mistyped
 //! variable can never make the cleanup delete a real service or directory.
 
@@ -546,4 +552,141 @@ async fn ssh_host_against_a_real_vm() {
         .expect("warm after drain");
     live.wait_http_200("/healthz", "healthz after re-warm");
     eprintln!("\nALL LIVE CHECKS PASSED (cleanup follows)");
+}
+
+// ---- through the CLI -----------------------------------------------------------
+
+/// Run `greentic-deployer op --store-root <store> [--answers F] <args…>`; the
+/// stdout JSON envelope's `result` on success, a panic quoting stderr otherwise.
+fn op(store_root: &Path, answers: Option<&Path>, args: &[&str]) -> Value {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_greentic-deployer"));
+    cmd.arg("op").arg("--store-root").arg(store_root);
+    if let Some(path) = answers {
+        cmd.arg("--answers").arg(path);
+    }
+    let out = cmd.args(args).output().expect("spawn greentic-deployer");
+    assert!(
+        out.status.success(),
+        "`op {}` failed:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`op {}` printed no JSON envelope ({e}): {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    envelope["result"].clone()
+}
+
+#[test]
+#[ignore = "needs a real VM; see the header of tests/ssh_host_live.rs"]
+fn ssh_host_through_the_cli() {
+    let start_binary = PathBuf::from(var("GREENTIC_SSH_LIVE_START_BINARY"));
+    assert!(start_binary.is_file(), "start binary not found");
+    let scratch = tempfile::tempdir().unwrap();
+    let store_root = scratch.path().join("store");
+    copy_dir(Path::new(&var("GREENTIC_SSH_LIVE_STORE")), &store_root);
+    let (env, env_id) = load_env(&store_root);
+    let live = Live::from_env(&env, &start_binary);
+    let _cleanup = CleanupGuard(&live);
+    let write = |name: &str, body: &Value| -> PathBuf {
+        let path = scratch.path().join(name);
+        std::fs::write(&path, serde_json::to_vec(body).unwrap()).unwrap();
+        path
+    };
+
+    // ---- 1. bind the deployer ---------------------------------------------------
+    step(
+        1,
+        "op env-packs update (bind ssh-host)",
+        "nothing on the VM (local store only)",
+    );
+    let answers_dir = store_root.join(&env_id).join("env-packs/deployer");
+    std::fs::create_dir_all(&answers_dir).unwrap();
+    std::fs::write(
+        answers_dir.join("answers.json"),
+        serde_json::to_vec(&live.answers).unwrap(),
+    )
+    .unwrap();
+    let bind = write(
+        "bind.json",
+        &json!({
+            "environment_id": env_id,
+            "slot": "deployer",
+            "kind": "greentic.deployer.ssh-host@0.1.0",
+            "pack_ref": "greentic.deployer.ssh-host",
+            "answers_ref": "env-packs/deployer/answers.json",
+        }),
+    );
+    let bound = op(&store_root, Some(&bind), &["env-packs", "update"]);
+    eprintln!("  binding: {bound}");
+
+    // ---- 2. credentials requirements --------------------------------------------
+    step(
+        2,
+        "op credentials requirements",
+        "nothing (read-only probes)",
+    );
+    let req = write("req.json", &json!({"environment_id": env_id}));
+    let report = op(&store_root, Some(&req), &["credentials", "requirements"]);
+    assert_eq!(report["result"], "pass", "{report}");
+    let checks = report["checks"].as_array().expect("checks");
+    assert_eq!(checks.len(), 6, "{report}");
+    for c in checks {
+        eprintln!("  {c}");
+    }
+
+    // ---- 3. env up --------------------------------------------------------------
+    step(
+        3,
+        "op env up (first)",
+        &format!(
+            "creates {d}/{{bin,home,logs,store-a,store}}, installs unit {u}.service, enables + starts it",
+            d = live.install_dir,
+            u = live.service
+        ),
+    );
+    let manifest = write(
+        "manifest.json",
+        &json!({"schema": "greentic.env-manifest.v1", "environment": {"id": env_id}}),
+    );
+    let up_args = ["env", "up", "--yes", "--non-interactive"];
+    let first = op(&store_root, Some(&manifest), &up_args);
+    eprintln!("  env up: {first}");
+    assert_eq!(first["changed"], true, "{first}");
+    assert_eq!(first["service"], live.service.as_str());
+    assert_eq!(first["store_slot"], "store-a");
+    assert!(
+        first.get("endpoint_url").is_none(),
+        "loopback bind: {first}"
+    );
+    assert_eq!(live.active(), "active");
+    live.wait_http_200("/healthz", "healthz");
+    if let Some(ui) = &live.ui_path {
+        live.wait_http_200(ui, "ui");
+    }
+    let stamp1 = live.start_stamp();
+
+    // ---- 4. env up again: idempotent -----------------------------------------------
+    step(4, "op env up (again)", "nothing expected (no-op)");
+    let fp_before = live.fingerprint();
+    let second = op(&store_root, Some(&manifest), &up_args);
+    eprintln!("  env up: {second}");
+    assert_eq!(second["changed"], false, "{second}");
+    assert_eq!(second["store_slot"], first["store_slot"]);
+    assert_eq!(
+        stamp1,
+        live.start_stamp(),
+        "an unchanged env up restarted the service"
+    );
+    assert_eq!(
+        fp_before,
+        live.fingerprint(),
+        "an unchanged env up modified the VM"
+    );
+    live.wait_http_200("/healthz", "healthz after the no-op");
+    eprintln!("\nALL LIVE CLI CHECKS PASSED (cleanup follows)");
 }

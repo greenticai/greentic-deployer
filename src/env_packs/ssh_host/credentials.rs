@@ -19,11 +19,11 @@
 //! verified (the K8s precedent). If the host is unreachable the remaining
 //! probes fail as "not probed", not as "assumed fine".
 //!
-//! **Known gap:** nothing in the CLI binds a target to these credentials yet, so
-//! `op credentials requirements` on an ssh-host env fails closed with the
-//! "no SSH target is bound" reason. [`SshHostCredentials::with_target`] is the
-//! seam (the K8s `with_client` analogue); wiring the binding's answers into it
-//! is a follow-up.
+//! The CLI binds the target: `op credentials requirements` reads the binding's
+//! answers (`answers_ref`) and builds these credentials with
+//! [`SshHostCredentials::with_target`] (`cli::ssh_host::connected_credentials`),
+//! the K8s `with_client` analogue. Only a binding that records NO answers still
+//! reaches the fail-closed default below.
 
 use std::sync::Arc;
 
@@ -234,8 +234,8 @@ impl DeployerCredentials for SshHostCredentials {
         let Some(binding) = &self.binding else {
             return all_failed(
                 caps,
-                "no SSH target is bound to these credentials (the binding's host, user and key \
-                 are not wired into `op credentials requirements` yet) — failing closed",
+                "no SSH target is bound to these credentials: the ssh-host binding records no \
+                 answers (`answers_ref` with at least `host` and `user`) — failing closed",
             );
         };
         let params = &binding.params;

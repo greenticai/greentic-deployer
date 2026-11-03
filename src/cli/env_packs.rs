@@ -78,6 +78,7 @@ pub fn add(
     let payload = resolve_payload(flags, payload)?;
     let env_id = parse_env_id(&payload.environment_id)?;
     let binding = build_binding(&payload, 0, None)?;
+    super::ssh_host::validate_binding_answers(store, &env_id, &binding)?;
     let target = json!({"slot": payload.slot, "kind": payload.kind});
     let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {
@@ -119,6 +120,7 @@ pub fn update(
     let env_id = parse_env_id(&payload.environment_id)?;
     let slot = payload.slot;
     let binding = build_binding(&payload, 0, None)?;
+    super::ssh_host::validate_binding_answers(store, &env_id, &binding)?;
     let target = json!({"slot": payload.slot, "kind": payload.kind});
     let idempotency_key = resolve_idempotency_key(payload.idempotency_key)?;
     let ctx = AuditCtx {

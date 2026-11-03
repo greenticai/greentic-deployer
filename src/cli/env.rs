@@ -1254,6 +1254,7 @@ pub fn apply_revision(
         && !is_aws_ecs_kind(&descriptor)
         && !is_cloudrun_kind(&descriptor)
         && !is_azure_aca_kind(&descriptor)
+        && !super::ssh_host::is_ssh_host_kind(&descriptor)
     {
         return Err(unsupported_apply_kind(&descriptor));
     }
@@ -1605,7 +1606,8 @@ fn unsupported_apply_kind(descriptor: &greentic_deploy_spec::PackDescriptor) -> 
     OpError::Conflict(format!(
         "env apply-revision is only supported for the `{}` (K8s), \
          `greentic.deployer.aws-ecs` (AWS-ECS), `greentic.deployer.azure-aca` (Azure \
-         Container Apps), and `greentic.deployer.gcp-cloudrun` (Cloud Run) deployer \
+         Container Apps), `greentic.deployer.gcp-cloudrun` (Cloud Run) and \
+         `greentic.deployer.ssh-host` (a Linux VM over SSH) deployer \
          env-packs today; `{}` has no live single-revision apply path",
         crate::env_packs::k8s::K8sDeployerHandler::DESCRIPTOR_PATH,
         descriptor.path()
@@ -1641,6 +1643,9 @@ fn apply_revision_non_k8s(
             verb,
             answers,
         );
+    }
+    if super::ssh_host::is_ssh_host_kind(descriptor) {
+        return super::ssh_host::apply_revision(store, env, env_id, revision_id, verb, answers);
     }
     #[cfg(feature = "creds-aws")]
     {
@@ -2855,7 +2860,7 @@ pub(crate) fn load_render_answers(
 /// under the env dir (fail-closed on path escape or a missing file). Shared by
 /// [`load_render_answers`] (Deployer slot) and [`load_secrets_answers`]
 /// (Secrets slot).
-fn read_binding_answers(
+pub(crate) fn read_binding_answers(
     store: &LocalFsStore,
     env: &greentic_deploy_spec::Environment,
     rel_path: &std::path::Path,

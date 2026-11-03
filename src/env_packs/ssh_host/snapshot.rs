@@ -65,7 +65,9 @@ pub struct StoreArchive {
 pub struct SnapshotInput<'a> {
     pub store_root: &'a Path,
     pub env: &'a Environment,
-    pub revision_id: RevisionId,
+    /// Every revision the VM must serve: the seed keeps these (plus whatever a
+    /// traffic split names) and prunes the rest.
+    pub revision_ids: &'a [RevisionId],
     pub dev_secrets: Option<&'a [u8]>,
     pub params: &'a SshHostParams,
 }
@@ -130,12 +132,11 @@ pub fn build_store_archive(input: &SnapshotInput<'_>) -> Result<StoreArchive, De
         &mut total,
     )?;
 
-    let environment_json =
-        seed_environment_bytes(input.env, &[input.revision_id]).map_err(|e| {
-            DeployerError::Provider(format!(
-                "ssh-host: serializing environment.json for the store snapshot: {e}"
-            ))
-        })?;
+    let environment_json = seed_environment_bytes(input.env, input.revision_ids).map_err(|e| {
+        DeployerError::Provider(format!(
+            "ssh-host: serializing environment.json for the store snapshot: {e}"
+        ))
+    })?;
     entries.insert(format!("{env_id}/environment.json"), Some(environment_json));
     if let Some(dev) = input.dev_secrets {
         entries.insert(format!("{env_id}/{DEV_STORE_RELATIVE}"), Some(dev.to_vec()));
@@ -365,7 +366,7 @@ pub(crate) mod tests {
         let env = build_fixture_env();
         build_store_archive(&SnapshotInput {
             store_root: dir,
-            revision_id: env.revisions[0].revision_id,
+            revision_ids: &[env.revisions[0].revision_id],
             env: &env,
             dev_secrets: dev,
             params: p,
@@ -563,7 +564,7 @@ pub(crate) mod tests {
         let input = |root: &Path, p: &SshHostParams| {
             build_store_archive(&SnapshotInput {
                 store_root: root,
-                revision_id: env.revisions[0].revision_id,
+                revision_ids: &[env.revisions[0].revision_id],
                 env: &env,
                 dev_secrets: None,
                 params: p,
