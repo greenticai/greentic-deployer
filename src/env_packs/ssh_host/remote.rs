@@ -48,6 +48,10 @@ pub struct RemoteTarget {
     pub identity_file: Option<PathBuf>,
     pub known_hosts_file: Option<PathBuf>,
     pub connect_timeout_secs: u32,
+    /// The `ssh -o ProxyCommand=` value of a [tunnel](super::tunnel), or `None`
+    /// to connect directly (the argv is then byte-identical to a build without
+    /// tunnels).
+    pub proxy_command: Option<String>,
 }
 
 impl fmt::Debug for RemoteTarget {
@@ -61,7 +65,19 @@ impl fmt::Debug for RemoteTarget {
                 &self.identity_file.as_ref().map(|_| "<redacted>"),
             )
             .field("known_hosts_file", &self.known_hosts_file)
+            .field(
+                "proxy_command",
+                &self.proxy_command.as_ref().map(|_| "<set>"),
+            )
             .finish()
+    }
+}
+
+impl RemoteTarget {
+    /// The same target, reached through `proxy_command` (see [`super::tunnel`]).
+    pub fn with_proxy_command(mut self, proxy_command: Option<String>) -> Self {
+        self.proxy_command = proxy_command;
+        self
     }
 }
 
@@ -74,6 +90,7 @@ impl From<&SshHostParams> for RemoteTarget {
             identity_file: p.identity_file.clone(),
             known_hosts_file: p.known_hosts_file.clone(),
             connect_timeout_secs: CONNECT_TIMEOUT_SECS,
+            proxy_command: None,
         }
     }
 }
@@ -211,10 +228,30 @@ pub fn ssh_args(target: &RemoteTarget) -> Vec<String> {
         args.push("-i".into());
         args.push(identity.display().to_string());
     }
+    if let Some(proxy_command) = &target.proxy_command {
+        args.push("-o".into());
+        args.push(format!("ProxyCommand={proxy_command}"));
+    }
     args.push("-p".into());
     args.push(target.port.to_string());
     args.push("--".into());
     args.push(format!("{}@{}", target.user, target.host));
+    args
+}
+
+/// The remote command an upload runs. `umask 077`: an uploaded file (a store
+/// snapshot, a unit) is private to the login user until a later step
+/// deliberately widens it.
+pub fn upload_command(remote_path: &str) -> String {
+    format!("umask 077 && cat > {}", shell_quote(remote_path))
+}
+
+/// Every local argument of one `ssh` invocation running `command`: what
+/// [`SystemSsh`] spawns, as data. Uploads use the same options, so a tunnel
+/// applies to them too.
+pub fn ssh_invocation(target: &RemoteTarget, command: &str) -> Vec<String> {
+    let mut args = ssh_args(target);
+    args.push(command.to_string());
     args
 }
 
@@ -235,8 +272,7 @@ impl SystemSsh {
         command: &str,
         stdin: Option<&Path>,
     ) -> Result<RemoteOutput, RemoteError> {
-        let mut args = ssh_args(target);
-        args.push(command.to_string());
+        let args = ssh_invocation(target, command);
         let mut child = Command::new("ssh")
             .args(&args)
             .stdin(if stdin.is_some() {
@@ -317,9 +353,7 @@ impl Remote for SystemSsh {
         if remote_path.contains('\0') {
             return Err(RemoteError::NulInCommand);
         }
-        // `umask 077`: an uploaded file (a store snapshot, a unit) is private to
-        // the login user until a later step deliberately widens it.
-        let command = format!("umask 077 && cat > {}", shell_quote(remote_path));
+        let command = upload_command(remote_path);
         let out = self.spawn(target, &command, Some(local_path))?;
         if out.success() {
             Ok(())
@@ -334,10 +368,15 @@ impl Remote for SystemSsh {
 
 /// Remove the identity file path from text that may be logged.
 fn scrub(target: &RemoteTarget, text: &str) -> String {
-    match &target.identity_file {
-        Some(identity) => text.replace(&identity.display().to_string(), "<identity_file>"),
+    let mut text = match &target.proxy_command {
+        // The command can carry a bastion identity path; it is never echoed.
+        Some(proxy) => text.replace(proxy.as_str(), "<proxy_command>"),
         None => text.to_string(),
+    };
+    if let Some(identity) = &target.identity_file {
+        text = text.replace(&identity.display().to_string(), "<identity_file>");
     }
+    text
 }
 
 fn truncate(text: &str) -> String {
@@ -361,6 +400,7 @@ mod tests {
             identity_file: Some("/home/ops/.ssh/id_ed25519".into()),
             known_hosts_file: Some("/home/ops/.ssh/kh".into()),
             connect_timeout_secs: 7,
+            proxy_command: None,
         }
     }
 

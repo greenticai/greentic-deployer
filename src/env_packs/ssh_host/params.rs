@@ -12,12 +12,15 @@
 //! `identity_file` is never echoed in an error message and is redacted from
 //! `Debug`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::Environment;
 use serde_json::Value;
 use thiserror::Error;
+
+use super::tunnel::{TunnelConfig, TunnelRegistry};
 
 /// Default SSH port.
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -40,7 +43,12 @@ pub const ANSWER_KEYS: &[&str] = &[
     "expose",
     "use_sudo",
     "service_user",
+    "tunnel",
 ];
+
+/// Answer keys the wizard does not ask: the qaspec has only flat string
+/// questions, so `tunnel` (an object) travels in the answers JSON alone.
+pub const WIZARD_EXCLUDED_KEYS: &[&str] = &["tunnel"];
 
 /// Why the binding's answers were refused.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -93,6 +101,9 @@ pub struct SshHostParams {
     /// (typically: log in as root, run as an unprivileged account). `None` runs
     /// it as the login user. The account must already exist on the VM.
     pub service_user: Option<String>,
+    /// How to reach a VM that is not directly reachable; `None` connects directly
+    /// and leaves every `ssh` argument exactly as it was without tunnels.
+    pub tunnel: Option<TunnelConfig>,
 }
 
 impl fmt::Debug for SshHostParams {
@@ -113,6 +124,7 @@ impl fmt::Debug for SshHostParams {
             .field("expose", &self.expose)
             .field("use_sudo", &self.use_sudo)
             .field("service_user", &self.service_user)
+            .field("tunnel", &self.tunnel)
             .finish()
     }
 }
@@ -185,6 +197,7 @@ impl SshHostParams {
             expose,
             use_sudo,
             service_user,
+            tunnel: parse_tunnel(obj.get("tunnel"))?,
         })
     }
 
@@ -213,6 +226,56 @@ impl SshHostParams {
     pub fn unit_path(&self) -> String {
         format!("/etc/systemd/system/{}.service", self.service_name)
     }
+}
+
+/// The optional `tunnel` answer: `{"kind": "...", "settings": {"k": "v"}}`.
+/// Only those two keys; settings are strings (a number or boolean is read as its
+/// text). The kind and every setting are validated by the provider, so a bad
+/// value is refused where the answers are written. Errors never echo a value.
+fn parse_tunnel(value: Option<&Value>) -> Result<Option<TunnelConfig>, SshHostParamsError> {
+    let obj = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(o)) => o,
+        Some(_) => return Err(invalid("tunnel", "must be an object")),
+    };
+    for key in obj.keys() {
+        if key != "kind" && key != "settings" {
+            return Err(invalid(
+                "tunnel",
+                "has an unknown field (only `kind` and `settings`)",
+            ));
+        }
+    }
+    let kind = match obj.get("kind") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Err(invalid("tunnel", "`kind` is required and must be a string")),
+    };
+    let mut settings = BTreeMap::new();
+    match obj.get("settings") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (key, value) in map {
+                let text = match value {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => {
+                        return Err(invalid(
+                            "tunnel",
+                            "`settings` values must be strings, numbers or booleans",
+                        ));
+                    }
+                };
+                settings.insert(key.clone(), text);
+            }
+        }
+        Some(_) => return Err(invalid("tunnel", "`settings` must be an object")),
+    }
+    let config = TunnelConfig { kind, settings };
+    TunnelRegistry::builtin()
+        .validate(&config)
+        .map_err(|e| invalid("tunnel", e.to_string()))?;
+    Ok(Some(config))
 }
 
 /// `greentic-<env_id>` with anything outside `[A-Za-z0-9_-]` mapped to `-`.

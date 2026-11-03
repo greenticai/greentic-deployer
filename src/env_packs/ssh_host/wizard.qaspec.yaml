@@ -10,6 +10,11 @@
 # restricted to letters, digits, `.`, `_`, `/`, `-`. The deployer re-validates
 # all answers regardless of these patterns.
 #
+# `tunnel` (reach a VM that is not directly reachable) is NOT asked here: the
+# wizard has only flat string questions and `tunnel` is an object
+# `{"kind": "...", "settings": {...}}`, so it goes in the answers JSON alone. See
+# docs/ssh-host-internals.md, "Tunnels".
+#
 # C6 ↔ Phase D split applies: answers are recorded on the binding
 # (`answers_ref`); the deployer verbs read them through `answers`.
 

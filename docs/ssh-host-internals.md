@@ -176,9 +176,149 @@ which of the two wins when they disagree was not isolated.
 | `render.rs` | pure: the systemd unit |
 | `steps.rs` | the warm/drain procedure on top of `Remote` |
 | `deployer.rs` | `impl Deployer` (passes `run_conformance`) |
-| `credentials.rs` | `impl DeployerCredentials`: six VM probes |
+| `credentials.rs` | `impl DeployerCredentials`: six VM probes (seven with a tunnel) |
+| `tunnel/` | the `tunnel` answer: `TunnelProvider`, registry, gate, guard, providers |
 | `fake.rs` (test) | `FakeRemote`, a simulated VM |
 | `tests.rs` (test) | handler, conformance, warm/drain scenarios |
+| `tests_tunnel.rs` (test) | the `tunnel` answer against the simulated VM |
+
+## Tunnels
+
+A VM that is not directly reachable (a customer network, a bastion, a VPN) is
+reached through the optional `tunnel` answer. No `tunnel` (or `none`) changes
+nothing: `ssh` gets exactly the arguments it always did (golden test
+`no_tunnel_leaves_the_ssh_argv_byte_identical`).
+
+```json
+{"host": "10.20.0.5", "user": "greentic",
+ "tunnel": {"kind": "openconnect", "settings": {
+   "server": "vpn.customer.example", "servercert": "pin-sha256:...",
+   "user": "svc-greentic", "password_file": "/run/secrets/vpn-pw",
+   "totp_seed_file": "/run/secrets/vpn-seed"}}}
+```
+
+`tunnel` is an object, and the wizard (`wizard.qaspec.yaml`) has only flat string
+questions, so it is **not asked by the wizard**: it goes in the answers JSON
+(`answers_ref` / `answers`) alone. `params::WIZARD_EXCLUDED_KEYS` records that and
+a test keeps the wizard and the parser in step. The answer has exactly two fields
+(`kind`, `settings`, the shape of the contract type `VmTunnel`); settings are
+strings, and a number or boolean is read as its text. The kind and every setting
+are validated when the answers are written, with an allow-list per value (no
+whitespace, `;`, `$(`, backtick, quotes, `..`, newline, leading `-`); errors name
+the key and never echo the value.
+
+### One mechanism
+
+A hosted deployer has no `NET_ADMIN` and no `/dev/net/tun`, so every kind works in
+userspace and ends as `ssh -o ProxyCommand=...`. The command rides on
+`RemoteTarget::proxy_command`, so commands, `tar` streams and uploads all take the
+same route and the `Remote` trait did not change.
+
+| kind | what runs | status |
+|---|---|---|
+| `none` | nothing | done |
+| `jump` | a second `ssh -W %h:%p` to the bastion; the bastion has its OWN `jump_known_hosts_file` (required) and `StrictHostKeyChecking=yes` | done; argv-tested only |
+| `proxy` | the gate dials the customer's SOCKS5 / HTTP CONNECT proxy | done; tested against fakes on loopback |
+| `openconnect` | `openconnect --script-tun --script "ocproxy -D <port>"`, then the gate | done for `anyconnect`; tested with a stub only |
+| `wireguard`, `tailscale` | would be `wireproxy` / `tailscaled --tun=userspace-networking` | recognised, `up()` answers "not available in this build" |
+| `openvpn`, `ikev2`, `zerotier` | need a kernel interface | recognised, `up()` answers "needs a runner, not available yet" |
+
+Helper kinds and `proxy` do not give `ssh` the helper's port. The **destination
+gate** (`tunnel/gate.rs`) listens on its own loopback port and forwards only
+`target_host:target_port`; the `ProxyCommand` is `nc -X 5 -x 127.0.0.1:<gate> %h %p`.
+Any other CONNECT is refused before anything is dialled, so a helper that can reach
+a whole network (ocproxy, tailscaled) is not a general proxy for whatever else shares
+the container. Residual: another process in the container can still ask the gate
+for the VM (all it can get) and can reach the helper's raw loopback port; separating
+tenants is the container's job. The registry also refuses a loopback, link-local
+(metadata) or unspecified target, and `proxy` / `jump` / `openconnect` refuse such
+an address as their own server.
+
+### The provider contract (`TunnelProvider`)
+
+```rust
+pub trait TunnelProvider: fmt::Debug + Send + Sync {
+    fn kind(&self) -> &'static str;
+    fn validate(&self, settings: &BTreeMap<String, String>) -> Result<(), TunnelError>;
+    fn up(&self, ctx: &TunnelContext<'_>) -> Result<TunnelUp, TunnelError>;
+}
+pub struct TunnelContext<'a> {
+    pub settings: &'a BTreeMap<String, String>,
+    pub login_user: &'a str,
+    pub target_host: &'a str,
+    pub target_port: u16,
+    pub ready_timeout: Duration,          // DEFAULT_READY_TIMEOUT = 60 s
+}
+pub struct TunnelUp {
+    pub proxy_command: Option<String>,    // None = connect directly
+    pub guard: TunnelGuard,
+}
+```
+
+Register a new provider in `TunnelRegistry::builtin()`. What `up` must do:
+
+* **Once per `env up`.** `Session::open` brings the tunnel up when a warm or drain
+  starts and drops it when the session ends; the credentials probe does the same for
+  all its probes. A provider is never called per command.
+* **Prove it, don't assume it.** Return only after `gate::publish` has made a SOCKS5
+  CONNECT through the gate to the VM and read an `SSH-` banner back. A listener that
+  accepts is not proof: wireproxy, tailscaled and ocproxy all accept before the
+  tunnel carries traffic. Give up after `ctx.ready_timeout`.
+* **Never retry a failed authentication.** Gateways lock accounts. (Two commands
+  that each log in, e.g. `op credentials requirements` and then `op env up`, are two
+  logins; that is the operator's call.)
+* **A free port, never a fixed one:** `support::free_loopback_port()`.
+* **Secrets:** read from `0600` files (`support::read_secret_file`, which refuses a
+  file others can read), keep them in `Zeroizing` memory, hand them to a helper on
+  its stdin or through `ScratchDir::write_secret` (`0600` in a `0700` directory).
+  Never argv, never the environment, never an error. A helper's output goes to a
+  scratch file and is **classified into a fixed sentence**, not quoted: it can echo
+  user names and form fields.
+* **Cleanup is the guard's job.** Put every child (`adopt_child`, or
+  `adopt_group_leader` for one spawned with `process_group(0)`, which signals the
+  whole group), hook (`on_drop`) and scratch dir (`adopt_scratch`) in
+  `TunnelUp::guard`. Dropping it kills and reaps the children, runs the hooks in
+  reverse, and deletes the directories. On any `Err` the guard you built is dropped.
+* **Validate first.** `validate` runs when answers are parsed and must start
+  nothing and read no file.
+
+### `openconnect`
+
+Cisco AnyConnect first (`protocol` accepts only `anyconnect`; the other protocols
+`openconnect` speaks are the same code path and are left out until someone can test
+them). Automated: user + password, and password + a TOTP code **computed here** from
+the customer's seed (`totp.rs`: RFC 6238, HMAC-SHA1, 6 digits, 30 s; checked against
+the RFC vectors). Not automatable: SAML / SSO, push or approval MFA (Duo, Okta
+Verify), HostScan / Cisco Secure Desktop posture; the error says so and points at a
+service account exempt from those, or a runner inside the customer's network.
+
+* The password and the code go on `openconnect`'s stdin (`--passwd-on-stdin`):
+  `second_prompt` (default) sends the code as the answer to the gateway's second
+  prompt, `append` sends `password+code` as one line. Which one a given gateway
+  wants is not known without trying it.
+* `servercert` (`pin-sha256:...`) is **mandatory** (it also turns system trust off).
+* **One attempt.** A refused login is reported once and not retried.
+* The host clock is refused when it is plainly wrong (before 2025 or after 2100), and
+  a code is never computed in the last 3 seconds of its step. Skew of a few seconds
+  or minutes cannot be detected offline; the gateway will refuse the code.
+* `--no-dtls`: everything over TLS on 443. The tunnel is single-use per deploy:
+  `openconnect`'s reconnect is not relied on.
+
+### Packages the image needs (not installed by this change)
+
+`openssh-client`, `netcat-openbsd` (the OpenBSD `nc`, for `-X`), `openconnect` and
+`ocproxy` (Debian trixie: 9.12 / 1.60). The deployer image is not touched here.
+Later: `wireproxy` and `tailscale` would go in through `Dockerfile.tools`.
+
+### Verification
+
+Unit tests only, no network: registry, settings (injection tables), argv goldens,
+guard cleanup (including a grandchild), the gate against a fake SOCKS5 server, the
+`proxy` kind against fake SOCKS5 / HTTP CONNECT servers on loopback, the
+`openconnect` kind against a stub shell script that records its argv and stdin and
+a fake SOCKS5 listener playing `ocproxy`, and the handler / credentials against
+`FakeRemote`. **`jump` has only been tested through its argv and the `FakeRemote`;
+it has not been run against a real bastion, and no test uses a shared VM.**
 
 ## Invariants — do not regress
 
@@ -312,3 +452,7 @@ contain `vmtest`. Note a first install uploads the whole binary (~160 MB).
   address when they disagree.
 * Network flakiness on large uploads (see "Follow-ups" 4).
 * TLS and DNS are not handled.
+* Every `tunnel` kind against the real thing: `jump` against a real bastion,
+  `proxy` against a real customer proxy, `openconnect` against a real gateway (and
+  whether `second_prompt` or `append` is what a given Cisco policy wants), and
+  `ssh` honouring the generated `ProxyCommand` with a real `nc -X`.

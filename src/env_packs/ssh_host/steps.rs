@@ -37,6 +37,7 @@ use super::params::SshHostParams;
 use super::remote::{Remote, RemoteOutput, RemoteTarget};
 use super::render::render_unit;
 use super::snapshot::{SnapshotInput, build_store_archive};
+use super::tunnel::{TunnelGuard, TunnelRegistry, connect};
 use super::{RUNTIME_KEY_FILE, STORE_MARKER_FILE, STORE_SLOTS};
 use crate::env_packs::deployer::DeployerError;
 
@@ -45,15 +46,27 @@ pub(super) struct Session<'a> {
     pub(super) remote: &'a dyn Remote,
     pub(super) target: RemoteTarget,
     pub(super) params: &'a SshHostParams,
+    /// The tunnel this session's commands ride, torn down when the session ends.
+    /// One session is one `env up`, so the tunnel is brought up once, not per call.
+    _tunnel: Option<TunnelGuard>,
 }
 
 impl<'a> Session<'a> {
-    pub(super) fn new(remote: &'a dyn Remote, params: &'a SshHostParams) -> Self {
-        Self {
+    /// Open the session, bringing up `params.tunnel` first when there is one. A
+    /// tunnel that cannot be brought up fails here, before the VM is touched.
+    pub(super) fn open(
+        remote: &'a dyn Remote,
+        params: &'a SshHostParams,
+        tunnels: &TunnelRegistry,
+    ) -> Result<Self, DeployerError> {
+        let (target, tunnel) = connect(params, tunnels)
+            .map_err(|e| DeployerError::Provider(format!("ssh-host: {e}")))?;
+        Ok(Self {
             remote,
-            target: RemoteTarget::from(params),
+            target,
             params,
-        }
+            _tunnel: tunnel,
+        })
     }
 
     fn fail(&self, step: &str, detail: impl std::fmt::Display) -> DeployerError {

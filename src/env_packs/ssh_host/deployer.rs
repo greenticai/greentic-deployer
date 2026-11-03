@@ -84,6 +84,7 @@ impl SshHostDeployerHandler {
             ));
         };
         let remote = std::sync::Arc::clone(&self.remote);
+        let tunnels = std::sync::Arc::clone(&self.tunnels);
         let input = WarmInput {
             env: env.clone(),
             revision_ids: revision_ids.to_vec(),
@@ -92,7 +93,7 @@ impl SshHostDeployerHandler {
         };
         // ssh is blocking I/O that can take minutes; keep it off the executor.
         tokio::task::spawn_blocking(move || {
-            let session = Session::new(remote.as_ref(), &params);
+            let session = Session::open(remote.as_ref(), &params, &tunnels)?;
             let mut report = steps::warm(&session, &input)?;
             if read_slot {
                 report.active_slot = steps::active_slot_name(&session)?;
@@ -150,8 +151,9 @@ impl Deployer for SshHostDeployerHandler {
         }
         let params = self.params_for(env, answers)?;
         let remote = std::sync::Arc::clone(&self.remote);
+        let tunnels = std::sync::Arc::clone(&self.tunnels);
         tokio::task::spawn_blocking(move || {
-            let session = Session::new(remote.as_ref(), &params);
+            let session = Session::open(remote.as_ref(), &params, &tunnels)?;
             steps::stop(&session)
         })
         .await
