@@ -35,6 +35,7 @@ pub(crate) struct Sim {
     running: BTreeSet<String>,
     restarts: u32,
     calls: Vec<Call>,
+    targets: Vec<RemoteTarget>,
     failures: Vec<(String, RemoteOutput)>,
     upload_failures: Vec<String>,
 }
@@ -161,6 +162,11 @@ impl FakeRemote {
 
     pub(crate) fn restarts(&self) -> u32 {
         self.sim.lock().unwrap().restarts
+    }
+
+    /// The target of every operation, in order (for tunnel / proxy assertions).
+    pub(crate) fn targets(&self) -> Vec<RemoteTarget> {
+        self.sim.lock().unwrap().targets.clone()
     }
 
     pub(crate) fn calls(&self) -> Vec<Call> {
@@ -518,13 +524,14 @@ impl Sim {
 }
 
 impl Remote for FakeRemote {
-    fn run(&self, _target: &RemoteTarget, argv: &[String]) -> Result<RemoteOutput, RemoteError> {
+    fn run(&self, target: &RemoteTarget, argv: &[String]) -> Result<RemoteOutput, RemoteError> {
         if self.unreachable {
             return Err(RemoteError::Transport(
                 "ssh: connect to host vm.example.com port 22: Connection timed out".into(),
             ));
         }
         let mut sim = self.sim.lock().unwrap();
+        sim.targets.push(target.clone());
         sim.calls.push(Call::Run(argv.to_vec()));
         let joined = argv.join(" ");
         if let Some((_, out)) = sim
@@ -539,7 +546,7 @@ impl Remote for FakeRemote {
 
     fn run_with_stdin(
         &self,
-        _target: &RemoteTarget,
+        target: &RemoteTarget,
         argv: &[String],
         stdin_file: &Path,
     ) -> Result<RemoteOutput, RemoteError> {
@@ -549,6 +556,7 @@ impl Remote for FakeRemote {
         let bytes = std::fs::read(stdin_file)
             .map_err(|e| RemoteError::Io(format!("opening local file: {e}")))?;
         let mut sim = self.sim.lock().unwrap();
+        sim.targets.push(target.clone());
         sim.calls.push(Call::Run(argv.to_vec()));
         let joined = argv.join(" ");
         if let Some((_, out)) = sim
@@ -563,7 +571,7 @@ impl Remote for FakeRemote {
 
     fn upload(
         &self,
-        _target: &RemoteTarget,
+        target: &RemoteTarget,
         local_path: &Path,
         remote_path: &str,
     ) -> Result<(), RemoteError> {
@@ -571,6 +579,7 @@ impl Remote for FakeRemote {
             return Err(RemoteError::Transport("Connection timed out".into()));
         }
         let mut sim = self.sim.lock().unwrap();
+        sim.targets.push(target.clone());
         sim.calls.push(Call::Upload(remote_path.to_string()));
         if sim.upload_failures.iter().any(|n| remote_path.contains(n)) {
             return Err(RemoteError::Io(format!(

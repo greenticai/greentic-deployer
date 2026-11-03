@@ -29,6 +29,7 @@ pub mod remote;
 pub mod render;
 pub mod snapshot;
 mod steps;
+pub mod tunnel;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use crate::tool_check::{ToolCheck, check_binary_present};
 pub use credentials::SshHostCredentials;
 pub use params::SshHostParams;
 pub use remote::{Remote, RemoteError, RemoteOutput, RemoteTarget, SystemSsh};
+pub use tunnel::{TunnelConfig, TunnelError, TunnelProvider, TunnelRegistry, TunnelUp};
 
 /// Name of the content marker inside the store (see [`render::StoreArchive`]).
 pub(crate) const STORE_MARKER_FILE: &str = ".greentic-store.sha256";
@@ -94,6 +96,9 @@ pub struct SshHostDeployerHandler {
     /// FILTERED bytes (`cli::env::read_dev_secrets_bytes`), exactly as the Cloud
     /// Run lane injects them; `None` ships no dev-store at all.
     pub(crate) dev_secrets: Option<Vec<u8>>,
+    /// The known tunnel kinds. [`TunnelRegistry::builtin`] by default; tests
+    /// inject providers that start nothing.
+    pub(crate) tunnels: Arc<TunnelRegistry>,
 }
 
 impl Default for SshHostDeployerHandler {
@@ -104,6 +109,7 @@ impl Default for SshHostDeployerHandler {
             fallback_params: None,
             store_root: None,
             dev_secrets: None,
+            tunnels: Arc::new(TunnelRegistry::builtin()),
         }
     }
 }
@@ -133,7 +139,16 @@ impl SshHostDeployerHandler {
             fallback_params,
             store_root: None,
             dev_secrets: None,
+            tunnels: Arc::new(TunnelRegistry::builtin()),
         }
+    }
+
+    /// Use these tunnel kinds instead of the built-in ones (builder-style), for
+    /// the warm verbs and the credentials probes alike.
+    pub fn with_tunnels(mut self, tunnels: Arc<TunnelRegistry>) -> Self {
+        self.creds = self.creds.with_tunnels(Arc::clone(&tunnels));
+        self.tunnels = tunnels;
+        self
     }
 
     /// Bind the local store to synchronize and the filtered dev-store bytes to
@@ -184,3 +199,5 @@ impl EnvPackHandler for SshHostDeployerHandler {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_tunnel;

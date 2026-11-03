@@ -34,6 +34,7 @@ use crate::credentials::{
 
 use super::params::SshHostParams;
 use super::remote::{Remote, RemoteTarget};
+use super::tunnel::{TunnelRegistry, connect};
 
 pub const REACHABLE_CAP: &str = "ssh-host.reachable";
 pub const ARCH_CAP: &str = "ssh-host.arch";
@@ -41,6 +42,8 @@ pub const GLIBC_CAP: &str = "ssh-host.glibc";
 pub const SYSTEMD_CAP: &str = "ssh-host.systemd";
 pub const INSTALL_DIR_WRITABLE_CAP: &str = "ssh-host.install-dir-writable";
 pub const PRIVILEGE_CAP: &str = "ssh-host.privilege";
+/// Listed first, and only when the answers configure a tunnel other than `none`.
+pub const TUNNEL_CAP: &str = "ssh-host.tunnel";
 
 /// Oldest glibc the greentic-start release binaries run on (they are built on
 /// ubuntu-24.04). Debian 12 (2.36) and Ubuntu 22.04 (2.35) are too old; Ubuntu
@@ -61,6 +64,7 @@ struct Binding {
 #[derive(Debug, Clone, Default)]
 pub struct SshHostCredentials {
     binding: Option<Binding>,
+    tunnels: Arc<TunnelRegistry>,
 }
 
 impl SshHostCredentials {
@@ -68,7 +72,142 @@ impl SshHostCredentials {
     pub fn with_target(remote: Arc<dyn Remote>, params: SshHostParams) -> Self {
         Self {
             binding: Some(Binding { remote, params }),
+            tunnels: Arc::default(),
         }
+    }
+
+    /// Use these tunnel kinds instead of the built-in ones (builder-style).
+    pub fn with_tunnels(mut self, tunnels: Arc<TunnelRegistry>) -> Self {
+        self.tunnels = tunnels;
+        self
+    }
+
+    /// Whether the bound answers ask for a tunnel that brings something up.
+    fn tunnel_listed(&self) -> bool {
+        self.binding
+            .as_ref()
+            .and_then(|b| b.params.tunnel.as_ref())
+            .is_some_and(|t| t.kind != "none")
+    }
+
+    fn probe(
+        &self,
+        binding: &Binding,
+        caps: Vec<Capability>,
+        target: RemoteTarget,
+    ) -> RequirementsReport {
+        let params = &binding.params;
+        let prober = Prober {
+            remote: binding.remote.as_ref(),
+            target,
+        };
+
+        match prober.succeeds(&["true"]) {
+            Ok(true) => {}
+            Ok(false) => return all_failed(caps, "the VM accepted the login but `true` failed"),
+            Err(e) => {
+                let mut checks = Vec::with_capacity(caps.len());
+                for (i, capability) in caps.into_iter().enumerate() {
+                    let reason = if i == 0 {
+                        format!(
+                            "cannot reach {}:{} as {}: {e}",
+                            params.host, params.port, params.user
+                        )
+                    } else {
+                        "not probed: the VM is unreachable".to_string()
+                    };
+                    checks.push(CapabilityCheck {
+                        capability,
+                        status: CapabilityStatus::Fail { reason },
+                    });
+                }
+                return RequirementsReport::new(checks);
+            }
+        }
+
+        let arch = match prober.run(&["uname", "-m"]) {
+            Ok(out) if out.success() => {
+                let machine = out.stdout.trim().to_string();
+                pass_or(SUPPORTED_ARCHES.contains(&machine.as_str()), || {
+                    format!(
+                        "unsupported architecture {machine:?}; greentic-start is published for {}",
+                        SUPPORTED_ARCHES.join(", ")
+                    )
+                })
+            }
+            Ok(out) => CapabilityStatus::Fail {
+                reason: format!("`uname -m` exited {}", out.status),
+            },
+            Err(e) => CapabilityStatus::Fail { reason: e },
+        };
+        let glibc = probe_glibc(&prober);
+        let systemd = match prober.succeeds(&["systemctl", "--version"]) {
+            Ok(ok) => pass_or(ok, || {
+                "`systemctl --version` failed — the VM does not run systemd".to_string()
+            }),
+            Err(e) => CapabilityStatus::Fail { reason: e },
+        };
+        let dir = &params.install_dir;
+        let writable = (|| -> Result<bool, String> {
+            if prober.succeeds(&["test", "-d", dir])? {
+                return prober.succeeds(&["test", "-w", dir]);
+            }
+            // Not there yet: `mkdir -p` at warm time needs a writable ancestor.
+            let mut ancestor = dir.as_str();
+            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                let parent = if parent.is_empty() { "/" } else { parent };
+                if prober.succeeds(&["test", "-d", parent])? {
+                    return prober.succeeds(&["test", "-w", parent]);
+                }
+                if parent == "/" {
+                    break;
+                }
+                ancestor = parent;
+            }
+            Ok(false)
+        })();
+        let install_dir = match writable {
+            Ok(ok) => pass_or(ok, || {
+                format!(
+                    "the login user cannot write {dir} (or its nearest existing parent); create \
+                     it once with `sudo install -d -o {} {dir}`",
+                    params.user
+                )
+            }),
+            Err(e) => CapabilityStatus::Fail { reason: e },
+        };
+        let privilege = if params.use_sudo {
+            match prober.succeeds(&["sudo", "-n", "true"]) {
+                Ok(ok) => pass_or(ok, || {
+                    "`sudo -n true` failed — the login user needs passwordless sudo, or set \
+                     use_sudo=false and log in as root"
+                        .to_string()
+                }),
+                Err(e) => CapabilityStatus::Fail { reason: e },
+            }
+        } else {
+            match prober.run(&["id", "-u"]) {
+                Ok(out) => pass_or(out.success() && out.stdout.trim() == "0", || {
+                    "use_sudo is false but the login user is not root".to_string()
+                }),
+                Err(e) => CapabilityStatus::Fail { reason: e },
+            }
+        };
+
+        let mut statuses = vec![
+            CapabilityStatus::Pass,
+            arch,
+            glibc,
+            systemd,
+            install_dir,
+            privilege,
+        ];
+        RequirementsReport::new(
+            caps.into_iter()
+                .zip(statuses.drain(..))
+                .map(|(capability, status)| CapabilityCheck { capability, status })
+                .collect(),
+        )
     }
 
     fn capabilities(&self) -> Vec<Capability> {
@@ -77,7 +216,14 @@ impl SshHostCredentials {
             .as_ref()
             .map(|b| b.params.install_dir.as_str())
             .unwrap_or("the install directory");
-        vec![
+        let mut caps = Vec::new();
+        if self.tunnel_listed() {
+            caps.push(Capability::new(
+                TUNNEL_CAP,
+                "The configured tunnel comes up and carries traffic to the VM's SSH port",
+            ));
+        }
+        caps.extend([
             Capability::new(REACHABLE_CAP, "The VM accepts a non-interactive SSH login"),
             Capability::new(
                 ARCH_CAP,
@@ -102,7 +248,8 @@ impl SshHostCredentials {
                 PRIVILEGE_CAP,
                 "The login user can install and control a systemd unit (root, or passwordless sudo)",
             ),
-        ]
+        ]);
+        caps
     }
 }
 
@@ -230,7 +377,7 @@ impl DeployerCredentials for SshHostCredentials {
     }
 
     fn validate(&self, _ctx: &ValidationContext<'_>) -> RequirementsReport {
-        let caps = self.capabilities();
+        let mut caps = self.capabilities();
         let Some(binding) = &self.binding else {
             return all_failed(
                 caps,
@@ -238,118 +385,37 @@ impl DeployerCredentials for SshHostCredentials {
                  answers (`answers_ref` with at least `host` and `user`) — failing closed",
             );
         };
-        let params = &binding.params;
-        let prober = Prober {
-            remote: binding.remote.as_ref(),
-            target: RemoteTarget::from(params),
-        };
-
-        match prober.succeeds(&["true"]) {
-            Ok(true) => {}
-            Ok(false) => return all_failed(caps, "the VM accepted the login but `true` failed"),
+        if !self.tunnel_listed() {
+            return self.probe(binding, caps, RemoteTarget::from(&binding.params));
+        }
+        // The tunnel is brought up ONCE for all the probes below, and torn down
+        // when `_guard` drops at the end of this function.
+        let tunnel_cap = caps.remove(0);
+        match connect(&binding.params, &self.tunnels) {
+            Ok((target, _guard)) => {
+                let mut checks = vec![CapabilityCheck {
+                    capability: tunnel_cap,
+                    status: CapabilityStatus::Pass,
+                }];
+                checks.extend(self.probe(binding, caps, target).checks);
+                RequirementsReport::new(checks)
+            }
             Err(e) => {
-                let mut checks = Vec::with_capacity(caps.len());
-                for (i, capability) in caps.into_iter().enumerate() {
-                    let reason = if i == 0 {
-                        format!(
-                            "cannot reach {}:{} as {}: {e}",
-                            params.host, params.port, params.user
-                        )
-                    } else {
-                        "not probed: the VM is unreachable".to_string()
-                    };
-                    checks.push(CapabilityCheck {
-                        capability,
-                        status: CapabilityStatus::Fail { reason },
-                    });
-                }
-                return RequirementsReport::new(checks);
+                let mut checks = vec![CapabilityCheck {
+                    capability: tunnel_cap,
+                    status: CapabilityStatus::Fail {
+                        reason: e.to_string(),
+                    },
+                }];
+                checks.extend(caps.into_iter().map(|capability| CapabilityCheck {
+                    capability,
+                    status: CapabilityStatus::Fail {
+                        reason: "not probed: the tunnel is not up".to_string(),
+                    },
+                }));
+                RequirementsReport::new(checks)
             }
         }
-
-        let arch = match prober.run(&["uname", "-m"]) {
-            Ok(out) if out.success() => {
-                let machine = out.stdout.trim().to_string();
-                pass_or(SUPPORTED_ARCHES.contains(&machine.as_str()), || {
-                    format!(
-                        "unsupported architecture {machine:?}; greentic-start is published for {}",
-                        SUPPORTED_ARCHES.join(", ")
-                    )
-                })
-            }
-            Ok(out) => CapabilityStatus::Fail {
-                reason: format!("`uname -m` exited {}", out.status),
-            },
-            Err(e) => CapabilityStatus::Fail { reason: e },
-        };
-        let glibc = probe_glibc(&prober);
-        let systemd = match prober.succeeds(&["systemctl", "--version"]) {
-            Ok(ok) => pass_or(ok, || {
-                "`systemctl --version` failed — the VM does not run systemd".to_string()
-            }),
-            Err(e) => CapabilityStatus::Fail { reason: e },
-        };
-        let dir = &params.install_dir;
-        let writable = (|| -> Result<bool, String> {
-            if prober.succeeds(&["test", "-d", dir])? {
-                return prober.succeeds(&["test", "-w", dir]);
-            }
-            // Not there yet: `mkdir -p` at warm time needs a writable ancestor.
-            let mut ancestor = dir.as_str();
-            while let Some((parent, _)) = ancestor.rsplit_once('/') {
-                let parent = if parent.is_empty() { "/" } else { parent };
-                if prober.succeeds(&["test", "-d", parent])? {
-                    return prober.succeeds(&["test", "-w", parent]);
-                }
-                if parent == "/" {
-                    break;
-                }
-                ancestor = parent;
-            }
-            Ok(false)
-        })();
-        let install_dir = match writable {
-            Ok(ok) => pass_or(ok, || {
-                format!(
-                    "the login user cannot write {dir} (or its nearest existing parent); create \
-                     it once with `sudo install -d -o {} {dir}`",
-                    params.user
-                )
-            }),
-            Err(e) => CapabilityStatus::Fail { reason: e },
-        };
-        let privilege = if params.use_sudo {
-            match prober.succeeds(&["sudo", "-n", "true"]) {
-                Ok(ok) => pass_or(ok, || {
-                    "`sudo -n true` failed — the login user needs passwordless sudo, or set \
-                     use_sudo=false and log in as root"
-                        .to_string()
-                }),
-                Err(e) => CapabilityStatus::Fail { reason: e },
-            }
-        } else {
-            match prober.run(&["id", "-u"]) {
-                Ok(out) => pass_or(out.success() && out.stdout.trim() == "0", || {
-                    "use_sudo is false but the login user is not root".to_string()
-                }),
-                Err(e) => CapabilityStatus::Fail { reason: e },
-            }
-        };
-
-        let mut statuses = vec![
-            CapabilityStatus::Pass,
-            arch,
-            glibc,
-            systemd,
-            install_dir,
-            privilege,
-        ];
-        RequirementsReport::new(
-            caps.into_iter()
-                .zip(statuses.drain(..))
-                .map(|(capability, status)| CapabilityCheck { capability, status })
-                .collect(),
-        )
     }
 
     fn bootstrap(&self, _input: &BootstrapInput<'_>) -> Result<BootstrapOutcome, BootstrapError> {

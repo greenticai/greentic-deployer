@@ -7,7 +7,7 @@ use greentic_deploy_spec::{CapabilitySlot, Environment, PackDescriptor};
 use serde_json::{Value, json};
 
 use super::fake::FakeRemote;
-use super::params::ANSWER_KEYS;
+use super::params::{ANSWER_KEYS, WIZARD_EXCLUDED_KEYS};
 use super::*;
 use crate::env_packs::deployer::conformance::build_fixture_env;
 use crate::env_packs::deployer::{Deployer, DeployerError, run_conformance};
@@ -123,7 +123,12 @@ fn wizard_id_matches_and_questions_are_exactly_the_accepted_answer_keys() {
     let spec: qa_spec::FormSpec = serde_yaml_bw::from_str(yaml).unwrap();
     assert_eq!(spec.id, "greentic.deployer.ssh-host.wizard");
     let ids: Vec<&str> = spec.questions.iter().map(|q| q.id.as_str()).collect();
-    assert_eq!(ids, ANSWER_KEYS, "wizard and params parser must agree");
+    let asked: Vec<&str> = ANSWER_KEYS
+        .iter()
+        .copied()
+        .filter(|k| !WIZARD_EXCLUDED_KEYS.contains(k))
+        .collect();
+    assert_eq!(ids, asked, "wizard and params parser must agree");
     // No question may ask for a secret VALUE.
     for forbidden in ["password", "passphrase", "private_key", "token"] {
         assert!(!ids.iter().any(|id| id.contains(forbidden)), "{forbidden}");
