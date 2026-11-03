@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use greentic_deploy_spec::{DeploymentId, Environment, RevisionId};
 use serde_json::Value;
 
-use super::SshHostDeployerHandler;
 use super::params::SshHostParams;
 use super::steps::{self, Session, WarmInput};
+use super::{SshHostDeployerHandler, WarmReport};
 use crate::env_packs::deployer::{
     AdapterCapabilities, ArchiveOutcome, Deployer, DeployerError, DrainOutcome, StageOutcome,
     TrafficSplitOutcome, WarmOutcome, enforce_split_invariants, require_revision,
@@ -37,6 +37,70 @@ impl SshHostDeployerHandler {
                     .to_string(),
             )),
         }
+    }
+}
+
+impl SshHostDeployerHandler {
+    /// Warm the VM for `revision_ids` (at least one) and report what happened.
+    ///
+    /// The VM runs ONE service that serves the whole env store, so every
+    /// revision the env serves belongs in one synchronization (the shipped
+    /// `environment.json` keeps exactly those, plus what a traffic split
+    /// names). `Deployer::warm_revision` is the one-revision case of this.
+    /// `Deployer::warm_revision` is this with a single id.
+    ///
+    /// With `read_slot` the report also names the live store slot, at the cost
+    /// of one extra `readlink` after the warm.
+    pub async fn warm_with_report(
+        &self,
+        env: &Environment,
+        revision_ids: &[RevisionId],
+        answers: Option<&Value>,
+    ) -> Result<WarmReport, DeployerError> {
+        self.warm(env, revision_ids, answers, true).await
+    }
+
+    async fn warm(
+        &self,
+        env: &Environment,
+        revision_ids: &[RevisionId],
+        answers: Option<&Value>,
+        read_slot: bool,
+    ) -> Result<WarmReport, DeployerError> {
+        if revision_ids.is_empty() {
+            return Err(DeployerError::Provider(
+                "ssh-host: warm needs at least one revision".to_string(),
+            ));
+        }
+        for revision_id in revision_ids {
+            require_revision(env, *revision_id)?;
+        }
+        let params = self.params_for(env, answers)?;
+        let Some(store_root) = self.store_root.clone() else {
+            return Err(DeployerError::Provider(
+                "ssh-host: no local store is bound to this deployer, so there is nothing to \
+                 synchronize (the CLI must pass the store root and the filtered dev-store)"
+                    .to_string(),
+            ));
+        };
+        let remote = std::sync::Arc::clone(&self.remote);
+        let input = WarmInput {
+            env: env.clone(),
+            revision_ids: revision_ids.to_vec(),
+            store_root,
+            dev_secrets: self.dev_secrets.clone(),
+        };
+        // ssh is blocking I/O that can take minutes; keep it off the executor.
+        tokio::task::spawn_blocking(move || {
+            let session = Session::new(remote.as_ref(), &params);
+            let mut report = steps::warm(&session, &input)?;
+            if read_slot {
+                report.active_slot = steps::active_slot_name(&session)?;
+            }
+            Ok(report)
+        })
+        .await
+        .map_err(|e| DeployerError::Provider(format!("ssh-host: warm task failed: {e}")))?
     }
 }
 
@@ -65,29 +129,10 @@ impl Deployer for SshHostDeployerHandler {
         revision_id: RevisionId,
         answers: Option<&Value>,
     ) -> Result<WarmOutcome, DeployerError> {
-        require_revision(env, revision_id)?;
-        let params = self.params_for(env, answers)?;
-        let Some(store_root) = self.store_root.clone() else {
-            return Err(DeployerError::Provider(
-                "ssh-host: no local store is bound to this deployer, so there is nothing to \
-                 synchronize (the CLI must pass the store root and the filtered dev-store)"
-                    .to_string(),
-            ));
-        };
-        let remote = std::sync::Arc::clone(&self.remote);
-        let input = WarmInput {
-            env: env.clone(),
-            revision_id,
-            store_root,
-            dev_secrets: self.dev_secrets.clone(),
-        };
-        // ssh is blocking I/O that can take minutes; keep it off the executor.
-        tokio::task::spawn_blocking(move || {
-            let session = Session::new(remote.as_ref(), &params);
-            steps::warm(&session, &input)
+        let report = self.warm(env, &[revision_id], answers, false).await?;
+        Ok(WarmOutcome {
+            endpoint_url: report.endpoint_url,
         })
-        .await
-        .map_err(|e| DeployerError::Provider(format!("ssh-host: warm task failed: {e}")))?
     }
 
     async fn drain_revision(
