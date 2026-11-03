@@ -164,7 +164,11 @@ pub fn requirements(
     let connected: Option<Box<dyn DeployerCredentials>> =
         match connected_k8s_credentials(store, &env_id)? {
             Some(c) => Some(Box::new(c)),
-            None => connected_cloudrun_credentials(store, &env_id)?,
+            None => match connected_cloudrun_credentials(store, &env_id)? {
+                Some(c) => Some(c),
+                // ssh-host: bind the answers' SSH target so the VM probes run.
+                None => super::ssh_host::connected_credentials(store, &env_id)?,
+            },
         };
     let (doc, report) = validate_requirements(store, registry, &env_id, connected.as_deref())
         .map_err(map_validate_err)?;

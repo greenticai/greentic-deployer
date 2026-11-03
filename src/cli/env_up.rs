@@ -5,6 +5,10 @@
 //! the manifest declared; the derived `kind-<name>` context is applied only to
 //! this reconcile. A later bare `op env reconcile` uses the ambient context —
 //! which `kind create cluster` already sets as current-context.
+//!
+//! Other deployers branch off after the apply: Cloud Run warms its revisions
+//! (`cloudrun_env_up`) and ssh-host synchronizes the store to its VM
+//! (`ssh_host::env_up`); neither reaches the k8s phases.
 
 #[cfg(any(feature = "k8s-client", test))]
 use serde_json::Value;
@@ -121,11 +125,16 @@ pub(crate) fn up(
     // Cloud Run kind, so it treats a Cloud Run manifest as k8s; such a build
     // cannot deploy Cloud Run regardless, and apply is idempotent.
     let targets_cloudrun = manifest_targets_cloudrun(store, &env_id, &manifest)?;
-    if let Err(missing) = env_up_deployer_gate(
-        targets_cloudrun,
-        cfg!(feature = "deploy-gcp-cloudrun"),
-        cfg!(feature = "k8s-client"),
-    ) {
+    // The ssh-host deployer needs neither feature: it drives the system `ssh`.
+    let targets_ssh_host =
+        manifest_targets_deployer(store, &env_id, &manifest, super::ssh_host::is_ssh_host_kind)?;
+    if !targets_ssh_host
+        && let Err(missing) = env_up_deployer_gate(
+            targets_cloudrun,
+            cfg!(feature = "deploy-gcp-cloudrun"),
+            cfg!(feature = "k8s-client"),
+        )
+    {
         return Err(OpError::Conflict(match missing {
             "deploy-gcp-cloudrun" => "this build was compiled without the \
                  `deploy-gcp-cloudrun` feature; `op env up` needs it to deploy a \
@@ -268,6 +277,13 @@ pub(crate) fn up(
         return Ok((OpOutcome::new(NOUN, "up", result), None));
     }
 
+    // ── Deployer dispatch: ssh-host bring-up ─────────────────────────
+    // A plain Linux VM over SSH: synchronize the env store and (re)start the
+    // service. No cluster, no reconcile, no port-forward.
+    if let Some(result) = super::ssh_host::env_up(store, registry, &env_id)? {
+        return Ok((OpOutcome::new(NOUN, "up", result), None));
+    }
+
     // ── Phase 4b: vault ──────────────────────────────────────────────
     // Deploy + bootstrap + seed an in-cluster (or external) Vault, when the
     // manifest declares one. Pinned AFTER apply (the secrets binding it needs
@@ -399,6 +415,17 @@ fn manifest_targets_cloudrun(
     env_id: &greentic_deploy_spec::EnvId,
     manifest: &EnvManifest,
 ) -> Result<bool, OpError> {
+    manifest_targets_deployer(store, env_id, manifest, super::env::is_cloudrun_kind)
+}
+
+/// [`manifest_targets_cloudrun`] for any deployer kind: whether the effective
+/// desired Deployer-slot pack satisfies `is_kind`, decided before any mutation.
+fn manifest_targets_deployer(
+    store: &LocalFsStore,
+    env_id: &greentic_deploy_spec::EnvId,
+    manifest: &EnvManifest,
+    is_kind: fn(&greentic_deploy_spec::PackDescriptor) -> bool,
+) -> Result<bool, OpError> {
     use crate::environment::EnvironmentStore as _;
     use greentic_deploy_spec::{CapabilitySlot, PackDescriptor};
 
@@ -409,16 +436,16 @@ fn manifest_targets_cloudrun(
         .find(|p| p.slot == CapabilitySlot::Deployer)
     {
         return Ok(PackDescriptor::try_new(pack.kind.as_str())
-            .map(|d| super::env::is_cloudrun_kind(&d))
+            .map(|d| is_kind(&d))
             .unwrap_or(false));
     }
 
     // No deployer in the manifest → inherit the existing env's binding, when the
-    // env already exists (a fresh env with no bound deployer is not Cloud Run).
+    // env already exists (a fresh env with no bound deployer matches nothing).
     if store.exists(env_id)? {
         let env = store.load(env_id)?;
         if let Some(binding) = env.pack_for_slot(CapabilitySlot::Deployer) {
-            return Ok(super::env::is_cloudrun_kind(&binding.kind));
+            return Ok(is_kind(&binding.kind));
         }
     }
     Ok(false)

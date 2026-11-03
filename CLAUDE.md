@@ -80,14 +80,14 @@ An env-pack binds a **capability slot** on an environment. Deployer slots:
 | `greentic.deployer.aws-ecs` | `src/env_packs/aws/` | yes |
 | `greentic.deployer.k8s` | `src/env_packs/k8s/` | yes — `kube` client |
 | `greentic.deployer.local-process` | `src/env_packs/local_process/` | local only |
-| `greentic.deployer.ssh-host` | `src/env_packs/ssh_host/` | yes — system `ssh` to a Linux VM (systemd); not CLI-wired yet |
+| `greentic.deployer.ssh-host` | `src/env_packs/ssh_host/` (CLI wiring: `src/cli/ssh_host.rs`) | yes — system `ssh` to a Linux VM (systemd); `op credentials requirements`, `op env up`, `op env apply-revision`; verified on one real Ubuntu 24.04 VM |
 
 Shared plumbing: `registry.rs` (descriptor → handler), `slot.rs`
 (`EnvPackHandler`), `deployer/` (the `Deployer` trait every deployer implements),
 `render.rs`.
 
 For the ssh-host subsystem (a plain Linux VM over SSH) — module map, invariants,
-and what is not yet verified or wired — read
+the CLI flow (`env-packs` bind -> `credentials requirements` -> `env up`), and what is not yet verified — read
 **[`docs/ssh-host-internals.md`](docs/ssh-host-internals.md)**.
 
 For the Cloud Run subsystem specifically — module map, the seam, the invariants
