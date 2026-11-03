@@ -47,7 +47,11 @@ impl Drop for FakeServer {
 }
 
 fn spawn_server(port: u16, handler: fn(TcpStream, &Mutex<Vec<String>>)) -> FakeServer {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    try_spawn_server(port, handler).expect("bind a loopback port")
+}
+
+fn try_spawn_server(port: u16, handler: fn(TcpStream, &Mutex<Vec<String>>)) -> Option<FakeServer> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
     let port = listener.local_addr().unwrap().port();
     let asked = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -63,7 +67,7 @@ fn spawn_server(port: u16, handler: fn(TcpStream, &Mutex<Vec<String>>)) -> FakeS
             }
         }
     });
-    FakeServer { port, asked, stop }
+    Some(FakeServer { port, asked, stop })
 }
 
 fn socks_handler(mut c: TcpStream, asked: &Mutex<Vec<String>>) {
@@ -126,6 +130,12 @@ fn http_handler(mut c: TcpStream, asked: &Mutex<Vec<String>>) {
 
 pub(super) fn fake_socks(port: u16) -> FakeServer {
     spawn_server(port, socks_handler)
+}
+
+/// For a port someone else chose (the provider's): another test may have taken
+/// it in the moment between the provider releasing it and this bind.
+pub(super) fn try_fake_socks(port: u16) -> Option<FakeServer> {
+    try_spawn_server(port, socks_handler)
 }
 
 fn fake_http_proxy() -> FakeServer {
