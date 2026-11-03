@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::openconnect::{OpenConnect, argv, classify_failure, stdin_payload};
-use super::tests::{ctx, fake_socks, map};
+use super::tests::{ctx, map, try_fake_socks};
 use super::*;
 use std::collections::BTreeMap;
 
@@ -196,6 +196,20 @@ fn failures_become_fixed_sentences_that_quote_nothing_and_name_the_way_out() {
 #[cfg(unix)]
 #[test]
 fn a_good_login_sends_password_and_a_computed_code_on_stdin_and_waits_for_the_banner() {
+    // The provider picks a free port and the fake `ocproxy` binds it a moment
+    // later; under a parallel test run another test can take it in between, so
+    // that (and only that) is retried.
+    for _ in 0..5 {
+        if good_login_once() {
+            return;
+        }
+    }
+    panic!("the SOCKS port was taken by another process five times in a row");
+}
+
+/// `false` when the port the provider chose was taken before the fake could bind it.
+#[cfg(unix)]
+fn good_login_once() -> bool {
     let secrets = ScratchDir::new().unwrap();
     let pw = secrets.write_secret("pw", b"hunter2\n").unwrap();
     let seed = secrets
@@ -220,7 +234,10 @@ fn a_good_login_sends_password_and_a_computed_code_on_stdin_and_waits_for_the_ba
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    let _ocproxy = fake_socks(port.expect("the stub reported the SOCKS port"));
+    let Some(_ocproxy) = try_fake_socks(port.expect("the stub reported the SOCKS port")) else {
+        let _ = worker.join();
+        return false;
+    };
     let up = worker.join().unwrap().expect("tunnel up");
 
     let cmd = up.proxy_command.clone().unwrap();
@@ -245,6 +262,7 @@ fn a_good_login_sends_password_and_a_computed_code_on_stdin_and_waits_for_the_ba
     );
     assert_eq!(calls(stubs.path()), 1);
     drop(up);
+    true
 }
 
 #[cfg(unix)]
