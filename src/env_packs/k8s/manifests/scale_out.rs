@@ -33,10 +33,14 @@ const SECRET_KEY: &str = "redis-url";
 
 const SESSION_BACKEND_ENV: &str = "GREENTIC_RUNNER_SESSION_BACKEND";
 const STATE_BACKEND_ENV: &str = "GREENTIC_RUNNER_STATE_BACKEND";
-/// Both variables the URL reaches the runtime through.
-const REDIS_URL_ENV_NAMES: [&str; 2] = [
+/// An Agentic Worker's conversation state (its memory of earlier turns) has its
+/// own selector and URL, and defaults to in-process memory.
+const AGENT_STATE_BACKEND_ENV: &str = "GREENTIC_AW_STATE_BACKEND";
+/// The variables the URL reaches the runtime through.
+const REDIS_URL_ENV_NAMES: [&str; 3] = [
     "GREENTIC_RUNNER_REDIS_URL",
     "GREENTIC_REVISION_PIN_REDIS_URL",
+    "GREENTIC_AW_REDIS_URL",
 ];
 
 /// The Redis URL. Never printed by `Debug`.
@@ -138,16 +142,20 @@ pub fn parse(obj: &serde_json::Map<String, Value>) -> Result<ScaleOut, String> {
 }
 
 impl ScaleOut {
-    /// Worker env: the two backend selectors plus the URL by `secretKeyRef`.
+    /// Worker env: the three backend selectors plus the URL by `secretKeyRef`.
     /// Empty unless `redis_url` is answered.
     pub fn worker_env(&self) -> Vec<Value> {
         if self.redis_url.is_none() {
             return Vec::new();
         }
-        let mut vars: Vec<Value> = [SESSION_BACKEND_ENV, STATE_BACKEND_ENV]
-            .into_iter()
-            .map(|n| json!({"name": n, "value": "redis"}))
-            .collect();
+        let mut vars: Vec<Value> = [
+            SESSION_BACKEND_ENV,
+            STATE_BACKEND_ENV,
+            AGENT_STATE_BACKEND_ENV,
+        ]
+        .into_iter()
+        .map(|n| json!({"name": n, "value": "redis"}))
+        .collect();
         vars.extend(REDIS_URL_ENV_NAMES.into_iter().map(|n| {
             json!({
                 "name": n,

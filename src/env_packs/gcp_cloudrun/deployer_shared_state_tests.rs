@@ -10,7 +10,7 @@ use crate::env_packs::deployer::conformance::build_fixture_env;
 use crate::env_packs::gcp_cloudrun::deploy_target::InMemoryCloudRun;
 use crate::env_packs::gcp_cloudrun::redis_secret::redis_url_secret_name;
 use crate::env_packs::gcp_cloudrun::shared_state::{
-    GeneratedSecretSeed, SESSION_BACKEND_ENV, STATE_BACKEND_ENV, VpcEgress,
+    AGENT_STATE_BACKEND_ENV, GeneratedSecretSeed, SESSION_BACKEND_ENV, STATE_BACKEND_ENV, VpcEgress,
 };
 
 const URL: &str = "redis://:s3cret-auth@10.0.0.3:6379";
@@ -113,6 +113,7 @@ async fn redis_is_selected_and_its_url_staged_as_one_secret_version() {
     let plain = target.service_env_for(dep).expect("service");
     assert!(plain.contains(&(SESSION_BACKEND_ENV.into(), "redis".into())));
     assert!(plain.contains(&(STATE_BACKEND_ENV.into(), "redis".into())));
+    assert!(plain.contains(&(AGENT_STATE_BACKEND_ENV.into(), "redis".into())));
     assert!(
         !plain.iter().any(|(_, v)| v.contains("s3cret-auth")),
         "the URL never rides as a literal"

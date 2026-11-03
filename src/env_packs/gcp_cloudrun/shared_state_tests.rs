@@ -51,6 +51,7 @@ fn a_connector_and_redis_select_the_redis_backends() {
         vec![
             (SESSION_BACKEND_ENV.to_string(), "redis".to_string()),
             (STATE_BACKEND_ENV.to_string(), "redis".to_string()),
+            (AGENT_STATE_BACKEND_ENV.to_string(), "redis".to_string()),
         ]
     );
     assert_eq!(p.shared_state.secret_env_names(), &REDIS_URL_ENV_NAMES);
