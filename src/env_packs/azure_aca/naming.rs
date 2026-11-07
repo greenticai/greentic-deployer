@@ -5,8 +5,19 @@ use sha2::{Digest, Sha256};
 
 /// Container App name limit (`NEEDS_LIVE`, see the decision record).
 pub(crate) const APP_NAME_MAX: usize = 32;
-/// Revision suffix limit documented by Microsoft Learn.
-pub(crate) const SUFFIX_MAX: usize = 64;
+/// Longest FULL revision name (`<app>--<suffix>`) the deployer will produce.
+///
+/// ARM rejected `gtc-<26 chars>--r<26 chars>` (59 characters) with
+/// `ContainerAppInvalidRevisionName` against a real subscription, so the limit
+/// applies to the whole name, not to the suffix alone. 54 is the figure Azure
+/// documents for a revision name; the suffix budget below is derived from it
+/// rather than taken from the 64-character *label* limit, which is a different
+/// thing.
+pub(crate) const REVISION_NAME_MAX: usize = 54;
+/// Revision suffix budget: what is left of [`REVISION_NAME_MAX`] after the
+/// longest possible app name and the `--` separator. Sizing it for the worst
+/// case keeps `revision_suffix` independent of the app name it is joined to.
+pub(crate) const SUFFIX_MAX: usize = REVISION_NAME_MAX - APP_NAME_MAX - 2;
 
 /// Name of the Container App serving one deployment.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -100,6 +111,38 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.len() <= 32 && b.len() <= 32);
         assert!(!a.ends_with('-') && !b.ends_with('-'));
+    }
+
+    #[test]
+    fn a_real_ulid_revision_name_fits_in_the_full_name_limit() {
+        // The live Azure run failed on exactly this shape: a 26-character ULID
+        // for both the deployment and the revision.
+        let d = DeploymentId("01M6TZBXX5T59P4JM1AA8X2TB5".parse().unwrap());
+        let r = RevisionId("01M6TZBXXMYCKQP5MRRJR2H19N".parse().unwrap());
+        let name = revision_name(&app_name(&d), &revision_suffix(&r));
+        assert!(
+            name.len() <= REVISION_NAME_MAX,
+            "{name} is {} characters",
+            name.len()
+        );
+        assert!(name.starts_with("gtc-01m6tzbxx5t59p4jm1aa8x2tb5--r"));
+    }
+
+    #[test]
+    fn the_worst_case_app_name_still_fits() {
+        let long_app = AppName("a".repeat(APP_NAME_MAX));
+        let r = RevisionId(Ulid::from(u128::MAX));
+        let name = revision_name(&long_app, &revision_suffix(&r));
+        assert!(name.len() <= REVISION_NAME_MAX, "{name}");
+    }
+
+    #[test]
+    fn two_revisions_of_one_millisecond_keep_distinct_suffixes() {
+        // Truncation keeps the timestamp half of a ULID; the hash is what tells
+        // two revisions created in the same millisecond apart.
+        let a = revision_suffix(&RevisionId("01M6TZBXXMYCKQP5MRRJR2H19N".parse().unwrap()));
+        let b = revision_suffix(&RevisionId("01M6TZBXXMZZZZP5MRRJR2H19N".parse().unwrap()));
+        assert_ne!(a, b);
     }
 
     #[test]

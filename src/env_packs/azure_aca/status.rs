@@ -39,7 +39,17 @@ pub(crate) fn revision_status(rev: &Value) -> RevisionStatus {
             reason: format!("{running}: {detail}"),
         },
         (_, "Stopped") => RevisionStatus::Inactive,
-        (_, "Running") => RevisionStatus::Running { replicas },
+        // `ScaledToZero` is a HEALTHY state, not a pending one: an app with
+        // `minReplicas: 0` (the deployer's default) reports it for every revision
+        // that has received no traffic yet, including the instant after it was
+        // provisioned. Falling through to `Provisioning` made `op env up` wait
+        // out its whole readiness window and fail a revision that ARM already
+        // called `Healthy` / `Provisioned` (found by the live Azure test).
+        // `RunningAtMaxScale` is the same kind of healthy-but-not-`Running`
+        // answer at the other end of the scale range.
+        (_, "Running" | "RunningAtMaxScale" | "ScaledToZero") => {
+            RevisionStatus::Running { replicas }
+        }
         _ => RevisionStatus::Provisioning,
     }
 }
@@ -133,6 +143,30 @@ mod tests {
         let mut inactive = rev("Provisioned", "Running");
         inactive["properties"]["active"] = json!(false);
         assert_eq!(revision_status(&inactive), RevisionStatus::Inactive);
+    }
+
+    #[test]
+    fn a_revision_scaled_to_zero_is_ready_not_pending() {
+        let mut idle = rev("Provisioned", "ScaledToZero");
+        idle["properties"]["replicas"] = json!(0);
+        assert_eq!(
+            revision_status(&idle),
+            RevisionStatus::Running { replicas: 0 }
+        );
+        assert_eq!(
+            revision_status(&rev("Provisioned", "RunningAtMaxScale")),
+            RevisionStatus::Running { replicas: 1 }
+        );
+        // Still pending while ARM itself says so, and an unknown state stays
+        // pending rather than being guessed healthy.
+        assert_eq!(
+            revision_status(&rev("Provisioning", "ScaledToZero")),
+            RevisionStatus::Provisioning
+        );
+        assert_eq!(
+            revision_status(&rev("Provisioned", "Unknown")),
+            RevisionStatus::Provisioning
+        );
     }
 
     #[test]
