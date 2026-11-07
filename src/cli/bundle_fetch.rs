@@ -96,8 +96,15 @@ fn fetch_oci_to_cache(oci_ref: &str) -> Result<PathBuf, OpError> {
             // only one this process is handed is the `OCI_USERNAME` /
             // `OCI_PASSWORD` pair the caller minted from `ecr:GetAuthorizationToken`
             // (the same pair that authenticates the worker's own boot pull).
+            //
+            // Azure Container Registry is the same again: a private registry
+            // refuses an anonymous pull, and the pair the caller hands over is
+            // the repository-scoped pull token the worker boots with.
             let fetcher: OciPackFetcher<DefaultRegistryClient> =
-                match artifact_registry_client(&rt, oci_ref).or_else(|| ecr_client(oci_ref)) {
+                match artifact_registry_client(&rt, oci_ref)
+                    .or_else(|| ecr_client(oci_ref))
+                    .or_else(|| acr_client(oci_ref))
+                {
                     Some(client) => OciPackFetcher::with_client(client, opts),
                     None => OciPackFetcher::new(opts),
                 };
@@ -174,6 +181,54 @@ fn ecr_client_with(
 
 fn ecr_client(oci_ref: &str) -> Option<DefaultRegistryClient> {
     ecr_client_with(
+        oci_ref,
+        oci_credentials_from(|name| std::env::var(name).ok()),
+    )
+}
+
+/// Whether `host` is an Azure Container Registry login server:
+/// `<registry>.azurecr.io` (or the sovereign `.azurecr.cn` / `.azurecr.us`),
+/// where `<registry>` is the 5-50 lowercase alphanumerics ACR allows.
+///
+/// Deliberately strict, for the reason `is_ecr_host` is: the credential is
+/// attached to a host only when this matches, so a manifest that also names
+/// `ghcr.io` or a customer's own registry never receives an ACR token. A
+/// regional data endpoint (`<registry>.<region>.data.azurecr.io`) is NOT
+/// matched: a reference names the login server, and the data endpoint is only
+/// reached by a redirect the client follows after authenticating.
+fn is_acr_host(host: &str) -> bool {
+    let host = host.split(':').next().unwrap_or_default();
+    let Some((registry, domain)) = host.split_once('.') else {
+        return false;
+    };
+    matches!(domain, "azurecr.io" | "azurecr.cn" | "azurecr.us")
+        && (5..=50).contains(&registry.len())
+        && registry
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// An authenticated client for an Azure Container Registry reference when
+/// `credentials` is present, else `None` (the anonymous client then lets the
+/// registry report the denial itself, exactly as for any other host).
+fn acr_client_with(
+    oci_ref: &str,
+    credentials: Option<(String, String)>,
+) -> Option<DefaultRegistryClient> {
+    let host = oci_ref
+        .trim_start_matches(OCI_SCHEME)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if !is_acr_host(host) {
+        return None;
+    }
+    let (user, password) = credentials?;
+    Some(DefaultRegistryClient::with_basic_auth(user, password))
+}
+
+fn acr_client(oci_ref: &str) -> Option<DefaultRegistryClient> {
+    acr_client_with(
         oci_ref,
         oci_credentials_from(|name| std::env::var(name).ok()),
     )
@@ -437,6 +492,52 @@ mod tests {
                 None
             )
             .is_none(),
+            "no credential handed over: stay anonymous"
+        );
+    }
+
+    #[test]
+    fn acr_hosts_are_recognised_and_nothing_else_is() {
+        for host in [
+            "gtce2ebima01.azurecr.io",
+            "gtce2ebima01.azurecr.io:443",
+            "myregistry.azurecr.cn",
+            "myregistry.azurecr.us",
+        ] {
+            assert!(is_acr_host(host), "{host} is an ACR login server");
+        }
+        for host in [
+            "ghcr.io",
+            "599558443099.dkr.ecr.eu-west-1.amazonaws.com",
+            "us-docker.pkg.dev",
+            "azurecr.io",
+            "abc.azurecr.io",
+            "UPPER123.azurecr.io",
+            "my-registry.azurecr.io",
+            "myregistry.azurecr.io.evil.example",
+            "evil.example/myregistry.azurecr.io",
+            "myregistry.eastus.data.azurecr.io",
+            "",
+        ] {
+            assert!(!is_acr_host(host), "{host:?} is not an ACR login server");
+        }
+    }
+
+    #[test]
+    fn only_an_acr_host_ever_gets_the_acr_credential() {
+        let creds = || Some(("greentic-pull-token".to_string(), "tok".to_string()));
+        assert!(acr_client_with("oci://ghcr.io/greenticai/x:v1", creds()).is_none());
+        assert!(
+            acr_client_with(
+                "oci://599558443099.dkr.ecr.eu-west-1.amazonaws.com/r:t",
+                creds()
+            )
+            .is_none(),
+            "an ECR host never takes the ACR path"
+        );
+        assert!(acr_client_with("oci://gtce2ebima01.azurecr.io/greentic/x:t", creds()).is_some());
+        assert!(
+            acr_client_with("oci://gtce2ebima01.azurecr.io/greentic/x:t", None).is_none(),
             "no credential handed over: stay anonymous"
         );
     }
