@@ -11,7 +11,7 @@
         "transport": "auto",
         "allowInsecure": false,
         "traffic": [
-          {"revisionName": "gtc-00000000000000000000000001--r0000000000000000000000000g", "weight": 100, "latestRevision": false}
+          {"revisionName": "gtc-00000000000000000000000001--r000000000000-40a31a", "weight": 100, "latestRevision": false}
         ]
       },
       "secrets": [
@@ -20,7 +20,7 @@
       ]
     },
     "template": {
-      "revisionSuffix": "r0000000000000000000000000g",
+      "revisionSuffix": "r000000000000-40a31a",
       "initContainers": [
         {
           "name": "seed-init",
