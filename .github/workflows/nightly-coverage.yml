@@ -60,13 +60,28 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Retry: GitHub release downloads occasionally time out, which fails the
+          # job (exit 94) before any test runs. Try 3 times, sleeping 20s then 40s,
+          # and fail with the last exit code. Keeps --disable-strategies compile.
+          binstall_retry() {
+            local attempt rc=0
+            for attempt in 1 2 3; do
+              cargo binstall -y --force --disable-strategies compile "$@" && return 0
+              rc=$?
+              if [ "$attempt" -lt 3 ]; then
+                echo "cargo binstall failed (exit $rc), attempt $attempt/3; retrying in $((attempt * 20))s"
+                sleep $((attempt * 20))
+              fi
+            done
+            return "$rc"
+          }
           # rust-cache restores ~/.cargo/.crates.toml but not ~/.cargo/bin,
           # so binstall may say "already installed" while the binary is gone.
           if ! command -v cargo-llvm-cov >/dev/null; then
-            cargo binstall -y --force --disable-strategies compile cargo-llvm-cov
+            binstall_retry cargo-llvm-cov
           fi
           if ! command -v cargo-nextest >/dev/null; then
-            cargo binstall -y --force --disable-strategies compile cargo-nextest
+            binstall_retry cargo-nextest
           fi
           command -v cargo-llvm-cov
           command -v cargo-nextest
@@ -76,7 +91,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cargo binstall -y --force --disable-strategies compile greentic-dev
+          # Retry: GitHub release downloads occasionally time out, which fails the
+          # job (exit 94) before any test runs. Try 3 times, sleeping 20s then 40s,
+          # and fail with the last exit code. Keeps --disable-strategies compile.
+          binstall_retry() {
+            local attempt rc=0
+            for attempt in 1 2 3; do
+              cargo binstall -y --force --disable-strategies compile "$@" && return 0
+              rc=$?
+              if [ "$attempt" -lt 3 ]; then
+                echo "cargo binstall failed (exit $rc), attempt $attempt/3; retrying in $((attempt * 20))s"
+                sleep $((attempt * 20))
+              fi
+            done
+            return "$rc"
+          }
+          binstall_retry greentic-dev
           command -v greentic-dev
           greentic-dev --version
 
