@@ -734,6 +734,32 @@ resource "aws_ecs_task_definition" "this" {
               name  = "GREENTIC_ADMIN_ALLOWED_CLIENTS"
               value = var.admin_allowed_clients
             }
+          ] : [],
+          # FIXME(env-bridge / PR-30): select the env secrets backend so the runtime
+          # reads cloud secrets that were promoted to Secrets Manager and surfaced as
+          # GREENTIC_SECRET__* container env vars (see the `secrets` block below, fed by
+          # var.secrets_map). This is a deliberate COMPATIBILITY BRIDGE, not the target:
+          #
+          #   PR-30: "that env bridge is the current compatibility path and must remain
+          #   until greentic-start can consume provider bindings at runtime… let
+          #   greentic-start resolve secrets:// URIs through that provider instead of
+          #   through env aliases."
+          #
+          # Security note: env-injected secrets are visible process-wide (and to child
+          # components / exec / logs) and fixed at container start. Replace this with a
+          # secrets-provider binding (.providers/platform/secrets-provider.json -> native
+          # AWS Secrets Manager resolution, per-secret + just-in-time) so secrets are not
+          # parked in the container environment. Remove these two env vars once the
+          # provider-binding runtime path lands.
+          length(var.secrets_map) > 0 ? [
+            {
+              name  = "GREENTIC_SECRETS_BACKEND"
+              value = "env"
+            },
+            {
+              name  = "GREENTIC_ALLOW_ENV_SECRETS"
+              value = "1"
+            }
           ] : []
         )
         secrets = concat(
