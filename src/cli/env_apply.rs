@@ -68,6 +68,7 @@
 
 mod ownership;
 mod prune;
+pub(super) use prune::require_confirmation as require_prune_confirmation;
 pub(super) mod runtime_pin;
 mod split_reuse;
 
@@ -649,6 +650,17 @@ fn apply_with_lookups(
     env_lookup: &dyn Fn(&str) -> Option<String>,
     prompter: Option<&SecretPrompter>,
 ) -> Result<OpOutcome, OpError> {
+    apply_with_retire_hooks(store, flags, opts, env_lookup, prompter, None)
+}
+
+pub(super) fn apply_with_retire_hooks(
+    store: &LocalFsStore,
+    flags: &OpFlags,
+    opts: ApplyOptions,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    prompter: Option<&SecretPrompter>,
+    retire_hooks: Option<&dyn super::bundles_retire::RetireHooks>,
+) -> Result<OpOutcome, OpError> {
     if flags.schema_only {
         return Ok(OpOutcome::new(NOUN, VERB, manifest_schema()));
     }
@@ -702,9 +714,10 @@ fn apply_with_lookups(
         force_drain: false,
         drain_seconds: None,
     };
+    let hooks: &dyn super::bundles_retire::RetireHooks = retire_hooks.unwrap_or(&hooks);
     // `None` unless `--prune`: the default report carries no `prune` key.
     let prune_preview = if prune {
-        Some(prune::preview(store, &ctx, &owner, &hooks)?)
+        Some(prune::preview(store, &ctx, &owner, hooks)?)
     } else {
         None
     };
@@ -810,7 +823,7 @@ fn apply_with_lookups(
         );
     }
     let pruned = if prune {
-        Some(prune::execute(store, &ctx, &owner, &hooks)?)
+        Some(prune::execute(store, &ctx, &owner, hooks)?)
     } else {
         None
     };

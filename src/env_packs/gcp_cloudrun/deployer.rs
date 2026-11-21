@@ -804,11 +804,7 @@ async fn wait_for_revision_ready(
             Err(e) => return Err(provider(e)),
         };
         if Instant::now() >= deadline {
-            return Err(readiness_timeout(
-                revision.revision_id,
-                timeout,
-                Some(&status),
-            ));
+            return Err(readiness_timeout(revision, timeout, Some(&status)));
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -823,14 +819,22 @@ async fn wait_for_revision_ready(
 /// link to its logs — so the error says so. The leading sentence is kept
 /// verbatim: callers match on it.
 fn readiness_timeout(
-    revision_id: RevisionId,
+    revision: &RevisionRef,
     timeout: Duration,
     last: Option<&super::deploy_target::RevisionStatus>,
 ) -> DeployerError {
+    let revision_id = revision.revision_id;
     let mut message = format!(
         "Cloud Run revision `{revision_id}` did not become ready within {}s",
         timeout.as_secs()
     );
+    message.push_str(&format!(
+        ". Cloud Run provider revision `{}`, service `{}` (project `{}`, region `{}`)",
+        revision_name(revision.deployment_id, revision_id),
+        service_name(revision.deployment_id),
+        revision.project,
+        revision.region,
+    ));
     if let Some(reason) = last.and_then(|s| s.not_ready_reason.as_deref()) {
         message.push_str(&format!(". Cloud Run reports: {reason}"));
     }
@@ -1432,6 +1436,15 @@ mod seed_mode_tests;
 mod tests {
     use super::*;
 
+    fn timeout_revision_ref(revision_id: RevisionId) -> RevisionRef {
+        RevisionRef {
+            deployment_id: DeploymentId::new(),
+            revision_id,
+            project: "test-project".into(),
+            region: "test-region".into(),
+        }
+    }
+
     fn not_ready(reason: Option<&str>, log_uri: Option<&str>) -> RevisionStatus {
         RevisionStatus {
             ready: false,
@@ -1447,12 +1460,13 @@ mod tests {
     #[test]
     fn a_readiness_timeout_says_what_cloud_run_reported() {
         let id = RevisionId::new();
+        let revision_ref = timeout_revision_ref(id);
         let last = not_ready(
             Some("Ready: The user-provided container failed to start"),
             Some("https://console.cloud.google.com/logs/viewer?x=1"),
         );
         let DeployerError::Provider(msg) =
-            readiness_timeout(id, Duration::from_secs(300), Some(&last))
+            readiness_timeout(&revision_ref, Duration::from_secs(300), Some(&last))
         else {
             panic!("a readiness timeout is a provider error");
         };
@@ -1472,21 +1486,32 @@ mod tests {
         );
     }
 
-    /// Nothing reported (never polled, or no message yet): the old sentence,
-    /// exactly — no dangling "Cloud Run reports:".
+    /// Even without provider status, preserve the leading sentence and add
+    /// resource identity without dangling condition/log labels.
     #[test]
-    fn a_readiness_timeout_with_nothing_reported_is_the_plain_sentence() {
+    fn a_readiness_timeout_without_status_still_identifies_provider_resources() {
         let id = RevisionId::new();
+        let revision_ref = timeout_revision_ref(id);
         for last in [None, Some(not_ready(None, None))] {
             let DeployerError::Provider(msg) =
-                readiness_timeout(id, Duration::from_secs(300), last.as_ref())
+                readiness_timeout(&revision_ref, Duration::from_secs(300), last.as_ref())
             else {
                 panic!("a readiness timeout is a provider error");
             };
-            assert_eq!(
-                msg,
-                format!("Cloud Run revision `{id}` did not become ready within 300s")
+            assert!(msg.starts_with(&format!(
+                "Cloud Run revision `{id}` did not become ready within 300s"
+            )));
+            assert!(msg.contains(&service_name(revision_ref.deployment_id)));
+            assert!(msg.contains(&revision_name(revision_ref.deployment_id, id)));
+            // A consumer looking for the first gtc resource must see the
+            // revision, rather than its shorter service-name prefix.
+            assert!(
+                msg[msg.find("gtc-").unwrap()..]
+                    .starts_with(&revision_name(revision_ref.deployment_id, id))
             );
+            assert!(msg.contains("project `test-project`, region `test-region`"));
+            assert!(!msg.contains("Cloud Run reports:"));
+            assert!(!msg.contains("Revision logs:"));
         }
     }
 

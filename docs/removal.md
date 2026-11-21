@@ -120,3 +120,90 @@ key at all — default apply output is unchanged.
 
 After a prune on K8s, run `op env reconcile` so the router's runtime config
 stops naming the removed deployment.
+
+## Pruning during `op env up`
+
+```bash
+greentic-deployer op --store-root ./state --answers env.json env up --prune --confirm-prune --dry-run
+greentic-deployer op --store-root ./state --answers env.json env up --prune --confirm-prune --non-interactive
+```
+
+`env up` forwards both flags to the same ownership-aware apply/retire engine.
+Without `--prune`, omitted deployments remain. `--yes` and
+`--non-interactive` do not replace `--confirm-prune`: missing confirmation
+fails before cluster provisioning or environment creation, including dry runs.
+Dry runs report `result.prune.retire` deployment IDs and change nothing.
+A successful imperative bring-up includes apply's `result.prune` retirement
+report. A failed retirement stops before bring-up; the store and ownership
+ledger retain the unfinished deployment so the same operation can retry it.
+Endpoint links and welcome flows retain the existing refusal checks. Handle
+those explicitly through the supported endpoint operations; pruning does not
+unlink routes, force a drain, or ignore teardown/readiness failures.
+
+### Designer coordination and the removed-worker incident
+
+Verified against develop `379ed6b` and Designer's pinned deployer
+`0f04a869eb7347dc453a8298f73005a7e8a6bd38`: there are no intervening
+changes to `env_up.rs`, the prune engine, `env.rs`, or the Cloud Run deployer.
+The prune implementation arrived in `3b1c715` (#628), capability refusal in
+`182555c` (#633), and drain-window overrides in `0210aa8` (#634). Readiness
+conditions and provider log URLs were already added by `a072fe6` (#617).
+Those improvements do not remove omitted deployments during `env up`.
+
+The removed `invoice-review-worker-2` deployment remains in the persisted
+environment with a traffic split targeting a failed immutable revision.
+Cloud Run bring-up warms split-selected revisions from that store, rather
+than just the latest manifest's workers. Retrying the same revision preserves
+its seed's pinned secret versions and therefore repeats the old credential
+failure. This fix retires an authorized owned omission before that warm;
+it does not change immutable revision or credential behavior.
+
+Designer needs a separate coordinated change:
+
+- Resolve a deployer release/build containing this fix and update its pinned
+  commit or binary. Its current pin cannot accept these `env up` flags.
+- Send **both** flags on the normal `env up` call only after confirmed removals
+  within the selected deployment scope. Omission alone is insufficient.
+- Keep a stable canonical answers-file path per manifest/scope and retain the
+  ownership ledger with the store and snapshots. Temporary paths or renamed
+  files acquire a new empty owner; pre-ledger deployments are unmanaged until
+  explicitly adopted by a manifest. Shared deployments claimed by another
+  manifest are protected. Do not repurpose a single owner for partial scopes.
+- Keep apply/prune inside `env up` so the existing before/after snapshot and
+  failed-deploy cleanup encompass the whole operation. Do not add a separate
+  mutating `env apply` ahead of that snapshot. Preserve retry checkpoints after
+  retirement failure; do not recreate a removed worker during cleanup.
+- Consume the dry-run retirement IDs for review and handle endpoint/welcome
+  flow refusals through the existing explicit removal workflow.
+
+The existing stale deployment also needs a **separate authorized one-time
+retirement** if the original manifest owner cannot prune it. Confirm the
+store/environment, exact deployment ID, ownership, endpoint links and welcome
+flows first, then use the normal lifecycle (example only, not executed):
+
+```bash
+greentic-deployer op --store-root <reviewed-store> bundles retire <environment-id> 01M7N57ARXJW6N5TCCMJPZT1AE
+```
+
+Do not use `--store-only` or `--force-drain` to work around this incident.
+Handle any linked routes explicitly before retrying. The failed revision
+`01M7N57AWG0H4JWTW0D5VFPFC7` must be drained/torn down through the supported
+lifecycle; readiness failures for any remaining worker still fail deployment.
+No production retirement, credential rotation, IAM change or deployment was
+performed for this fix.
+
+### Readiness diagnostic compatibility
+
+The leading sentence remains
+`Cloud Run revision <logical revision ULID> did not become ready within <N>s`
+(with backticks around the ID). The diagnostic now appends deterministic
+`Cloud Run provider revision` and `service` names, plus project and region.
+The provider revision comes first so a consumer extracting the first `gtc-…`
+resource sees the revision rather than its shorter service-name prefix.
+Provider conditions and `Revision logs: <URL>` remain appended when Cloud Run
+supplies them. Logical IDs and existing error kinds are preserved; no secret
+material is added. Designer's log extractor should prefer the explicit
+`provider revision` field (`gtc-svc-<deployment-ulid>-<revision-ulid>`) rather
+than treating the first backticked logical ID as a provider resource name.
+Coordinate that parser change separately; the message remains a textual
+provider error, not a new structured error schema.
