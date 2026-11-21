@@ -69,6 +69,16 @@ that owns them. Secret Manager is global and uses its default endpoint.
 
 ## 3. The `CloudRunTarget` seam
 
+The seam's revision IDs cannot represent Cloud Run-generated revision names
+or `LATEST`. Do not replay that partial projection when warming an existing
+service: it can discard its healthy 100% target and send only the candidate's
+0%, which Cloud Run rejects. The real target re-reads the complete provider
+allocation, checks its etag against the caller's snapshot, and preserves named
+targets (including foreign revision names and tags). It pins `LATEST` to the
+previous latest-ready revision before updating the template, so warming never
+silently promotes the candidate. Missing/unresolvable allocations fail before
+the update; traffic is not normalized or assigned to the new candidate.
+
 Every side effect goes through one trait (`deploy_target.rs:298`), with three
 implementations:
 
