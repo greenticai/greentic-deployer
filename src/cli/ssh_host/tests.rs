@@ -76,6 +76,8 @@ fn up_args() -> EnvUpArgs {
         yes: true,
         non_interactive: true,
         dry_run: false,
+        prune: false,
+        confirm_prune: false,
         skip_cluster: true,
         no_port_forward: true,
         port: 8080,

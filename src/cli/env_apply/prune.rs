@@ -32,7 +32,7 @@ use super::ownership::{self, Owner};
 
 /// Refuse `--prune` without its confirmation flag. Checked first, before the
 /// manifest is even read.
-pub(super) fn require_confirmation(prune: bool, confirm_prune: bool) -> Result<(), OpError> {
+pub(crate) fn require_confirmation(prune: bool, confirm_prune: bool) -> Result<(), OpError> {
     if prune && !confirm_prune {
         return Err(OpError::InvalidArgument(
             "`--prune` removes deployments this environment's manifest owns but no longer \

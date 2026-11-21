@@ -44,6 +44,12 @@ pub struct EnvUpArgs {
     /// Preview the apply plan without mutating the store or the cluster.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
+    /// Retire deployments owned by this manifest that it no longer declares.
+    #[arg(long)]
+    pub prune: bool,
+    /// Explicitly confirm ownership-aware pruning; --yes is not sufficient.
+    #[arg(long)]
+    pub confirm_prune: bool,
     /// Skip cluster provisioning (phases 2). Useful when the cluster already
     /// exists and you only want to apply + reconcile.
     #[arg(long = "skip-cluster")]
@@ -76,6 +82,34 @@ pub(crate) fn up(
     flags: &OpFlags,
     args: EnvUpArgs,
 ) -> Result<(OpOutcome, Option<PortForward>), OpError> {
+    up_with_operations(
+        store,
+        registry,
+        flags,
+        args,
+        super::env_apply::apply,
+        imperative_bring_up,
+    )
+}
+
+// Keep apply (including retirement) and bring-up ordered behind one fallible
+// boundary. Tests replace these operations with local fixtures/fake providers.
+fn up_with_operations(
+    store: &LocalFsStore,
+    registry: &EnvPackRegistry,
+    flags: &OpFlags,
+    args: EnvUpArgs,
+    apply: impl FnOnce(
+        &LocalFsStore,
+        &OpFlags,
+        crate::cli::env_apply::ApplyOptions,
+    ) -> Result<OpOutcome, OpError>,
+    bring_up: impl FnOnce(
+        &LocalFsStore,
+        &EnvPackRegistry,
+        &greentic_deploy_spec::EnvId,
+    ) -> Result<Option<serde_json::Value>, OpError>,
+) -> Result<(OpOutcome, Option<PortForward>), OpError> {
     use crate::cli::env_apply::{ApplyMode, ApplyOptions};
     use crate::environment::EnvironmentStore as _;
     use greentic_deploy_spec::EnvId;
@@ -88,7 +122,7 @@ pub(crate) fn up(
                 "up",
                 json!({
                     "input_schema": "manifest via --answers <PATH>; \
-                     --yes, --non-interactive, --dry-run, --skip-cluster, \
+                     --yes, --non-interactive, --dry-run, --prune, --confirm-prune, --skip-cluster, \
                      --no-port-forward, --port <u16>, --allow-missing-seeds, \
                      --updated-by <STRING>"
                 }),
@@ -96,6 +130,10 @@ pub(crate) fn up(
             None,
         ));
     }
+
+    // This must precede cluster provisioning and environment creation, not
+    // merely the apply call's own confirmation guard.
+    super::env_apply::require_prune_confirmation(args.prune, args.confirm_prune)?;
 
     // ── Phase 0: parse ───────────────────────────────────────────────
     let answers_path = flags.answers.as_ref().ok_or_else(|| {
@@ -261,11 +299,13 @@ pub(crate) fn up(
     } else {
         ApplyMode::Apply
     };
-    let apply_outcome = super::env_apply::apply(
+    let apply_outcome = apply(
         store,
         flags,
         ApplyOptions {
             mode,
+            prune: args.prune,
+            confirm_prune: args.confirm_prune,
             updated_by: args.updated_by.clone(),
             yes: args.yes,
             non_interactive: args.non_interactive,
@@ -283,14 +323,20 @@ pub(crate) fn up(
     // traffic and return the discovered endpoint URL(s) (no port-forward). Any
     // other deployer kind returns `None` and falls through to the k8s
     // convergence phases below, unchanged.
-    if let Some(result) = imperative_bring_up(store, registry, &env_id)? {
+    if let Some(mut result) = bring_up(store, registry, &env_id)? {
+        if let Some(prune) = apply_outcome.result.get("prune") {
+            result["prune"] = prune.clone();
+        }
         return Ok((OpOutcome::new(NOUN, "up", result), None));
     }
 
     // ── Deployer dispatch: ssh-host bring-up ─────────────────────────
     // A plain Linux VM over SSH: synchronize the env store and (re)start the
     // service. No cluster, no reconcile, no port-forward.
-    if let Some(result) = super::ssh_host::env_up(store, registry, &env_id)? {
+    if let Some(mut result) = super::ssh_host::env_up(store, registry, &env_id)? {
+        if let Some(prune) = apply_outcome.result.get("prune") {
+            result["prune"] = prune.clone();
+        }
         return Ok((OpOutcome::new(NOUN, "up", result), None));
     }
 
@@ -349,6 +395,9 @@ pub(crate) fn up(
     };
 
     let mut result = up_result_json(&env_id, &report);
+    if let Some(prune) = apply_outcome.result.get("prune") {
+        result["prune"] = prune.clone();
+    }
     if let Some(vault) = &vault_report {
         result["vault"] = json!({
             "namespace": vault.namespace,
@@ -2407,6 +2456,8 @@ mod tests {
             yes: true,
             non_interactive: true,
             dry_run: false,
+            prune: false,
+            confirm_prune: false,
             skip_cluster: false,
             no_port_forward: true,
             port: 8080,
@@ -2753,3 +2804,7 @@ mod tests {
         // `Drop` reaps the child — a leaked `kubectl` would outlive `up`.
     }
 }
+
+#[cfg(all(test, feature = "k8s-client"))]
+#[path = "env_up_prune_tests.rs"]
+mod prune_tests;
