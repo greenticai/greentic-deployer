@@ -60,6 +60,8 @@ use super::deploy_target::{
 use super::deployer::{revision_name, service_name};
 use super::shared_state::{VpcAccess, VpcEgress, VpcTarget};
 
+mod warm_traffic;
+
 /// The IAM permissions [`RealCloudRunTarget`]'s methods exercise at deploy time —
 /// the authoritative Cloud Run / Secret Manager runtime surface. A test pins this
 /// ⊆ [`VALIDATED_GCP_PERMISSIONS`](super::credentials::VALIDATED_GCP_PERMISSIONS)
@@ -225,7 +227,24 @@ impl CloudRunTarget for RealCloudRunTarget {
         spec: &ServiceSpec,
         etag: Option<&str>,
     ) -> Result<ServiceStatus, CloudRunTargetError> {
-        let service = build_service_message(spec, etag);
+        let mut service = build_service_message(spec, etag);
+        if let Some(expected) = etag {
+            // The seam only represents our named revisions. Preserve the full
+            // provider allocation, including LATEST and foreign revisions,
+            // rather than sending the seam's potentially zero-total projection.
+            let current = self
+                .services
+                .get_service()
+                .set_name(service.name.clone())
+                .send()
+                .await
+                .map_err(|e| classify("get_service before warm", &e))?;
+            if current.etag != expected {
+                return Err(CloudRunTargetError::PreconditionFailed);
+            }
+            service.traffic =
+                warm_traffic::preserve(&current, spec.deployment_id, spec.revision_id)?;
+        }
         let svc = match etag {
             // Conditional update: etag rides on the Service message itself
             // (update_service has no separate precondition setter).
@@ -928,8 +947,9 @@ fn service_status_from(svc: &run::Service) -> ServiceStatus {
 
 /// Recover seam [`TrafficTarget`]s from Cloud Run's `traffic[]`. Only entries
 /// pinned to a *named* revision whose name parses back to a `RevisionId` are
-/// kept — `LATEST`-type or foreign entries are dropped (they are not ours to
-/// preserve across a warm).
+/// kept. This is a partial seam projection, not an authoritative allocation:
+/// `upsert_service` preserves the provider's complete traffic through
+/// `warm_traffic`, including foreign names and LATEST, under the same etag.
 fn traffic_targets_from(traffic: &[run::TrafficTarget]) -> Vec<TrafficTarget> {
     traffic
         .iter()

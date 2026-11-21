@@ -7,6 +7,11 @@ The current environment-store architecture lives in `src/cli/`,
 Build requirements and feature defaults are authoritative in `CLAUDE.md` and
 `Cargo.toml`. Repository checks run through `bash ci/local_check.sh`.
 
+Reviewed against the current module layout for the Cloud Run traffic repair;
+the legacy overview below remains unchanged. The maintained Cloud Run
+architecture and its provider-traffic preservation contract are documented in
+`docs/cloudrun-internals.md`.
+
 ## 1. High-Level Purpose
 - `greentic-deployer` is a Rust CLI/library that builds deployment plans from Greentic packs, chooses a deployment pack mapping, and generates provider-specific IaC/artifacts for apply/destroy workflows.
 - It introspects pack manifests (local dirs, `.gtpack` archives, or distributor fetches), resolves config/secrets/telemetry via `greentic-config` and `greentic-secrets`, and emits Terraform/Bicep/Deployment Manager snippets plus manifests for AWS/Azure/GCP; Local/K8s rely on deployment-pack executors.
