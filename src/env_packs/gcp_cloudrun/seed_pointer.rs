@@ -47,7 +47,7 @@ use super::deploy_target::{CloudRunTarget, CloudRunTargetError};
 use super::sor::spec::ar_repository;
 
 /// Secret Manager's per-version payload cap.
-pub const SECRET_VERSION_CAP: usize = 65_536;
+pub use greentic_deploy_spec::secret_chunks::SECRET_VERSION_CAP;
 
 /// Under `auto`, a seed larger than this goes out as a pointer. Below the hard
 /// cap on purpose: the version also has to survive growth between deploys, and

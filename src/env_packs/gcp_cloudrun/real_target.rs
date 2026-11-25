@@ -210,6 +210,63 @@ impl RealCloudRunTarget {
 
 #[async_trait]
 impl CloudRunTarget for RealCloudRunTarget {
+    async fn supports_secret_chunks(&self, image: &str) -> Result<bool, CloudRunTargetError> {
+        use greentic_distributor_client::oci_distribution::{
+            Reference,
+            client::{Client, ClientConfig, linux_amd64_resolver},
+            secrets::RegistryAuth,
+        };
+        if super::secret_chunks::pinned_image_digest(image).is_none() {
+            return Ok(false);
+        }
+        let reference: Reference = image.parse().map_err(|_| {
+            CloudRunTargetError::Api("invalid pinned runtime image reference".into())
+        })?;
+        // Never forward the bound GCP credential to an arbitrary registry.
+        let auth = if reference.registry().ends_with("-docker.pkg.dev") {
+            use google_cloud_auth::credentials::CacheableResource;
+            let headers = match self
+                .credentials
+                .headers(http::Extensions::new())
+                .await
+                .map_err(|_| {
+                    CloudRunTargetError::Api("cannot authenticate runtime capability lookup".into())
+                })? {
+                CacheableResource::New { data, .. } => data,
+                CacheableResource::NotModified => {
+                    return Err(CloudRunTargetError::Api(
+                        "no fresh runtime registry credential".into(),
+                    ));
+                }
+            };
+            let token = super::credentials::extract_bearer_token(&headers).map_err(|_| {
+                CloudRunTargetError::Api("cannot authenticate runtime capability lookup".into())
+            })?;
+            RegistryAuth::Basic("oauth2accesstoken".into(), token)
+        } else {
+            RegistryAuth::Anonymous
+        };
+        let client = Client::new(ClientConfig {
+            platform_resolver: Some(Box::new(linux_amd64_resolver)),
+            connect_timeout: Some(std::time::Duration::from_secs(10)),
+            read_timeout: Some(std::time::Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let (manifest, manifest_digest, config, index_digest) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.pull_manifest_and_config_and_list_digest(&reference, &auth),
+        ).await
+            .map_err(|_| CloudRunTargetError::Api("runtime image capability verification timed out; no seed was staged".into()))?
+            .map_err(|_| CloudRunTargetError::Api("cannot verify pinned runtime image capability; check registry access and runtime release".into()))?;
+        super::secret_chunks::verify_image_capability(
+            image,
+            &manifest_digest,
+            index_digest.as_deref(),
+            &manifest.config.digest,
+            &config,
+        )
+    }
+
     async fn get_service(
         &self,
         service: &ServiceRef,
@@ -441,6 +498,7 @@ impl CloudRunTarget for RealCloudRunTarget {
         name: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError> {
+        super::deploy_target::validate_secret_payload(payload)?;
         let version = self
             .secrets
             .add_secret_version()
@@ -448,10 +506,16 @@ impl CloudRunTarget for RealCloudRunTarget {
             .set_payload(sm::SecretPayload::new().set_data(bytes_from(payload)))
             .send()
             .await
-            .map_err(|e| classify("add_secret_version", &e))?;
-        Ok(SecretVersion {
-            version: numeric_version_from(&version.name),
-        })
+            // An upstream error body is not a safe place to echo encrypted
+            // credential payloads. Preserve failure with a static diagnosis.
+            .map_err(|_| CloudRunTargetError::Api("add_secret_version failed; check Secret Manager access, quota and payload limits".into()))?;
+        let version = numeric_version_from(&version.name);
+        if !greentic_deploy_spec::secret_chunks::numeric_version(&version) {
+            return Err(CloudRunTargetError::Api(
+                "Secret Manager returned an invalid immutable version".into(),
+            ));
+        }
+        Ok(SecretVersion { version })
     }
 
     async fn grant_secret_accessor(
@@ -1324,6 +1388,48 @@ mod tests {
             ),
             "update must identify the resource by name, or Cloud Run rejects it",
         );
+    }
+
+    #[test]
+    fn build_chunked_store_projects_all_versions_under_a_single_seed_mount() {
+        use greentic_deploy_spec::secret_chunks::{self as protocol, ChunkManifest};
+        let manifest = ChunkManifest::new(&vec![7; 70_737], &["6".into(), "7".into()]).unwrap();
+        let mut items = vec![SecretMountItem {
+            version: "5".into(),
+            rel_path: "environment.json".into(),
+        }];
+        items.extend(manifest.chunks.iter().map(|c| SecretMountItem {
+            version: c.version.clone(),
+            rel_path: c.path.clone(),
+        }));
+        items.push(SecretMountItem {
+            version: "8".into(),
+            rel_path: protocol::MANIFEST_PATH.into(),
+        });
+        let s = spec(
+            vec![],
+            vec![SecretMount {
+                mount_dir: "/seed".into(),
+                secret_name: "gtc-local-environment".into(),
+                items,
+            }],
+        );
+        let volumes = build_secret_volumes(&s);
+        assert_eq!(volumes.len(), 1);
+        let source = volumes[0].secret().unwrap();
+        assert_eq!(source.items.len(), 4);
+        assert!(
+            source
+                .items
+                .iter()
+                .all(|i| protocol::numeric_version(&i.version))
+        );
+        assert_eq!(source.items[1].path, protocol::chunk_path(0));
+        assert_eq!(source.items[2].path, protocol::chunk_path(1));
+        assert_eq!(source.items[3].path, protocol::MANIFEST_PATH);
+        let mounts = build_secret_volume_mounts(&s);
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_path, "/seed");
     }
 
     #[test]

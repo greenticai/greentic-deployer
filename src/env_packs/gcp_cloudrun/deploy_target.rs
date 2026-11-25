@@ -363,8 +363,24 @@ pub enum CloudRunTargetError {
 /// Every method is idempotent. Mutations are read-modify-write under `etag`
 /// optimistic concurrency (plan D4). Tests use [`InMemoryCloudRun`]; production
 /// wires the `google-cloud-*`-backed impl (follow-up PR).
+/// Enforce Secret Manager's payload bound before sending any bytes to a provider.
+pub fn validate_secret_payload(payload: &[u8]) -> Result<(), CloudRunTargetError> {
+    if payload.is_empty() || payload.len() > greentic_deploy_spec::secret_chunks::SECRET_VERSION_CAP
+    {
+        return Err(CloudRunTargetError::Api(
+            "secret payload must contain 1..=65536 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 pub trait CloudRunTarget: std::fmt::Debug + Send + Sync {
+    /// Verified image capability; unknown runtimes fail closed for chunked seeds.
+    async fn supports_secret_chunks(&self, _image: &str) -> Result<bool, CloudRunTargetError> {
+        Ok(false)
+    }
+
     /// Read the live Service — its `traffic[]`, readiness, and `etag`. Returns
     /// `None` when the Service does not yet exist (first-create path).
     async fn get_service(
@@ -663,9 +679,25 @@ pub struct InMemoryCloudRun {
     /// When set, `push_seed_artifact` fails — models a credential without
     /// Artifact Registry write.
     deny_seed_push: Mutex<bool>,
+    chunk_images: Mutex<std::collections::BTreeSet<String>>,
+    fail_secret_upload_after: Mutex<Option<usize>>,
 }
 
 impl InMemoryCloudRun {
+    pub fn enable_secret_chunks_for(&self, image: &str) {
+        self.chunk_images
+            .lock()
+            .expect("chunk image mutex")
+            .insert(image.into());
+    }
+
+    pub fn fail_secret_upload_after(&self, count: Option<usize>) {
+        *self
+            .fail_secret_upload_after
+            .lock()
+            .expect("upload failure mutex") = count;
+    }
+
     fn next_etag(&self) -> String {
         let mut c = self.etag_counter.lock().expect("etag mutex not poisoned");
         *c += 1;
@@ -859,6 +891,14 @@ impl InMemoryCloudRun {
 
 #[async_trait]
 impl CloudRunTarget for InMemoryCloudRun {
+    async fn supports_secret_chunks(&self, image: &str) -> Result<bool, CloudRunTargetError> {
+        Ok(self
+            .chunk_images
+            .lock()
+            .expect("chunk image mutex")
+            .contains(image))
+    }
+
     async fn get_service(
         &self,
         service: &ServiceRef,
@@ -1083,6 +1123,24 @@ impl CloudRunTarget for InMemoryCloudRun {
         name: &str,
         payload: &[u8],
     ) -> Result<SecretVersion, CloudRunTargetError> {
+        validate_secret_payload(payload)?;
+        if let Some(limit) = *self
+            .fail_secret_upload_after
+            .lock()
+            .expect("upload failure mutex")
+            && self
+                .secret_versions
+                .lock()
+                .expect("versions mutex")
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+                >= limit
+        {
+            return Err(CloudRunTargetError::Api(
+                "injected secret upload failure".into(),
+            ));
+        }
         let mut secrets = self.secrets.lock().expect("secrets mutex");
         let entry = secrets
             .get_mut(name)

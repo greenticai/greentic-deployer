@@ -888,7 +888,15 @@ impl Deployer for GcpCloudRunDeployerHandler {
         // versions, and a retry must not have to mint any to know what it wants.
         let runtime_service_account = params.runtime_service_account(env.environment_id.as_str());
         let secret_name = environment_secret_name(&params.secret_prefix);
-        let boot_env = runtime_boot_env(env, revision, &params);
+        let mut boot_env = runtime_boot_env(env, revision, &params);
+        if self.dev_secrets.as_ref().is_some_and(|bytes| {
+            bytes.len() > greentic_deploy_spec::secret_chunks::SECRET_VERSION_CAP
+        }) {
+            boot_env.push((
+                greentic_deploy_spec::secret_chunks::TRANSPORT_ENV.into(),
+                greentic_deploy_spec::secret_chunks::SCHEMA.into(),
+            ));
+        }
         // Only when the operator answered a header (or a Redis URL) does the
         // revision carry a secret-sourced env var at all — mirrors the staging
         // in `create_revision`, below.
@@ -1173,6 +1181,11 @@ impl GcpCloudRunDeployerHandler {
         } = spec;
         let deployment_id = revision_ref.deployment_id;
         let revision_id = revision_ref.revision_id;
+        if let Some(bytes) = &self.dev_secrets {
+            super::secret_chunks::preflight(self.target.as_ref(), image, bytes)
+                .await
+                .map_err(provider)?;
+        }
 
         // Stage the env-store seed (plan D6): upload environment.json to a
         // version-pinned Secret Manager secret and grant the runtime SA read
@@ -1183,7 +1196,7 @@ impl GcpCloudRunDeployerHandler {
         // revision's boot env (`runtime_boot_env`) sets `GREENTIC_SEED_DIR`, so
         // greentic-start copies this mount into its writable store at boot. When
         // the env carries dev-store material, the CLI injected the raw bytes and
-        // they are staged as a SECOND version of the same secret below.
+        // they are staged as additional pinned versions of the same secret below.
         // The seed is a copy for the worker, so it omits archived revisions
         // nothing references (Secret Manager caps a version at 64 KiB); the
         // on-disk store stays complete. This revision is always kept.
@@ -1241,24 +1254,32 @@ impl GcpCloudRunDeployerHandler {
             version: env_version.version,
             rel_path: ENVIRONMENT_SEED_FILE.to_string(),
         }];
-        // Stage the operator's encrypted dev-store (`.dev.secrets.env`) as a
-        // second version of the SAME secret, projected at a subdirectory item
-        // path under the one `/seed` volume — Cloud Run forbids nested mounts, so
-        // the two seed files cannot be two volumes. Absent for envs with no
-        // `Secrets`-slot pack (the CLI passes `None`).
+        // Preserve the complete encrypted dev-store buffer. A fitting store
+        // uses the legacy second version; oversized stores use bounded chunks
+        // and a last-published manifest. All use the SAME secret and one /seed
+        // volume: no nested volume mounts or wider accessor grants. Absent for
+        // envs with no `Secrets`-slot pack (the CLI passes `None`).
         if let Some(dev_bytes) = &self.dev_secrets {
-            let dev_version = self
-                .target
-                .add_secret_version(secret_name, dev_bytes)
-                .await
-                .map_err(provider)?;
-            secret_items.push(SecretMountItem {
-                version: dev_version.version,
-                // The seed tree mirrors the on-disk store, so the dev-store's
-                // store-relative path is also its path under `/seed`, projected
-                // as a subdirectory item (Cloud Run forbids a nested mount).
-                rel_path: DEV_STORE_RELATIVE.to_string(),
-            });
+            if dev_bytes.len() > greentic_deploy_spec::secret_chunks::SECRET_VERSION_CAP {
+                secret_items.extend(
+                    super::secret_chunks::stage(self.target.as_ref(), secret_name, dev_bytes)
+                        .await
+                        .map_err(provider)?,
+                );
+            } else {
+                let dev_version = self
+                    .target
+                    .add_secret_version(secret_name, dev_bytes)
+                    .await
+                    .map_err(provider)?;
+                secret_items.push(SecretMountItem {
+                    version: dev_version.version,
+                    // The seed tree mirrors the on-disk store, so the dev-store's
+                    // store-relative path is also its path under `/seed`, projected
+                    // as a subdirectory item (Cloud Run forbids a nested mount).
+                    rel_path: DEV_STORE_RELATIVE.to_string(),
+                });
+            }
         }
         // The telemetry header credential: one more version of the SAME
         // environment secret (so the accessor grant below already covers it),

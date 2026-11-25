@@ -30,6 +30,7 @@ pub mod retention;
 pub mod revenue_policy;
 pub mod revision;
 pub mod runtime_config;
+pub mod secret_chunks;
 pub mod traffic_split;
 pub mod version;
 

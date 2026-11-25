@@ -154,6 +154,14 @@ pub fn capabilities(
     let mut result = serde_json::to_value(report)
         .map_err(|e| OpError::Conflict(format!("capability report: {e}")))?;
     result["environment_id"] = json!(env.environment_id.as_str());
+    #[cfg(feature = "creds-gcp")]
+    if descriptor.path()
+        == crate::env_packs::gcp_cloudrun::GcpCloudRunDeployerHandler::DESCRIPTOR_PATH
+    {
+        result["secret_store_transport"] =
+            crate::env_packs::gcp_cloudrun::secret_chunks::capability_report();
+    }
+
     Ok(OpOutcome::new(NOUN, "capabilities", result))
 }
 
