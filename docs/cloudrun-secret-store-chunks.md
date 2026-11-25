@@ -181,6 +181,29 @@ published by this task. Those exact artifact pins must be recorded from the
 coordinated release outputs before Designer enables large-store deployment;
 there is deliberately no invented minimum nightly/run ID or runtime digest.
 
+## Release workflow alignment
+
+Follow Bima's *Greentic handover* (2026-11-16, updated 2026-11-17), sections
+13.2–13.4 and 14.1. Upstream feature PRs target `develop`; never promote this
+feature directly into `main` or push either protected branch. A merge to
+`develop` triggers dev publication, so distinguish a branch push from a
+published artifact and record the successful publishing run's exact versions.
+
+After both compatible upstream releases exist, Designer's integration PR must
+coordinate `Cargo.toml`/`Cargo.lock` where Rust dependencies change,
+`Dockerfile.tools` for installed CLIs, runtime digest pins, and the relevant
+capability/pin ratchet constants. Keep prerelease ranges intentional; verify
+shared runtime crates resolve to one instance with `cargo tree -i` as required
+by Designer's instructions. Re-evaluate each ratchet's guarded verdict instead
+of mechanically changing its expected pin. Keep Designer's monolithic guard
+until the capability and size checks above replace it in that compatible build.
+
+Do not put a root package version bump into the feature/pin PR. Designer's
+version bump is a separate `chore(release)` PR, based on the version current at
+landing time, after the compatible pin changes land. Follow Designer's allowed
+local checks and CI policy; verify the resulting deploy run and live build
+identity before declaring the capacity fix available to Designer users.
+
 ## Independent secrets-door diagnostics
 
 Workspace-admin loading is a policy/placement optimization, not a capacity
