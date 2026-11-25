@@ -12,6 +12,12 @@ the legacy overview below remains unchanged. The maintained Cloud Run
 architecture and its provider-traffic preservation contract are documented in
 `docs/cloudrun-internals.md`.
 
+Generated structural refresh: the Cloud Run encrypted-store transport shares
+`crates/greentic-deploy-spec/src/secret_chunks.rs` with the runtime. Its deployer
+staging and verified-image gate live in
+`src/env_packs/gcp_cloudrun/secret_chunks.rs`; maintained details and cross-repo
+handover live in `docs/cloudrun-secret-store-chunks.md`.
+
 ## 1. High-Level Purpose
 - `greentic-deployer` is a Rust CLI/library that builds deployment plans from Greentic packs, chooses a deployment pack mapping, and generates provider-specific IaC/artifacts for apply/destroy workflows.
 - It introspects pack manifests (local dirs, `.gtpack` archives, or distributor fetches), resolves config/secrets/telemetry via `greentic-config` and `greentic-secrets`, and emits Terraform/Bicep/Deployment Manager snippets plus manifests for AWS/Azure/GCP; Local/K8s rely on deployment-pack executors.

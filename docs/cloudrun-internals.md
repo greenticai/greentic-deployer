@@ -24,6 +24,7 @@ failure.
 | `bootstrap.rs` | 414 | Renders the minimum-privilege Terraform module (deployer SA, runtime SA, custom role). |
 | `bound_session.rs` | 261 | Resolves the env's bound credential material into live `Credentials`. |
 | `shared_state.rs` | ~450 | Redis + VPC answers, the `multi_instance_safe` capability and the multi-instance `gate`. |
+| `secret_chunks.rs` | — | Oversized encrypted-store staging and digest-bound runtime capability verification; wire codec in deploy-spec. |
 | `redis_secret.rs` | ~230 | The Redis URL's own env-owned secret: reuse an unchanged value, prune superseded versions after a ready warm. |
 | `sor/` | ~1100 | SoR units (SoRLa phase 3E): the SorServiceTarget seam + fake, pure builders, bring-up/retire, the real target. |
 
@@ -481,3 +482,13 @@ inside `op env up` (`cli::env_cloudrun_sor`, core in `cli::env_sor::cloudrun`).
 - `../CLAUDE.md` — repo orientation, and the two-architectures warning.
 - `tests/gcp_cloudrun_e2e.rs` — the executable version of the lifecycle above.
 - `tests/gcp_cloudrun_sor_e2e.rs` — the SoR-unit lifecycle in §10, live.
+
+
+## Encrypted dev-store capacity
+
+The encrypted dev-store seed has a separate capacity problem from
+`environment.json`. The versioned chunk protocol, verified runtime image gate,
+atomic start reconstruction and Designer release/preflight handover are in
+[cloudrun-secret-store-chunks.md](cloudrun-secret-store-chunks.md). Legacy stores
+through 65,536 bytes retain their single pinned file. No deployment may send
+chunks to an unverified or tag-only runtime image.
